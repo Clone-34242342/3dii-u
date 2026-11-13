@@ -58,6 +58,8 @@ def main():
         'program rules': [[py, ROOT + '/tools/gsh_rules.py', '--self-check']],
         'fragment variants': [[py, ROOT + '/tools/fs_variants.py', '--self-check']],
         'picture check': [[py, ROOT + '/tools/test_check_pictures.py']],
+        'missed code': [[py, ROOT + '/tools/test_learn_missed.py']],
+        'build markers': [[py, ROOT + '/tools/test_mark_built.py']],
         'WUP packer': [[py, ROOT + '/tools/test_pack_wup.py']],
         'game detection': [[py, ROOT + '/tools/win/test_detect.py']],
         'shader logs': [[py, ROOT + '/builder/test_shaderlogs.py']],
