@@ -1,6 +1,7 @@
 // Small services: ptm, ndm, ac, frd, boss, cecd, news, ir, mic, cam, y2r, ldr:ro, soc, ssl, http, ...
 #include <algorithm>
 #include <cstring>
+#include <ctime>
 #include <vector>
 
 #include "../loader.h"
@@ -574,6 +575,28 @@ struct Generic : Service {
     void handle(IPC &ipc) override { unimplemented(ipc); }
 };
 
+// ssl:C has no network behind it, but games take their random numbers from it: Pokemon Ultra Sun seeds its own generator with them at
+// every start and save. Unanswered, the buffer stayed as the game left it, and every start rolled the same.
+struct Ssl : Service {
+    using Service::Service;
+    void handle(IPC &ipc) override {
+        if (ipc.cmd() != 0x0011) return unimplemented(ipc);
+        // GenerateRandomData(size, [buffer]): the clock and the tick it's first asked at, stirred (splitmix64)
+        static u64 state = (u64)time(nullptr) << 32 ^ system_tick();
+        u64 z = 0;
+        for (u32 i = 0; i < std::min(ipc[1], ipc[2] >> 4); i++) {  // (no further than the buffer it names)
+            if (i % 8 == 0) {
+                z = (state += 0x9E3779B97F4A7C15ull);
+                z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9ull;
+                z = (z ^ z >> 27) * 0x94D049BB133111EBull;
+                z ^= z >> 31;
+            }
+            w8(ipc[3] + i, (u8)(z >> (i % 8 * 8)));
+        }
+        ipc.ok(1, 2);  // (the buffer's two words go back as they came)
+    }
+};
+
 // am:app: the add-on content and update the builder put beside the game (builder/dumps.py), as Azahar's AM hands them out: dlc_contents.bin
 // holds the DLC title's content infos (index, type, id, size, ownership; 0x18 bytes each), dlc_title.bin and update_title.bin a title info
 // each (title id, size, version, type), dlc_ticket.bin a ticket info. With none of them nothing is installed.
@@ -710,7 +733,8 @@ void register_misc() {
     register_service(std::make_shared<Am>("am:app"));  // was Generic: NSMB2's Coin Rush read its own request back as thousands of DLC tickets (2026-11-07)
     register_y2r();
     register_cam();
-    for (const char *n : {"news:u", "soc:U", "ssl:C", "http:C", "dlp:FKCL", "dlp:SRVR",
+    register_service(std::make_shared<Ssl>("ssl:C"));
+    for (const char *n : {"news:u", "soc:U", "http:C", "dlp:FKCL", "dlp:SRVR",
                           "pxi:dev", "act:u", "nim:aoc", "qtm:u", "csnd:SND", "nfc:u"})
         register_service(std::make_shared<Generic>(n));
 }
