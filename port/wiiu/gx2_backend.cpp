@@ -45,6 +45,7 @@
 #include "gpu_iface.h"
 #include "services/services.h"
 #include "kernel.h"
+#include "latte_program.h"
 #include "loader.h"
 #include "present_rule.h"
 #include "shader_compile.h"
@@ -371,6 +372,15 @@ void install_compiled() {
             v.shader = d.vs_shader;
             v.index = COMPILED_HERE;
             v.inputs = d.inputs;
+            if (in_cemu) {  // Cemu loses all but the first register of a burst of exports (latte_program.h): the program without them, in a block of its own
+                const u8 *const made = (const u8 *)v.shader->program;
+                const u32 words = unburst(made, v.shader->size / 4, nullptr);
+                if (u8 *const longer = words ? (u8 *)memalign(GX2_SHADER_PROGRAM_ALIGNMENT, words * 4) : nullptr) {
+                    unburst(made, v.shader->size / 4, longer);
+                    v.shader->program = longer;  // (the compiler's block stays its own: nothing frees an installed shader)
+                    v.shader->size = words * 4;
+                }
+            }
             GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, v.shader->program, v.shader->size);
             vs_locations(v);
             log_vs_tables("compiled", d.key, v.shader);
