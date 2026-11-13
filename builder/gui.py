@@ -17,7 +17,7 @@ from PySide6.QtCore import QBuffer, QIODevice, QObject, Property, QSize, QStanda
 from PySide6.QtGui import QColor, QFontDatabase, QGuiApplication, QIcon, QImage, QPixmap
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
-from PySide6.QtWidgets import QApplication, QFileDialog
+from PySide6.QtWidgets import QApplication, QFileDialog, QInputDialog
 
 import covers
 import credits
@@ -37,6 +37,7 @@ DUMPS = '3DS games (*.3ds *.cci *.cia *.cxi *.app);;All files (*.*)'
 DUMP_EXTS = ('.3ds', '.cci', '.cia', '.cxi', '.app')
 STAGE_OF = {n: i for i, (n, _) in enumerate(pipeline.STAGES)}
 NO_ART = "The game's own icon"
+BOOT_SOUND = os.path.join(os.path.dirname(pipeline.ARCHIVES), 'boot_sound.btsnd')  # where every build picks it up (tools/make_game_title.py)
 LIBRARY_MAX = 40  # games the Games page remembers
 # What each of "Your Files" is and how to get it from your own consoles: the Info buttons, and the message when one is missing.
 # Testers asked what the system files were and how to get seeddb.bin (Nov 9 and 10).
@@ -217,7 +218,8 @@ def theme():
 # ---- what the window shows, and what its buttons do
 class App(QObject):
     changed = Signal()
-    coverReady = Signal(str, str)  # title id, path: from fetch_cover's thread
+    coverReady = Signal(str, str, str)  # title id, the picture's path, the icon's: from fetch_cover's thread
+    keyRefused = Signal()  # SteamGridDB turned the key down: from fetch_cover's thread
     updateEvent = Signal(str, object)  # what, value: from the updater's worker threads, the value passed as it is
     logChanged = Signal()
 
@@ -229,6 +231,7 @@ class App(QObject):
     updateText, hasUpdate, dlcText, hasDlc = _p(str, 'updateText'), _p(bool, 'hasUpdate'), _p(str, 'dlcText'), _p(bool, 'hasDlc')
     modText, hasMod = _p(str, 'modText'), _p(bool, 'hasMod')
     artText, hasArt, artUrl = _p(str, 'artText'), _p(bool, 'hasArt'), _p(str, 'artUrl')
+    artKeySet, soundSet = _p(bool, 'artKeySet'), _p(bool, 'soundSet')
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
@@ -249,7 +252,8 @@ class App(QObject):
         if not self.st.get('keys'):
             self.st['keys'] = decrypt.KEYS_DEFAULT
         decrypt.use_keys(self.st['keys'])
-        self.game = self.update = self.dlc = self.mod = self.art = None  # the mod and the banner art are paths
+        self.game = self.update = self.dlc = self.mod = self.art = self.icon_art = None  # the mod, the banner art and the icon art are paths
+        self.refused_key = None  # the SteamGridDB key it turned down, if it did (fetch_cover)
         self.proc, self.result, self.cancelled = None, None, False
         self.lines, self.log_lines, self.dialogs, self.flow = queue.Queue(), [], [], None
         compat = json.load(open(os.path.join(HERE, 'compat.json'), encoding='utf-8'))
@@ -262,7 +266,7 @@ class App(QObject):
         theme_mode = self.st.get('theme')
         self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
-                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
+                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -282,6 +286,7 @@ class App(QObject):
         QGuiApplication.styleHints().colorSchemeChanged.connect(self.apply_theme)  # "system" follows Windows switching while the window is open
         self.apply_theme()
         self.coverReady.connect(self.cover_ready)
+        self.keyRefused.connect(self.key_refused)
         self.refresh_library()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -393,9 +398,10 @@ class App(QObject):
         self.set_extra('dlc', None)
         self.set_extra('mod', None)
         saved = self.st.get('art', {}).get(f'{d.title_id:016x}')  # a game keeps the banner art chosen for it; '' is "none, on purpose"
-        self.set_art(saved if saved and os.path.isfile(saved) else None, remember=False)
+        icon = self.st.get('icon_art', {}).get(f'{d.title_id:016x}')
+        self.set_art(saved if saved and os.path.isfile(saved) else None, icon if icon and os.path.isfile(icon) else None, remember=False)
         if saved is None:  # nothing chosen yet: its cover art, fetched off the window's thread
-            threading.Thread(target=self.fetch_cover, args=(d,), daemon=True).start()
+            threading.Thread(target=self.fetch_cover, args=(d, info['name']), daemon=True).start()
         self.refresh_files()
         self.remember_game(d, info['name'])
         if ask:  # a game picked again from the library keeps quiet
@@ -415,7 +421,8 @@ class App(QObject):
         covers_dir = os.path.join(os.path.dirname(settings_file()), 'covers')
         shown = []
         for g in self.st.get('library', []):
-            art = self.st.get('art', {}).get(g['id']) or os.path.join(covers_dir, (covers.game_code(g['product']) or '-') + '.jpg')
+            art = (self.st.get('icon_art', {}).get(g['id']) or self.st.get('art', {}).get(g['id'])  # a square icon fills a tile best
+                   or os.path.join(covers_dir, (covers.game_code(g['product']) or '-') + '.jpg'))
             cover = QUrl.fromLocalFile(art).toString() if os.path.isfile(art) else ''
             shown.append(dict(path=g['path'], name=g['name'], icon=g['icon'], cover=cover, current=bool(self.game and self.game.path == g['path'])))
         self.set(library=shown)
@@ -531,29 +538,86 @@ class App(QObject):
     def removeArt(self):
         self.set_art(None)
 
-    def fetch_cover(self, game):
-        """on a thread of its own: the game's cover art from GameTDB (covers.py), handed to the window's thread when it's here"""
-        path = covers.cover(game.product, os.path.join(os.path.dirname(settings_file()), 'covers'))
-        if path:
-            self.coverReady.emit(f'{game.title_id:016x}', path)
+    def fetch_cover(self, game, name):
+        """on a thread of its own: the game's banner and icon from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
+        and for what SteamGridDB lacks (covers.py), handed to the window's thread when they're here"""
+        folder, title_id, key = os.path.join(os.path.dirname(settings_file()), 'covers'), f'{game.title_id:016x}', self.st.get('sgdb_key')
+        found = {}
+        try:
+            found = (covers.steamgriddb(name, key, folder, title_id) if key and key != self.refused_key else None) or {}
+        except covers.BadKey:
+            self.refused_key = key  # not asked with again until it's changed, and said once
+            self.keyRefused.emit()
+        cover = None if found.get('banner') and found.get('icon') else covers.cover(game.product, folder)
+        banner, icon = found.get('banner') or cover, found.get('icon') or (cover if found.get('banner') else None)
+        if banner or icon:
+            self.coverReady.emit(title_id, banner or '', icon or '')
 
-    def cover_ready(self, title_id, path):
-        if self.game and f'{self.game.title_id:016x}' == title_id and not self.art and not self._s['building']:
-            self.set_art(path)
+    def cover_ready(self, title_id, path, icon):
+        if self.game and f'{self.game.title_id:016x}' == title_id and not self.art and not self.icon_art and not self._s['building']:
+            self.set_art(path or None, icon or None)
         self.refresh_library()
 
-    def set_art(self, path, remember=True):
-        """the picture this game's start-up screens and Wii U Menu icon are made from, remembered for the game: a path, or '' once the
-        player has removed it, so its cover isn't fetched again"""
-        self.art = path
+    def key_refused(self):
+        self.tell("SteamGridDB didn't take the key", 'Check it on the Help page, under Art and sound: it is the long code on steamgriddb.com under '
+                  'Preferences, API. Until then the art comes from GameTDB.', 'warn')
+
+    def set_art(self, path, icon=None, remember=True):
+        """the pictures this game's start-up screens and Wii U Menu icon are made from, remembered for the game: path for both, or for the
+        screens alone where icon is the icon's; '' once the player has removed them, so they aren't fetched again"""
+        self.art, self.icon_art = path, icon
         if self.game and remember:
             self.st.setdefault('art', {})[f'{self.game.title_id:016x}'] = path or ''
+            self.st.setdefault('icon_art', {})[f'{self.game.title_id:016x}'] = icon or ''
             save_settings(self.st)
-        cover = bool(path) and os.path.dirname(path) == os.path.join(os.path.dirname(settings_file()), 'covers')
-        self.set(artText=('Its cover art, from GameTDB' if cover else os.path.basename(path)) if path else NO_ART, hasArt=bool(path),
-                 artUrl=QUrl.fromLocalFile(path).toString() if path else '')  # the Build page's tile shows it
+        shown = icon or path
+        covers_dir = os.path.join(os.path.dirname(settings_file()), 'covers')  # what's in it was fetched: covers.py names SteamGridDB's sgdb_...
+        fetched = sorted({'SteamGridDB' if os.path.basename(p).startswith('sgdb_') else 'GameTDB' for p in (path, icon) if p and os.path.dirname(p) == covers_dir})
+        text = ('Its art, from ' + ' and '.join(fetched) if fetched else os.path.basename(shown)) if shown else NO_ART
+        self.set(artText=text, hasArt=bool(shown), artUrl=QUrl.fromLocalFile(shown).toString() if shown else '')  # the Build page's tile shows it
         if remember:
             self.refresh_library()
+
+    @Slot()
+    def setArtKey(self):
+        key, ok = QInputDialog.getText(None, 'SteamGridDB', 'Your SteamGridDB API key: the long code on steamgriddb.com under Preferences, API.\n'
+                                       "It stays on this PC, in the builder's settings. Leave it empty to stop asking SteamGridDB.")
+        if not ok:
+            return
+        self.st['sgdb_key'] = key.strip()
+        save_settings(self.st)
+        self.set(artKeySet=bool(self.st['sgdb_key']))
+        removed = self.game and self.st.get('art', {}).get(f'{self.game.title_id:016x}') == ''  # on purpose: it stays removed
+        if self.game and self.st['sgdb_key'] and not self._s['building'] and not removed and (not self.art or self._s['artText'].endswith('GameTDB')):
+            self.set_art(None, remember=False)  # the open game's fetched art, again from the new place; a picture the player chose stays
+            threading.Thread(target=self.fetch_cover, args=(self.game, self._s['gameName']), daemon=True).start()
+
+    @Slot()
+    def chooseSound(self):
+        path = QFileDialog.getOpenFileName(None, 'A sound to play while your games start', self.st.get('sound_folder', ''),
+                                           'Sounds (*.wav *.btsnd);;All files (*.*)')[0]
+        if not path:
+            return
+        self.st['sound_folder'] = os.path.dirname(path)
+        save_settings(self.st)
+        try:
+            data = pipeline.tool('make_boot_sound').boot_sound(path)
+            os.makedirs(os.path.dirname(BOOT_SOUND), exist_ok=True)
+            with open(BOOT_SOUND, 'wb') as f:
+                f.write(data)
+        except (OSError, ValueError, EOFError, ImportError) as e:
+            self.tell("That sound can't be used", f'{e}. Choose a WAV file: most sound programs can save one.', 'error')
+            return
+        self.set(soundSet=True)
+
+    @Slot()
+    def removeSound(self):
+        try:
+            if os.path.isfile(BOOT_SOUND):
+                os.remove(BOOT_SOUND)
+        except OSError as e:
+            self.tell("The sound couldn't be removed", str(e), 'error')
+        self.set(soundSet=os.path.isfile(BOOT_SOUND))
 
     @Slot(str)
     def removeExtra(self, kind):
@@ -856,6 +920,8 @@ class App(QObject):
             argv += ['--mod', self.mod]
         if self.art:
             argv += ['--art', self.art]
+        if self.icon_art:
+            argv += ['--icon-art', self.icon_art]
         self.log_lines, self.result, self.cancelled = [], None, False
         stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or self._s['target'] == 'card']
         self.set(building=True, view='building', stages=stages, stage=0, failed=False, progress=0.0, detail='Starting...', log='')

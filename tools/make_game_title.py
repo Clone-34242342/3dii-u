@@ -112,9 +112,10 @@ def write_art_tga(path, rows, bpp):
         f.write(header + bytes(pixels) + TGA_FOOTER + (bytes(4) if bpp == 24 else b''))
 
 
-def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None):
+def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
-    art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up."""
+    art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
+    picture for the icon alone (a square one, where art is a wide banner)."""
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):
@@ -135,13 +136,12 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     write_tga(os.path.join(meta_dir, 'bootLogoTex.tga'), icon, 170, 42, 32, 0, (0, 0, 0))
     write_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), icon, 854, 480, 24, 6, BACKGROUND)
     write_tga(os.path.join(meta_dir, 'bootTvTex.tga'), icon, 1280, 720, 24, 10, BACKGROUND)
-    if art:
-        for tga, w, h, bpp in (('iconTex.tga', 128, 128, 32), ('bootDrcTex.tga', 854, 480, 24), ('bootTvTex.tga', 1280, 720, 24)):
-            rows = art_pixels(art, w, h, (0, 0, 0))
-            if rows is None:
-                print(f'the banner picture {art} could not be read: the game\'s own icon is used')
-                break
+    for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art or art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
+        rows = art_pixels(picture, w, h, (0, 0, 0)) if picture else None
+        if rows:
             write_art_tga(os.path.join(meta_dir, tga), rows, bpp)
+        elif picture:
+            print(f'the picture {picture} could not be read: the game\'s own icon is used for {tga}')
     # the sound while the game starts, if this PC has one (tools/make_boot_sound.py); a title without the file starts silently
     boot_sound = os.path.join(os.path.dirname(os.path.abspath(archives)), 'boot_sound.btsnd')
     if os.path.isfile(boot_sound):

@@ -66,6 +66,10 @@ Windows 10 or 11 for now (Linux is planned):
   - Its `engine` folder holds the rest: the recompiler, the runtime's sources, devkitPro's PowerPC toolchain with wut, the CafeGLSL shader compiler, and a ready-built shader generator.
   - It builds in `%LOCALAPPDATA%\3Dii U Builder`, which keeps the compiled runtime for the next game.
   - Beside it, `objcache` keeps up to 2 GB of compiled game code by what went into it (`tools/win/objcache.py`). A game built again by a newer app, or with its update, then compiles only the files whose code changed.
+- A game's art comes from the web when the game is picked (`covers.py`), and the user's own picture or "Remove art" overrides it.
+  - With the user's SteamGridDB key (Help page, "Art and sound"; kept in `settings.json`, never in the repository): a wide banner for the start-up screens and a square icon for the Wii U Menu, found by the game's name.
+  - Without a key, or where SteamGridDB has nothing: the cover from GameTDB, by the product code's four letters.
+- The start-up sound is the user's own too (Help page, "Art and sound", a WAV file): `tools/make_boot_sound.py` turns it into `boot_sound.btsnd` in the work folder, and every title built after carries it.
 - The 3DS system archives (its shared font and Mii data) don't come with it: they're your own 3DS's files.
   - The builder copies them from Azahar's or Citra's user folder, or from any folder holding a 3DS NAND up to three levels down in Downloads, Desktop or Documents, whatever it's called. It keeps them in its work folder.
   - Off a 3DS, GodMode9 copies `title/0004009b` (font, Mii data) and `title/000400db` (the bad-word list) out of `[1:] SYSNAND CTRNAND`; the user picks either folder (or the one holding them) with "Folder". A build stops if the game's code names an archive the files lack (`dumps.archives_named`): Tomodachi Life stops at start without the word list. Azahar gets them with File > Set Up System Files and the Artic Setup Tool.

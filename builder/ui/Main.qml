@@ -926,6 +926,23 @@ ApplicationWindow {
                 }
                 Card {
                     width: 1030
+                    title: "Art and sound"
+                    subtitle: "What your games show and play on the Wii U while they start."
+                    CardRow {
+                        label: "Banners and icons"
+                        sub: app.artKeySet ? "From SteamGridDB, with your key. GameTDB's covers fill in where it has nothing."
+                                           : "Covers from GameTDB. With a free SteamGridDB key (steamgriddb.com, Preferences, API) each game gets a banner and an icon from there."
+                        Pill { text: app.artKeySet ? "Change key" : "Add key"; accessibleName: "SteamGridDB key"; tone: "cyan"; onClicked: app.setArtKey() }
+                    }
+                    CardRow {
+                        label: "Start-up sound"
+                        sub: app.soundSet ? "Your sound plays while a game starts." : "None: games start silently. Choose a WAV file to have one."
+                        Pill { text: "Choose"; accessibleName: "Choose the start-up sound"; tone: "cyan"; onClicked: app.chooseSound() }
+                        Pill { text: "Remove"; accessibleName: "Remove the start-up sound"; tone: "red"; visible: app.soundSet; onClicked: app.removeSound() }
+                    }
+                }
+                Card {
+                    width: 1030
                     title: "About"
                     subtitle: "3Dii U Builder " + app.version
                     CardRow {

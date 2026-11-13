@@ -98,6 +98,10 @@ WHAT STAYS ON YOUR PC
 
 - When you pick a game, the builder downloads its cover art from GameTDB (art.gametdb.com) for the game's start-up screens and Wii U Menu icon.
   It sends only the four letters of the game's product code. The "Art" pill on the game's tile lets you choose your own picture, or "Remove art" to use the game's icon.
+- With a SteamGridDB key (Help page, "Art and sound"; the key is free, on steamgriddb.com under Preferences, API) each game gets a banner for
+  its start-up screens and an icon for the Wii U Menu from SteamGridDB instead. The builder sends the game's name and your key there, and
+  nothing else; the key stays in the builder's settings on this PC.
+- A start-up sound is yours to add (Help page, "Art and sound"): choose a WAV file and every game you build plays it while it starts.
 - The builder asks GitHub for the list of its releases, and downloads one from there only when you press "Update".
 
 The builder comes with no game, no game data and no keys. This is a beta, with no warranty.

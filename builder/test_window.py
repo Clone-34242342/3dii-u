@@ -295,6 +295,53 @@ try:
     for st in ('downloading', 'unpacking', 'ready', 'restarting', 'failed'):
         state.set(updateState=st, updateProgress=37)
         settle(f'the update card, {st}')
+    # a picked game's art, with covers.py's two places faked: SteamGridDB's banner and icon where there's a key, GameTDB's cover for what it
+    # lacks and where there's none, and a key it turns down said so
+    made = {n: os.path.join(base, 'covers', n) for n in ('sgdb_1_banner.png', 'sgdb_1_icon.png', 'AAAE.jpg')}
+    os.makedirs(os.path.join(base, 'covers'))
+    for path in made.values():
+        img.save(path)
+    banner, square, cover = made.values()
+    picked = type('Game', (), dict(title_id=1, product='CTR-P-AAAE'))()
+    gui.covers.cover = lambda product, folder: cover
+
+    def pick(found, key='a key'):
+        def site(name, key, folder, title_id):
+            if found is None:
+                raise gui.covers.BadKey
+            return found
+        gui.covers.steamgriddb = site
+        state.st['sgdb_key'] = key
+        state.game, state.art, state.icon_art = picked, None, None
+        state.fetch_cover(picked, 'A game')
+        return state.art, state.icon_art, state.artText
+
+    assert pick(dict(banner=banner, icon=square)) == (banner, square, 'Its art, from SteamGridDB')
+    assert pick(dict(banner=banner, icon=None)) == (banner, cover, 'Its art, from GameTDB and SteamGridDB')
+    assert pick(dict(banner=None, icon=square)) == (cover, square, 'Its art, from GameTDB and SteamGridDB')
+    assert pick(dict(banner=None, icon=None)) == (cover, None, 'Its art, from GameTDB')
+    assert pick(dict(banner=banner, icon=square), key='') == (cover, None, 'Its art, from GameTDB'), 'SteamGridDB asked without a key'
+    assert pick(None) == (cover, None, 'Its art, from GameTDB') and 'SteamGridDB' in state.dialog['title']
+    state.answer(True)
+    assert pick(None) == (cover, None, 'Its art, from GameTDB') and not state.dialog, 'a key turned down is said once, not for every game'
+
+    # a new key fetches the open game's art again, unless the player chose its picture or removed it on purpose
+    asked_again = threading.Event()
+    state.fetch_cover = lambda *a: asked_again.set()
+    gui.QInputDialog.getText = lambda *a, **k: (' another key ', True)
+    state.set_art(None)  # removed: '' is remembered for the game
+    state.setArtKey()
+    assert state.st['sgdb_key'] == 'another key' and state.artKeySet and not asked_again.wait(0.3), 'art removed on purpose came back'
+    state.set_art(art)  # the player's own picture
+    state.setArtKey()
+    assert not asked_again.wait(0.3) and state.art == art, "the player's own picture was dropped"
+    state.set_art(cover)
+    state.setArtKey()
+    assert asked_again.wait(5), "GameTDB's cover wasn't looked up again with the new key"
+    gui.QInputDialog.getText = lambda *a, **k: ('', True)
+    state.setArtKey()
+    assert state.st['sgdb_key'] == '' and not state.artKeySet
+    state.game = None
     del engine  # before the App it shows, or its bindings read a gone app on the way out
     print('window ok')
 finally:

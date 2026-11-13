@@ -18,5 +18,7 @@
   {"q": "How does the Builder update itself?",
    "a": "When it starts, the Builder asks GitHub for the list of its releases; it only downloads the one you choose. If a newer one is out, the Build page offers it. Press Update and the new version is downloaded into the Builder's data folder, %LOCALAPPDATA%\\3Dii U Builder\\app, and opens from then on. The folder you unzipped is never changed."},
   {"q": "An update went wrong. What can I do?",
-   "a": "Hold Shift while starting the Builder to open the copy you unzipped. Or delete the folder %LOCALAPPDATA%\\3Dii U Builder\\app, and the copy you unzipped runs again. A version that fails to start is set aside by itself, and Check for updates on the Help page offers it again."}
+   "a": "Hold Shift while starting the Builder to open the copy you unzipped. Or delete the folder %LOCALAPPDATA%\\3Dii U Builder\\app, and the copy you unzipped runs again. A version that fails to start is set aside by itself, and Check for updates on the Help page offers it again."},
+  {"q": "How do I get better banners and icons, or a start-up sound?",
+   "a": "On this page, under Art and sound. With a SteamGridDB key each game gets a banner for its start-up screens and an icon for the Wii U Menu from SteamGridDB: make a free account on steamgriddb.com, copy the key from Preferences, API, and press Add key. Without one the Builder uses GameTDB's covers. Start-up sound takes a WAV file of yours, which every game you build then plays while it starts. Both are kept on this PC; build a game again for it to take them."}
 ]

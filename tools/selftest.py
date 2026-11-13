@@ -61,6 +61,8 @@ def main():
         'missed code': [[py, ROOT + '/tools/test_learn_missed.py']],
         'build markers': [[py, ROOT + '/tools/test_mark_built.py']],
         'WUP packer': [[py, ROOT + '/tools/test_pack_wup.py']],
+        'boot sound': [[py, ROOT + '/tools/test_boot_sound.py']],
+        'game art': [[py, ROOT + '/builder/test_covers.py']],
         'game detection': [[py, ROOT + '/tools/win/test_detect.py']],
         'shader logs': [[py, ROOT + '/builder/test_shaderlogs.py']],
         'user files': [[py, ROOT + '/builder/test_user_files.py']],

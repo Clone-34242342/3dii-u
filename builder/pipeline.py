@@ -133,14 +133,19 @@ def console_learned(info, slug, card):
     return [os.path.join(kept, f) for f in sorted(os.listdir(kept)) if f.startswith('console_card_')] if os.path.isdir(kept) else []
 
 
-def make_title(game_dir, out, info, art=None):
-    """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
+def tool(name):
+    """one of the repository's tool scripts, loaded by its path: the app carries them as files, not as modules"""
     import importlib.util
-    spec = importlib.util.spec_from_file_location('make_game_title', os.path.join(ROOT, 'tools', 'make_game_title.py'))
-    titles = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(titles)
-    titles.make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
-                      info['title_id'], info['name'], info['product'], ARCHIVES, art)
+    spec = importlib.util.spec_from_file_location(name, os.path.join(ROOT, 'tools', name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def make_title(game_dir, out, info, art=None, icon_art=None):
+    """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
+    tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
+                                       info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art)
     content = os.path.join(out, 'title', 'content')
     for f in os.listdir(game_dir):
         if f.startswith(('update_', 'dlc_')):
@@ -198,6 +203,7 @@ def main():
     ap.add_argument('--out', help='a folder to put the WUP in instead')
     ap.add_argument('--keep', action='store_true', help='keep the work files, for a quicker rebuild')
     ap.add_argument('--art', help="a picture (the cover art, say) for the start-up screens and the Wii U Menu icon; the game's own icon otherwise")
+    ap.add_argument('--icon-art', help='a square picture for the Wii U Menu icon alone, where --art is a wide banner')
     ap.add_argument('--mixed', action='store_true', help='trial: fast code with only the video decoder in safe mode (build3ds.Game.mixed)')
     ap.add_argument('--cold', action='store_true', help="for the checks: build it as a game nobody has built before, with none of this PC's lists of "
                                                         'its code and shaders (tools/check_ports.py --cold)')
@@ -390,7 +396,7 @@ def main():
         shutil.copyfile(dvlb, os.path.join(learned, 'dvlb.bin'))
 
     PROGRESS.stage('Making the title')
-    make_title(game_dir, out, info, a.art)
+    make_title(game_dir, out, info, a.art, a.icon_art)
 
     if b3.MEASURE:  # the checks' own kind of build, for Cemu (build3ds.py): never packed, so none can reach a console
         print('a measuring build: not packed', flush=True)
