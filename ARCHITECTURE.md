@@ -109,7 +109,8 @@ a `DrawState`, and the backend turns each draw into GX2 state and a draw call.
   (`third_party/cafeglsl/glslcompiler.exe`) compiles them, and `build3ds.py` merges the results into `shaders.gsh`.
 - The shaders a game needs come from several places:
   - the PC trial's logs (`vs_log.bin`, `fs_log.bin`)
-  - every vertex program found in the game's files (`tools/dvlb_to_log.py`)
+  - every vertex program found in the game's files (`tools/dvlb_to_log.py`): shader binaries, and the GPU command lists
+    that Game Freak's model files load their shaders with instead (`tools/shadergen_lists.cpp`)
   - every material in its model files (`tools/tev_to_log.py`)
   - other games' logs, because fragment states don't depend on the game
   - misses reported by consoles (`tools/misses_to_log.py`)

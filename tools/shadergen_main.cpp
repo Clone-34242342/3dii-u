@@ -2,6 +2,8 @@
 //   shadergen <pipelines.bin> <fs and vs log dir> <output dir> <glsl compiler>
 // Inputs: the fragment state list shipped with the recompiler, plus what runs of the game recorded (vs_log.bin, fs_log.bin) and
 // what the console logged as missing (shader_misses.bin, same records). Outputs shaders.gsh and shaders.idx.
+//   shadergen --lists <out.bin> <romfs.bin>...
+// finds the vertex programs a game's files set up from GPU command lists instead (shadergen_lists.cpp), as records for those logs.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -84,9 +86,12 @@ std::string hex64(u64 v) {
 }
 }  // namespace
 
+int lists_main(int argc, char **argv);  // shadergen_lists.cpp
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--lists")) return lists_main(argc, argv);
     if (argc < 5) {
-        fprintf(stderr, "usage: shadergen <pipelines.bin> <log dir> <output dir> <compiler>\n");
+        fprintf(stderr, "usage: shadergen <pipelines.bin> <log dir> <output dir> <compiler>\n       shadergen --lists <out.bin> <romfs.bin>...\n");
         return 2;
     }
     const std::string pipelines = argv[1], logs = argv[2], out = argv[3], compiler = argv[4];

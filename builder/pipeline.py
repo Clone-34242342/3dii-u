@@ -324,8 +324,8 @@ def main():
     b3.WORK = os.path.join(WORK, 'build_win_builder').replace('\\', '/')
     prepare_logs = b3.prepare_logs
 
-    def with_vertex_programs(g):  # the standalone app's logs name vertex programs by fingerprint: this dump's own dvlb.bin has their code
-        prepare_logs(g)
+    def with_vertex_programs(g, shadergen):  # the standalone app's logs name vertex programs by fingerprint: this dump's own dvlb.bin has their code
+        prepare_logs(g, shadergen)
         made, left = shaderlogs.restore(g.dir + '/shader_logs')
         if made or left:
             print(f'vertex records from earlier runs: {made}, and {left} whose program this dump hasn\'t', flush=True)

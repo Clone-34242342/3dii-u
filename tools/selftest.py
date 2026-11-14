@@ -36,10 +36,15 @@ def latte_program():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_latte_program.cpp', '-lpthread', '-o', exe], [exe]]
 
 
-def open_bools():
-    """tools/test_open_bools.cpp with the shader generator's own objects, which build3ds keeps built, for this PC"""
+def shadergen():
+    """the shader generator, which build3ds keeps built for this PC"""
     with contextlib.redirect_stdout(io.StringIO()):
-        build3ds.build_shadergen(types.SimpleNamespace(jobs=4, force=False, extra_flags=None, only=None, opt=None))
+        return build3ds.build_shadergen(types.SimpleNamespace(jobs=4, force=False, extra_flags=None, only=None, opt=None))
+
+
+def open_bools():
+    """tools/test_open_bools.cpp with the shader generator's own objects"""
+    shadergen()
     exe = build3ds.WORK + '/selftest/test_open_bools.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     objs = [f'{build3ds.WORK}/shadergen/{n}.o' for n in ('shadergen.cpp', 'shaderkeys.cpp', 'shader.cpp', 'shadergen_stubs.cpp')]
@@ -55,6 +60,7 @@ def main():
         'present rule': present_rule(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
+        'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
         'program rules': [[py, ROOT + '/tools/gsh_rules.py', '--self-check']],
         'fragment variants': [[py, ROOT + '/tools/fs_variants.py', '--self-check']],
         'picture check': [[py, ROOT + '/tools/test_check_pictures.py']],
