@@ -1179,6 +1179,14 @@ struct SpecGen {
                 break;
             case OP_JMPU:
             case OP_JMPC: {
+                // A JMPU the variant's bools settle (an open one is written out below): one not taken does nothing, and one taken is a goto the
+                // code can follow, backwards too, outside every call, if and loop, where no region ends between the two. Luigi's Mansion 2's one
+                // vertex program jumps back on b14: every variant reaching one ran on the CPU, 1.6 fps on a console (Senne, darkmoon 965b3d5, 4bb53fe).
+                if (I.op == OP_JMPU && decided(I) && ((b >> I.bid) & 1) != !(num & 1)) break;
+                if (I.op == OP_JMPU && decided(I) && dst < i && dst < n && ends.empty() && !loops && !ifs && !calls) {
+                    cont = dst;
+                    break;
+                }
                 if (dst <= i || dst >= e) {
                     fail = true;
                     return false;
