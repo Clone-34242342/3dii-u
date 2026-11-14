@@ -3244,6 +3244,7 @@ static void tv_buffer_to_mem2() {
     if (!in_mem2.surface.image) {
         void *p = memalign(whb->surface.alignment, whb->surface.imageSize);
         if (!p) return;
+        memset(p, 0, whb->surface.imageSize);  // the bars beside the picture are never drawn: black, not what the memory held before
         DCFlushRange(p, whb->surface.imageSize);
         in_mem2 = *whb;
         in_mem2.surface.image = p;
