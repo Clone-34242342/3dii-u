@@ -1,6 +1,7 @@
 """Self-check for the window (ui/Main.qml), unseen: it loads without a QML warning, every app.<name> it uses exists on App (a missing one is a
 dead button), each page, build view, list and dialog loads cleanly with its delegates made, every pill has a name for screen readers, the
-theme switches, and the updater's part walks its states with updater's network and disk calls faked. python builder/test_window.py"""
+theme switches, and the updater's part walks its states with updater's network and disk calls faked; and the simple window (ui/Simple.qml)
+loads as cleanly and shows the app's questions. python builder/test_window.py"""
 import json
 import os
 import re
@@ -21,7 +22,7 @@ from PySide6.QtQuick import QQuickWindow  # noqa: E402
 import shiboken6  # noqa: E402
 
 warnings = []
-qInstallMessageHandler(lambda kind, ctx, msg: warnings.append(msg) if 'qml' in msg.lower() or 'Main.qml' in msg else None)
+qInstallMessageHandler(lambda kind, ctx, msg: warnings.append(msg) if 'qml' in msg.lower() else None)
 import gui  # noqa: E402
 
 base = tempfile.mkdtemp()
@@ -31,7 +32,17 @@ gui.updater.home = lambda: os.path.join(base, 'app')  # nor the downloaded versi
 os.makedirs(os.path.join(base, 'keys'))
 json.dump({'keys': os.path.join(base, 'keys')}, open(settings, 'w'))  # an empty key folder: the user's keys are never looked at
 try:
+    # a saved layout whose window won't load: the modern window comes up instead, and the setting goes back to it
+    broken = os.path.join(base, 'Broken.qml')
+    open(broken, 'w').write('import QtQuick\nWindow { nothing here }\n')
+    json.dump({'keys': os.path.join(base, 'keys'), 'layout': 'simple'}, open(settings, 'w'))
+    real_window_qml = gui.window_qml
+    gui.window_qml = lambda layout: QUrl.fromLocalFile(broken) if layout == 'simple' else real_window_qml(layout)
     qt, engine, state = gui.create(['test'])
+    gui.window_qml = real_window_qml
+    assert engine.rootObjects() and engine.rootObjects()[0].objectName() != 'simple', 'a broken layout left the app without a window'
+    assert json.load(open(settings))['layout'] == 'modern'
+    warnings.clear()  # the broken file's own
     engine.warnings.connect(lambda ws: warnings.extend(w.toString() for w in ws))
     assert engine.rootObjects(), warnings
     win = shiboken6.wrapInstance(shiboken6.getCppPointer(engine.rootObjects()[0])[0], QQuickWindow)
@@ -342,6 +353,44 @@ try:
     state.setArtKey()
     assert state.st['sgdb_key'] == '' and not state.artKeySet
     state.game = None
+
+    # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a
+    # question shown in it and answered; it comes back to the modern one the same way
+    used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Simple.qml'), encoding='utf-8').read()))
+    missing = sorted(n for n in used if not hasattr(state, n))
+    assert not missing, f'Simple.qml uses app.{missing}, which App lacks'
+    asked = []
+    state.layoutWanted.connect(asked.append)
+    state.setLayout('simple')
+    assert asked == ['simple'] and json.load(open(settings))['layout'] == 'simple', asked
+    engine.load(gui.window_qml('simple'))
+    simple = engine.rootObjects()[-1]
+    assert simple.objectName() == 'simple' and not simple.property('visible'), 'the simple window did not load, or showed itself'
+    settle('the simple window')
+    state.tell('A message', 'In the simple window.')
+    settle('a message in the simple window')
+    assert simple.findChild(QObject, 'dialog').property('visible'), 'the simple window did not show the message'
+    state.answer(True)
+    settle('the message answered')
+    assert not simple.findChild(QObject, 'dialog').property('visible')
+    # two questions waiting: its Yes button answers the first, and the second then stays up (the dialog follows app.dialog alone)
+    dialog = simple.findChild(QObject, 'dialog')
+    state.tell('First', 'The first question.')
+    state.tell('Second', 'The second question.')
+    settle('two messages in the simple window')
+    assert dialog.property('title') == 'First'
+    QMetaObject.invokeMethod(simple.findChild(QObject, 'yes'), 'click')
+    settle('the first answered')
+    assert dialog.property('visible') and dialog.property('title') == 'Second', (dialog.property('visible'), dialog.property('title'))
+    QMetaObject.invokeMethod(simple.findChild(QObject, 'yes'), 'click')
+    settle('the second answered')
+    assert not dialog.property('visible') and not state.dialogs
+    for dark in (True, False):
+        state.set(dark=dark)
+        settle(f'the simple window, dark {dark}')
+    state.setLayout('bogus')
+    state.setLayout('modern')
+    assert asked == ['simple', 'modern'] and json.load(open(settings))['layout'] == 'modern', asked
     del engine  # before the App it shows, or its bindings read a gone app on the way out
     print('window ok')
 finally:

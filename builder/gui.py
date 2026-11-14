@@ -224,6 +224,7 @@ def theme():
 class App(QObject):
     changed = Signal()
     coverReady = Signal(str, str, str)  # title id, the picture's path, the icon's: from fetch_cover's thread
+    layoutWanted = Signal(str)  # setLayout: run() swaps the window
     keyRefused = Signal()  # SteamGridDB turned the key down: from fetch_cover's thread
     updateEvent = Signal(str, object)  # what, value: from the updater's worker threads, the value passed as it is
     logChanged = Signal()
@@ -336,6 +337,15 @@ class App(QObject):
     @Slot()
     def about(self):
         self.tell(f'About {APP}', credits.about())
+
+    @Slot(str)
+    def setLayout(self, name):
+        """the modern window (ui/Main.qml) or the simple one (ui/Simple.qml): kept in the settings, and the window swapped at once (run)"""
+        if name not in ('modern', 'simple') or self._s['building']:
+            return
+        self.st['layout'] = name
+        save_settings(self.st)
+        self.layoutWanted.emit(name)
 
     @Slot(str)
     def setArtStyle(self, style):
@@ -1079,7 +1089,27 @@ class App(QObject):
         return bool(self.proc and self.proc.poll() is None)
 
     def stop_for_close(self):
+        """the app is quitting: a build and an update download stop with it"""
         self.cancel()
+        self.cancelUpdate()
+
+
+def window_qml(layout):
+    """the window the settings' layout asks for: the simple one, or the modern one"""
+    return QUrl.fromLocalFile(os.path.join(HERE, 'ui', 'Simple.qml' if layout == 'simple' else 'Main.qml'))
+
+
+def place(win):
+    """a window sized to its screen's free area and centred on it: the modern one 16:9 up to 1280 wide, the simple one at its own size"""
+    area = win.screen().availableGeometry()  # its own screen's free area, not the whole desktop: "Build It!" stays above the taskbar
+    if win.objectName() == 'simple':
+        w, h = min(win.width(), area.width()), min(win.height(), area.height())
+        win.setMinimumSize(QSize(min(640, area.width()), min(480, area.height())))
+    else:
+        w = int(min(1280, area.width() * 0.9, area.height() * 0.9 * 16 / 9))
+        h = w * 9 // 16
+        win.setMinimumSize(QSize(min(960, area.width()), min(540, area.height())))
+    win.setGeometry(area.x() + (area.width() - w) // 2, area.y() + (area.height() - h) // 2, w, h)
 
 
 def create(argv=None):
@@ -1097,7 +1127,11 @@ def create(argv=None):
     engine.rootContext().setContextProperty('app', state)
     engine.rootContext().setContextProperty('T', theme())
     engine.rootContext().setContextProperty('appIcon', png_url(draw_icon(512)))  # the rail shows it at 162: 512 stays sharp up to a 4K window
-    engine.load(QUrl.fromLocalFile(os.path.join(HERE, 'ui', 'Main.qml')))
+    engine.load(window_qml(state.st.get('layout')))
+    if not engine.rootObjects():  # the saved layout's window didn't load: the modern one, so the app always shows one
+        state.st['layout'] = 'modern'
+        save_settings(state.st)
+        engine.load(window_qml('modern'))
     for win in engine.rootObjects():  # its first frame on screen is when it has really been shown (App.windowShown)
         quick = shiboken6.wrapInstance(shiboken6.getCppPointer(win)[0], QQuickWindow)
         # it comes at every frame, from the render thread: windowShown ends the connection at the first
@@ -1110,14 +1144,24 @@ def run():
     if not engine.rootObjects():
         return 1
     win = engine.rootObjects()[0]  # loaded hidden, so a check can load it without showing it
-    area = win.screen().availableGeometry()  # its own screen's free area, not the whole desktop: "Build It!" stays above the taskbar
-    w = int(min(1280, area.width() * 0.9, area.height() * 0.9 * 16 / 9))
-    win.setMinimumSize(QSize(min(960, area.width()), min(540, area.height())))
-    win.setGeometry(area.x() + (area.width() - w) // 2, area.y() + (area.height() - w * 9 // 16) // 2, w, w * 9 // 16)
+    place(win)
     win.show()
+
+    def swap(layout):  # the other window, shown before this one goes, so the app never has no window
+        old = engine.rootObjects()[-1]
+        engine.load(window_qml(layout))
+        new = engine.rootObjects()[-1]
+        if new is old:  # it didn't load: the window stays as it was
+            return
+        place(new)
+        new.show()
+        old.close()
+        old.deleteLater()
+    state.layoutWanted.connect(swap)
     # The first frame is the sign the window came up. A window started minimised draws none, so a timer says it for one that isn't showing.
     # One that is showing and has still drawn nothing is broken, and is left unconfirmed: updater sets that version aside.
-    QTimer.singleShot(10000, lambda: None if win.isExposed() else state.windowShown())
+    qt.aboutToQuit.connect(state.stop_for_close)  # not a swap: the new window is shown before the old one closes
+    QTimer.singleShot(10000, lambda: None if not engine.rootObjects() or engine.rootObjects()[-1].isExposed() else state.windowShown())
     code = qt.exec()
     del engine  # before the App it shows, or its bindings read a gone app on the way out
     return code

@@ -87,7 +87,7 @@ Windows 10 or 11 for now (Linux is planned):
 
 ## How it works
 
-- The window is Qt Quick: `ui/Main.qml` draws it (Wii U Menu glass laid out on a 1280x720 surface scaled to the window, light and dark, the in-window questions, the update card), and `gui.py` holds what it shows and does what its buttons ask. A choice that asks several things is a generator that yields each question.
+- The window is Qt Quick: `ui/Main.qml` draws it (Wii U Menu glass laid out on a 1280x720 surface scaled to the window, light and dark, the in-window questions, the update card), `ui/Simple.qml` is the plainer window the About card can switch to and back from (the same `app`, one window at a time), and `gui.py` holds what it shows and does what its buttons ask. A choice that asks several things is a generator that yields each question.
 - `app.py` is the one program: the window, the build when run with `--pipeline`, and `python.exe`'s part for the repository's tool scripts the build runs. In the standalone app, the build's compilers start without console windows.
 - `make_app.py` builds the standalone app with PyInstaller (`python builder/make_app.py`, on a PC with the build tools above).
   - It leaves out the parts of Qt the window never loads.

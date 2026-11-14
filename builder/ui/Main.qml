@@ -962,6 +962,11 @@ ApplicationWindow {
                         Pill { text: "About and licences"; onClicked: app.about() }
                     }
                     CardRow {
+                        label: "Window"; sub: "This one, or a simple one of plain tabs, buttons and file paths."
+                        Pill { text: "This one"; accessibleName: "Keep this window"; tone: "cyan" }
+                        Pill { text: "Simple"; accessibleName: "Switch to the simple window"; enabled: !app.building; onClicked: app.setLayout("simple") }
+                    }
+                    CardRow {
                         id: updatesRow
                         readonly property string st: app.updateState
                         readonly property bool offered: ["available", "downloading", "unpacking", "ready", "restarting", "failed"].indexOf(st) >= 0
@@ -1088,9 +1093,4 @@ ApplicationWindow {
     Shortcut { sequence: "F1"; enabled: !win.blocked; onActivated: win.page = "help" }
     Shortcut { sequences: ["Return", "Enter"]; enabled: dialogLayer.visible && !noPill.hasFocus; onActivated: app.answer(true) }
     Shortcut { sequence: "Escape"; enabled: dialogLayer.visible || cardMenu.visible; onActivated: dialogLayer.visible ? app.answer(false) : cardMenu.visible = false }
-
-    onClosing: (close) => {
-        if (app.busy()) app.cancel()
-        app.cancelUpdate()  // a download stops with the window
-    }
 }
