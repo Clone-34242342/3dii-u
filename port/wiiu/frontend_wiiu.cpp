@@ -498,7 +498,7 @@ static int watchdog_thread(int, void *) {
         // minutes before the screen says otherwise. Counted by drawing alone, any start slower than 30 s ended as "frozen": a tester's Mario
         // Kart 7 ended 30 s after its second list on its first start, its last note the save it had just written, and started the second
         // time (2026-11-12). Whether that one was at work or stopped, the screen couldn't say.
-        const u32 asking = kernel::svcs + (u32)kernel::gx_stats.transfers;
+        const u32 asking = kernel::svcs + (u32)kernel::gx_stats.transfers + wiiu::files_copied;  // and a save brought in as it starts (save_from_card)
         quiet = asking == asked ? quiet + 1 : 0;
         asked = asking;
         if (++seconds >= 41 && !drawn && (quiet >= 30 || seconds >= 180) && !wiiu::net_connected()) report_stuck("The game got stuck starting up.");
@@ -615,13 +615,18 @@ static void read_mii_maker(FILE *f) {
     }
 }
 
-static void leave_on_card() {
+// the game's folder on the SD card, which the builder reads and writes (builder/pipeline.py, builder/saves.py)
+static std::string card_dir() {
     char dir[64];
     snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
-    const std::string to = dir, from = wiiu::data_dir();
+    return dir;
+}
+
+static void leave_on_card() {
+    const std::string to = card_dir(), from = wiiu::data_dir();
     wiiu::fs_begin(0xC00D);
     mkdir("fs:/vol/external01/3dii-u", 0777);
-    mkdir(dir, 0777);
+    mkdir(to.c_str(), 0777);
     copy_to_card(from + "/shader_misses.bin", to + "/learned.bin");
     wiiu::fs_end();
 }
@@ -800,6 +805,7 @@ int main(int argc, char **argv) {
     load_game(CONTENT_DIR);
     stage("game loaded");
     std::filesystem::create_directories(kernel::save_root(), no_save);
+    if (!wiiu::test_run()) wiiu::save_from_card(card_dir(), kernel::save_root() + "/savedata");  // services/fs.cpp's folder for the game's save (archive_dir)
     rt_log_open(wiiu::data_dir() + "/log.txt");
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);

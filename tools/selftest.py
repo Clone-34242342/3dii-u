@@ -50,6 +50,18 @@ def latte_program():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_latte_program.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def save_from_card():
+    """port/wiiu/save_storage.cpp's save_from_card on folders of this PC, built for this PC with the Wii U's headers stood in for"""
+    exe = build3ds.WORK + '/selftest/test_save_from_card.exe'
+    fake = build3ds.WORK + '/selftest/fake_wut'
+    os.makedirs(fake + '/coreinit', exist_ok=True)
+    for h in ('dynload.h', 'filesystem.h', 'time.h'):
+        open(f'{fake}/coreinit/{h}', 'a').close()
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{fake}', f'-I{build3ds.PORT}/wiiu', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc',
+                                 f'-I{build3ds.RT}', '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_save_from_card.cpp',
+                                 f'{build3ds.PORT}/pc/win/win_compat.cpp', '-lpthread', '-lwinmm', '-o', exe], [exe]]
+
+
 def shadergen():
     """the shader generator, which build3ds keeps built for this PC"""
     with contextlib.redirect_stdout(io.StringIO()):
@@ -88,6 +100,7 @@ def main():
         'game detection': [[py, ROOT + '/tools/win/test_detect.py']],
         'shader logs': [[py, ROOT + '/builder/test_shaderlogs.py']],
         'user files': [[py, ROOT + '/builder/test_user_files.py']],
+        'moving saves': [[py, ROOT + '/builder/test_saves.py'], *save_from_card()],
         'system archives': [[py, ROOT + '/builder/test_system_archives.py']],
         'builder app': [[py, ROOT + '/builder/test_app.py']],
         'builder window': [[py, ROOT + '/builder/test_window.py']],

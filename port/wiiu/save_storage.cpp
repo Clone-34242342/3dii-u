@@ -232,6 +232,8 @@ void save_resize(int fd, u64 size) {
     grow(fd, size);  // whichever of those turned it down, or a truncate that doesn't lengthen a file
 }
 
+volatile u32 files_copied;
+
 // A folder and all in it, each file read and written whole from an aligned buffer (write_out says why): the C library's copy goes a little at a time. false: something
 // didn't copy.
 bool save_copy_tree(const std::string &from, const std::string &to) {
@@ -257,8 +259,56 @@ bool save_copy_tree(const std::string &from, const std::string &to) {
         if (out >= 0) close(out);
         free(buf);
         if (!ok) return false;
+        files_copied = files_copied + 1;
     }
     return !ec;
+}
+
+// A copy made whole beside where it goes, then put in its place, what was there set aside until it is: a copy cut short, or a flush
+// partway through one (a full journal, write_retrying), never stands for a save
+static bool copy_into_place(const std::string &from, const std::string &to) {
+    namespace fs = std::filesystem;
+    std::error_code ec, aside;
+    const std::string fresh = to + "_new", old = to + "_old";
+    fs::remove_all(fresh, ec);
+    if (!save_copy_tree(from, fresh)) {
+        fs::remove_all(fresh, ec);
+        return false;
+    }
+    fs::remove_all(old, ec);
+    fs::rename(to, old, aside);  // nothing there yet is fine
+    fs::rename(fresh, to, ec);
+    if (ec) {
+        if (!aside) fs::rename(old, to, aside);
+        fs::remove_all(fresh, aside);
+        return false;
+    }
+    fs::remove_all(old, ec);
+    return true;
+}
+
+// A save moved with the builder (builder/saves.py), before the game starts. card is the game's folder on the SD card, sd:/3dii-u/<title id>.
+// export, empty: the game's save is copied into it. import: the files of a 3DS save, as Checkpoint, JKSM or an emulator keep them, take the
+// place of the game's save, which is copied to previous first; nothing is replaced if that copy fails. Each import is tried once: renamed
+// importing before the save is touched, then imported once it is flushed, or import_failed with the save as it was. Imports wait for the
+// game's save folder, which is there once the game has formatted on this console (services/fs.cpp, OpenArchive): its first format would wipe them.
+void save_from_card(const std::string &card, const std::string &save) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string import = card + "/import", taking = card + "/importing";
+    if (fs::is_directory(card + "/export", ec) && fs::is_empty(card + "/export", ec)) copy_into_place(save, card + "/export");
+    if (!fs::is_directory(import, ec) || fs::is_empty(import, ec) || !fs::is_directory(save, ec) || !copy_into_place(save, card + "/previous")) return;
+    fs::remove_all(taking, ec);
+    fs::rename(import, taking, ec);
+    if (ec) return;
+    const bool in = copy_into_place(taking, save);
+    if (in) {
+        save_dirty();
+        save_flush(true);
+    }
+    const std::string done = card + (in ? "/imported" : "/import_failed");
+    fs::remove_all(done, ec);
+    fs::rename(taking, done, ec);
 }
 
 // A game's save file, from memory when it's been opened before: null for one too big to hold, which then goes to storage as before

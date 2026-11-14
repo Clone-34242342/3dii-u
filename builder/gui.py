@@ -25,6 +25,7 @@ import decrypt
 import dumps
 import mods
 import pipeline
+import saves
 import updater
 import user_files
 
@@ -550,6 +551,67 @@ class App(QObject):
     @Slot()
     def removeArt(self):
         self.set_art(None)
+
+    def save_card(self):
+        """the SD card and the game's Wii U title id for moving a save (saves.py), or None after saying what's missing"""
+        card = self.st.get('card', '')
+        if not self.game or self._s['building']:
+            return None
+        if not card or not os.path.isdir(card):
+            self.tell('Choose your SD card first', 'A save goes between this PC and the Wii U on its SD card: choose the card on the Build page.', 'warn')
+            return None
+        return card, (pipeline.profile_for(self.game) or pipeline.derived(self.game))['title_id'].lower()
+
+    @Slot()
+    def bringSave(self):
+        """a 3DS save onto the SD card, for the game to take in as it starts"""
+        where = self.save_card()
+        if not where:
+            return
+        name = self._s['gameName']
+        chosen = QFileDialog.getExistingDirectory(None, f'The folder with the save of {name}: Checkpoint\'s, JKSM\'s or an emulator\'s',
+                                                  self.st.get('save_folder', ''))
+        if not chosen:
+            return
+        self.st['save_folder'] = os.path.dirname(chosen)
+        save_settings(self.st)
+        try:
+            taken, n = saves.bring_in(*where, chosen)
+        except (saves.SaveError, OSError) as e:
+            self.tell('The save couldn\'t be moved', str(e), 'error')
+            return
+        self.tell('The save is on the SD card', f'{n} files from {taken}. Put the card in your Wii U and start {name}: it takes the save in as it '
+                  f'starts, and the save it had goes to the card first (3dii-u/{where[1]}/previous). Not started on the Wii U since it was installed? '
+                  'Start it once and quit first: the save waits on the card until the game has made its own.')
+
+    @Slot()
+    def takeSave(self):
+        """the game's save off the SD card, or the card set to ask the game for it"""
+        where = self.save_card()
+        if not where:
+            return
+        name = self._s['gameName']
+        if not saves.exported(*where):
+            try:
+                saves.ask_for_it(*where)
+            except OSError as e:
+                self.tell('The save couldn\'t be moved', str(e), 'error')
+                return
+            self.tell('The SD card asks for the save', f'Put the card in your Wii U and start {name}: it copies its save to the card as it starts. '
+                      'Then bring the card back here and choose Take back again.')
+            return
+        dest = QFileDialog.getExistingDirectory(None, f'Where to put the save of {name}', self.st.get('save_folder', ''))
+        if not dest:
+            return
+        self.st['save_folder'] = dest
+        save_settings(self.st)
+        try:
+            target = saves.take_out(*where, dest)
+        except (saves.SaveError, OSError) as e:
+            self.tell('The save couldn\'t be moved', str(e), 'error')
+            return
+        self.tell('The save is on this PC', f'In {target}. For Checkpoint on a 3DS, copy that folder into Checkpoint\'s folder of the game on '
+                  'the 3DS\'s SD card (3ds/Checkpoint/saves) and restore it from there.')
 
     def fetch_cover(self, game, name):
         """on a thread of its own: the game's banner and icon from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
