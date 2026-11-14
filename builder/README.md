@@ -69,6 +69,7 @@ Windows 10 or 11 for now (Linux is planned):
 - A game's art comes from the web when the game is picked (`covers.py`), and the user's own picture or "Remove art" overrides it.
   - With the user's SteamGridDB key (Help page, "Art and sound"; kept in `settings.json`, never in the repository): a wide banner for the start-up screens and a square icon for the Wii U Menu, found by the game's name.
   - Without a key, or where SteamGridDB has nothing: the cover from GameTDB, by the product code's four letters.
+  - For the Virtual Console's start-up screens, the year a game came out comes from GameTDB's list of 3DS games (`3dstdb.zip`), fetched once; a build goes on without a year if it can't be had.
 - The start-up sound is the user's own too (Help page, "Art and sound", a WAV file): `tools/make_boot_sound.py` turns it into `boot_sound.btsnd` in the work folder, and every title built after carries it.
 - The 3DS system archives (its shared font and Mii data) don't come with it: they're your own 3DS's files.
   - The builder copies them from Azahar's or Citra's user folder, or from any folder holding a 3DS NAND up to three levels down in Downloads, Desktop or Documents, whatever it's called. It keeps them in its work folder.

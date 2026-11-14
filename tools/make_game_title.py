@@ -100,6 +100,112 @@ def art_pixels(path, w, h, background):
     return [[tuple(data[y * stride + 3 * x:y * stride + 3 * x + 3]) for x in range(w)] for y in range(h)]
 
 
+def smdh_names(smdh_path):
+    """the game's long name and its publisher from its SMDH: the English ones, or the Japanese where a game has no English"""
+    smdh = open(smdh_path, 'rb').read()
+    for lang in (1, 0):
+        at = 8 + 0x200 * lang
+        text = lambda o, n: smdh[at + o:at + o + n].decode('utf-16-le', 'replace').split('\0')[0]
+        name = ' '.join(text(0x80, 0x100).split())
+        if name:
+            return name, text(0x180, 0x80).strip()
+    return '', ''
+
+
+_qt = None  # the application Qt draws text with, made once
+
+
+def console_screens(art, smdh_path, released='', case_scan=False):
+    """The start-up screens as the Wii U's Virtual Console draws a DS game's (the user's picture of one, 2026-11-14): "Virtual Console" at the
+    top left, a large faint drawing of the console behind it all on the right, and across the middle a white band holding the game's art, the
+    console's name, the game's name from its SMDH, and released ("Released in Europe: 2011", say), or its publisher without one. A GameTDB cover
+    (case_scan: 768x680, the case's front) gives the case without the strip with the console's name down its side, shown whole.
+    All of it is drawn here; none of it is Nintendo's artwork. {'bootTvTex.tga': rows, 'bootDrcTex.tga': rows}, as art_pixels gives them, or
+    None if art can't be read."""
+    global _qt
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen
+    _qt = QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
+    cover = QImage(art)
+    if cover.isNull():
+        return None
+    if case_scan:  # a GameTDB case scan: its white strip down the right goes, and the whole height stays (a logo can sit low on it)
+        cover = cover.copy(0, 0, 684, 680)
+    name, publisher = smdh_names(smdh_path)
+    img = QImage(1280, 720, QImage.Format_RGB888)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setRenderHint(QPainter.SmoothPixmapTransform)
+
+    def text(x, y, w, h, px, rgb, words, weight=QFont.Normal, italic=False, spacing=0.0):
+        f = QFont('Segoe UI')
+        f.setPixelSize(px)
+        f.setWeight(weight)
+        f.setItalic(italic)
+        f.setLetterSpacing(QFont.AbsoluteSpacing, spacing)
+        p.setFont(f)
+        p.setPen(QColor(*rgb))
+        p.drawText(QRectF(x, y, w, h), Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap, words)
+        return p.fontMetrics().horizontalAdvance(words)
+
+    bg = QLinearGradient(0, 0, 0, 720)
+    bg.setColorAt(0, QColor(247, 247, 247))
+    bg.setColorAt(1, QColor(212, 212, 212))
+    p.fillRect(0, 0, 1280, 720, bg)
+    # an open 3DS in faint lines, behind everything on the right and running off the edge: lid, screens, hinge, base, controls, stylus
+    p.save()
+    p.translate(812, 8)
+    p.scale(1.3, 1.3)
+    p.setPen(QPen(QColor(192, 192, 192), 1.6))
+    p.setBrush(Qt.NoBrush)
+    for x, y, w, h, r in ((0, 0, 400, 240, 22), (50, 26, 300, 180, 4), (12, 244, 376, 16, 8), (0, 262, 400, 240, 22), (100, 296, 200, 150, 4)):
+        p.drawRoundedRect(QRectF(x, y, w, h), r, r)
+    p.drawEllipse(QPointF(45, 318), 25, 25)
+    cross = QPainterPath()
+    for x, y, w, h in ((34, 364, 22, 62), (14, 384, 62, 22)):
+        cross.addRect(QRectF(x, y, w, h))
+    p.drawPath(cross.simplified())
+    for dx, dy in ((0, -24), (24, 0), (0, 24), (-24, 0)):
+        p.drawEllipse(QPointF(355 + dx, 335 + dy), 11, 11)
+    for k in range(3):
+        p.drawRoundedRect(QRectF(130 + k * 52, 466, 36, 9), 4, 4)
+    p.drawLine(QPointF(330, 482), QPointF(395, 250))
+    p.restore()
+    # the band across the middle, on a soft shadow
+    for k in range(14):
+        p.fillRect(QRectF(0, 564 + k, 1280, 1), QColor(0, 0, 0, 34 - 34 * k // 14))
+    p.fillRect(QRectF(0, 180, 1280, 384), QColor(255, 255, 255, 236))
+    p.fillRect(QRectF(0, 180, 1280, 2), QColor(255, 255, 255))
+    # the game's art, filling its frame, vertically centred in the band
+    if case_scan:  # shown whole: its own shape, inside the band with a margin
+        scale = min(344 / cover.width(), 344 / cover.height())
+        frame = QRectF(72, 372 - cover.height() * scale / 2, cover.width() * scale, cover.height() * scale)
+    else:
+        height = max(200.0, min(300.0, 344 * cover.height() / cover.width()))  # the art's own shape, within reason
+        frame = QRectF(72, 372 - height / 2, 344, height)
+    fit = cover.scaled(int(frame.width()), int(frame.height()), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    clip = QPainterPath()
+    clip.addRoundedRect(frame, 8, 8)
+    p.save()
+    p.setClipPath(clip)
+    p.drawImage(frame, fit, QRectF((fit.width() - frame.width()) / 2, 0, frame.width(), frame.height()))
+    p.restore()
+    p.setPen(QPen(QColor(200, 200, 200), 1.5))
+    p.drawPath(clip)
+    # the console's name, the game's, and when it came out or who made it
+    shift = text(552, 262, 300, 70, 30, (88, 88, 88), 'NINTENDO', QFont.Light, spacing=3.0)
+    text(552 + shift + 16, 250, 300, 80, 56, (58, 58, 58), '3DS', QFont.Bold)
+    text(552, 344, 690, 104, 40, (52, 52, 52), name)
+    text(552, 456, 690, 48, 26, (84, 84, 84), released or publisher)
+    text(52, 48, 600, 70, 46, (156, 156, 156), 'Virtual Console', italic=True)
+    p.end()
+
+    def rows(image):
+        stride, data = image.bytesPerLine(), bytes(image.constBits())
+        return [[tuple(data[y * stride + 3 * x:y * stride + 3 * x + 3]) for x in range(image.width())] for y in range(image.height())]
+    return {'bootTvTex.tga': rows(img), 'bootDrcTex.tga': rows(img.scaled(854, 480, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))}
+
+
 def write_art_tga(path, rows, bpp):
     """rows of (r, g, b), top first, as the TGA the Wii U Menu expects (write_tga's layout)"""
     h, w = len(rows), len(rows[0])
@@ -112,10 +218,11 @@ def write_art_tga(path, rows, bpp):
         f.write(header + bytes(pixels) + TGA_FOOTER + (bytes(4) if bpp == 24 else b''))
 
 
-def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None):
+def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
     art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
-    picture for the icon alone (a square one, where art is a wide banner)."""
+    picture for the icon alone (a square one, where art is a wide banner). style: 'picture' shows art as it is on the start-up screens,
+    'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan."""
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):
@@ -136,8 +243,9 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     write_tga(os.path.join(meta_dir, 'bootLogoTex.tga'), icon, 170, 42, 32, 0, (0, 0, 0))
     write_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), icon, 854, 480, 24, 6, BACKGROUND)
     write_tga(os.path.join(meta_dir, 'bootTvTex.tga'), icon, 1280, 720, 24, 10, BACKGROUND)
+    screens = console_screens(art, os.path.join(game, 'exefs', 'icon.bin'), released, case_scan) if style == 'console' and art else None
     for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art or art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
-        rows = art_pixels(picture, w, h, (0, 0, 0)) if picture else None
+        rows = screens[tga] if screens and tga in screens else art_pixels(picture, w, h, (0, 0, 0)) if picture else None
         if rows:
             write_art_tga(os.path.join(meta_dir, tga), rows, bpp)
         elif picture:

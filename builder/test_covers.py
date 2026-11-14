@@ -1,13 +1,15 @@
-"""Self-check for covers.steamgriddb against a stand-in for the site on this PC, answering as its API description says it does
+"""Self-check for covers.steamgriddb and covers.released against a stand-in for the site on this PC, answering as its API description says it does
 (steamgriddb.com/api/v2): which game, banner and icon it takes, that each is fetched once, that the key doesn't follow a redirect, and
-what a wrong key, an unknown game and no connection give. Nothing leaves this PC. Run: python builder/test_covers.py"""
+what a wrong key, an unknown game and no connection give, and the year a game came out from GameTDB's list, kept once it is a whole zip. Nothing leaves this PC. Run: python builder/test_covers.py"""
 import http.server
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import urllib.parse
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import covers  # noqa: E402
@@ -16,6 +18,7 @@ PNG, JPG = b'\x89PNG\r\n\x1a\n' + bytes(32), b'\xff\xd8\xff\xe0' + bytes(32)
 GAMES = {'pokemon ultra': [{'id': 7, 'name': 'Pokémon Ultra Moon'}, {'id': 8, 'name': 'Pokemon Ultra Sun'}],
          'bare': [{'id': 9, 'name': 'Bare'}]}
 asked = []
+cut = []  # when set, GameTDB's list comes short: this many bytes of it, and a length that promises all
 
 
 class Site(http.server.BaseHTTPRequestHandler):
@@ -30,6 +33,19 @@ class Site(http.server.BaseHTTPRequestHandler):
         here = f'http://127.0.0.1:{self.server.server_port}'
         if path.startswith('/img/'):
             return self.send(200, JPG if path.endswith('wide') else PNG, 'image/png')
+        if path == '/short.zip':  # a whole body of a zip's first bytes, no more
+            return self.send(200, b'PK' + bytes(20), 'application/zip')
+        if path == '/3dstdb.zip':  # GameTDB's list of 3DS games, as a zip of its XML
+            z = io.BytesIO()
+            with zipfile.ZipFile(z, 'w') as f:
+                f.writestr('3dstdb.xml', '<datafile><WiiTDB version="1"/><game name="Mario Kart 7"><id>AMKE</id><date year="2011" month="12" day="4"/></game>'
+                                         '<game name="Undated"><id>BXXP</id><date year="" month="" day=""/></game></datafile>')
+            if cut:
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(z.getvalue())))
+                self.end_headers()
+                return self.wfile.write(z.getvalue()[:cut[0]])
+            return self.send(200, z.getvalue(), 'application/zip')
         if self.headers.get('Authorization') != 'Bearer good':
             return self.send(401, b'{"success":false,"errors":["Unauthorized"]}')
         if path == '/search/autocomplete/moved':
@@ -87,6 +103,20 @@ with tempfile.TemporaryDirectory() as tmp:
         raise AssertionError('a wrong key went through')
     except covers.BadKey:
         pass
+    # the year a game came out, from GameTDB's list, fetched once; a game it has without a year, or not at all, gets no line
+    tdb = base + '/3dstdb.zip'
+    elsewhere = os.path.join(tmp, 'short')
+    for n in (10, 150):  # a body cut off: with its length promised (http.client.IncompleteRead); nothing is kept
+        cut[:] = [n]
+        assert covers.released('CTR-P-AMKE', elsewhere, tdb) == '' and not os.path.exists(os.path.join(elsewhere, '3dstdb.zip')), n
+    assert covers.released('CTR-P-AMKE', elsewhere, base + '/short.zip') == '' and not os.path.exists(os.path.join(elsewhere, '3dstdb.zip'))
+    cut.clear()
+    assert covers.released('CTR-P-AMKE', elsewhere, tdb) == 'Released in North America: 2011' and os.path.isfile(os.path.join(elsewhere, '3dstdb.zip'))
+    assert covers.released('CTR-P-AMKE', tmp, tdb) == 'Released in North America: 2011'
+    before = len(asked)
+    assert covers.released('CTR-N-AMKP', tmp, tdb) == '' and covers.released('CTR-P-BXXP', tmp, tdb) == '' and covers.released('x', tmp, tdb) == ''
+    assert len(asked) == before  # kept: nothing asked again
+    assert covers.released('CTR-P-AMKE', os.path.join(tmp, 'elsewhere'), base + '/nothing.zip') == ''  # nothing there
     server.shutdown()
     server.server_close()
     assert covers.steamgriddb('bare', 'good', tmp, 'offline', base) is None  # no connection, nothing kept

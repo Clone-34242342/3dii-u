@@ -2,13 +2,18 @@
 With a SteamGridDB key (each user's own, from steamgriddb.com > Preferences > API; the app keeps it in its settings file) a banner and an
 icon come from SteamGridDB, found by the game's name: the name and the key are all it sends there. Without one, or where SteamGridDB has
 nothing, the cover comes from GameTDB (art.gametdb.com), by the four letters at the end of the game's product code (CTR-P-AMKE: AMKE),
-which are all it sends. These are the only things the builder downloads."""
+which are all it sends. For the Virtual Console's start-up screens, the year a game came out comes from GameTDB's list of 3DS games, fetched
+once for all. These are the only things the builder downloads."""
+import http.client
+import io
 import json
 import os
 import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from xml.etree import ElementTree
 
 URL = 'https://art.gametdb.com/3ds/coverHQ/{region}/{game}.jpg'
 # GameTDB files covers by language; the product code's last letter says where the game was sold
@@ -81,6 +86,48 @@ def cover(product, folder):
     return None
 
 
+TDB = 'https://www.gametdb.com/3dstdb.zip'
+# where a game was sold, by the product code's last letter, as the Virtual Console's screens name it ("Released in Europe: 2007")
+PLACES = {'E': 'North America', 'P': 'Europe', 'J': 'Japan', 'K': 'Korea', 'U': 'Australia', 'D': 'Germany', 'F': 'France', 'I': 'Italy', 'S': 'Spain',
+          'W': 'Taiwan', 'C': 'China'}
+
+
+def released(product, folder, url=TDB):
+    """'Released in North America: 2011' for the game of this product code, from GameTDB's list of 3DS games (3dstdb.zip, fetched into
+    folder the first time), or '' if the list has no year for it or can't be had"""
+    code = game_code(product)
+    if not code:
+        return ''
+    path = os.path.join(folder, '3dstdb.zip')
+    if not os.path.isfile(path):
+        try:
+            data = fetch(url)
+            zipfile.ZipFile(io.BytesIO(data)).close()  # a short or wrong body isn't kept: the next build asks again
+            os.makedirs(folder, exist_ok=True)
+            with open(path + '.part', 'wb') as f:
+                f.write(data)
+            os.replace(path + '.part', path)
+        except (OSError, http.client.HTTPException, zipfile.BadZipFile):  # no connection, no such file, or cut short: no year this build
+            return ''
+    try:
+        with zipfile.ZipFile(path) as z:
+            xml = next((n for n in z.namelist() if n.lower().endswith('.xml')), None)
+            if not xml:
+                return ''
+            for _, e in ElementTree.iterparse(io.BytesIO(z.read(xml))):
+                if e.tag != 'game':
+                    continue
+                if (e.findtext('id') or '').strip().upper().startswith(code):
+                    year = (e.find('date').get('year') if e.find('date') is not None else '') or ''
+                    if not year.isdigit():
+                        return ''
+                    return f'Released in {PLACES[code[3]]}: {year}' if code[3] in PLACES else f'Released: {year}'
+                e.clear()
+    except (OSError, zipfile.BadZipFile, ElementTree.ParseError):
+        return ''
+    return ''
+
+
 def plain(name):
     """a name as two spellings of it compare: letters and digits only, without accents, case or trademark signs"""
     return ''.join(c for c in unicodedata.normalize('NFKD', name.translate({0x2122: None, 0xAE: None, 0xA9: None})).casefold() if c.isalnum())
@@ -134,3 +181,8 @@ def steamgriddb(name, key, folder, title_id, base=SGDB):
     except (OSError, ValueError, KeyError, TypeError):  # no connection, or an answer that isn't what the site documents
         return have if any(have.values()) else None
     return have
+
+
+def is_case_scan(path, folder):
+    """whether path is a GameTDB cover that cover() fetched into folder, not a picture the user picked or SteamGridDB's"""
+    return os.path.dirname(os.path.abspath(path)) == os.path.abspath(folder) and not os.path.basename(path).startswith('sgdb_')

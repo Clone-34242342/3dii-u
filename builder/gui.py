@@ -76,6 +76,10 @@ def settings_file():
     return os.path.join(base or HERE, APP, 'settings.json')
 
 
+def covers_folder():
+    return os.path.join(os.path.dirname(settings_file()), 'covers')
+
+
 def load_settings():
     try:
         return json.load(open(settings_file(), encoding='utf-8'))
@@ -231,7 +235,7 @@ class App(QObject):
     updateText, hasUpdate, dlcText, hasDlc = _p(str, 'updateText'), _p(bool, 'hasUpdate'), _p(str, 'dlcText'), _p(bool, 'hasDlc')
     modText, hasMod = _p(str, 'modText'), _p(bool, 'hasMod')
     artText, hasArt, artUrl = _p(str, 'artText'), _p(bool, 'hasArt'), _p(str, 'artUrl')
-    artKeySet, soundSet = _p(bool, 'artKeySet'), _p(bool, 'soundSet')
+    artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
@@ -266,7 +270,7 @@ class App(QObject):
         theme_mode = self.st.get('theme')
         self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
-                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
+                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -331,6 +335,15 @@ class App(QObject):
     @Slot()
     def about(self):
         self.tell(f'About {APP}', credits.about())
+
+    @Slot(str)
+    def setArtStyle(self, style):
+        """the start-up screens: the art as it is, or laid out as the Wii U's Virtual Console shows a game (tools/make_game_title.py, console_screens)"""
+        if style not in ('picture', 'console'):
+            return
+        self.st['art_style'] = style
+        save_settings(self.st)
+        self.set(artStyle=style)
 
     @Slot(str)
     def setThemeMode(self, mode):
@@ -418,7 +431,7 @@ class App(QObject):
     def refresh_library(self):
         """what the window shows of each remembered game: its name, its picture (the cover if this PC has it, else its own icon), and
         which one is open"""
-        covers_dir = os.path.join(os.path.dirname(settings_file()), 'covers')
+        covers_dir = covers_folder()
         shown = []
         for g in self.st.get('library', []):
             art = (self.st.get('icon_art', {}).get(g['id']) or self.st.get('art', {}).get(g['id'])  # a square icon fills a tile best
@@ -541,7 +554,7 @@ class App(QObject):
     def fetch_cover(self, game, name):
         """on a thread of its own: the game's banner and icon from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
         and for what SteamGridDB lacks (covers.py), handed to the window's thread when they're here"""
-        folder, title_id, key = os.path.join(os.path.dirname(settings_file()), 'covers'), f'{game.title_id:016x}', self.st.get('sgdb_key')
+        folder, title_id, key = covers_folder(), f'{game.title_id:016x}', self.st.get('sgdb_key')
         found = {}
         try:
             found = (covers.steamgriddb(name, key, folder, title_id) if key and key != self.refused_key else None) or {}
@@ -571,7 +584,7 @@ class App(QObject):
             self.st.setdefault('icon_art', {})[f'{self.game.title_id:016x}'] = icon or ''
             save_settings(self.st)
         shown = icon or path
-        covers_dir = os.path.join(os.path.dirname(settings_file()), 'covers')  # what's in it was fetched: covers.py names SteamGridDB's sgdb_...
+        covers_dir = covers_folder()  # what's in it was fetched: covers.py names SteamGridDB's sgdb_...
         fetched = sorted({'SteamGridDB' if os.path.basename(p).startswith('sgdb_') else 'GameTDB' for p in (path, icon) if p and os.path.dirname(p) == covers_dir})
         text = ('Its art, from ' + ' and '.join(fetched) if fetched else os.path.basename(shown)) if shown else NO_ART
         self.set(artText=text, hasArt=bool(shown), artUrl=QUrl.fromLocalFile(shown).toString() if shown else '')  # the Build page's tile shows it
@@ -919,7 +932,7 @@ class App(QObject):
         if self.mod:
             argv += ['--mod', self.mod]
         if self.art:
-            argv += ['--art', self.art]
+            argv += ['--art', self.art, '--art-style', self._s['artStyle'], '--tdb', covers_folder()]
         if self.icon_art:
             argv += ['--icon-art', self.icon_art]
         self.log_lines, self.result, self.cancelled = [], None, False

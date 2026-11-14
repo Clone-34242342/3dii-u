@@ -935,6 +935,13 @@ ApplicationWindow {
                         Pill { text: app.artKeySet ? "Change key" : "Add key"; accessibleName: "SteamGridDB key"; tone: "cyan"; onClicked: app.setArtKey() }
                     }
                     CardRow {
+                        label: "Start-up screens"
+                        sub: app.artStyle === "console" ? "As the Wii U's Virtual Console shows a game: its art, its name and when it came out, before a drawing of the 3DS."
+                                                        : "A game's art on its own, filling the screen."
+                        Pill { text: "Art"; accessibleName: "Art on its own"; tone: app.artStyle === "picture" ? "cyan" : "grey"; onClicked: app.setArtStyle("picture") }
+                        Pill { text: "Virtual Console"; accessibleName: "As the Virtual Console shows a game"; tone: app.artStyle === "console" ? "cyan" : "grey"; onClicked: app.setArtStyle("console") }
+                    }
+                    CardRow {
                         label: "Start-up sound"
                         sub: app.soundSet ? "Your sound plays while a game starts." : "None: games start silently. Choose a WAV file to have one."
                         Pill { text: "Choose"; accessibleName: "Choose the start-up sound"; tone: "cyan"; onClicked: app.chooseSound() }
