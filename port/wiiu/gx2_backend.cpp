@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -46,6 +47,7 @@
 #include "services/services.h"
 #include "kernel.h"
 #include "latte_program.h"
+#include "memory_fills.h"
 #include "loader.h"
 #include "present_rule.h"
 #include "shader_compile.h"
@@ -457,6 +459,7 @@ struct Surface {
     bool gpu_newer = false, guest_newer = false, written_since_flush = false;
     bool first_use = true;                             // nothing has drawn into it yet: see upload_target
     bool gpu_chain = false;                            // made by gx2_texture_copy, or from one: the transfers that make its mipmaps stay on the GPU too
+    bool copy = false;                                 // a texture a transfer or a copy made on the GPU, its bytes not in guest memory (gpu_copy_transfer, gx2_texture_copy): whatever the game says it wrote there is newer
     bool shared_depth = false, clear_pending = false;  // see share_depth_block
     // For a target the game's own code may read (cpu_reads): the list being run has drawn to it; a draw to some other kind of target has sampled
     // the picture it holds; and the same of the picture it held before this list drew to it. See gx2_finish_list.
@@ -551,7 +554,8 @@ bool top_720 = true;
 
 // The screens' render targets are drawn larger: the top screen for the size above, the bottom one 1:1 on the GamePad. The game
 // renders some of them twice as wide and scales them down (cheap antialiasing), so the two axes scale differently.
-void rt_scale(u32 w, u32 h, float &sx, float &sy) {
+// vw, vh: the viewport of the draw a target is made for, when there is one
+void rt_scale(u32 w, u32 h, float &sx, float &sy, u32 vw = 0, u32 vh = 0) {
     sx = sy = 1;
     // 256 and 512 wide, and 416 tall: some games draw a little more than the screen and crop it in the display transfer
     const u32 shown = w == 256 ? 240 : w == 512 ? 480 : w;
@@ -563,13 +567,19 @@ void rt_scale(u32 w, u32 h, float &sx, float &sy) {
         sy = 2.0f;
     } else if ((w & (w - 1)) == 0 && (h & (h - 1)) != 0 && h > 400 && h <= 1024) {
         sx = sy = (top_720 ? 1200.0f : 1800.0f) / h;  // a screen drawn off-screen at about twice the size, for the game to draw as a texture: as sharp as that screen
+    } else if (w == 256 && h == 512 && vw == 240 && (vh == 400 || vh == 320)) {
+        // Pokemon Ultra Sun and Moon draw both screens, one after the other, into one 256x512 target, and textures into others of that size:
+        // a screen's viewport on the draw it's made for says which it is. The top screen's scale, whichever screen that draw is.
+        sx = sy = top_720 ? 3.0f : 4.5f;
     }
 }
 
-// scale_as: a copy of that surface's picture (gx2_texture_copy and its mipmaps), made at its scale so what the game draws from it stays as sharp
-Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface *scale_as = nullptr) {
+// scale_as: a copy of that surface's picture (gx2_texture_copy and its mipmaps), made at its scale so what the game draws from it stays as sharp.
+// first: the draw a colour target is made for. with: the colour target a depth buffer is bound with, whose scale it has to have: a game uses one
+// depth buffer's memory with targets this draws at different scales.
+Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface *scale_as = nullptr, const DrawState *first = nullptr, const Surface *with = nullptr) {
     for (auto &s : surfaces)
-        if (s->addr == addr && s->w == w && s->h == h && s->depth == depth) {
+        if (s->addr == addr && s->w == w && s->h == h && s->depth == depth && (!with || (s->base_sx == with->base_sx && s->base_sy == with->base_sy))) {
             s->fmt = fmt;
             return s.get();
         }
@@ -582,7 +592,10 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
     if (scale_as) {
         s->sx = scale_as->base_sx;
         s->sy = scale_as->base_sy;
-    } else rt_scale(w, h, s->sx, s->sy);
+    } else if (with) {
+        s->sx = with->base_sx;
+        s->sy = with->base_sy;
+    } else rt_scale(w, h, s->sx, s->sy, first ? (u32)lroundf(2 * first->vp_hw) : 0, first ? (u32)lroundf(2 * first->vp_hh) : 0);
     s->base_sx = s->sx;
     s->base_sy = s->sy;
     // Textures have power-of-two sizes, so a 512x800 target the game draws from is read as 512x1024, sharing its memory. In memory the
@@ -700,10 +713,9 @@ void flush_surface(Surface &s) {
 }
 
 // a fill the game asked for before the surface exists, or while drawing was elsewhere
-struct Fill {
-    u32 start, end, value, control;
-};
 std::vector<Fill> pending_fills;
+
+MemoryFills memory_fills;
 
 void restore_context() {
     GX2SetContextState(ctx);
@@ -1367,9 +1379,10 @@ static void upload_target(Surface &s);
 namespace {
 
 // ---------------------------------------------------------------- render state
-void bind_targets(const RTConfig &rt) {
-    Surface *c = get_surface(rt.color_addr, rt.w, rt.h, rt.color_fmt, false);
-    Surface *d = rt.depth_addr && pptr(rt.depth_addr) ? get_surface(rt.depth_addr, rt.w, rt.h, rt.depth_fmt, true) : nullptr;
+// ds: the draw they're bound for, when it's the one that may make them
+void bind_targets(const RTConfig &rt, const DrawState *ds = nullptr) {
+    Surface *c = get_surface(rt.color_addr, rt.w, rt.h, rt.color_fmt, false, nullptr, ds);
+    Surface *d = rt.depth_addr && pptr(rt.depth_addr) ? get_surface(rt.depth_addr, rt.w, rt.h, rt.depth_fmt, true, nullptr, nullptr, c) : nullptr;
     take_dyn_level(*c);
     if (d) take_dyn_level(*d);
     // fills the game asked for while these surfaces did not exist yet
@@ -1388,6 +1401,7 @@ void bind_targets(const RTConfig &rt) {
         c->first_use = false;
         if (c->guest_newer) upload_target(*c);
     }
+    c->copy = false;         // drawn into: a target like any other
     c->guest_newer = false;  // shortcut: a target the game writes into after its first use keeps what the GPU drew, as in Cemu; upload it too once a game shows it must
     if (d && d->guest_newer) d->guest_newer = false;
     if (c != cur_color) {
@@ -2019,7 +2033,7 @@ bool gx2_draw(const Gx2Draw &d) {
     }
     lap(P_KEY);
     decode_textures_first(ds);
-    bind_targets(ds.rt);
+    bind_targets(ds.rt, &ds);
     if (cur_depth && (ds.depth_test || ds.depth_write || ds.stencil)) take_depth_block(ds.rt);
     lap(P_BIND);
     GX2PixelShader *const ps = find_ps(ds);
@@ -2283,7 +2297,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         for (u32 i = 0; i < 7; i++) k.s[k.count++] = float4_stream(i, 0, offs[i], false);
         fetch = get_fetch(k);
     }
-    bind_targets(rt);
+    bind_targets(rt, mb.segs[0].ds);
     for (const MSeg &seg : mb.segs)
         if (cur_depth && (seg.ds->depth_test || seg.ds->depth_write || seg.ds->stencil)) {
             take_depth_block(rt);
@@ -2329,6 +2343,9 @@ static void mark_textures(u32 paddr, u32 size, bool definite) {
 // real CPU flushing a whole heap, as some games ask for after every file, would take tens of milliseconds.
 void metal_guest_written(u32 paddr, u32 size, bool definite) {
     st_flushes++;
+    memory_fills.written(paddr, size);
+    for (auto &s : surfaces)  // a maybe counts here: the game has likely given that VRAM to an ordinary texture
+        if (s->copy && s->addr < paddr + size && paddr < s->addr + s->bytes()) s->guest_newer = true;
     if (!definite && size >= 1 << 20) {
         heap_flushes++;
         heap_flush_gap = st_flips - heap_flush_flip;
@@ -2379,6 +2396,7 @@ void write_back(Surface &s) {
     const u32 pf = cbuf_to_pixfmt(s.fmt);
     const u32 bpp = pixel_bytes(pf);
     if (dst) {
+        memory_fills.forget(s.addr, s.bytes());
         // Azran's title and save screens read the whole screen back every frame, so the usual format doesn't go through a pixel at a time
         u16 column[1024];
         if (pf == 0)
@@ -2438,8 +2456,18 @@ bool gx2_memory_fill(u32 start, u32 end, u32 value, u32 control) {
             other = true;
         }
     if (!any && pending_fills.size() < 16 && start >= mem::VRAM_PADDR) pending_fills.push_back(f);
+    if (any && !other) {
+        mark_textures(start, end - start, true);
+        return true;  // Nothing reads a render target from guest memory without asking, and filling it there costs real time: New Super Mario Bros. 2 does 2.5 MB a frame
+    }
+    if (memory_fills.holds(f, pptr(start))) {  // nothing to write, and a texture made from those bytes is current; surfaces there are older than memory, as metal_guest_written would mark them
+        for (auto &s : surfaces)
+            if (s->addr < end && start < s->addr + s->bytes()) s->guest_newer = true;
+        return true;
+    }
     if (any) mark_textures(start, end - start, true);
-    return any && !other;  // Nothing reads a render target from guest memory without asking, and filling it there costs real time: New Super Mario Bros. 2 does 2.5 MB a frame
+    memory_fills.remember(f);
+    return false;
 }
 
 // ---------------------------------------------------------------- presenting
@@ -2821,6 +2849,10 @@ struct LastTransfer {
 // A transfer between two surfaces the game draws at screen size stays on the GPU, at their higher resolution. Paper Mario draws its 3D at
 // double width, scales it down into a buffer, and copies that into the target it draws the 2D on. Through guest memory that would be a
 // readback every frame at the original resolution, and Cemu doesn't read the GPU's work back at all.
+// So does a picture drawn at its own size that a transfer makes a texture of in VRAM, also at its own size, which a game's code doesn't
+// read: Pokémon Ultra Sun halves a small picture of its scene into one every frame, and through guest memory that is a read back, which
+// waits for the GPU, and an upload. The texture's bytes aren't in guest memory then: a lookup there of another size or format than the
+// transfer's reads what was there before, and what the game puts there later counts as newer (Surface::copy).
 static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
     const u32 in_w = in_dims & 0xffff, in_h = in_dims >> 16, out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
     const u32 scaling = (flags >> 24) & 3;
@@ -2828,14 +2860,21 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     const bool flip = flags & 1, crop = flags & 4;
     float sx, sy;
     rt_scale(out_w, out_h, sx, sy);
+    // tiles in, tiles out (0x20 without 0x02): a texture
+    const bool own_size = sy <= 1 && (flags & 0x22) == 0x20 && out_paddr >= mem::VRAM_PADDR && out_paddr < mem::VRAM_PADDR + mem::VRAM_SIZE;
     if ((flip && crop) || in_w < out_w0 || in_h < out_h0) return false;
     Surface *src = nullptr;
     for (auto &x : surfaces)
-        if (!x->depth && x->addr == in_paddr && x->w == in_w && x->h == in_h && (x->sy > 1 || x->gpu_chain) && !x->guest_newer) src = x.get();
-    if (!src || (sy <= 1 && !src->gpu_chain)) return false;
+        if (!x->depth && x->addr == in_paddr && x->w == in_w && x->h == in_h && !x->guest_newer &&
+            (x->sy > 1 || x->gpu_chain || (own_size && x->gpu_newer)))
+            src = x.get();
+    if (!src) return false;
+    const bool own_size_copy = own_size && src->sy <= 1 && !src->gpu_chain;
+    if (sy <= 1 && !src->gpu_chain && !own_size_copy) return false;
     Surface *dst = get_surface(out_paddr, out_w, out_h, cbuf_to_pixfmt((flags >> 12) & 7), false, src->gpu_chain ? src : nullptr);
     if (dst == src) return false;
     dst->gpu_chain |= src->gpu_chain;
+    dst->copy = own_size_copy;
     take_dyn_level(*dst);
     static u32 notes;
     if (gxt()) LOG("[gxt] gpu copy %08x -> %08x, %08x %08x flags %08x\n", in_paddr, out_paddr, in_dims, out_dims, flags);
@@ -2871,14 +2910,18 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
 // memory each was a read back, which waits for the GPU, then a 512 KB upload. A copy of a whole screen target, a row of tiles at a time into a wider power-of-two
 // texture, is drawn on the GPU into a surface at that address instead, at the target's scale, which the game then samples (get_texture) or makes mipmaps of
 // (gpu_copy_transfer). Metroid draws its final picture from these copies, so at 1:1 the whole screen came out at the 3DS's resolution.
+// So is a copy of the whole target as it lies, with no gaps, into VRAM, when the target has a texture's height: a texture of the target's
+// own size, which Pokémon Ultra Sun makes of its screen every frame of a battle's opening. What the game later says it wrote there counts
+// as newer (Surface::copy).
 bool gx2_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap) {
     Surface *src = find_surface(in_paddr, false, [&](const Surface &t) { return t.gpu_newer && !t.guest_newer && t.sy > 1 && size == t.bytes(); });
     if (!src) return false;
     const u32 bpp = src->bytes() / (src->w * src->h), tile_row = src->w * 8 * bpp;
     const u32 in_w = (in_width_gap & 0xffff) * 16, in_gap = (in_width_gap >> 16) * 16;
     const u32 out_w = (out_width_gap & 0xffff) * 16, out_gap = (out_width_gap >> 16) * 16;
-    if ((in_gap && in_w != tile_row) || out_w != tile_row || !out_gap || (out_w + out_gap) % (8 * bpp)) return false;
-    const u32 w = (out_w + out_gap) / (8 * bpp);
+    const bool whole = !in_gap && !out_gap && !(src->h & (src->h - 1)) && out_paddr >= mem::VRAM_PADDR && out_paddr < mem::VRAM_PADDR + mem::VRAM_SIZE;
+    if (!whole && ((in_gap && in_w != tile_row) || out_w != tile_row || !out_gap || (out_w + out_gap) % (8 * bpp))) return false;
+    const u32 w = whole ? src->w : (out_w + out_gap) / (8 * bpp);
     u32 h = src->h;
     while (h & (h - 1)) h += h & -h;
     if ((w & (w - 1)) || w > 1024 || h > 1024) return false;
@@ -2896,6 +2939,7 @@ bool gx2_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u
         restore_context();
     }
     dst->gpu_chain = true;
+    if (whole) dst->copy = true;
     flush_surface(*src);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, src->tex.surface.image, src->tex.surface.imageSize);
     GX2SetColorBuffer(&dst->cb, GX2_RENDER_TARGET_0);
@@ -3144,6 +3188,7 @@ void gx2_cpu_will_read(u32 paddr, u32 size) {
         const u8 *src = pptr(t.in_paddr);
         u8 *dst = pptr(t.out_paddr);
         if (src && dst) {
+            memory_fills.forget(t.out_paddr, t.out_size);
             transfer_convert(src, dst, t.in_dims, t.out_dims, t.flags);
             DCFlushRange(dst, t.out_size);
         }

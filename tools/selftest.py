@@ -29,6 +29,13 @@ def present_rule():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_present_rule.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def memory_fills():
+    """port/wiiu/memory_fills.h against made-up fills and writes of a made-up memory, built for this PC"""
+    exe = build3ds.WORK + '/selftest/test_memory_fills.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_memory_fills.cpp', '-lpthread', '-o', exe], [exe]]
+
+
 def latte_program():
     """port/wiiu/latte_program.h against small programs made up word by word, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_latte_program.exe'
@@ -58,6 +65,7 @@ def main():
     checks = {
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
+        'memory fills': memory_fills(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
         'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
