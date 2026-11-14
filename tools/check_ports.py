@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -182,6 +183,22 @@ def cemu(t, seconds, interp):
     if interp:
         ps.append('-Interpreter')
     return run(*ps).stdout
+
+
+def gsx_misses(path):
+    """the "GSX " records of a run's miss list: geometry shaders' draws the pack had no shader for, which the CPU drew (gx2_backend.cpp)"""
+    d, p, n = open(path, 'rb').read(), 0, 0
+    while p + 8 <= len(d):
+        tag = d[p:p + 4]
+        if tag in (b'GSX ', b'FS  '):
+            n += tag == b'GSX '
+            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
+        elif tag == b'VS  ':
+            _, nc, ns = struct.unpack_from('<III', d, p + 4)
+            p += 16 + (nc + ns) * 4 + 56
+        else:
+            break
+    return n
 
 
 def learn_missed(t):
@@ -413,6 +430,9 @@ def judge(t, seconds, flags, measured=False):
             notes.append(note)
         misses = d + '/shader_misses.bin'
         if os.path.exists(misses) and os.path.getsize(misses):
+            gsx = gsx_misses(misses)
+            if gsx:
+                notes.append(f"{name}: {gsx} geometry shaders' draws the pack lacked a shader for, drawn by the CPU")
             if not t.like:  # what a cold build missed stays out of the lists the usual builds are made from
                 os.makedirs(t.data + '/shader_logs', exist_ok=True)
                 run(sys.executable, 'tools/misses_to_log.py', misses, f'{t.data}/shader_logs/cemu_{time.strftime("%m%d_%H%M%S")}.bin')

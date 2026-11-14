@@ -568,25 +568,42 @@ def merge_gfd(paths, out):
     return counts
 
 
-def check_registers(path):
-    """GX2SetShaderMode leaves 48 registers for vertex shaders and 200 for pixel shaders. A shader asking for more can't start on a real GPU, and Cemu doesn't mind."""
-    vs = ps = 0
-    for kind, _, body in gfd_blocks(open(path, 'rb').read()):
-        if kind == VS_HEAD:
-            vs = max(vs, struct.unpack('>I', body[:4])[0] & 255)
-        if kind == PS_HEAD:
-            ps = max(ps, struct.unpack('>I', body[:4])[0] & 255)
-    print(f'registers: vertex shaders use up to {vs} of 48, pixel shaders up to {ps} of 200')
-    if not vs or vs > 48 or ps > 200:
-        sys.exit('a shader needs more registers than the GPU gives it')
-    # and what else a real GPU holds a program to that Cemu doesn't
+def check_registers(path, droppable=frozenset()):
+    """GX2SetShaderMode leaves 48 registers for vertex shaders and 200 for pixel shaders. A shader asking for more can't start on a real GPU, and Cemu doesn't mind;
+    tools/gsh_rules.py says what else a real GPU holds a program to. droppable: vertex shaders (by number) whose draws the CPU can shade instead, a vertex
+    program and the geometry shader after it (gen_gsx_glsl): one of those a GPU can't take leaves shaders.idx, and the build goes on."""
     import importlib.util
     spec = importlib.util.spec_from_file_location('gsh_rules', ROOT + '/tools/gsh_rules.py')
     rules = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rules)
-    _, broken = rules.check_file(path)
+    vs = ps = vi = 0
+    broken, dropped = [], set()
+    for kind, registers, words in rules.programs(open(path, 'rb').read()):
+        bad = rules.check(words, registers)
+        if kind == 'vertex':
+            if (registers > 48 or bad) and vi in droppable:
+                dropped.add(vi)
+            else:
+                vs = max(vs, registers)
+                broken += [f'vertex program {vi}: {what}' for what in bad]
+            vi += 1
+        else:
+            ps = max(ps, registers)
+            broken += [f'pixel program: {what}' for what in bad]
+    print(f'registers: vertex shaders use up to {vs} of 48, pixel shaders up to {ps} of 200')
+    if not vs or vs > 48 or ps > 200:
+        sys.exit('a shader needs more registers than the GPU gives it')
     if broken:
         sys.exit('shader programs a real GPU may not take (tools/gsh_rules.py):\n   ' + '\n   '.join(broken[:20]))
+    if dropped:  # shaders.idx (shadergen.h): its header, the fragment entries, then the vertex ones, 16 bytes each, big-endian
+        idx = os.path.join(os.path.dirname(path), 'shaders.idx')
+        d = bytearray(open(idx, 'rb').read())
+        num_ps, num_vs = struct.unpack_from('>II', d, 8)
+        at = 32 + 16 * num_ps
+        kept = [d[p:p + 16] for p in range(at, at + 16 * num_vs, 16) if struct.unpack_from('>I', d, p + 8)[0] not in dropped]
+        struct.pack_into('>I', d, 12, len(kept))
+        open(idx, 'wb').write(bytes(d[:at]) + b''.join(kept))
+        print(f'{len(dropped)} geometry shader draws left to the CPU: their shaders are more than a GPU takes')
 
 
 def compile_shaders(out, jobs):
@@ -615,7 +632,8 @@ def compile_shaders(out, jobs):
     if counts != {VS_HEAD: len(vs), PS_HEAD: len(ps)}:
         sys.exit(f'expected {len(vs)} vertex and {len(ps)} pixel shaders, the compiler made {counts}')
     shutil.rmtree(tmp)
-    check_registers(out + '/shaders.gsh')
+    gsx = glsl + '/gsx.txt'  # shadergen: which vertex shaders draw a geometry shader's output
+    check_registers(out + '/shaders.gsh', {int(x) for x in open(gsx).read().split()} if os.path.exists(gsx) else frozenset())
     print(f'shaders.gsh: {os.path.getsize(out + "/shaders.gsh") >> 10} KB, {len(vs)} vertex and {len(ps)} pixel shaders')
 
 

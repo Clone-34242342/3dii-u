@@ -86,6 +86,17 @@ def open_bools():
                                  '-lpthread', '-o', exe], [exe]]
 
 
+def gsx():
+    """tools/test_gsx.cpp with the shader generator's own objects"""
+    shadergen()
+    exe = build3ds.WORK + '/selftest/test_gsx.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    objs = [f'{build3ds.WORK}/shadergen/{n}.o' for n in ('shadergen.cpp', 'shaderkeys.cpp', 'shader.cpp', 'shadergen_stubs.cpp')]
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                                 f'-I{build3ds.RT}/gpu', '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_gsx.cpp', *objs,
+                                 '-lpthread', '-o', exe], [exe]]
+
+
 def main():
     py = sys.executable
     checks = {
@@ -96,6 +107,7 @@ def main():
         'game languages': languages(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
+        'geometry shaders': gsx(),
         'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
         'program rules': [[py, ROOT + '/tools/gsh_rules.py', '--self-check']],
         'fragment variants': [[py, ROOT + '/tools/fs_variants.py', '--self-check']],

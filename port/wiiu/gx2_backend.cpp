@@ -147,6 +147,8 @@ struct VsEntry {
     GX2VertexShader *shader = nullptr;
     u32 index = 0, inputs = 0;
     s32 location[16];  // input register -> attribute location
+    s32 corner = -1;   // a geometry shader's draw (gen_gsx_glsl): where its corner numbers go
+    s32 vertex_loc[3][16];  // input register -> attribute location for a fixed-primitive run's second to fourth vertices (w, x, y)
 };
 struct PsEntry {
     GX2PixelShader *shader = nullptr;
@@ -331,9 +333,15 @@ GX2PixelShader *find_ps(const DrawState &ds) {
 // attribute location of input register r, from the name the shader generator gave it
 void vs_locations(VsEntry &v) {
     for (auto &l : v.location) l = -1;
+    for (auto &k : v.vertex_loc)
+        for (auto &l : k) l = -1;
+    v.corner = -1;
     for (u32 i = 0; i < v.shader->attribVarCount; i++) {
         const GX2AttribVar &a = v.shader->attribVars[i];
-        if (a.name[0] == 'v') v.location[atoi(a.name + 1)] = a.location;
+        const u32 r = (u32)atoi(a.name + 1) & 15;
+        if (a.name[0] == 'v') v.location[r] = a.location;
+        else if (a.name[0] >= 'w' && a.name[0] <= 'y') v.vertex_loc[a.name[0] - 'w'][r] = a.location;  // gen_gsx_glsl's names
+        else if (!strcmp(a.name, "aCorner")) v.corner = a.location;
     }
 }
 // what the fetch shader is built from (attribVars) against what the GPU routes by (the semantic table): a compiler may number them differently
@@ -1955,6 +1963,34 @@ static const u16 *outline_triangles(const Gx2Draw &d, const u8 *ip, u32 &count) 
     return list;
 }
 
+// a draw of a vertex shader and the geometry shader after it (gen_gsx_glsl). pa_submit turns a geometry shader's triangle round on its
+// winding flag where the topology is the geometry shader's own.
+static u64 gsx_key(const Gx2Draw &d) {
+    return gsx_variant_key(d.prog, d.entry, g.vs.b, d.gs, d.gs_entry, g.gs.b, g.gs.i, d.vs_outmask, d.gs_in, d.gs_perm, d.slot_src, d.topology == 3);
+}
+
+bool gx2_gsx_ready(const Gx2Draw &d) {
+    const u64 key = gsx_key(d);
+    if (const auto it = vs_table.find(key); it != vs_table.end()) return it->second.index != MISSED;
+    vs_table[key].index = MISSED;  // in the miss list once, for the next build (tools/shadergen_main.cpp reads it): little-endian
+    std::vector<u32> rec = {le32(d.entry), le32(g.vs.code_size), le32(g.vs.swizzle_size), le32(d.gs_entry), le32(g.gs.code_size), le32(g.gs.swizzle_size),
+                            le32(d.vs_outmask), le32(d.gs_in), le32((u32)d.gs_perm), le32((u32)(d.gs_perm >> 32)), le32(d.topology == 3)};
+    for (const ShaderSetup *s : {&g.vs, &g.gs}) {
+        for (u32 i = 0; i < s->code_size; i++) rec.push_back(le32(s->code[i]));
+        for (u32 i = 0; i < s->swizzle_size; i++) rec.push_back(le32(s->swizzle[i]));
+    }
+    const u32 size = le32((u32)rec.size() * 4 + 88);  // after the tag: what a log reader steps over
+    miss_put("GSX ", 4);
+    miss_put(&size, 4);
+    miss_put(rec.data(), rec.size() * 4);
+    miss_put(g.vs.b, 16);
+    miss_put(g.vs.i, 16);
+    miss_put(g.gs.b, 16);
+    miss_put(g.gs.i, 16);
+    miss_put(d.slot_src, 24);
+    return false;
+}
+
 bool gx2_draw(const Gx2Draw &d) {
     const DrawState &ds = *d.ds;
     if (ds.skip || ds.shadow_mode || ds.gas || !ds.rt.color_addr || !pptr(ds.rt.color_addr) || (ds.rt.color_fmt & 0x80)) return true;
@@ -1968,15 +2004,16 @@ bool gx2_draw(const Gx2Draw &d) {
         s8 slots[24];
         u64 key;
     } vk;
-    if (vk.prog != d.prog || vk.entry != d.entry || memcmp(vk.b, g.vs.b, sizeof vk.b) || memcmp(vk.slots, d.slot_src, sizeof vk.slots)) {
+    if (!d.gs && (vk.prog != d.prog || vk.entry != d.entry || memcmp(vk.b, g.vs.b, sizeof vk.b) || memcmp(vk.slots, d.slot_src, sizeof vk.slots))) {
         vk.prog = d.prog;
         vk.entry = d.entry;
         memcpy(vk.b, g.vs.b, sizeof vk.b);
         memcpy(vk.slots, d.slot_src, sizeof vk.slots);
         vk.key = vs_variant_key(d.prog, d.entry, g.vs.b, d.slot_src);
     }
-    const u64 key = vk.key;
+    const u64 key = d.gs ? gsx_key(d) : vk.key;
     auto it = vs_table.find(key);
+    if (d.gs && (it == vs_table.end() || it->second.index == MISSED)) return false;  // (gx2_gsx_ready has logged the miss)
     if (it == vs_table.end()) {
         // No shader for this draw's own set of bools. Where its entry reads more of them than a build makes every set of, the pack has one
         // that reads them as it runs (kVsBoolsMade), and this draw's key gets that shader.
@@ -2023,6 +2060,16 @@ bool gx2_draw(const Gx2Draw &d) {
     VsEntry &vs = it->second;
     if (vs.index == ~0u) return false;
     if (!vs.shader) prepare_vs(vs);
+    // a geometry shader's draw (below): an instance a run, of a vertex for every corner it can emit, each of the run's inputs a stream (in
+    // fixed-primitive mode, each input of each of a run's vertices). One that would take more than half a ring segment goes the CPU way,
+    // before anything is set up for it.
+    const u32 run_vertices = d.gs_in & kGsxPrim ? d.gs_in & 0xff : 1;
+    if (d.gs) {
+        u32 streams = 0;
+        for (u32 k = 0; k < run_vertices; k++)
+            for (u32 r = 0; r < 16; r++) streams += (vs.inputs >> r & 1) && (k ? vs.vertex_loc[k - 1][r] : vs.location[r]) >= 0;
+        if (vs.corner < 0 || streams > 15 || ((u64)(d.count / run_vertices) * streams + 3 * (vs.inputs >> 16)) * 16 > (4u << 20)) return false;
+    }
     gx2_flush_cpu_batch();
     const u8 *ip = nullptr;
     if (d.indexed) {
@@ -2070,10 +2117,61 @@ bool gx2_draw(const Gx2Draw &d) {
         for (u32 i = 0; i < 4; i++) o[4 + i] = swap_float(d.outline_color[i]);
         GX2Invalidate((GX2InvalidateMode)(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK), u, size);
         GX2SetVertexUniformBlock(vs_ubo_loc, size, u);
+    } else if (d.gs) {
+        constexpr u32 size = (VS_BLOCK_WORDS + 96 * 4 + 16) * 4;  // and the geometry shader's gf[96] and gInt[4] after uInt (gen_gsx_glsl)
+        u32 *u = (u32 *)ring_alloc((size + 255) & ~255u, 256);
+        const u32 *src = (const u32 *)g.vs.f, *gsrc = (const u32 *)g.gs.f;
+        for (u32 i = 0; i < 96 * 4; i++) u[i] = __builtin_bswap32(src[i]);
+        u[384] = swap_float(ds.depth_scale);
+        u[385] = swap_float(ds.depth_offset);
+        u[386] = u[387] = 0;
+        put_vs_ints(u);
+        u32 *const gu = u + VS_BLOCK_WORDS;
+        for (u32 i = 0; i < 96 * 4; i++) gu[i] = __builtin_bswap32(gsrc[i]);
+        for (u32 n = 0; n < 4; n++)
+            for (u32 c = 0; c < 4; c++) gu[384 + n * 4 + c] = __builtin_bswap32((u32)g.gs.i[n][c]);
+        GX2Invalidate((GX2InvalidateMode)(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK), u, size);
+        GX2SetVertexUniformBlock(vs_ubo_loc, size, u);
     } else {
         set_vertex_uniforms(ds, g.vs.f);
     }
     lap(P_VSUNI);
+    if (d.gs) {
+        // A run is an instance: its game vertices' inputs as the CPU read them, one element each, and every corner of every triangle the
+        // geometry shader can emit is a vertex of it, saying which triangle and which of its corners it is (gen_gsx_glsl). The index entry's
+        // inputs: the input registers in bits 0-15, the triangles a run makes above them (tools/shadergen_main.cpp). Sizes checked above.
+        const u32 runs = d.count / run_vertices, per = 3 * (vs.inputs >> 16);
+        if (!runs) return true;  // nothing to run: no draw of no instances
+        s32 src_of[16];
+        std::fill(src_of, src_of + 16, -1);
+        for (u32 a = 0; a <= d.in_maxi; a++)  // the last attribute a register is given wins, as in load_inputs; past the draw's attributes, zero
+            src_of[(d.in_map >> (4 * a)) & 0xf] = a < d.num_attr ? (s32)a : -1;
+        FetchKey fk;
+        fk.count = 0;
+        u32 buf = 0;
+        auto bind = [&](s32 location, V4 *c, u32 elements, bool instance) {
+            DCFlushRange(c, elements * 16);
+            GX2SetAttribBuffer(buf, elements * 16, 16, c);
+            fk.s[fk.count++] = float4_stream(location, buf++, 0, instance);
+        };
+        for (u32 j = 0; j < run_vertices; j++)
+            for (u32 r = 0; r < 16; r++) {
+                const s32 location = j ? vs.vertex_loc[j - 1][r] : vs.location[r];
+                if (!(vs.inputs & (1u << r)) || location < 0) continue;
+                V4 *c = (V4 *)ring_alloc(runs * 16 + 64, 64);
+                for (u32 i = 0; i < runs; i++) c[i] = src_of[r] >= 0 ? d.points[(size_t)src_of[r] * d.count + i * run_vertices + j] : V4{};
+                bind(location, c, runs, true);
+            }
+        V4 *c = (V4 *)ring_alloc(per * 16 + 64, 64);
+        for (u32 k = 0; k < per; k++) c[k] = V4{{(float)(k / 3), (float)(k % 3), 0, 1}};
+        bind(vs.corner, c, per, false);
+        lap(P_ATTR);
+        GX2SetFetchShader(get_fetch(fk));
+        GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, per, 0, runs);
+        lap(P_DRAW);
+        st_draws++;
+        return true;
+    }
 
     // the range of vertices used, to make sure the GPU sees them
     u32 minv, maxv;

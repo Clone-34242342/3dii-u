@@ -238,6 +238,8 @@ def vertex_records(d):
             p += (nc + ns) * 4
             yield entry, code, swz, [x - 256 if x >= 128 else x for x in d[p + 32:p + 56]]
             p += 56
+        elif d[p:p + 4] == b'GSX ':  # a vertex shader and a geometry shader (shadergen_main.cpp): its size after the tag
+            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
         else:
             q = p + 4 if d[p:p + 4] == b'FS  ' else p
             if q + 4 > len(d):
