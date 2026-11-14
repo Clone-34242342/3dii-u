@@ -3627,7 +3627,14 @@ void gfx_pump(bool quiet) {
         draw_keyboard();
         screen_fresh = true;
     }
-    if (present_rule.vblank(screen_fresh)) {
+    static u32 swaps_seen[2];  // each screen's swaps (services/gsp.cpp) up to the last VBlank's look
+    unsigned swapped = 0;
+    for (int s = 0; s < 2; s++) {
+        const u32 swaps = kernel::gsp_swaps(s);
+        if (swaps != swaps_seen[s]) swapped |= 1u << s;
+        swaps_seen[s] = swaps;
+    }
+    if (present_rule.vblank(screen_fresh, swapped, menu_is_open || kb_active)) {
         screen_fresh = false;
         present();
     }
