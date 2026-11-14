@@ -18,6 +18,8 @@
 #include <sys/stat.h>
 #include <malloc.h>
 #include <nn/act.h>
+#include <padscore/kpad.h>
+#include <padscore/wpad.h>
 #include <unistd.h>
 #include <vpad/input.h>
 #include <whb/gfx.h>
@@ -221,6 +223,37 @@ static int gpu_thread(int, void *) {
     return 0;
 }
 
+// A Wii U Pro Controller's buttons, as the GamePad's are mapped (map_buttons)
+static u32 map_pro(u32 h) {
+    u32 b = 0;
+    if (h & WPAD_PRO_BUTTON_A) b |= 1u << 0;
+    if (h & WPAD_PRO_BUTTON_B) b |= 1u << 1;
+    if (h & WPAD_PRO_BUTTON_MINUS) b |= 1u << 2;
+    if (h & WPAD_PRO_BUTTON_PLUS) b |= 1u << 3;
+    if (h & WPAD_PRO_BUTTON_RIGHT) b |= 1u << 4;
+    if (h & WPAD_PRO_BUTTON_LEFT) b |= 1u << 5;
+    if (h & WPAD_PRO_BUTTON_UP) b |= 1u << 6;
+    if (h & WPAD_PRO_BUTTON_DOWN) b |= 1u << 7;
+    if (h & (WPAD_PRO_BUTTON_R | WPAD_PRO_BUTTON_ZR)) b |= 1u << 8;
+    if (h & (WPAD_PRO_BUTTON_L | WPAD_PRO_BUTTON_ZL)) b |= 1u << 9;
+    if (h & WPAD_PRO_BUTTON_X) b |= 1u << 10;
+    if (h & WPAD_PRO_BUTTON_Y) b |= 1u << 11;
+    return b;
+}
+
+// its presses as the GamePad's, for the options menu (menu_input): the left stick in to open it, the D-pad, A and B
+static u32 pro_as_gamepad(u32 t) {
+    u32 v = 0;
+    if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
+    if (t & WPAD_PRO_BUTTON_A) v |= VPAD_BUTTON_A;
+    if (t & WPAD_PRO_BUTTON_B) v |= VPAD_BUTTON_B;
+    if (t & WPAD_PRO_BUTTON_UP) v |= VPAD_BUTTON_UP;
+    if (t & WPAD_PRO_BUTTON_DOWN) v |= VPAD_BUTTON_DOWN;
+    if (t & WPAD_PRO_BUTTON_LEFT) v |= VPAD_BUTTON_LEFT;
+    if (t & WPAD_PRO_BUTTON_RIGHT) v |= VPAD_BUTTON_RIGHT;
+    return v;
+}
+
 // 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y
 static u32 map_buttons(u32 h) {
     u32 b = 0;
@@ -253,27 +286,33 @@ static int hid_thread(int, void *) {
         fclose(f);
         kernel::g_live_path = live_path.c_str();
     }
+    // Pro Controllers beside the GamePad: what either holds counts, and the stick pushed further is the circle pad
+    KPADInit();
+    WPADEnableURCC(TRUE);
     u32 tick = 0;
     bool touch_was = false, leaving = false;
     VPADStatus st{};
     VPADTouchData cal{};
-    u32 buttons = 0;
+    u32 buttons = 0, pad_buttons = 0, pro_hold[4] = {};
+    float pad_x = 0, pad_y = 0, pro_x[4] = {}, pro_y[4] = {};
     s16 cx = 0, cy = 0;
     bool touch = false;
     u16 tx = 0, ty = 0;
     for (;;) {
+        u32 presses = 0;  // the GamePad's way, from either, for the options menu
         VPADReadError err = VPAD_READ_SUCCESS;
         VPADRead(VPAD_CHAN_0, &st, 1, &err);
+        if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
+            pad_buttons = 0;
+            pad_x = pad_y = 0;
+            touch = false;
+        }
         if (err == VPAD_READ_SUCCESS) {
-            buttons = map_buttons(st.hold);
+            pad_buttons = map_buttons(st.hold);
+            presses |= st.trigger;
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
-            wiiu::menu_input(st.trigger);
-            if (!leaving && wiiu::menu_wants_quit()) {
-                leaving = true;
-                SYSLaunchMenu();
-            }
-            cx = (s16)(st.leftStick.x * 156.0f);
-            cy = (s16)(st.leftStick.y * 156.0f);
+            pad_x = st.leftStick.x;
+            pad_y = st.leftStick.y;
             // The GamePad's sensors in the 3DS's frame: y comes out of the screen and z towards the player. 512 is 1g; 14.375 is a degree a second, and the GamePad's 1.0 is a turn a second.
             auto to_s16 = [](float v) { return (s16)std::clamp(v, -32767.0f, 32767.0f); };
             const VPADVec3D &ac = st.accelerometer.acc;
@@ -292,6 +331,34 @@ static int hid_thread(int, void *) {
             }
             wiiu::keyboard_input(st.trigger, down && !touch_was, px, py);
             touch_was = down;
+        }
+        buttons = pad_buttons;
+        float sx = pad_x, sy = pad_y;
+        for (int ch = 0; ch < 4; ch++) {
+            KPADStatus ks{};
+            KPADError kerr = KPAD_ERROR_OK;
+            const bool read = KPADReadEx((KPADChan)ch, &ks, 1, &kerr) > 0 && kerr == KPAD_ERROR_OK;
+            if (read && ks.extensionType == WPAD_EXT_PRO_CONTROLLER) {
+                pro_hold[ch] = ks.pro.hold;
+                pro_x[ch] = ks.pro.leftStick.x;
+                pro_y[ch] = ks.pro.leftStick.y;
+                presses |= pro_as_gamepad(ks.pro.trigger);
+            } else if (read || kerr == KPAD_ERROR_INVALID_CONTROLLER) {  // another kind of controller there, or none
+                pro_hold[ch] = 0;
+                pro_x[ch] = pro_y[ch] = 0;
+            }
+            buttons |= map_pro(pro_hold[ch]);
+            if (std::fabs(pro_x[ch]) + std::fabs(pro_y[ch]) > std::fabs(sx) + std::fabs(sy)) {
+                sx = pro_x[ch];
+                sy = pro_y[ch];
+            }
+        }
+        cx = (s16)(sx * 156.0f);
+        cy = (s16)(sy * 156.0f);
+        wiiu::menu_input(presses);
+        if (!leaving && wiiu::menu_wants_quit()) {
+            leaving = true;
+            SYSLaunchMenu();
         }
         if (autoplay || kernel::g_live_path || wiiu::test_run()) {
             tick++;
