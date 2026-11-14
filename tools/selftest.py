@@ -36,6 +36,13 @@ def memory_fills():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_memory_fills.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def ro_tree():
+    """third_party/3dsrecomp/runtime/services/ro_tree.h against an export tree made up for three names, built for this PC"""
+    exe = build3ds.WORK + '/selftest/test_ro_tree.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}/services', '-static', ROOT + '/tools/test_ro_tree.cpp', '-o', exe], [exe]]
+
+
 def latte_program():
     """port/wiiu/latte_program.h against small programs made up word by word, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_latte_program.exe'
@@ -66,6 +73,7 @@ def main():
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'memory fills': memory_fills(),
+        'module exports': ro_tree(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
         'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
