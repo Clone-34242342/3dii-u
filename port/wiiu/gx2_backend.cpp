@@ -2851,25 +2851,74 @@ void present() {
 bool screen_fresh;
 PresentRule present_rule;  // when a finished frame is shown (present_rule.h, gfx_pump)
 
+// What the TV shows, from the options menu's SCREENS line (settings.ini's tv_layout): the top screen alone, or both, for play with a Pro
+// Controller or a GamePad set aside: side by side, one above the other, or the top one large with the bottom one at half its scale beside
+// it. The GamePad always shows the bottom screen, which it touches.
+constexpr int kLayouts = 4;
+volatile int tv_layout;      // the menu's (input thread)
+int tv_layout_shown = -1;    // what the TV buffer has been drawn for (GPU thread): another clears it first
+struct Rect {
+    u32 x, y, w, h;
+};
+// where a screen goes on a TV of tw x th; false where the layout leaves it off the TV
+bool tv_rect(int layout, int which, u32 tw, u32 th, Rect &r) {
+    auto fit = [&](float w, float h) { return std::min(tw / w, th / h); };  // scale of a w x h arrangement that fills the TV one way
+    switch (layout) {
+    case 1: {  // side by side: 720x240
+        const float k = fit(720, 240);
+        const u32 x0 = (u32)((tw - 720 * k) / 2), y = (u32)((th - 240 * k) / 2);
+        r = which == 0 ? Rect{x0, y, (u32)(400 * k), (u32)(240 * k)} : Rect{x0 + (u32)(400 * k), y, (u32)(320 * k), (u32)(240 * k)};
+        return true;
+    }
+    case 2: {  // the top screen above the bottom one: 400x480
+        const float k = fit(400, 480);
+        const u32 y0 = (u32)((th - 480 * k) / 2);
+        r = which == 0 ? Rect{(u32)((tw - 400 * k) / 2), y0, (u32)(400 * k), (u32)(240 * k)}
+                       : Rect{(u32)((tw - 320 * k) / 2), y0 + (u32)(240 * k), (u32)(320 * k), (u32)(240 * k)};
+        return true;
+    }
+    case 3: {  // the top screen large, the bottom one at half its scale beside its lower half: 560x240
+        const float k = fit(560, 240);
+        const u32 x0 = (u32)((tw - 560 * k) / 2), y = (u32)((th - 240 * k) / 2);
+        r = which == 0 ? Rect{x0, y, (u32)(400 * k), (u32)(240 * k)} : Rect{x0 + (u32)(400 * k), y + (u32)(120 * k), (u32)(160 * k), (u32)(120 * k)};
+        return true;
+    }
+    default:  // the top screen alone, as tall as the TV
+        if (which) return false;
+        r = Rect{(tw - th * 5 / 3) / 2, 0, th * 5 / 3, th};
+        return true;
+    }
+}
+
 void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_hi = 1, float u_hi = 1) {
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->surface.image, tex->surface.imageSize);
-    GX2ColorBuffer *cb = which == 0 ? tv_cb : drc_cb;
-    GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
-    cur_color = nullptr;
-    begin_blit();
     Screen sc;
     sc.tex = tex;
     sc.flip = flip;
     sc.v_lo = v_lo;
     sc.v_hi = v_hi;
     sc.u_hi = u_hi;
-    if (which == 0) {
-        const u32 w = cb->surface.height * 5 / 3;
-        draw_screen(sc, (cb->surface.width - w) / 2, 0, w, cb->surface.height);
-    } else {
-        draw_screen(sc, (cb->surface.width - 640) / 2, 0, 640, 480);
+    const int layout = tv_layout;
+    if (layout != tv_layout_shown) {  // what was beside the pictures before goes
+        GX2ClearColor(tv_cb, 0, 0, 0, 1);
+        restore_context();
+        tv_layout_shown = layout;
     }
-    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+    Rect r;
+    if (tv_rect(layout, which, tv_cb->surface.width, tv_cb->surface.height, r)) {
+        GX2SetColorBuffer(tv_cb, GX2_RENDER_TARGET_0);
+        cur_color = nullptr;
+        begin_blit();
+        draw_screen(sc, r.x, r.y, r.w, r.h);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tv_cb->surface.image, tv_cb->surface.imageSize);
+    }
+    if (which == 1) {
+        GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
+        cur_color = nullptr;
+        begin_blit();
+        draw_screen(sc, (drc_cb->surface.width - 640) / 2, 0, 640, 480);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
+    }
     state_lost = true;
     screen_fresh = true;
     present_rule.drew(which);
@@ -3456,6 +3505,7 @@ void gfx_thread_init() {
     // (NSMB2's world map lost its ground, 2026-11-11): there the CPU makes them. The console's GPU fetches them itself.
     in_cemu = wiiu::debug_flag("cemu");
     if (in_cemu) gxt_cpu_attr |= 1;
+    tv_layout = std::clamp(g_settings.tv_layout, 0, kLayouts - 1);
     if (wiiu::debug_flag("dynres")) dyn_test = true;
     if (wiiu::debug_flag("uberall")) uber_all = true;
     if (wiiu::debug_flag("glslforce")) glsl_force = true;
@@ -3501,7 +3551,7 @@ void gfx_write_misses() {
 void gfx_vblank() { vblank_pending = true; }
 
 // ---- options menu state; the input thread changes it, the GPU thread draws it
-static constexpr int MENU_ITEMS = 5;
+static constexpr int MENU_ITEMS = 6;
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
@@ -3517,6 +3567,12 @@ static void next_language(int dir) {
     const int keep = l == kernel::pick_language(offered, -1, kernel::g_system_language) ? -1 : l;  // the console's own: following it again
     if (keep == g_settings.language) return;
     g_settings.language = keep;
+    wiiu::settings_due = true;
+}
+
+// what the TV shows (tv_rect): at once, and from the next start too
+static void next_layout(int dir) {
+    tv_layout = g_settings.tv_layout = (tv_layout + dir + kLayouts) % kLayouts;
     wiiu::settings_due = true;
 }
 
@@ -3546,9 +3602,10 @@ void menu_input(u32 pressed) {
         audio::set_volume(menu_volume / 100.0f);
     }
     if (menu_item == 3 && dir) next_language(dir);
+    if (menu_item == 4 && dir) next_layout(dir);
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
-        if (menu_item == 4) menu_quit = true;
+        if (menu_item == 5) menu_quit = true;
     }
 }
 
@@ -3565,9 +3622,9 @@ static void draw_menu() {
     draw_rect(w, h, 127, 60, 727, 420, 0, 0, 1, 1);
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
-    const float rowh = 50, top = 130;
+    const float rowh = 44, top = 126;
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
-    draw_rect(w, h, 145, top + menu_item * rowh - 6, 709, top + menu_item * rowh + 42, 0, 0, 1, 1);
+    draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + 38, 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
     GX2SetPixelSampler(&lut_sampler, 0);
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
@@ -3577,18 +3634,20 @@ static void draw_menu() {
     set_blit_colors(0.2f, 0.1f, 0.0f, 0, 0, 0);
     static const char *const k_languages[12] = {"JAPANESE", "ENGLISH", "FRENCH",  "GERMAN",     "ITALIAN", "SPANISH",
                                                 "CHINESE",  "KOREAN",  "DUTCH",   "PORTUGUESE", "RUSSIAN", "CHINESE (TW)"};
-    char line[48], vol[32], lang[40];
+    static const char *const k_layouts[kLayouts] = {"TOP ONLY", "SIDE BY SIDE", "STACKED", "LARGE + SMALL"};
+    char line[48], vol[32], lang[40], screens[40];
     snprintf(line, sizeof line, "GAME SPEED: %d%%", menu_speed);
     snprintf(vol, sizeof vol, "VOLUME: %d%%", menu_volume);
     snprintf(lang, sizeof lang, "LANGUAGE: %s", k_languages[menu_language()]);
-    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, "QUIT TO WII U MENU"};
+    snprintf(screens, sizeof screens, "SCREENS: %s", k_layouts[tv_layout % kLayouts]);
+    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, screens, "QUIT TO WII U MENU"};
     for (int i = 0; i < MENU_ITEMS; i++) {
         draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
     }
     set_blit_colors(0.45f, 0.3f, 0.15f, 0, 0, 0);
     const bool later = menu_item == 3 && menu_language() != kernel::cfg_language();  // a game takes its language as it starts
     const char *hint = later ? "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS" : "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
-    draw_text(w, h, hint, 165, 385, 2);
+    draw_text(w, h, hint, 165, 396, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     state_lost = true;
 }
