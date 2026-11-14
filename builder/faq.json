@@ -3,6 +3,8 @@
    "a": "Your own 3DS game dump (a .3ds, .cci, .cia, .cxi or .app file, encrypted or decrypted), your Wii U's otp.bin, your 3DS's system files, and for encrypted dumps the keys from your own 3DS (boot9.bin and seeddb.bin). On the console: a Wii U with Aroma and WUP Installer GX2, and its SD card."},
   {"q": "Where do the 3DS keys come from?",
    "a": "From GodMode9 on a 3DS with custom firmware. boot9.bin: open [M:] MEMORY VIRTUAL, highlight boot9.bin and press Y, then open [0:] SDCARD, press Y again and choose Copy. seeddb.bin: press HOME, choose More..., then Build support files; it lands in gm9/out on the SD card. Put both in one folder, .3ds in your user folder by default, or choose their folder under Your Files. Decrypted dumps don't need them."},
+  {"q": "What can I change while a game plays?",
+   "a": "Click the left stick in, on the GamePad or a Wii U Pro Controller, for the options menu: game speed, volume, the game's language (it takes it at its next start; at first it follows your Wii U's), what the TV shows (the top screen alone, both side by side, one above the other, or the top one large and the bottom one small; the GamePad always shows the bottom screen, which you touch) and quitting to the Wii U Menu. A Pro Controller plays beside the GamePad, its buttons as the GamePad's."},
   {"q": "Where does otp.bin come from?",
    "a": "From your own Wii U with Aroma: run Wii U NAND Dumper, choose Dump OTP, and otp.bin is written to the SD card. If you made a NAND backup when setting up Aroma, otp.bin is in that backup. The game is packed with a key from it so your console installs it. The builder never shows or stores that key. Keep it private: it is unique to your console."},
   {"q": "What are the 3DS system files?",
