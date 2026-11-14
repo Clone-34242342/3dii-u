@@ -39,6 +39,7 @@ struct FramebufferInfo {
 };
 FramebufferInfo gsp_framebuffer(int screen);  // what the LCD shows (any thread)
 void gsp_vblank();                             // (host thread, lock not held) VBlank interrupts
+u32 gsp_swaps(int screen);                     // (any thread) the VBlanks at which that screen changed buffer, so far
 void gsp_process_gx();                         // (GPU/host thread) run queued GX commands
 extern volatile bool gx_hold;                  // while set, gsp_process_gx leaves the rest of the queue for later
 void gsp_cpu_wrote(u32 vaddr, u32 size);       // a service wrote guest memory the GPU may read
