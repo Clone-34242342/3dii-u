@@ -50,6 +50,7 @@
 #include "memory_fills.h"
 #include "loader.h"
 #include "present_rule.h"
+#include "settings.h"
 #include "shader_compile.h"
 #include "shadergen.h"
 #include "swkbd.h"
@@ -3381,10 +3382,24 @@ void gfx_write_misses() {
 void gfx_vblank() { vblank_pending = true; }
 
 // ---- options menu state; the input thread changes it, the GPU thread draws it
-static constexpr int MENU_ITEMS = 4;
+static constexpr int MENU_ITEMS = 5;
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
+
+// The game's language from its next start, as cfg.cpp will pick it (services/languages.h). settings.ini keeps a choice; the card thread
+// writes it (frontend_wiiu.cpp), as this one, the input thread, would wait out any save being written.
+static int menu_language() { return kernel::pick_language(kernel::cfg_languages(), g_settings.language, kernel::g_system_language); }
+static void next_language(int dir) {
+    const u32 offered = kernel::cfg_languages();
+    int l = menu_language();
+    do l = (l + dir + 12) % 12;
+    while (!(offered >> l & 1));
+    const int keep = l == kernel::pick_language(offered, -1, kernel::g_system_language) ? -1 : l;  // the console's own: following it again
+    if (keep == g_settings.language) return;
+    g_settings.language = keep;
+    wiiu::settings_due = true;
+}
 
 bool menu_open() { return menu_is_open; }
 int game_speed() { return menu_speed; }
@@ -3411,9 +3426,10 @@ void menu_input(u32 pressed) {
         menu_volume = std::clamp(menu_volume + dir * 10, 0, 100);
         audio::set_volume(menu_volume / 100.0f);
     }
+    if (menu_item == 3 && dir) next_language(dir);
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
-        if (menu_item == 3) menu_quit = true;
+        if (menu_item == 4) menu_quit = true;
     }
 }
 
@@ -3430,7 +3446,7 @@ static void draw_menu() {
     draw_rect(w, h, 127, 60, 727, 420, 0, 0, 1, 1);
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
-    const float rowh = 58, top = 130;
+    const float rowh = 50, top = 130;
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
     draw_rect(w, h, 145, top + menu_item * rowh - 6, 709, top + menu_item * rowh + 42, 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
@@ -3440,17 +3456,20 @@ static void draw_menu() {
     set_blit_colors(1, 1, 1, 0, 0, 0);
     draw_text(w, h, "OPTIONS", 165, 68, 4);
     set_blit_colors(0.2f, 0.1f, 0.0f, 0, 0, 0);
-    char line[48];
-    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, nullptr, "QUIT TO WII U MENU"};
-    char vol[32];
+    static const char *const k_languages[12] = {"JAPANESE", "ENGLISH", "FRENCH",  "GERMAN",     "ITALIAN", "SPANISH",
+                                                "CHINESE",  "KOREAN",  "DUTCH",   "PORTUGUESE", "RUSSIAN", "CHINESE (TW)"};
+    char line[48], vol[32], lang[40];
     snprintf(line, sizeof line, "GAME SPEED: %d%%", menu_speed);
     snprintf(vol, sizeof vol, "VOLUME: %d%%", menu_volume);
-    items[2] = vol;
+    snprintf(lang, sizeof lang, "LANGUAGE: %s", k_languages[menu_language()]);
+    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, "QUIT TO WII U MENU"};
     for (int i = 0; i < MENU_ITEMS; i++) {
         draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
     }
     set_blit_colors(0.45f, 0.3f, 0.15f, 0, 0, 0);
-    draw_text(w, h, "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK", 165, 375, 2);
+    const bool later = menu_item == 3 && menu_language() != kernel::cfg_language();  // a game takes its language as it starts
+    const char *hint = later ? "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS" : "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
+    draw_text(w, h, hint, 165, 385, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     state_lost = true;
 }

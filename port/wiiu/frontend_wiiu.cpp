@@ -11,6 +11,7 @@
 #include <coreinit/systeminfo.h>
 #include <coreinit/time.h>
 #include <coreinit/title.h>
+#include <coreinit/userconfig.h>
 #include <gx2/event.h>
 #include <proc_ui/procui.h>
 #include <sysapp/launch.h>
@@ -522,6 +523,8 @@ static int watchdog_thread(int, void *) {
     return 0;
 }
 
+volatile bool wiiu::settings_due;
+
 // Slow work for later, at the lowest priority on its core: flushing saves, and the log, which only reaches storage when the game ends: the PC and the report on the screen don't need it.
 static int card_thread(int, void *) {
     for (u32 pass = 1;; pass++) {
@@ -530,6 +533,13 @@ static int card_thread(int, void *) {
             const u32 seconds = want_hang_dump - 1;
             want_hang_dump = 0;
             dump_hang(seconds);
+        }
+        if (wiiu::settings_due) {  // before the flush below, and so before the one a quit asks for
+            wiiu::settings_due = false;
+            wiiu::fs_begin(0xC00E);
+            settings_save();
+            wiiu::fs_end();
+            wiiu::save_dirty();
         }
         if (kMeasure && pass % 300 == 0) {
             const struct mallinfo m = mallinfo();
@@ -835,6 +845,13 @@ int main(int argc, char **argv) {
     }
     LOG("[wiiu] guest memory at %p\n", g_mem);
     settings_load();
+    // the Wii U's language: a game takes it when its region has it, until the player picks another in the options menu (services/cfg.cpp)
+    if (const UCHandle uc = UCOpen(); uc >= 0) {
+        u32 language = 0;
+        UCSysConfig c = {"cafe.language", 0x777, UC_DATATYPE_UNSIGNED_INT, 0, sizeof language, &language};
+        if (UCReadSysConfig(uc, 1, &c) == 0 && c.error == 0) kernel::g_system_language = (int)language;
+        UCClose(uc);
+    }
     // The console's Miis, one per account: the game finds them in Mii Maker and as the player's Mii (services/misc.cpp, fs.cpp). On since
     // the user's yes on 2026-11-08 ("Yes, next build"); a `nowiimiis` flag turns it off, and the games then get the stand-in Mii as before.
     if (!wiiu::debug_flag("nowiimiis") && nn::act::Initialize().IsSuccess()) {
