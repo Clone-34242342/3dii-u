@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "../kernel.h"
+#include "languages.h"
 
 namespace kernel {
 // The host console's own Miis (the Wii U's accounts: frontend_wiiu.cpp), as 0x60-byte store data, filled before the services start.
@@ -31,6 +32,11 @@ std::vector<u8> system_archive_file(u64 tid, const std::string &path);
 // a file of the game's RomFS by path ("/LayoutData/x.szs"), empty if missing
 std::vector<u8> romfs_file(const std::string &path);
 void apt_notify(u32 signal);
+
+// cfg (languages.h has the rule)
+extern int g_system_language;  // the console's own language: the frontend sets it before the game starts (-1: none)
+u32 cfg_languages();           // the languages the game's region has, a bit each
+int cfg_language();            // the one the game is told, the same all run
 
 // gsp
 struct FramebufferInfo {
