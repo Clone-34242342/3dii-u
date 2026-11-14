@@ -461,6 +461,9 @@ struct Surface {
     bool first_use = true;                             // nothing has drawn into it yet: see upload_target
     bool gpu_chain = false;                            // made by gx2_texture_copy, or from one: the transfers that make its mipmaps stay on the GPU too
     bool copy = false;                                 // a texture a transfer or a copy made on the GPU, its bytes not in guest memory (gpu_copy_transfer, gx2_texture_copy): whatever the game says it wrote there is newer
+    // What of its memory the game has written since the GPU last made it newer (metal_guest_read). shortcut: one span, so bytes between two
+    // writes or in a copy's gaps count as written; track rows (as Tex::dirty_rows) once a game needs it
+    u32 written_lo = 0, written_hi = 0;
     bool shared_depth = false, clear_pending = false;  // see share_depth_block
     // For a target the game's own code may read (cpu_reads): the list being run has drawn to it; a draw to some other kind of target has sampled
     // the picture it holds; and the same of the picture it held before this list drew to it. See gx2_finish_list.
@@ -1404,6 +1407,7 @@ void bind_targets(const RTConfig &rt, const DrawState *ds = nullptr) {
     }
     c->copy = false;         // drawn into: a target like any other
     c->guest_newer = false;  // shortcut: a target the game writes into after its first use keeps what the GPU drew, as in Cemu; upload it too once a game shows it must
+    c->written_lo = c->written_hi = 0;
     if (d && d->guest_newer) d->guest_newer = false;
     if (c != cur_color) {
         if (gxt()) LOG("[gxt] target %08x %ux%u fmt %u, depth %08x\n", rt.color_addr, rt.w, rt.h, rt.color_fmt, rt.depth_addr);
@@ -2340,6 +2344,15 @@ static void mark_textures(u32 paddr, u32 size, bool definite) {
     }
 }
 
+// The game wrote these bytes of a surface's memory: newer than what the GPU holds there. The span starts again once GPU work has made the
+// surface newer since (a draw, a fill, a copy on the GPU: each clears guest_newer).
+static void guest_wrote(Surface &s, u32 paddr, u32 size) {
+    const bool fresh = !s.guest_newer || !s.written_hi;
+    s.written_lo = fresh ? paddr : std::min(s.written_lo, paddr);
+    s.written_hi = fresh ? paddr + size : std::max(s.written_hi, paddr + size);
+    s.guest_newer = true;
+}
+
 // CPU or DMA writes the game told us about. Nothing needs the CPU's cache flushed here: what the GPU reads in place is flushed at the draw, and on a
 // real CPU flushing a whole heap, as some games ask for after every file, would take tens of milliseconds.
 void metal_guest_written(u32 paddr, u32 size, bool definite) {
@@ -2356,7 +2369,7 @@ void metal_guest_written(u32 paddr, u32 size, bool definite) {
     mark_textures(paddr, size, definite);
     if (definite)
         for (auto &s : surfaces)
-            if (s->addr < paddr + size && paddr < s->addr + s->bytes()) s->guest_newer = true;
+            if (s->addr < paddr + size && paddr < s->addr + s->bytes()) guest_wrote(*s, paddr, size);
 }
 
 // ---------------------------------------------------------------- reading the GPU's work back to guest memory
@@ -2386,6 +2399,7 @@ void write_back(Surface &s) {
     st.image = memalign(st.alignment, st.imageSize);
     if (!st.image) return;  // still newer on the GPU: the next read back tries again
     s.gpu_newer = false;
+    s.written_lo = s.written_hi = 0;
     DCInvalidateRange(st.image, st.imageSize);
     if (in_cemu) draw_done();
     GX2CopySurface(&s.cb.surface, 0, 0, &st, 0, 0);
@@ -2421,10 +2435,17 @@ void write_back(Surface &s) {
 }
 }  // namespace
 
+// A target the game has written over since the GPU last drew into it (texture copies, transfers through memory, fills) isn't read back where
+// those writes cover the read: memory holds the newer picture there. Luigi's Mansion 2 puts its top screen together at 18000000, where its
+// targets are.
 void metal_guest_read(u32 paddr, u32 size) {
     Surface *best = nullptr;
-    for (auto &s : surfaces)
-        if (!s->depth && s->gpu_newer && s->addr < paddr + size && paddr < s->addr + s->bytes() && (!best || s->bytes() == size)) best = s.get();
+    for (auto &s : surfaces) {
+        if (s->depth || !s->gpu_newer || s->addr >= paddr + size || paddr >= s->addr + s->bytes()) continue;
+        const u32 lo = std::max(paddr, s->addr), hi = std::min(paddr + size, s->addr + s->bytes());  // the read, of this surface's bytes
+        const bool memory_newer = s->guest_newer && s->written_lo <= lo && hi <= s->written_hi;
+        if (!memory_newer && (!best || s->bytes() == size)) best = s.get();
+    }
     if (best) write_back(*best);
 }
 void metal_guest_prewrite(u32, u32) {}
@@ -2463,7 +2484,7 @@ bool gx2_memory_fill(u32 start, u32 end, u32 value, u32 control) {
     }
     if (memory_fills.holds(f, pptr(start))) {  // nothing to write, and a texture made from those bytes is current; surfaces there are older than memory, as metal_guest_written would mark them
         for (auto &s : surfaces)
-            if (s->addr < end && start < s->addr + s->bytes()) s->guest_newer = true;
+            if (s->addr < end && start < s->addr + s->bytes()) guest_wrote(*s, start, end - start);
         return true;
     }
     if (any) mark_textures(start, end - start, true);
