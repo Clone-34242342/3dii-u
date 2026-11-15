@@ -594,6 +594,14 @@ void rt_scale(u32 w, u32 h, float &sx, float &sy, u32 vw = 0, u32 vh = 0) {
     }
 }
 
+// targets their display transfers scale down, drawn at the size they're used (note_downscaled): by address and size, for a target made again
+bool half_ss = true;
+struct HalfKey {
+    u32 addr, w, h;
+    float sx, sy;
+};
+std::vector<HalfKey> half_keys;
+
 // scale_as: a copy of that surface's picture (gx2_texture_copy and its mipmaps), made at its scale so what the game draws from it stays as sharp.
 // first: the draw a colour target is made for. with: the colour target a depth buffer is bound with, whose scale it has to have: a game uses one
 // depth buffer's memory with targets this draws at different scales.
@@ -616,6 +624,9 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
         s->sx = with->base_sx;
         s->sy = with->base_sy;
     } else rt_scale(w, h, s->sx, s->sy, first ? (u32)lroundf(2 * first->vp_hw) : 0, first ? (u32)lroundf(2 * first->vp_hh) : 0);
+    if (!depth && !scale_as && half_ss)
+        for (const HalfKey &k : half_keys)
+            if (k.addr == addr && k.w == w && k.h == h && k.sx <= s->sx && k.sy <= s->sy) s->sx = k.sx, s->sy = k.sy;
     s->base_sx = s->sx;
     s->base_sy = s->sy;
     // Textures have power-of-two sizes, so a 512x800 target the game draws from is read as 512x1024, sharing its memory. In memory the
@@ -685,11 +696,10 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
 u32 dyn_level;
 inline bool dyn_scaled(const Surface &s) { return s.base_sy > 2; }  // not the bottom screen, which is 2x on a screen a quarter of the size, nor a 1:1 target
 
-void set_surface_scale(Surface &s, u32 level) {
-    if (s.dyn_level == level) return;
-    s.dyn_level = level;
-    s.sx = level ? s.base_sx * 2 / 3 : s.base_sx;
-    s.sy = level ? s.base_sy * 2 / 3 : s.base_sy;
+// the surface at its base scale, two thirds of it at the lower level, in the memory it has: only ever smaller than it was made
+void apply_scale(Surface &s) {
+    s.sx = s.dyn_level ? s.base_sx * 2 / 3 : s.base_sx;
+    s.sy = s.dyn_level ? s.base_sy * 2 / 3 : s.base_sy;
     s.sw = (u32)(s.w * s.sx);
     s.sh = (u32)(s.tex_h * s.sy);
     s.row0 = s.sh - (u32)(s.h * s.sy);
@@ -710,8 +720,45 @@ void set_surface_scale(Surface &s, u32 level) {
     if (&s == cur_color) cur_color = nullptr;
     if (&s == cur_depth) cur_depth = nullptr;
 }
+void set_surface_scale(Surface &s, u32 level) {
+    if (s.dyn_level == level) return;
+    s.dyn_level = level;
+    apply_scale(s);
+}
 inline void take_dyn_level(Surface &s) {
     if (s.dyn_level != dyn_level && dyn_scaled(s)) set_surface_scale(s, dyn_level);
+}
+
+// A target the game draws at twice the size it uses and scales down with a display transfer (its own antialiasing): Luigi's Mansion 2 draws
+// each half of its top screen 256 wide for 128 columns of the LCD, twice a frame. At the screens' scale that is 768x1248 for a strip the TV
+// shows as 369x1200, 2.2 times the pixels, and those draws took 54 of the GPU's 64 ms a frame on the title screen and in the rain on a
+// console (Senne's measure). Such a target is drawn from its next frame at the scale its transfer's destination has, so the transfer copies
+// one to one; the game's antialiasing that way goes, the picture is still three times a 3DS's. Its depth buffers (its size, its old scale)
+// shrink with it, in their own memory: bind_targets would otherwise make one of the new scale beside the old, and the fast memory the old
+// one kept sent Luigi's Mansion 2's next target to slow memory. Kept by address and size for a target made again (get_surface). "set halfss
+// 0" stops it.
+void note_downscaled(Surface &src, const Surface &dst, u32 scaling) {
+    if (!half_ss || !scaling || src.depth) return;
+    const float nx = dst.base_sx / 2, ny = std::min(src.base_sy, scaling == 2 ? dst.base_sy / 2 : dst.base_sy);
+    if (nx < 1 || ny < 1 || src.base_sx < nx * 1.2f) return;
+    if (kMeasure) LOG("[gx2] target %08x %ux%u is scaled down by its transfer: drawn at %.2fx%.2f, not %.2fx%.2f\n", src.addr, src.w, src.h, nx, ny,
+                      src.base_sx, src.base_sy);
+    bool known = false;
+    for (HalfKey &k : half_keys)
+        if (k.addr == src.addr && k.w == src.w && k.h == src.h) {
+            k.sx = nx, k.sy = ny;
+            known = true;
+        }
+    if (!known && half_keys.size() < 16) half_keys.push_back({src.addr, src.w, src.h, nx, ny});
+    for (auto &d : surfaces)
+        if (d->depth && d->w == src.w && d->h == src.h && d->base_sx == src.base_sx && d->base_sy == src.base_sy) {
+            d->base_sx = nx;
+            d->base_sy = ny;
+            apply_scale(*d);
+        }
+    src.base_sx = nx;
+    src.base_sy = ny;
+    apply_scale(src);
 }
 
 u64 gpu_writes;  // a count of the GPU's writes into targets, for Surface::drawn
@@ -3159,6 +3206,7 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     dst->drawn = ++gpu_writes;
     dst->guest_newer = false;
     dst->written_since_flush = true;
+    note_downscaled(*src, *dst, scaling);  // from its next frame on
     return true;
 }
 
@@ -4257,6 +4305,7 @@ bool gfx_set(const char *name, u32 v) {
         uber_fallback = v;
         forget_ps = true;
     } else if (!strcmp(name, "cpuvs")) gxt_cpu_vs = v;
+    else if (!strcmp(name, "halfss")) half_ss = v;  // a target its transfer scales down is drawn at the smaller size (note_downscaled), from the next one
     else if (!strcmp(name, "trace")) {  // the next v draws and what they use, in the log
         gxt_from = (u32)g_frame;
         gxt_left = v;
