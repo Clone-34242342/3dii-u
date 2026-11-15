@@ -245,6 +245,7 @@ ApplicationWindow {
                     Button { text: "Look again"; enabled: !win.busy; onClicked: app.refreshCards() }
                 }
                 PathRow { visible: app.target === "folder"; label: "Folder..."; text: app.destText; onChoose: app.chooseFolder() }
+                PathRow { label: "Build folder..."; text: app.buildText; removable: app.buildCustom; onChoose: app.chooseBuild(); onRemove: app.defaultBuild() }
                 RowLayout {
                     spacing: 6
                     Button {

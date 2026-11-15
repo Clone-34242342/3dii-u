@@ -35,7 +35,11 @@ import shaderlogs  # noqa: E402
 import user_files  # noqa: E402
 
 WORK = os.environ.get('THREEDII_WORK') or ROOT  # the standalone app's engine may be read-only: then it builds in a folder of the user's
-WORK_GAMES = os.path.join(WORK, 'builder_work')
+# Where games are built: each game's work while it builds and the compiled code kept between builds, gigabytes of files the build makes
+# again as it needs them. A folder the player chose (a drive with room: a tester's C: had none), or the work folder.
+BUILD = os.environ.get('THREEDII_BUILD') or WORK
+BUILD_FILES = ('builder_work', 'build_win_builder', 'objcache')  # what it holds, all of it: build3ds puts objcache beside build_win_builder
+WORK_GAMES = os.path.join(BUILD, 'builder_work')
 ARCHIVES = os.path.join(WORK, 'system_archives') if WORK != ROOT else os.path.join(ROOT, 'games', 'system_archives')
 STAGES = [('Reading your game', 2), ('Decrypting', 8), ('Unpacking', 7), ('Finding the game\'s code', 2), ('Recompiling', 48), ('Shaders', 14),
           ('Making the title', 2), ('Packing the WUP', 10), ('Copying', 7)]
@@ -335,7 +339,7 @@ def main():
     b3 = importlib.util.module_from_spec(spec)
     sys.modules['build3ds'] = b3
     spec.loader.exec_module(b3)
-    b3.WORK = os.path.join(WORK, 'build_win_builder').replace('\\', '/')
+    b3.WORK = os.path.join(BUILD, 'build_win_builder').replace('\\', '/')
     prepare_logs = b3.prepare_logs
 
     def with_vertex_programs(g, shadergen):  # the standalone app's logs name vertex programs by fingerprint: this dump's own dvlb.bin has their code

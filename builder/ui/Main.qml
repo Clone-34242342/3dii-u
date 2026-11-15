@@ -987,6 +987,11 @@ ApplicationWindow {
                         Pill { text: "Simple"; accessibleName: "Switch to the simple window"; enabled: !app.building; onClicked: app.setLayout("simple") }
                     }
                     CardRow {
+                        label: "Build folder"; sub: app.buildText
+                        Pill { text: "Folder"; accessibleName: "Choose a folder for building games"; tone: "cyan"; enabled: !app.building; onClicked: app.chooseBuild() }
+                        Pill { text: "Default"; accessibleName: "Build in the usual folder"; visible: app.buildCustom; enabled: !app.building; onClicked: app.defaultBuild() }
+                    }
+                    CardRow {
                         id: updatesRow
                         readonly property string st: app.updateState
                         readonly property bool offered: ["available", "downloading", "unpacking", "ready", "restarting", "failed"].indexOf(st) >= 0

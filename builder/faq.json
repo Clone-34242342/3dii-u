@@ -12,7 +12,7 @@
   {"q": "What are the 3DS system files?",
    "a": "A few small files every 3DS keeps in its own memory: the system font, the parts Miis are drawn from, and the list of bad words games check typed names against. Game dumps don't have them. Get them with Azahar (File > Set Up System Files, with the Artic Setup Tool running on your 3DS), or copy the 0004009b and 000400db folders with GodMode9 and choose the 0004009b folder under Your Files. The builder copies them once and keeps them for every game after."},
   {"q": "Where does the build go?",
-   "a": "Onto your SD card, in its install folder, or into a folder you choose. From a folder, copy it to your SD card's install folder."},
+   "a": "Onto your SD card, in its install folder, or into a folder you choose. From a folder, copy it to your SD card's install folder. While it builds, a game needs several GB of room; if your C: drive is full, choose another drive under Help, About, Build folder."},
   {"q": "How do I install it on the Wii U?",
    "a": "Put the SD card in the Wii U and install the game with WUP Installer GX2. If you installed an earlier build of the same game, delete it first (System Settings > Data Management), then install the new one. Deleting a game deletes its saves."},
   {"q": "What do \"Complete\", \"Plays\" and \"Untested\" mean?",

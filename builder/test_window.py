@@ -468,6 +468,32 @@ try:
     else:
         os.environ['BOOT9_PATH'] = kept_env
 
+    # The build folder (a tester's C: had no room): builds go to the one chosen, the old one's build files are offered for deletion and go only on
+    # a yes, and Default comes back to the work folder. Nothing outside the build files is touched.
+    kept_build, kept_work = os.environ.get('THREEDII_BUILD'), os.environ.get('THREEDII_WORK')
+    work, roomy = os.path.join(base, 'work'), os.path.join(base, 'roomy')
+    os.makedirs(os.path.join(work, 'builder_work'))
+    os.makedirs(os.path.join(work, 'system_archives'))
+    open(os.path.join(work, 'builder_work', 'big.bin'), 'wb').write(bytes(2 << 20))
+    os.environ['THREEDII_WORK'] = os.environ['THREEDII_BUILD'] = work
+    gui.QFileDialog.getExistingDirectory = lambda *a, **k: roomy
+    state.chooseBuild()
+    assert state.st['build_folder'] == os.path.normpath(roomy) and os.environ['THREEDII_BUILD'] == os.path.normpath(roomy)
+    assert state.buildCustom and 'GB free' in state.buildText and 'Delete' in state.dialog['yes']
+    state.answer(False)  # Keep
+    assert os.path.isfile(os.path.join(work, 'builder_work', 'big.bin'))
+    state.defaultBuild()
+    assert not state.st['build_folder'] and os.environ['THREEDII_BUILD'] == work and not state.buildCustom and not state.dialog  # roomy has none
+    state.chooseBuild()
+    state.answer(True)  # Delete
+    assert not os.path.exists(os.path.join(work, 'builder_work')) and os.path.isdir(os.path.join(work, 'system_archives'))
+    state.defaultBuild()
+    for k, v in (('THREEDII_BUILD', kept_build), ('THREEDII_WORK', kept_work)):
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
     # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a
     # question shown in it and answered; it comes back to the modern one the same way
     used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Simple.qml'), encoding='utf-8').read()))

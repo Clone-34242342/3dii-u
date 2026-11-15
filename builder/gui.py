@@ -268,6 +268,7 @@ class App(QObject):
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
+    buildText, buildCustom = _p(str, 'buildText'), _p(bool, 'buildCustom')
     target, destText, cards = _p(str, 'target'), _p(str, 'destText'), _p('QVariantList', 'cards')
     building, view = _p(bool, 'building'), _p(str, 'view')
     stages, stage, failed, progress, detail = _p('QVariantList', 'stages'), _p(int, 'stage'), _p(bool, 'failed'), _p(float, 'progress'), _p(str, 'detail')
@@ -310,7 +311,7 @@ class App(QObject):
                        others=compat.get('_cemu', []),  # shown only: they build as untested games, by their own code
                        faq=faq, themeMode=theme_mode if theme_mode in ('system', 'light', 'dark') else 'system', dark=False,
                        updateState='', updateTitle='', updateNotes='', updateProgress=0, updateMessage='', releaseTag=updater.own_tag(),
-                       updateSetAside=False)
+                       updateSetAside=False, buildText='', buildCustom=False)
         self.release, self.update_job, self.check_job, self.update_stop, self.shown, self.ask_again = None, None, None, threading.Event(), False, False
         self.set(updateSetAside=self.set_aside(updater.failed_tags()))
         ready = updater.activated()  # a version downloaded before (Later, or a start with Shift held) is ready without a check
@@ -328,6 +329,7 @@ class App(QObject):
         self.timer.timeout.connect(self.poll)
         self.refresh_cards()
         self.refresh_files()
+        self.refresh_build()
 
     def set(self, **kw):
         self._s.update(kw)
@@ -920,6 +922,58 @@ class App(QObject):
         if p:
             self.st['folder'] = p
             self.setTarget('folder')
+
+    # ---- where games are built (pipeline.BUILD): gigabytes of build files, on a drive the player chooses
+    def build_folder(self):
+        return os.environ.get('THREEDII_BUILD') or pipeline.BUILD
+
+    def refresh_build(self):
+        folder = self.build_folder()
+        try:
+            free = f'{shutil.disk_usage(folder).free / 2 ** 30:.0f} GB free'
+        except OSError:
+            free = 'not there yet'
+        self.set(buildText=f'{short(folder, 60)}  ·  {free}', buildCustom=bool(self.st.get('build_folder')))
+
+    @Slot()
+    def chooseBuild(self):
+        p = QFileDialog.getExistingDirectory(None, 'Choose a folder for building games', self.build_folder())
+        if p:
+            self.set_build(os.path.normpath(p))
+
+    @Slot()
+    def defaultBuild(self):
+        self.set_build('')
+
+    def set_build(self, chosen):
+        """Builds go to the chosen folder from the next one on ('' for the usual one). The old folder's build files are only a cache, so
+        deleting them is offered: the point was room on that drive."""
+        if self._s['building']:
+            return
+        old, new = self.build_folder(), chosen or os.environ.get('THREEDII_WORK') or pipeline.WORK
+        try:
+            os.makedirs(new, exist_ok=True)
+            probe = os.path.join(new, '.3diiu_check')
+            open(probe, 'wb').close()
+            os.remove(probe)
+        except OSError as e:
+            self.tell('That folder can\'t be used', f'The builder can\'t write there: {e.strerror or e}', 'warn')
+            return
+        self.st['build_folder'] = chosen
+        save_settings(self.st)
+        os.environ['THREEDII_BUILD'] = new
+        self.refresh_build()
+        if os.path.normcase(os.path.abspath(old)) != os.path.normcase(os.path.abspath(new)):
+            stale = [os.path.join(old, n) for n in pipeline.BUILD_FILES if os.path.isdir(os.path.join(old, n))]
+            size = sum(os.path.getsize(os.path.join(d, f)) for s in stale for d, _, fs in os.walk(s) for f in fs)
+            if size >> 20:
+                self.run_flow(self.drop_build_files(stale, size))
+
+    def drop_build_files(self, folders, size):
+        if (yield dict(title='Delete the old build files?', message=f'{size / 2 ** 30:.1f} GB in {os.path.dirname(folders[0])}. The builder makes '
+                       'them again as it needs them.', yes='Delete', no='Keep', tone='ask')):
+            for f in folders:
+                shutil.rmtree(f, ignore_errors=True)
 
     @Slot(str)
     def pickCard(self, path):
