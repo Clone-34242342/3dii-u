@@ -957,7 +957,7 @@ ApplicationWindow {
                         label: "Banners and icons"
                         sub: app.artKeySet ? "From SteamGridDB, with your key. GameTDB's covers fill in where it has nothing."
                                            : "Covers from GameTDB. With a free SteamGridDB key (steamgriddb.com, Preferences, API) each game gets a banner and an icon from there."
-                        Pill { text: app.artKeySet ? "Change key" : "Add key"; accessibleName: "SteamGridDB key"; tone: "cyan"; onClicked: app.setArtKey() }
+                        Pill { text: app.artKeySet ? "Key" : "Add key"; accessibleName: "SteamGridDB key"; tone: "cyan"; onClicked: app.setArtKey() }
                     }
                     CardRow {
                         label: "Start-up screens"
@@ -990,7 +990,7 @@ ApplicationWindow {
                         id: updatesRow
                         readonly property string st: app.updateState
                         readonly property bool offered: ["available", "downloading", "unpacking", "ready", "restarting", "failed"].indexOf(st) >= 0
-                        label: app.releaseTag ? "Release " + app.releaseTag : "A test build"
+                        label: app.releaseTag ? "Release " + app.version : "A test build"
                         sub: st === "checking" ? "Checking..." : st === "none" ? "Up to date."  // also what a check that couldn't reach GitHub ends in
                             : st === "downloading" || st === "unpacking" ? "The update is downloading."
                             : st === "ready" || st === "restarting" ? "The update is ready."

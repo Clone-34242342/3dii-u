@@ -38,9 +38,9 @@ def text():
     return '\n'.join(lines)
 
 
-def about():
+def about(tag=''):
     """the credits for the About dialog, short enough to fit it: the projects by name; --credits and the file have the rest"""
-    return (f'Version {VERSION}. Free and open-source under the {LICENCE}: {SOURCE}\n\n'
+    return (f'Version {VERSION}' + (f' ({tag})' if tag else '') + f'. Free and open-source under the {LICENCE}: {SOURCE}\n\n'
             'Built on 3dsrecomp by Nathan Soufflet (nathsou), devkitPro\'s devkitPPC and wut, CafeGLSL by Exzap, FFmpeg, '
             'makerom by 3DSGuy, applestash and Jakcron, pyctr by Ian Burgwin, PyCryptodome, cryptography, Qt and PySide6, '
             'Python, PyInstaller, and woomïnstaller by shinyquagsire23.\n\n'

@@ -210,7 +210,7 @@ ApplicationWindow {
                 }
                 RowLayout {
                     spacing: 6
-                    Button { text: app.artKeySet ? "Change SteamGridDB key..." : "SteamGridDB key..."; Layout.preferredWidth: 220; onClicked: app.setArtKey() }
+                    Button { text: "SteamGridDB key..."; Layout.preferredWidth: 220; onClicked: app.setArtKey() }
                     Label {
                         Layout.fillWidth: true
                         wrapMode: Text.WordWrap

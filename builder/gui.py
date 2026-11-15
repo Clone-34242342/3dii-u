@@ -366,7 +366,7 @@ class App(QObject):
 
     @Slot()
     def about(self):
-        self.tell(f'About {APP}', credits.about())
+        self.tell(f'About {APP}', credits.about(self._s['releaseTag']))
 
     @Slot(str)
     def setLayout(self, name):
