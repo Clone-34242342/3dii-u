@@ -1055,8 +1055,8 @@ ApplicationWindow {
             }
         }
 
-        // ---- the game's pictures, under the Art pill: the start-up screens', the Wii U Menu icon's (each its own if the player likes) and
-        // the GamePad's bezel
+        // ---- the game's pictures and sound, under the Art pill: the start-up screens' (the GamePad's can have a picture of its own), the Wii
+        // U Menu icon's, the game's start-up sound and the GamePad's bezel
         Item {
             id: artMenu
             objectName: "artMenu"  // test_window.py opens it
@@ -1074,8 +1074,12 @@ ApplicationWindow {
                     x: 12; y: 12; width: 356
                     ArtEntry { id: artFirst; label: "Start-up screen art..."; chosen: app.artText; onPicked: { artMenu.visible = false; app.chooseArt() } }
                     ArtEntry { label: "Wii U Menu icon..."; chosen: app.iconText; onPicked: { artMenu.visible = false; app.chooseIcon() } }
+                    ArtEntry { label: "GamePad start screen..."; chosen: app.padArtText; onPicked: { artMenu.visible = false; app.choosePadArt() } }
+                    ArtEntry { label: "This game's sound..."; chosen: app.gameSoundText; onPicked: { artMenu.visible = false; app.chooseGameSound() } }
                     ArtEntry { label: "GamePad bezel..."; chosen: app.bezelText; onPicked: { artMenu.visible = false; app.chooseBezel() } }
                     ArtEntry { label: "Remove the bezel"; danger: true; visible: app.hasBezel; onPicked: { artMenu.visible = false; app.removeBezel() } }
+                    ArtEntry { label: "Remove the game's sound"; danger: true; visible: app.hasGameSound; onPicked: { artMenu.visible = false; app.removeGameSound() } }
+                    ArtEntry { label: "Remove the GamePad picture"; danger: true; visible: app.hasPadArt; onPicked: { artMenu.visible = false; app.removePadArt() } }
                     ArtEntry { label: "Remove the icon picture"; danger: true; visible: app.hasIconArt; onPicked: { artMenu.visible = false; app.removeIcon() } }
                     ArtEntry { label: "Remove the art and icon"; danger: true; visible: app.hasArt; onPicked: { artMenu.visible = false; app.removeArt() } }
                 }

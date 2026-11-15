@@ -40,7 +40,10 @@ STAGE_OF = {n: i for i, (n, _) in enumerate(pipeline.STAGES)}
 NO_ART = "The game's own icon"
 NO_ICON_ART = 'The same as the art'  # the Wii U Menu icon without a picture of its own
 NO_BEZEL = 'Black'  # the GamePad beside the screens without a picture
+NO_PAD_ART = 'The same as the TV'  # the GamePad's start-up screen without a picture of its own
+NO_GAME_SOUND = 'The one for all games'  # a game without a start-up sound of its own: the one for every game, if there is one
 BOOT_SOUND = os.path.join(os.path.dirname(pipeline.ARCHIVES), 'boot_sound.btsnd')  # where every build picks it up (tools/make_game_title.py)
+GAME_SOUNDS = os.path.join(os.path.dirname(BOOT_SOUND), 'boot_sounds')  # a game's own, <title id>.btsnd
 LIBRARY_MAX = 40  # games the Games page remembers
 # What each of "Your Files" is and how to get it from your own consoles: the Info buttons, and the message when one is missing.
 # Testers asked what the system files were and how to get seeddb.bin (Nov 9 and 10).
@@ -256,6 +259,7 @@ class App(QObject):
     artText, hasArt, artUrl = _p(str, 'artText'), _p(bool, 'hasArt'), _p(str, 'artUrl')
     iconText, hasIconArt, iconArtUrl, tileUrl = _p(str, 'iconText'), _p(bool, 'hasIconArt'), _p(str, 'iconArtUrl'), _p(str, 'tileUrl')
     bezelText, hasBezel = _p(str, 'bezelText'), _p(bool, 'hasBezel')
+    padArtText, hasPadArt, gameSoundText, hasGameSound = _p(str, 'padArtText'), _p(bool, 'hasPadArt'), _p(str, 'gameSoundText'), _p(bool, 'hasGameSound')
     artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
@@ -279,6 +283,7 @@ class App(QObject):
         decrypt.use_keys(self.st['keys'])
         self.game = self.update = self.dlc = self.mod = self.art = self.icon_art = None  # the mod, the banner art and the icon art are paths
         self.bezel = None  # the GamePad's picture beside the screens, a path
+        self.pad_art = self.game_sound = None  # the GamePad's start-up picture and the game's start-up sound (a .btsnd), paths
         self.refused_key = None  # the SteamGridDB key it turned down, if it did (fetch_cover)
         self.proc, self.result, self.cancelled = None, None, False
         self.lines, self.log_lines, self.dialogs, self.flow = queue.Queue(), [], [], None
@@ -292,7 +297,7 @@ class App(QObject):
         theme_mode = self.st.get('theme')
         self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
-                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
+                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -446,6 +451,10 @@ class App(QObject):
         self.set_art(saved if saved and os.path.isfile(saved) else None, icon if icon and os.path.isfile(icon) else None, remember=False)
         bezel = self.st.get('pad_bezel', {}).get(f'{d.title_id:016x}')
         self.set_bezel(bezel if bezel and os.path.isfile(bezel) else None, remember=False)
+        pad_art = self.st.get('pad_art', {}).get(f'{d.title_id:016x}')
+        self.set_pad_art(pad_art if pad_art and os.path.isfile(pad_art) else None, remember=False)
+        sound = self.st.get('boot_sound', {}).get(f'{d.title_id:016x}')
+        self.set_game_sound(sound if sound and os.path.isfile(sound) else None, remember=False)
         if saved is None:  # nothing chosen yet: its cover art, fetched off the window's thread
             threading.Thread(target=self.fetch_cover, args=(d, info['name']), daemon=True).start()
         self.refresh_files()
@@ -613,13 +622,56 @@ class App(QObject):
         """the picture the GamePad shows where it shows no screen (tools/make_game_title.py, bezel_pixels), remembered for the game"""
         self.bezel = path
         if self.game and remember:
-            bezels = self.st.setdefault('pad_bezel', {})
-            if path:
-                bezels[f'{self.game.title_id:016x}'] = path
-            else:
-                bezels.pop(f'{self.game.title_id:016x}', None)
-            save_settings(self.st)
+            self.keep_for_game('pad_bezel', path)
         self.set(bezelText=os.path.basename(path) if path else NO_BEZEL, hasBezel=bool(path))
+
+    def keep_for_game(self, key, path):
+        """a path chosen for the open game (settings[key][title id]), or forgotten with None"""
+        chosen = self.st.setdefault(key, {})
+        if path:
+            chosen[f'{self.game.title_id:016x}'] = path
+        else:
+            chosen.pop(f'{self.game.title_id:016x}', None)
+        save_settings(self.st)
+
+    @Slot()
+    def choosePadArt(self):
+        path = self.ask_picture(f'A picture for the GamePad while {self._s["gameName"]} starts, shown as it is')
+        if path:
+            self.set_pad_art(path)
+
+    @Slot()
+    def removePadArt(self):
+        self.set_pad_art(None)
+
+    def set_pad_art(self, path, remember=True):
+        """the GamePad's start-up screen of its own (tools/make_game_title.py, pad_art), remembered for the game"""
+        self.pad_art = path
+        if self.game and remember:
+            self.keep_for_game('pad_art', path)
+        self.set(padArtText=os.path.basename(path) if path else NO_PAD_ART, hasPadArt=bool(path))
+
+    @Slot()
+    def chooseGameSound(self):
+        sound = os.path.join(GAME_SOUNDS, f'{self.game.title_id:016x}.btsnd')
+        if self.ask_sound(f'A sound to play while {self._s["gameName"]} starts', sound):
+            self.set_game_sound(sound)
+
+    @Slot()
+    def removeGameSound(self):
+        if self.game_sound:
+            try:
+                os.remove(self.game_sound)
+            except OSError:
+                pass  # forgotten either way: the build goes back to the sound for every game
+        self.set_game_sound(None)
+
+    def set_game_sound(self, path, remember=True):
+        """the game's own start-up sound, a .btsnd made from the player's WAV (tools/make_boot_sound.py), remembered for the game"""
+        self.game_sound = path
+        if self.game and remember:
+            self.keep_for_game('boot_sound', path)
+        self.set(gameSoundText='Its own' if path else NO_GAME_SOUND, hasGameSound=bool(path))
 
     def save_card(self):
         """the SD card and the game's Wii U title id for moving a save (saves.py), or None after saying what's missing"""
@@ -746,23 +798,27 @@ class App(QObject):
             self.set_art(None, self.icon_art if picked(self.icon_art) else None, remember=False)
             threading.Thread(target=self.fetch_cover, args=(self.game, self._s['gameName']), daemon=True).start()
 
-    @Slot()
-    def chooseSound(self):
-        path = QFileDialog.getOpenFileName(None, 'A sound to play while your games start', self.st.get('sound_folder', ''),
-                                           'Sounds (*.wav *.btsnd);;All files (*.*)')[0]
+    def ask_sound(self, title, to):
+        """a sound the player picks, made into a start-up sound at to (tools/make_boot_sound.py); False if none, or after saying why not"""
+        path = QFileDialog.getOpenFileName(None, title, self.st.get('sound_folder', ''), 'Sounds (*.wav *.btsnd);;All files (*.*)')[0]
         if not path:
-            return
+            return False
         self.st['sound_folder'] = os.path.dirname(path)
         save_settings(self.st)
         try:
             data = pipeline.tool('make_boot_sound').boot_sound(path)
-            os.makedirs(os.path.dirname(BOOT_SOUND), exist_ok=True)
-            with open(BOOT_SOUND, 'wb') as f:
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            with open(to, 'wb') as f:
                 f.write(data)
         except (OSError, ValueError, EOFError, ImportError) as e:
             self.tell("That sound can't be used", f'{e}. Choose a WAV file: most sound programs can save one.', 'error')
-            return
-        self.set(soundSet=True)
+            return False
+        return True
+
+    @Slot()
+    def chooseSound(self):
+        if self.ask_sound('A sound to play while your games start', BOOT_SOUND):
+            self.set(soundSet=True)
 
     @Slot()
     def removeSound(self):
@@ -1078,6 +1134,10 @@ class App(QObject):
             argv += ['--icon-art', self.icon_art]
         if self.bezel:
             argv += ['--pad-bezel', self.bezel]
+        if self.pad_art:
+            argv += ['--pad-art', self.pad_art]
+        if self.game_sound:
+            argv += ['--boot-sound', self.game_sound]
         self.log_lines, self.result, self.cancelled = [], None, False
         stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or self._s['target'] == 'card']
         self.set(building=True, view='building', stages=stages, stage=0, failed=False, progress=0.0, detail='Starting...', log='')

@@ -240,11 +240,13 @@ def bezel_pixels(path):
 
 
 def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False,
-               pad_bezel=None):
+               pad_bezel=None, pad_art=None, boot_sound=None):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
     art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
     picture for the icon alone (a square one, where art is a wide banner). style: 'picture' shows art as it is on the start-up screens,
-    'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan."""
+    'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan.
+    pad_art: a picture of its own for the GamePad's start-up screen, shown as it is. boot_sound: the game's own start-up sound (a .btsnd,
+    tools/make_boot_sound.py), in place of the one this PC has for every game."""
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):
@@ -272,10 +274,25 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
             write_art_tga(os.path.join(meta_dir, tga), rows, bpp)
         elif picture:
             print(f'the picture {picture} could not be read: the game\'s own icon is used for {tga}')
-    # the sound while the game starts, if this PC has one (tools/make_boot_sound.py); a title without the file starts silently
-    boot_sound = os.path.join(os.path.dirname(os.path.abspath(archives)), 'boot_sound.btsnd')
-    if os.path.isfile(boot_sound):
-        shutil.copyfile(boot_sound, os.path.join(meta_dir, 'bootSound.btsnd'))
+    pad = art_pixels(pad_art, PAD_W, PAD_H, (0, 0, 0)) if pad_art else None
+    if pad:  # the GamePad's start-up screen of its own, over the one made above
+        write_art_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), pad, 24)
+    elif pad_art:
+        print(f"the picture {pad_art} could not be read: the GamePad shows the TV's start-up screen")
+    # the sound while the game starts: its own, or the one this PC has for every game (tools/make_boot_sound.py); a title without either starts silently
+    sound, every_game = None, os.path.join(os.path.dirname(os.path.abspath(archives)), 'boot_sound.btsnd')
+    if boot_sound:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import make_boot_sound  # checks a .btsnd, and makes one of a WAV
+        try:
+            sound = make_boot_sound.boot_sound(boot_sound)
+        except (OSError, ValueError, EOFError) as e:
+            print(f"the sound {boot_sound} can't be used ({e}): the one for every game is used")
+    if sound is None and os.path.isfile(every_game):
+        sound = open(every_game, 'rb').read()
+    if sound is not None:
+        with open(os.path.join(meta_dir, 'bootSound.btsnd'), 'wb') as f:
+            f.write(sound)
     elif os.path.exists(os.path.join(meta_dir, 'bootSound.btsnd')):
         os.remove(os.path.join(meta_dir, 'bootSound.btsnd'))
     shutil.copyfile(os.path.join(TEMPLATE, 'meta', 'bootMovie.h264'), os.path.join(meta_dir, 'bootMovie.h264'))

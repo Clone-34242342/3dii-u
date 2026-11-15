@@ -142,10 +142,12 @@ def tool(name):
     return module
 
 
-def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None):
+def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
+               boot_sound=None):
     """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
     tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
-                                       info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel)
+                                       info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel,
+                                       pad_art, boot_sound)
     content = os.path.join(out, 'title', 'content')
     for f in os.listdir(game_dir):
         if f.startswith(('update_', 'dlc_')):
@@ -205,6 +207,8 @@ def main():
     ap.add_argument('--art', help="a picture (the cover art, say) for the start-up screens and the Wii U Menu icon; the game's own icon otherwise")
     ap.add_argument('--icon-art', help='a square picture for the Wii U Menu icon alone, where --art is a wide banner')
     ap.add_argument('--pad-bezel', help="a picture (854x480, say) the GamePad shows where it shows no screen, a bezel or overlay; black otherwise")
+    ap.add_argument('--pad-art', help="a picture of its own for the GamePad's start-up screen, shown as it is; the TV's otherwise")
+    ap.add_argument('--boot-sound', help="the game's own start-up sound, a .btsnd (tools/make_boot_sound.py); the one for every game otherwise")
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
     ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games, where the Virtual Console's screens find the year a game came out")
@@ -405,7 +409,7 @@ def main():
         import covers  # only here: the one download a build may make, and only with the Virtual Console's screens chosen
         released = covers.released(game.product, a.tdb)
         case_scan = covers.is_case_scan(a.art, a.tdb)  # the folder is the covers' own
-    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel)
+    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound)
 
     if b3.MEASURE:  # the checks' own kind of build, for Cemu (build3ds.py): never packed, so none can reach a console
         print('a measuring build: not packed', flush=True)

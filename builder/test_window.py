@@ -89,14 +89,16 @@ try:
     settle('the card menu')
     assert not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the card menu'
     menu.setProperty('visible', False)
-    state.set(hasGame=True, hasArt=True, hasIconArt=True, hasBezel=True, artText='A picture.png', iconText='An icon.png', bezelText='A bezel.png')  # every line of the art menu
+    state.set(hasGame=True, hasArt=True, hasIconArt=True, hasBezel=True, hasPadArt=True, hasGameSound=True, artText='A picture.png', iconText='An icon.png',
+              bezelText='A bezel.png', padArtText='A GamePad picture.png', gameSoundText='Its own')  # every line of the art menu
     menu = win.findChild(QObject, 'artMenu')
     art_pill = next(p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'pill' and p.property('accessibleName') == 'Art and icon')
     QMetaObject.invokeMethod(menu, 'openAt', Q_ARG('QVariant', art_pill))  # as the pill does: under it, its first line focused
     settle('the art menu')
     assert menu.property('visible') and not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the art menu'
     menu.setProperty('visible', False)
-    state.set(hasGame=False, hasArt=False, hasIconArt=False, hasBezel=False, artText=gui.NO_ART, iconText=gui.NO_ART, bezelText=gui.NO_BEZEL)
+    state.set(hasGame=False, hasArt=False, hasIconArt=False, hasBezel=False, hasPadArt=False, hasGameSound=False, artText=gui.NO_ART, iconText=gui.NO_ART,
+              bezelText=gui.NO_BEZEL, padArtText=gui.NO_PAD_ART, gameSoundText=gui.NO_GAME_SOUND)
     stages = ['Reading', 'Recompiling', 'Packing']
     for view in ('building', 'done', 'failed', 'form'):
         state.set(view=view, stages=stages, stage=1, failed=view == 'failed', building=view == 'building', resultText='x', log='a\nb')
@@ -394,6 +396,27 @@ try:
     assert state.bezel == cover and state.hasBezel and state.bezelText == os.path.basename(cover) and json.load(open(settings))['pad_bezel'][title] == cover
     state.removeBezel()
     assert state.bezel is None and not state.hasBezel and state.bezelText == gui.NO_BEZEL and title not in json.load(open(settings))['pad_bezel']
+    # the GamePad's start-up picture and the game's start-up sound: chosen, kept for the game, removed (the sound's file with it)
+    state.choosePadArt()
+    assert state.pad_art == cover and state.hasPadArt and state.padArtText == os.path.basename(cover) and json.load(open(settings))['pad_art'][title] == cover
+    state.removePadArt()
+    assert state.pad_art is None and not state.hasPadArt and state.padArtText == gui.NO_PAD_ART and title not in json.load(open(settings))['pad_art']
+    import wave
+    sound = os.path.join(base, 'start.wav')
+    with wave.open(sound, 'wb') as w:  # half a second of 48 kHz stereo
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(48000)
+        w.writeframes(bytes(4 * 24000))
+    gui.GAME_SOUNDS = os.path.join(base, 'boot_sounds')
+    gui.QFileDialog.getOpenFileName = lambda *a, **k: (sound, '')
+    state.chooseGameSound()
+    kept = json.load(open(settings))['boot_sound'][title]
+    assert kept == os.path.join(gui.GAME_SOUNDS, title + '.btsnd'), ('the game\'s sound went somewhere else, the sound for every game, say', kept)
+    assert state.game_sound == kept and os.path.isfile(kept) and state.hasGameSound and state.gameSoundText == 'Its own', kept
+    state.removeGameSound()
+    assert state.game_sound is None and not state.hasGameSound and not os.path.exists(kept) and title not in json.load(open(settings))['boot_sound']
+    assert state.gameSoundText == gui.NO_GAME_SOUND
     state.game = None
 
     # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a

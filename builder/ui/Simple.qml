@@ -184,6 +184,16 @@ ApplicationWindow {
                     onRemove: app.removeIcon()
                 }
                 PathRow {
+                    label: "GamePad art..."; text: app.padArtText; removable: app.hasPadArt
+                    onChoose: app.hasGame ? app.choosePadArt() : app.chooseGame()
+                    onRemove: app.removePadArt()
+                }
+                PathRow {
+                    label: "Game's sound..."; text: app.gameSoundText; removable: app.hasGameSound
+                    onChoose: app.hasGame ? app.chooseGameSound() : app.chooseGame()
+                    onRemove: app.removeGameSound()
+                }
+                PathRow {
                     label: "GamePad bezel..."; text: app.bezelText; removable: app.hasBezel
                     onChoose: app.hasGame ? app.chooseBezel() : app.chooseGame()
                     onRemove: app.removeBezel()

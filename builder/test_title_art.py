@@ -1,6 +1,7 @@
 """Self-check for the start-up screens in the Virtual Console's manner (tools/make_game_title.py, console_screens): their sizes, the band and the
 art where they go, a GameTDB case scan's strip left out and its whole height kept, the release line, and the names read from a made-up SMDH;
-and the GamePad's bezel picture (bezel_pixels): its size, scale, cut, row order and see-through parts. Run: python builder/test_title_art.py"""
+and the GamePad's bezel picture (bezel_pixels): its size, scale, cut, row order and see-through parts; a whole title's start-up screens and
+sound (make_title), with a GamePad picture and a sound of the game's own or without. Run: python builder/test_title_art.py"""
 import os
 import struct
 import sys
@@ -113,4 +114,53 @@ with tempfile.TemporaryDirectory() as tmp:
     assert near(at(400, 5)[:3], (255, 255, 0)) and near(at(400, 470)[:3], (0, 0, 255)), ('upside down, or not scaled', at(400, 5), at(400, 470))
     assert near(at(850, 240)[:3], (0, 0, 255)), ('not cut at the sides', at(850, 240))
     assert title.bezel_pixels(os.path.join(tmp, 'bad.png')) is None
+
+    # A whole title (make_title) from a made-up game: the GamePad's start-up screen from a picture of its own (green), shown as it is,
+    # beside the TV's art (red) as it is or in the Virtual Console's layout; without one, or with one that can't be read, the TV's picture
+    # on both. The game's own start-up sound (a .btsnd, or a WAV made into one) in place of the one for every game, which a title without
+    # one, or with one gone or not a sound, gets.
+    game, shaders, archives = (os.path.join(tmp, d) for d in ('game', 'shaders', 'archives'))
+    for d in (os.path.join(game, 'exefs'), shaders, archives):
+        os.makedirs(d, exist_ok=True)
+    every, own = struct.pack('>II', 2, 0) + b'EVRY' * 4, struct.pack('>II', 2, 0) + b'OWN!' * 4  # a boot sound's head, then samples
+    for f, body in (('game/exheader.bin', b''), ('game/code.bin', b''), ('game/romfs.bin', b''), ('game/exefs/icon.bin', bytes(0x36C0)),
+                    ('g.rpx', b'rpx'), ('shaders/shaders.gsh', b''), ('shaders/shaders.idx', b''), ('boot_sound.btsnd', every),
+                    ('own.btsnd', own), ('bad.btsnd', b'not a sound')):
+        with open(os.path.join(tmp, f), 'wb') as fh:
+            fh.write(body)
+    import wave
+    with wave.open(os.path.join(tmp, 'start.wav'), 'wb') as w:  # half a second of 48 kHz stereo
+        w.setnchannels(2)
+        w.setsampwidth(2)
+        w.setframerate(48000)
+        w.writeframes(bytes(4 * 24000))
+    pictures = {}
+    for name, w, h, rgb in (('red', 1280, 720, (255, 0, 0)), ('green', 854, 480, (0, 255, 0))):
+        img = QImage(w, h, QImage.Format_RGB888)
+        img.fill(QColor(*rgb))
+        pictures[name] = os.path.join(tmp, name + '.png')
+        assert img.save(pictures[name])
+
+    def made(style, pad_art=None, boot_sound=None):
+        out = os.path.join(tmp, 'title')
+        title.make_title(out, game, os.path.join(tmp, 'g.rpx'), shaders, '0005000010334455', 'A game', 'WUP-N-ABCD', archives,
+                         pictures['red'], None, style, pad_art=pad_art, boot_sound=boot_sound)
+        middle = {}
+        for tga, w, h in (('bootTvTex.tga', 1280, 720), ('bootDrcTex.tga', 854, 480)):
+            data = open(os.path.join(out, 'meta', tga), 'rb').read()
+            at = 18 + ((h - 1 - h // 2) * w + w // 2) * 3  # 24-bit, bottom row first
+            middle[tga] = tuple(data[at + 2:at - 1:-1])
+        return middle, open(os.path.join(out, 'meta', 'bootSound.btsnd'), 'rb').read()
+
+    middle, sound = made('picture')
+    assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, (middle, sound)
+    middle, sound = made('picture', pictures['green'], os.path.join(tmp, 'own.btsnd'))
+    assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == own, (middle, sound)
+    middle, sound = made('console', pictures['green'], os.path.join(tmp, 'gone.btsnd'))
+    assert near(middle['bootTvTex.tga'], (255, 255, 255), 12), ("the TV lost the Virtual Console's layout", middle)  # its white band
+    assert near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == every, ('the GamePad picture laid out, or a lost sound kept', middle, sound)
+    middle, sound = made('picture', os.path.join(tmp, 'bad.png'), os.path.join(tmp, 'bad.btsnd'))
+    assert near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, ("a picture or sound that can't be used wasn't left out", middle, sound)
+    sound = made('picture', boot_sound=os.path.join(tmp, 'start.wav'))[1]
+    assert sound[:4] == struct.pack('>I', 2) and len(sound) > 8 + 4 * 24000 // 2, 'a WAV given as the sound was not made into one'
 print('title art: ok')
