@@ -2531,21 +2531,22 @@ static void guest_wrote(Surface &s, u32 paddr, u32 size) {
     s.guest_newer = true;
 }
 
-// CPU or DMA writes the game told us about. Nothing needs the CPU's cache flushed here: what the GPU reads in place is flushed at the draw, and on a
-// real CPU flushing a whole heap, as some games ask for after every file, would take tens of milliseconds.
-// What the game's texture copies and display transfers put into guest memory since the last VBlank (gpu/transfer.cpp): a top screen the game put together
-// in its LCD buffer itself shows from there (show_lcd_from_memory). Fills don't count: a game may clear an LCD buffer that a transfer fills later.
+// The game's last texture copies and display transfers through guest memory (gpu/transfer.cpp), numbered: a top screen the game puts together
+// in its LCD buffer itself is shown from there (show_lcd_from_memory). Copies under 4 KB are a few tiles, never a screen's rows, and fills
+// don't count: a game may clear an LCD buffer that a transfer fills later.
 struct MemoryWrite {
     u32 pa, size, seq;
 };
-MemoryWrite lcd_writes[16];
-u32 lcd_write_seq;
+MemoryWrite memory_writes[16];
+u32 memory_write_seq;
 void gx2_copied_to_memory(u32 paddr, u32 size) {
     if (size < 4096) return;
-    lcd_write_seq++;
-    lcd_writes[lcd_write_seq % 16] = {paddr, size, lcd_write_seq};
+    memory_write_seq++;
+    memory_writes[memory_write_seq % 16] = {paddr, size, memory_write_seq};
 }
 
+// CPU or DMA writes the game told us about. Nothing needs the CPU's cache flushed here: what the GPU reads in place is flushed at the draw, and on a
+// real CPU flushing a whole heap, as some games ask for after every file, would take tens of milliseconds.
 void metal_guest_written(u32 paddr, u32 size, bool definite) {
     st_flushes++;
     memory_fills.written(paddr, size);
@@ -2569,8 +2570,7 @@ void write_back(Surface &s) {
     if (s.depth || !s.gpu_newer) return;
     st_readbacks++;
     static u32 notes;
-    static u32 told;
-    if (gxt() || told++ < 8) LOG("[gxt] read back %08x %ux%u fmt %u%s, %ux%u at %.2fx%.2f\n", s.addr, s.w, s.h, s.fmt, s.linear ? " linear" : "", s.sw, s.sh, s.sx, s.sy);
+    if (gxt()) LOG("[gxt] read back %08x %ux%u%s\n", s.addr, s.w, s.h, s.linear ? " linear" : "");
     if (notes < 4) wiiu::note("reading back surface %08x, %ux%u", s.addr, s.w, s.h);
     flush_surface(s);
     GX2Surface st;
@@ -2635,20 +2635,17 @@ void write_back(Surface &s) {
 }
 }  // namespace
 
-// A target the game has written over since the GPU last drew into it (texture copies, transfers through memory, fills) isn't read back where
-// those writes cover the read: memory holds the newer picture there. Luigi's Mansion 2 puts its top screen together at 18000000, where its
-// targets are.
+// Of the targets a read covers, the one the GPU wrote last holds what the memory would: Luigi's Mansion 2 draws its bottom screen (240x320) and
+// each part of its top screen (256x416, 128x416) at 18000000. Not read back where the game has written over it since the GPU drew it (texture
+// copies, transfers through memory, fills): memory holds the newer picture there.
 void metal_guest_read(u32 paddr, u32 size) {
-    // Of the targets there, the one the GPU wrote last holds what the memory would: Luigi's Mansion: Dark Moon draws its bottom screen (240x320) and each half
-    // of its top screen (256x416, then 128x416) at 0x18000000, and the top screen's texture copies to its LCD buffer read the bottom screen back, so the TV showed black.
-    Surface *best = nullptr;
-    for (auto &s : surfaces) {
-        if (s->depth || !s->gpu_newer || s->addr >= paddr + size || paddr >= s->addr + s->bytes()) continue;
-        const u32 lo = std::max(paddr, s->addr), hi = std::min(paddr + size, s->addr + s->bytes());  // the read, of this surface's bytes
-        const bool memory_newer = s->guest_newer && s->written_lo <= lo && hi <= s->written_hi;
-        if (!memory_newer && (!best || s->drawn > best->drawn)) best = s.get();
-    }
-    if (best) write_back(*best);
+    Surface *last = nullptr;
+    for (auto &s : surfaces)
+        if (!s->depth && s->gpu_newer && s->addr < paddr + size && paddr < s->addr + s->bytes() && (!last || s->drawn > last->drawn)) last = s.get();
+    if (!last) return;
+    const u32 lo = std::max(paddr, last->addr), hi = std::min(paddr + size, last->addr + last->bytes());  // the read, of this surface's bytes
+    if (last->guest_newer && last->written_lo <= lo && hi <= last->written_hi) return;
+    write_back(*last);
 }
 void metal_guest_prewrite(u32, u32) {}
 
@@ -3131,7 +3128,7 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     dst->gpu_chain |= src->gpu_chain;
     dst->copy = own_size_copy;
     // Neither bit 1 (linear in) nor bit 5 (left tiled): the picture lands in memory row by row, for whatever reads its bytes. Paper Mario's goes on to another
-    // transfer here on the GPU; Luigi's Mansion: Dark Moon's top screen halves go to texture copies into its LCD buffer, which read them back, and tiled they came out black.
+    // transfer here on the GPU; Luigi's Mansion 2's top screen halves go to texture copies into its LCD buffer, which read them back, and tiled they came out black.
     dst->linear = !(flags & 0x22);
     take_dyn_level(*dst);
     static u32 notes;
@@ -3168,7 +3165,7 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
 // The top screen's LCD buffers lately (show_lcd_from_memory notes them at each VBlank), and how their rows are laid out
 u32 recent_top[4], recent_top_stride, recent_top_bpp, recent_top_fmt;
 
-// Luigi's Mansion: Dark Moon puts its top screen together with the copy engine, from linear pictures its transfers make (gpu_copy_transfer): each third
+// Luigi's Mansion 2 puts its top screen together with the copy engine, from linear pictures its transfers make (gpu_copy_transfer): each third
 // of the screen is drawn, transferred to a linear picture and copied a row at a time, a few columns over or into its columns of the LCD buffer. Through guest
 // memory that was read backs every frame, each waiting for the GPU, and in Cemu, which reads nothing back, a black screen. A copy of whole rows out of a linear
 // surface is drawn on the GPU instead, into a linear surface at the destination: one already there whose rows it fits, or the top screen's LCD buffer (whole
@@ -3177,10 +3174,11 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     const u32 in_w = (in_width_gap & 0xffff) * 16, in_gap = (in_width_gap >> 16) * 16;
     const u32 out_w = (out_width_gap & 0xffff) * 16, out_gap = (out_width_gap >> 16) * 16;
     if (!in_w || in_w != out_w || size % in_w) return false;
+    // what the GPU wrote there last, if that is a linear picture the game hasn't written over since
     Surface *src = nullptr;
     for (auto &s : surfaces)
-        if (!s->depth && s->linear && s->addr <= in_paddr && in_paddr < s->addr + s->bytes() && (!src || s->drawn > src->drawn)) src = s.get();
-    if (!src) return false;
+        if (!s->depth && s->addr <= in_paddr && in_paddr < s->addr + s->bytes() && (!src || s->drawn > src->drawn)) src = s.get();
+    if (!src || !src->linear || src->guest_newer) return false;
     const u32 bpp = pixel_bytes(cbuf_to_pixfmt(src->fmt)), src_stride = src->w * bpp, rows = size / in_w;
     const u32 in_off = in_paddr - src->addr;
     if (in_w + in_gap != src_stride && !(in_gap == 0 && in_w == src_stride)) return false;
@@ -3193,6 +3191,7 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     Surface *dst = nullptr;
     u32 base = out_paddr, height = rows;
     u32 lcd = 0;
+    // a copy starting up to 33 rows before an LCD buffer is that buffer's: Luigi's Mansion 2's start 16 before it, its pictures being 416 rows
     if (recent_top_stride == out_stride && recent_top_bpp == bpp)
         for (u32 pa : recent_top)
             if (pa && out_paddr < pa + 400 * out_stride && out_paddr + rows * out_stride > pa && pa - out_paddr <= 33 * out_stride) lcd = pa;
@@ -3202,8 +3201,8 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
         height = back + 400;
     } else {
         for (auto &s : surfaces)
-            if (!s->depth && s->linear && s.get() != src && s->w * bpp == out_stride && s->addr <= out_paddr && out_paddr + (rows - 1) * out_stride < s->addr + s->bytes() &&
-                (!dst || s->drawn > dst->drawn))
+            if (!s->depth && s->linear && s.get() != src && s->w * bpp == out_stride && s->addr <= out_paddr &&
+                out_paddr + (rows - 1) * out_stride < s->addr + s->bytes() && (!dst || s->drawn > dst->drawn))
                 dst = s.get();
         if (dst) {
             base = dst->addr;
@@ -3408,9 +3407,9 @@ static void upload_target(Surface &s) {
 // (the user, 2026-11-08: "the bottom screen flashing in and out with the top showing on it briefly").
 // The picture's height rules out the other LCD whatever the addresses say: the top's are 400 rows (NSMB2's 416), the bottom's 320. A Link Between Worlds' second
 // top buffer is 18300000 too, and its top kept flashing onto the GamePad on a console (2026-11-09).
-// A buffer its screen stopped showing more than 8 swaps ago says nothing of where the picture starts: Luigi's Mansion 2's top LCD was at
-// 18300000 only at start-up, and its 416-row pictures still go there, to be texture-copied to FCRAM 16 rows before the LCD it shows now.
-// Such a picture is taken from its last 400 rows, where a screen sits in a taller target (NSMB2's 416).
+// A buffer its screen stopped showing more than 8 swaps ago is no screen's any more (a game turns over two or three buffers): Luigi's Mansion 2's
+// top LCD is at 18300000 only at start-up, then each half of its top screen is transferred there and put together in its LCD buffers in FCRAM
+// (show_lcd_from_memory). Taken as a screen's, the first half went to the TV as the whole top screen, twice its height.
 static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
     struct Seen {
         u32 pa, when, swaps;  // swaps: its screen's buffer changes so far, when it last showed this one
@@ -3432,23 +3431,16 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
     }
     int found = -1;
     u32 best = 0;
-    bool stale = false;
     const bool bottom_rows = rows <= 320;
-    // A buffer an LCD hasn't shown for a while is no screen's any more. Luigi's Mansion: Dark Moon shows "Preparing to start game" from VRAM at 0x18300000,
-    // later draws each half of its top screen there and puts the halves together in its LCD buffers in FCRAM: remembered for good, the first half went to the
-    // TV as the whole top screen, stretched to twice its height. Games that take turns between buffers show each of them every frame or two.
-    constexpr u32 kForgetAfter = 240;  // transfers: a few seconds, at the most a game makes
     for (int s = 0; s < 3; s++) {
         if ((s == 1) != bottom_rows) continue;  // only the screens of the picture's height
         for (const Seen &x : seen[s])
-            if (x.pa && clock - x.when <= kForgetAfter && x.pa >= paddr && x.pa - paddr < size && x.when >= best) {  // a tie goes to the later screen, as before
+            if (x.pa && swaps[s] - x.swaps <= 8 && x.pa >= paddr && x.pa - paddr < size && x.when >= best) {  // a tie goes to the later screen
                 found = s;
                 best = x.when;
                 skip = x.pa - paddr;
-                stale = swaps[s] - x.swaps > 8;  // a game turns over two or three buffers
             }
     }
-    if (stale) skip = rows > 400 ? size / rows * (rows - 400) : 0;
     return found;
 }
 
@@ -4073,11 +4065,10 @@ static std::atomic<bool> report_due;
 static std::atomic<float> report_draws_per_flip;
 static void write_report();
 
-// The top screen as its LCD buffer holds it in guest memory, when no display transfer brought it this frame but the GPU's commands wrote into that buffer:
-// Luigi's Mansion: Dark Moon draws its top screen in two halves and puts them side by side in the LCD buffer with two texture copies. A 3DS's LCD just shows
-// the buffer, so this does too: 240x400, read as a render target's texture is (its last memory row the texture's first), so show_screen takes it as one.
-// A game writes the buffer the LCD doesn't show and swaps to it later, often after the next VBlank: what's shown is whichever buffer the LCD shows now,
-// as last written, each time that changes.
+// The top screen as its LCD buffer holds it, for a game that brings it by no display transfer: Luigi's Mansion 2 draws its top screen in parts and
+// puts them together in the LCD buffer with texture copies. A 3DS's LCD just shows the buffer, so this does too: 240x400, read as a render target's
+// texture is (its last memory row the texture's first), so show_screen takes it as one. A game writes the buffer the LCD doesn't show and swaps to
+// it later, often after the next VBlank: what's shown is whichever buffer the LCD shows now, as last written, each time that changes.
 static void show_lcd_from_memory() {
     static u32 shown_pa, shown_seq;
     static u64 shown_drawn;
@@ -4092,40 +4083,44 @@ static void show_lcd_from_memory() {
     recent_top_stride = stride;
     recent_top_bpp = bpp;
     recent_top_fmt = cbuf_to_pixfmt(fmt);  // the display format as a colour buffer's (the table is its own inverse)
-    // What the LCD buffer holds counts only if it was written after the last picture a display transfer brought: a game whose top screen comes
-    // by transfers at thirty a second (New Super Mario Bros. 2, Tomodachi Life) once wrote into its LCD buffer, and at every VBlank without a
-    // transfer the TV then showed that memory, black, between the game's pictures: the whole TV flickered (Senne's console, 2026-11-14).
-    static u32 transfer_seq;
+    // Not for a game that brought its top screen by transfer within the last second, and only what was written after its last such picture: at
+    // thirty a second there's a VBlank without a transfer between two pictures, and New Super Mario Bros. 2 and Tomodachi Life had once written
+    // into their LCD buffers: that memory, black, showed between their pictures, and the whole TV flickered.
+    static u32 transfer_seq, quiet;  // quiet: VBlanks since a transfer last brought the top screen
     static u64 transfer_drawn;
-    const bool by_transfer = top_shown;
-    top_shown = false;
-    if (by_transfer) {
+    if (top_shown) {
+        top_shown = false;
         shown_pa = 0;
-        transfer_seq = lcd_write_seq;
+        transfer_seq = memory_write_seq;
         transfer_drawn = gpu_writes;
+        quiet = 0;
+        return;
+    }
+    if (quiet < 60) {
+        quiet++;
         return;
     }
     const u8 *src = pa ? pptr(pa) : nullptr;
     if (!src || stride < 240 * bpp) return;
-    // put together on the GPU (linear_copy_on_gpu): shown from there, never read back
+    // put together on the GPU (linear_copy_on_gpu): shown from there, never read back, unless the game has written over it since
     Surface *lcd = nullptr;
     for (auto &s : surfaces)
-        if (!s->depth && s->linear && s->addr <= pa && pa + size <= s->addr + s->w * bpp * s->h && s->w * bpp == stride && (!lcd || s->drawn > lcd->drawn)) lcd = s.get();
-    if (lcd) {
-        if (lcd->drawn <= transfer_drawn) return;
-        if (pa == shown_pa && lcd->drawn == shown_drawn) return;
+        if (!s->depth && s->linear && s->addr <= pa && pa + size <= s->addr + s->w * bpp * s->h && s->w * bpp == stride &&
+            (!lcd || s->drawn > lcd->drawn))
+            lcd = s.get();
+    if (lcd && !lcd->guest_newer) {
+        if (lcd->drawn <= transfer_drawn || (pa == shown_pa && lcd->drawn == shown_drawn)) return;
         shown_pa = pa;
         shown_drawn = lcd->drawn;
         flush_surface(*lcd);
         const float h = (float)lcd->tex_h, first_row = (float)((pa - lcd->addr) / stride);
-        static u32 told;
-        if (told++ % 300 == 0) LOG("[gx2] top screen from the LCD buffer put together on the GPU, %08x, from row %u of %08x\n", pa, (u32)first_row, lcd->addr);
+        if (gxt()) LOG("[gxt] top screen from the LCD buffer put together on the GPU, %08x, from row %u of %08x\n", pa, (u32)first_row, lcd->addr);
         show_screen(0, &lcd->tex, false, (h - first_row - 400) / h, (h - first_row) / h, 240.0f / lcd->w);
         top_shown = false;
         return;
     }
     u32 latest = 0;
-    for (const MemoryWrite &w : lcd_writes)
+    for (const MemoryWrite &w : memory_writes)
         if (w.seq && w.pa < pa + size && pa < w.pa + w.size) latest = std::max(latest, w.seq);
     if (!latest || latest <= transfer_seq || (pa == shown_pa && latest == shown_seq)) return;
     shown_pa = pa;
@@ -4170,12 +4165,7 @@ static void show_lcd_from_memory() {
     }
     DCFlushRange(out, t.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, out, t.surface.imageSize);
-    static u32 notes;
-    if (notes++ % 100 == 0) {
-        u32 lit = 0;
-        for (u32 i = 0; i < size; i += 4) lit += src[i] != 0;
-        LOG("[gx2] top screen from its LCD buffer %08x, format %u, stride %u: %u of %u samples not black\n", pa, fmt, stride, lit, size / 4);
-    }
+    if (gxt()) LOG("[gxt] top screen from its LCD buffer in memory %08x, format %u, stride %u\n", pa, fmt, stride);
     show_screen(0, &t, false);
     top_shown = false;
 }
