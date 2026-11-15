@@ -3163,20 +3163,24 @@ static void upload_target(Surface &s) {
     s.written_since_flush = true;
 }
 
-// Which screen shows these bytes, or -1, and how far into them the LCD starts: New Super Mario Bros. 2 transfers 416 rows and shows the
-// last 400. Games alternate between buffers, so every buffer each screen has shown is remembered. Screen 2 is the top screen's right eye.
+// Which screen shows these bytes, or -1, and how far into them its picture starts: New Super Mario Bros. 2 transfers 416 rows and its LCD
+// shows the last 400. Games alternate between buffers, so every buffer each screen has shown is remembered. Screen 2 is the top screen's right eye.
 // Each screen's last few framebuffers, as a game draws into the ones not shown. When a transfer lands on addresses of more than one screen, the one shown there
 // most recently wins: NSMB2's third top buffer, 18300000, is where its bottom screen was during start-up, so every third top picture went to the GamePad
 // (the user, 2026-11-08: "the bottom screen flashing in and out with the top showing on it briefly").
 // The picture's height rules out the other LCD whatever the addresses say: the top's are 400 rows (NSMB2's 416), the bottom's 320. A Link Between Worlds' second
 // top buffer is 18300000 too, and its top kept flashing onto the GamePad on a console (2026-11-09).
+// A buffer its screen stopped showing more than 8 swaps ago says nothing of where the picture starts: Luigi's Mansion 2's top LCD was at
+// 18300000 only at start-up, and its 416-row pictures still go there, to be texture-copied to FCRAM 16 rows before the LCD it shows now.
+// Such a picture is taken from its last 400 rows, where a screen sits in a taller target (NSMB2's 416).
 static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
     struct Seen {
-        u32 pa, when;
+        u32 pa, when, swaps;  // swaps: its screen's buffer changes so far, when it last showed this one
     };
     static Seen seen[3][4];
     static u32 next[3], clock;
     clock++;
+    const u32 swaps[3] = {kernel::gsp_swaps(0), kernel::gsp_swaps(1), kernel::gsp_swaps(0)};
     for (int s = 0; s < 3; s++) {
         const kernel::FramebufferInfo f = kernel::gsp_framebuffer(s == 2 ? 0 : s);
         const u32 addr = s == 2 && f.addr_right != f.addr_left ? f.addr_right : s == 2 ? 0 : f.addr_left;
@@ -3186,10 +3190,11 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
         for (Seen &x : seen[s])
             if (x.pa == pa) e = &x;
         if (!e) e = &seen[s][next[s]++ % 4];
-        *e = {pa, clock};
+        *e = {pa, clock, swaps[s]};
     }
     int found = -1;
     u32 best = 0;
+    bool stale = false;
     const bool bottom_rows = rows <= 320;
     for (int s = 0; s < 3; s++) {
         if ((s == 1) != bottom_rows) continue;  // only the screens of the picture's height
@@ -3198,8 +3203,10 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
                 found = s;
                 best = x.when;
                 skip = x.pa - paddr;
+                stale = swaps[s] - x.swaps > 8;  // a game turns over two or three buffers
             }
     }
+    if (stale) skip = rows > 400 ? size / rows * (rows - 400) : 0;
     return found;
 }
 
