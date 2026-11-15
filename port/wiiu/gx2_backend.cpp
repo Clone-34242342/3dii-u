@@ -474,6 +474,7 @@ struct Surface {
     // writes or in a copy's gaps count as written; track rows (as Tex::dirty_rows) once a game needs it
     u32 written_lo = 0, written_hi = 0;
     u64 drawn = 0;                                     // when the GPU last wrote it (gpu_writes): of targets sharing memory, the latest holds what's there
+    u64 last_use = 0;                                  // use_counter when it was last drawn into, sampled, copied or shown (forget_unused)
     bool linear = false;                               // its memory holds the picture row by row, not in tiles: a display transfer's linear output (gpu_copy_transfer)
     bool shared_depth = false, clear_pending = false;  // see share_depth_block
     // For a target the game's own code may read (cpu_reads): the list being run has drawn to it; a draw to some other kind of target has sampled
@@ -487,6 +488,8 @@ struct Surface {
     u32 image_size() { return depth ? db.surface.imageSize : cb.surface.imageSize; }
 };
 std::vector<std::unique_ptr<Surface>> surfaces;
+u64 use_counter;  // presents so far: when a texture or a target was last used
+inline void used(Surface &s) { s.last_use = use_counter; }
 Surface *cur_color, *cur_depth;
 // A colour target in memory the game's code reads as it likes, and smaller than a screen: a picture the game may have drawn to pick up itself,
 // as Miitopia does a Mii's face (gx2_finish_list). A whole screen it asks for with a transfer.
@@ -609,6 +612,7 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
     for (auto &s : surfaces)
         if (s->addr == addr && s->w == w && s->h == h && s->depth == depth && (!with || (s->base_sx == with->base_sx && s->base_sy == with->base_sy))) {
             s->fmt = fmt;
+            used(*s);
             return s.get();
         }
     auto s = std::make_unique<Surface>();
@@ -682,6 +686,7 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
         GX2InitTextureRegs(&s->tex);
     }
     s->guest_newer = true;
+    used(*s);
     LOG("[gx2] new %s surface %08x %ux%u fmt %u, %ux%u, %u KB in %s\n", depth ? "depth" : "color", addr, w, h, fmt, s->sw, s->sh,
         s->image_size() >> 10, s->mem1 ? "MEM1" : "MEM2");
     wiiu::note("new %s surface %08x %ux%u, %u KB in %s", depth ? "depth" : "color", addr, w, h, s->image_size() >> 10, s->mem1 ? "MEM1" : "MEM2");
@@ -768,7 +773,10 @@ u64 gpu_writes;  // a count of the GPU's writes into targets, for Surface::drawn
 template <class Match>
 Surface *find_surface(u32 addr, bool depth, Match match) {
     for (auto &s : surfaces)
-        if (s->addr == addr && s->depth == depth && match(*s)) return s.get();
+        if (s->addr == addr && s->depth == depth && match(*s)) {
+            used(*s);
+            return s.get();
+        }
     return nullptr;
 }
 Surface *find_surface(u32 addr, bool depth) {
@@ -848,7 +856,6 @@ struct Tex {
 std::vector<std::unique_ptr<Tex>> textures;
 std::unordered_map<u64, Tex *> tex_index;
 inline u64 tex_key(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) { return (u64)addr << 32 | w << 20 | h << 8 | fmt << 4 | levels; }
-u64 use_counter;
 u64 tex_memory;
 constexpr u64 TEX_MEMORY_LIMIT = 128ull << 20;
 
@@ -1863,6 +1870,7 @@ void set_fragment(const DrawState &ds, bool uber) {
         }
         Surface *drawn = nullptr;  // a picture the game drew, sampled where it lies
         GX2Texture *tex = get_texture(t.face_addr[0], t.w, t.h, t.fmt, t.levels, &drawn);
+        if (drawn) used(*drawn);
         if (drawn && !cpu_reads(*cur_color)) drawn->sampled = true;
         if (!tex) tex = &black_tex;
         GX2SetPixelTexture(tex, k);
@@ -2692,6 +2700,7 @@ void metal_guest_read(u32 paddr, u32 size) {
     if (!last) return;
     const u32 lo = std::max(paddr, last->addr), hi = std::min(paddr + size, last->addr + last->bytes());  // the read, of this surface's bytes
     if (last->guest_newer && last->written_lo <= lo && hi <= last->written_hi) return;
+    used(*last);
     write_back(*last);
 }
 void metal_guest_prewrite(u32, u32) {}
@@ -2948,6 +2957,27 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
     GX2CopyColorBufferToScanBuffer(to.surface.image ? &to : from, target);
 }
 
+// Render targets a game made and stopped using (a course or a scene left behind) are freed. Kept for good, Mario Kart 7 had 88 after three
+// races where it began with 21, each holding its GPU memory (fast memory filled, and later targets went to slow memory), and every walk of the
+// list took longer: games slowed the longer they were played. One unused for kForgetAfter presents goes, what the GPU drew there that memory
+// lacks written back first, so nothing the game may still read is lost. One a present, as a write back waits for the GPU.
+void forget_unused() {
+    constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
+    for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
+        Surface &s = **it;
+        if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth) continue;
+        if (!s.depth && s.gpu_newer && !s.guest_newer) write_back(s);
+        if (void *image = s.image()) {
+            if (!s.mem1) free(image);
+            else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(image);
+        }
+        surfaces.erase(it);
+        state_sent_valid = false;
+        state_lost = true;
+        return;
+    }
+}
+
 void present() {
     const OSTime tp = prof_now();
     if (dump_enabled && st_flips % 120 == 0) {
@@ -2991,6 +3021,7 @@ void present() {
     GX2SetDRCEnable(TRUE);
     st_flips++;
     use_counter++;
+    forget_unused();
     ring_next_segment();
     dyn_res_update();
     prof_add(P_PRESENT, tp);
@@ -3168,6 +3199,7 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
             (x->sy > 1 || x->gpu_chain || (own_size && x->gpu_newer)))
             src = x.get();
     if (!src) return false;
+    used(*src);
     const bool own_size_copy = own_size && src->sy <= 1 && !src->gpu_chain;
     if (sy <= 1 && !src->gpu_chain && !own_size_copy) return false;
     Surface *dst = get_surface(out_paddr, out_w, out_h, cbuf_to_pixfmt((flags >> 12) & 7), false, src->gpu_chain ? src : nullptr);
@@ -3227,6 +3259,7 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     for (auto &s : surfaces)
         if (!s->depth && s->addr <= in_paddr && in_paddr < s->addr + s->bytes() && (!src || s->drawn > src->drawn)) src = s.get();
     if (!src || !src->linear || src->guest_newer) return false;
+    used(*src);
     const u32 bpp = pixel_bytes(cbuf_to_pixfmt(src->fmt)), src_stride = src->w * bpp, rows = size / in_w;
     const u32 in_off = in_paddr - src->addr;
     if (in_w + in_gap != src_stride && !(in_gap == 0 && in_w == src_stride)) return false;
@@ -3262,6 +3295,7 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     const u32 first_col = (off % out_stride) / bpp;
     if (!dst) dst = get_surface(base, out_stride / bpp, height, lcd ? recent_top_fmt : src->fmt, false, src);
     if (dst == src || first_col + cols > dst->w) return false;
+    used(*dst);
     take_dyn_level(*dst);
     static u32 notes;
     if (notes++ < 4) wiiu::note("copying rows on the GPU: %08x into %08x, %u columns from %u", in_paddr, base, cols, first_col);
@@ -3319,6 +3353,7 @@ static bool tile_run_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_ga
     for (auto &x : surfaces)
         if (!x->depth && x->gpu_newer && !x->guest_newer && x->sy > 1 && in_paddr >= x->addr && in_paddr + size <= x->addr + x->bytes()) src = x.get();
     if (!src || src->w % 8) return false;
+    used(*src);
     const u32 tile = src->bytes() / (src->w * src->h) * 64, per_row = src->w / 8, offset = in_paddr - src->addr;
     if (offset % tile || size % (tile * per_row)) return false;
     const u32 first = offset / tile, q = first / per_row, m = first % per_row, w = src->w, h = size / (tile * per_row) * 8;
@@ -3622,6 +3657,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         first_row = off / row_bytes;
     }
     if (!s) return false;
+    used(*s);
     gx2_flush_cpu_batch();
     flush_surface(*s);
     // memory rows run top down, surface rows bottom up; a surface read as a taller texture has its window at the top of that texture
@@ -4157,6 +4193,7 @@ static void show_lcd_from_memory() {
             (!lcd || s->drawn > lcd->drawn))
             lcd = s.get();
     if (lcd && !lcd->guest_newer) {
+        used(*lcd);
         if (lcd->drawn <= transfer_drawn || (pa == shown_pa && lcd->drawn == shown_drawn)) return;
         shown_pa = pa;
         shown_drawn = lcd->drawn;
