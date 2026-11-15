@@ -119,13 +119,15 @@ std::vector<u32> smdh_icon(const std::string &path) {
     return px;
 }
 
-// The region a game is for, from its SMDH region lockout bits (the lowest one: EUR for EUR+AUS); -1 if region free.
+// SMDH region lockout bits. Multiregion releases with both Japan and North
+// America can pick Japanese content from CFG's region even with English set.
 static int smdh_region(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     std::vector<u8> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (d.size() < 0x2040 || memcmp(d.data(), "SMDH", 4) != 0) return -1;
     u32 bits = d[0x2018] | d[0x2019] << 8 | d[0x201A] << 16 | (u32)d[0x201B] << 24;
     if ((bits & 0x7F) == 0 || (bits & 0x7F) == 0x7F) return -1;
+    if ((bits & 3) == 3) return 1;
     return __builtin_ctz(bits & 0x7F);
 }
 

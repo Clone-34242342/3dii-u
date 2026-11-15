@@ -133,7 +133,20 @@ def console_learned(info, slug, card):
     return [os.path.join(kept, f) for f in sorted(os.listdir(kept)) if f.startswith('console_card_')] if os.path.isdir(kept) else []
 
 
-def make_title(game_dir, out, info, art=None):
+LANGUAGES = ('Japanese', 'English', 'French', 'German', 'Italian', 'Spanish',
+             'Simplified Chinese', 'Korean', 'Dutch', 'Portuguese', 'Russian', 'Traditional Chinese')
+
+def language_for_locale(locale):
+    language, *qualifiers = locale.lower().replace('_', '-').split('-')
+    if language == 'zh':
+        traditional = 'hant' in qualifiers or ('hans' not in qualifiers and any(
+            region in qualifiers for region in ('tw', 'hk', 'mo')))
+        return 'Traditional Chinese' if traditional else 'Simplified Chinese'
+    codes = dict(zip(('ja', 'en', 'fr', 'de', 'it', 'es', 'zh', 'ko', 'nl', 'pt', 'ru'), LANGUAGES))
+    return codes.get(language, 'English')
+
+
+def make_title(game_dir, out, info, art=None, language=None):
     """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
     import importlib.util
     spec = importlib.util.spec_from_file_location('make_game_title', os.path.join(ROOT, 'tools', 'make_game_title.py'))
@@ -142,6 +155,9 @@ def make_title(game_dir, out, info, art=None):
     titles.make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
                       info['title_id'], info['name'], info['product'], ARCHIVES, art)
     content = os.path.join(out, 'title', 'content')
+    if language is not None:
+        with open(os.path.join(content, 'language.txt'), 'w', encoding='ascii') as f:
+            f.write(f'{LANGUAGES.index(language)}\n')
     for f in os.listdir(game_dir):
         if f.startswith(('update_', 'dlc_')):
             os.link(os.path.join(game_dir, f), os.path.join(content, f))
@@ -198,6 +214,7 @@ def main():
     ap.add_argument('--out', help='a folder to put the WUP in instead')
     ap.add_argument('--keep', action='store_true', help='keep the work files, for a quicker rebuild')
     ap.add_argument('--art', help="a picture (the cover art, say) for the start-up screens and the Wii U Menu icon; the game's own icon otherwise")
+    ap.add_argument('--language', choices=LANGUAGES, help='3DS system language to report to the game')
     ap.add_argument('--mixed', action='store_true', help='trial: fast code with only the video decoder in safe mode (build3ds.Game.mixed)')
     ap.add_argument('--cold', action='store_true', help="for the checks: build it as a game nobody has built before, with none of this PC's lists of "
                                                         'its code and shaders (tools/check_ports.py --cold)')
@@ -390,7 +407,7 @@ def main():
         shutil.copyfile(dvlb, os.path.join(learned, 'dvlb.bin'))
 
     PROGRESS.stage('Making the title')
-    make_title(game_dir, out, info, a.art)
+    make_title(game_dir, out, info, a.art, a.language)
 
     if b3.MEASURE:  # the checks' own kind of build, for Cemu (build3ds.py): never packed, so none can reach a console
         print('a measuring build: not packed', flush=True)

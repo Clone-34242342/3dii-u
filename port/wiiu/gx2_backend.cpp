@@ -5,6 +5,7 @@
 // Surfaces hold PICA window rows: row 0 is y = 0, the bottom of the image, which is also how textures are sampled (t = 0 at row
 // 0). So a render target can be sampled as a texture as it is. Screens are rotated into place when they are presented.
 #include <coreinit/cache.h>
+#include <coreinit/debug.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/memexpheap.h>
 #include <coreinit/memfrmheap.h>
@@ -543,6 +544,9 @@ bool top_720 = true;
 // renders some of them twice as wide and scales them down (cheap antialiasing), so the two axes scale differently.
 void rt_scale(u32 w, u32 h, float &sx, float &sy) {
     sx = sy = 1;
+    // Cave Story 3D's pixel-aligned UI and transition strips develop seams
+    // when rasterized into enlarged targets.
+    if (g_game.program_id == 0x000400000004a100ULL) return;
     // 256 and 512 wide, and 416 tall: some games draw a little more than the screen and crop it in the display transfer
     const u32 shown = w == 256 ? 240 : w == 512 ? 480 : w;
     if ((h == 400 || h == 416) && (shown == 240 || shown == 480)) {
@@ -1072,9 +1076,14 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
     const u64 tkey = tex_key(addr, w, h, fmt, levels);
     if (auto hit = tex_index.find(tkey); hit != tex_index.end()) {
         Tex &e = *hit->second;
-        if (stale_check && e.last_use != use_counter && !e.dirty && !e.maybe_dirty && !e.hash_stale && hash_guest(pptr(addr), e.bytes, std::array<u32, SLICES>().data()) != e.hash) {
+        // Brain Age writes ink into its A4 canvas without a texture flush.
+        // Check the canvas on first use each flip, using the same path as stalecheck.
+        const bool handwriting_canvas = g_game.program_id == 0x00040000000b3c00ULL
+            && w == 512 && h == 256 && fmt == 11 && levels == 1;
+        if ((stale_check || handwriting_canvas) && e.last_use != use_counter && !e.dirty && !e.maybe_dirty && !e.hash_stale
+            && hash_guest(pptr(addr), e.bytes, std::array<u32, SLICES>().data()) != e.hash) {
             static u32 logged;
-            if (logged++ < 400) LOG("STALE tex %08x %ux%u fmt %u levels %u bytes %u, flip %llu\n", addr, w, h, fmt, levels, e.bytes, (unsigned long long)st_flips);
+            if (stale_check && logged++ < 400) LOG("STALE tex %08x %ux%u fmt %u levels %u bytes %u, flip %llu\n", addr, w, h, fmt, levels, e.bytes, (unsigned long long)st_flips);
             e.maybe_dirty = true;
         }
         e.last_use = use_counter;
@@ -2684,6 +2693,7 @@ void present() {
     GX2SetTVEnable(TRUE);
     GX2SetDRCEnable(TRUE);
     st_flips++;
+    if (st_flips == 1) OSReport("[3dii-u startup] first GPU present submitted\n");
     use_counter++;
     ring_next_segment();
     dyn_res_update();
@@ -3218,6 +3228,7 @@ static void relieve_mem1() {
 }
 
 void gfx_thread_init() {
+    OSReport("[3dii-u startup] initializing GX2\n");
     int_floats.fill();
     WHBGfxInit();
     free_whb_depth();
@@ -3235,7 +3246,9 @@ void gfx_thread_init() {
     tv_cb = WHBGfxGetTVColourBuffer();
     drc_cb = WHBGfxGetDRCColourBuffer();
     tv_buffer_to_mem2();
+    OSReport("[3dii-u startup] loading shader tables\n");
     load_shader_tables();
+    OSReport("[3dii-u startup] shader tables loaded\n");
     shader_compile_init();  // what the set lacks, the console compiles as it goes
     vs_ubo_loc = vs_passthrough->uniformBlockCount ? vs_passthrough->uniformBlocks[0].offset : 0;
     ps_ubo_loc = ps_blit->uniformBlockCount ? ps_blit->uniformBlocks[0].offset : 0;

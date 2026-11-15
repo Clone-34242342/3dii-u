@@ -20,6 +20,7 @@ import argparse
 import ctypes
 import functools
 import glob
+import hashlib
 import json
 import os
 import re
@@ -277,7 +278,7 @@ DECODER_MARGIN = 64 << 10
 
 class Game:
     """How a game builds. Every game follows the same recipe: what differs comes from the game itself (its code, its program id) or from what
-    earlier runs of it learned (functions.txt, shader logs), never from which game it is."""
+    earlier runs of it learned (functions.txt, shader logs)."""
     def __init__(self, name, game_dir=None):
         self.name = name
         self.dir = (game_dir or f'{ROOT}/games/{name}').replace('\\', '/')
@@ -296,9 +297,23 @@ class Game:
         # goes through memory at calls: safe mode. gcc -O2 turns that C into code Cemu's recompiler runs wrong (a compare reused across a jump), so -O1.
         decoder = mobiclip_sites(self.dir)
         safe = len(decoder) >= 8 or coroutine_switches(self.dir) > 0
+        if self.name == 'g_acve':
+            # Cave Story 3D's USA executable can lose its stack return address
+            # while unwinding a chain of calls in the ABI build.
+            with open(self.dir + '/code.bin', 'rb') as code:
+                safe |= hashlib.sha256(code.read()).hexdigest() == '496841ca1bdd506e82652392d34978f367a1f8a5407d589e6fbd5cc3ef16938c'
         self.gen, self.mode, self.opt = ('gen_safe', 'safe', ['-O1']) if safe else ('gen_abi', 'abi', [])
         self.gen_dir = f'{self.dir}/{self.gen}'
         self.safe_ranges = []  # with mode 'abi': address ranges generated the safe way (mixed)
+        self.verified_entries = ()
+        # This ASRE base executable's sort routine splits around ARM calls that
+        # retain live registers across generated entry points.
+        if self.mode == 'abi' and self.name == 'g_asre':
+            with open(self.dir + '/code.bin', 'rb') as code:
+                if hashlib.sha256(code.read()).hexdigest() == '7c820d33c3b4aa8dddc479bc2fd48b92994f1701dad011470a31bb69acdbe7f5':
+                    self.safe_ranges = [(0x0013d500, 0x0013e800), (0x00278de4, 0x002791f0)]
+                    self.verified_entries = (0x0013df38, 0x0013e790, 0x00279134)
+                    self.opt = ['-O1']
         # the decoder's sites span 65 KB of each game that has it; the margin takes in the rest of its library
         self.decoder_range = (decoder[0] - DECODER_MARGIN, decoder[-1] + DECODER_MARGIN) if len(decoder) >= 8 else None
 
@@ -320,10 +335,11 @@ def functions_list(g):
     """The recompiler's --extra: the entries this game's runs found, and the 3dsrecomp project's runs of it if it has any.
     A merged list is written only when it changes, so its date says when the entries did."""
     lists = [p for p in (g.extra_functions, g.upstream_functions) if p and os.path.isfile(p) and os.path.getsize(p)]
-    if len(lists) == 1:
+    if len(lists) == 1 and not g.verified_entries:
         return lists[0]
     merged = f'{WORK}/functions_{g.name}.txt'
     text = ''.join(open(p, encoding='utf-8').read().strip() + '\n' for p in lists)
+    text += ''.join(f'0x{entry:08x}\n' for entry in g.verified_entries)
     if not os.path.isfile(merged) or open(merged, encoding='utf-8').read() != text:
         os.makedirs(WORK, exist_ok=True)
         with open(merged, 'w', encoding='utf-8', newline='\n') as f:

@@ -22,6 +22,8 @@ No game data and no keys come with the builder. Everything it builds from is you
 
 **Games** in the bar on the left holds the games you picked before and lists the games tested on a real Wii U; **Help** answers questions about what you need, and holds the version, the update check and the light or dark look.
 
+**Game language** defaults to the computer's display language, with English as the fallback. Choose a language to override it for the selected title. The game must already include that language.
+
 Saves live in the game's own save storage on the console, like any installed game. They show up in Data Management.
 
 ## Which games work

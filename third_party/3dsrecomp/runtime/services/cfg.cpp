@@ -2,13 +2,25 @@
 #include "../loader.h"
 #include "../service.h"
 #include "services.h"
+#include <fstream>
 
 namespace kernel {
 
 static int cfg_language() {
     // 0 JP, 1 EN, 2 FR, 3 DE, 4 IT, 5 ES, 6 ZH, 7 KO, 8 NL, 9 PT, 10 RU, 11 TW
-    if (const char *l = getenv("RECOMP_LANGUAGE")) return atoi(l);
-    return 1;
+    static const int language = [] {
+        if (const char *override = getenv("RECOMP_LANGUAGE")) {
+            char *end;
+            const long value = strtol(override, &end, 10);
+            if (end != override && !*end && value >= 0 && value <= 11) return (int)value;
+        }
+        std::ifstream file(g_game.dir + "/language.txt");
+        int value;
+        char extra;
+        if (file >> value && value >= 0 && value <= 11 && !(file >> extra)) return value;
+        return 1;
+    }();
+    return language;
 }
 
 static u32 cfg_region() {

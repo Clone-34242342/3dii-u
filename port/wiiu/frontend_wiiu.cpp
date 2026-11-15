@@ -58,7 +58,9 @@ static const char *volatile trace_stage = "before main";
 
 static void stage(const char *name) {
     trace_stage = name;
-    LOG("[stage] %s at %u ms\n", name, (u32)OSTicksToMilliseconds(OSGetSystemTime() - trace_start));
+    const u32 elapsed = OSTicksToMilliseconds(OSGetSystemTime() - trace_start);
+    OSReport("[3dii-u startup] %s at %u ms\n", name, elapsed);
+    LOG("[stage] %s at %u ms\n", name, elapsed);
 }
 
 static char last_note[80];
@@ -186,6 +188,34 @@ static void gpu_trip() {
     longjmp(gpu_restart, 1);
 }
 
+// Opt-in hardware sample. Keep timing and reporting on the GPU thread.
+static bool perf_trace;
+
+static void report_gpu_timing(OSTime begin) {
+    static OSTime start, last_flip;
+    static u64 previous_flips;
+    static u32 count, longest_gap, longest_pump;
+    const OSTime now = OSGetSystemTime();
+    if (!start) start = now;
+    const u64 flips = wiiu::gfx_flips();
+    if (flips != previous_flips) {
+        if (last_flip)
+            longest_gap = std::max(longest_gap, (u32)OSTicksToMicroseconds(now - last_flip));
+        last_flip = now;
+        count += (u32)(flips - previous_flips);
+        previous_flips = flips;
+    }
+    longest_pump = std::max(longest_pump, (u32)OSTicksToMicroseconds(now - begin));
+    if (now - start < OSSecondsToTicks(2)) return;
+    const auto elapsed = (u32)OSTicksToMilliseconds(now - start);
+    LOG("[perf] presents=%u window_ms=%u max_present_gap_us=%u max_gpu_work_us=%u\n",
+        count, elapsed, longest_gap, longest_pump);
+    OSReport("[3dii-u perf] presents=%u window_ms=%u max_present_gap_us=%u max_gpu_work_us=%u\n",
+        count, elapsed, longest_gap, longest_pump);
+    start = now;
+    count = longest_gap = longest_pump = 0;
+}
+
 static int gpu_thread(int, void *) {
     wiiu::profile_this_core();
     wiiu::gfx_thread_init();
@@ -207,10 +237,11 @@ static int gpu_thread(int, void *) {
         // finished frame may be shown
         const bool waited = !OSWaitEventWithTimeout(&gpu_event, 2000000);  // nanoseconds
         const u64 done = kernel::gx_stats.cmdlists + kernel::gx_stats.transfers;
-        const OSTime t0 = kMeasure ? OSGetSystemTime() : 0;
+        const OSTime t0 = (kMeasure || perf_trace) ? OSGetSystemTime() : 0;
         kernel::gsp_process_gx();
         if (!gpu_pause) wiiu::gfx_pump(waited && done == kernel::gx_stats.cmdlists + kernel::gx_stats.transfers);
         if (kMeasure) wiiu::gfx_note_busy((u32)OSTicksToMicroseconds(OSGetSystemTime() - t0));
+        if (perf_trace) report_gpu_timing(t0);
     }
     if (!gpu_parked) wiiu::gfx_shutdown();
     gpu_parked = true;
@@ -529,7 +560,13 @@ static int card_thread(int, void *) {
         if (want_hang_dump) {
             const u32 seconds = want_hang_dump - 1;
             want_hang_dump = 0;
+            if (perf_trace && seconds) {
+                OSReport("[3dii-u perf] no new GPU command lists for %u s\n", seconds);
+                wiiu::log_status();
+                rt_log_sync();
+            }
             dump_hang(seconds);
+            if (perf_trace && seconds) rt_log_sync();
         }
         if (kMeasure && pass % 300 == 0) {
             const struct mallinfo m = mallinfo();
@@ -760,6 +797,7 @@ static BOOL on_program(OSContext *c) { return on_exception(c, "program exception
 extern "C" const char g_build_stamp[];  // tools/win/build3ds.py writes it at every link
 
 int main(int argc, char **argv) {
+    OSReport("[3dii-u startup] main entered, build %s\n", g_build_stamp);
     LOG("[loader] build %s\n", g_build_stamp);
     g_argv = argv;
     OSInitMutex(&file_m);
@@ -776,17 +814,17 @@ int main(int argc, char **argv) {
         OSFatal(m);
     };
     host_threads[0] = OSGetCurrentThread();
-    trace_stage = "starting the watchdog";
+    stage("starting the watchdog");
     spawn(watchdog_thread, 0, 13, 64 << 10, "watchdog");
     if (kMeasure) spawn(wiiu::net_thread, 0, 12, 64 << 10, "net");
-    trace_stage = "system libraries";
+    stage("initializing system libraries");
     WHBProcInit();
     // WHB registers its own at priority 100 from the GPU thread, on core 2. Each core has its own list, highest first: the GPU stops before WHB's goes, and starts after WHB's has made the screens again.
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, on_release, nullptr, 1000, 2);
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, on_acquire, nullptr, 50, 2);
     VPADInit();
     OSEnableHomeButtonMenu(TRUE);
-    trace_stage = "save storage";
+    stage("mounting save storage");
     wiiu::save_mount();
     stage("system up");
     std::error_code no_save;
@@ -795,12 +833,15 @@ int main(int argc, char **argv) {
     // better now than after hours of play that couldn't be kept
     if (no_save) report_stuck("Can't use this game's save storage on the console.");
     OSSetThreadPriority(OSGetCurrentThread(), 14);
+    stage("initializing guest memory");
     mem::init();
     stage("memory up");
+    stage("loading game content");
     load_game(CONTENT_DIR);
     stage("game loaded");
     std::filesystem::create_directories(kernel::save_root(), no_save);
     rt_log_open(wiiu::data_dir() + "/log.txt");
+    perf_trace = wiiu::debug_flag("perftrace");
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);
         extern bool g_log_each_line;
