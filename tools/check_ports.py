@@ -358,10 +358,13 @@ def judge(t, seconds, flags, measured=False):
                 os.remove(f)
             said = cemu(t, secs, interp)
             text = read_log()
-        if 'exited by itself' in said and not interp and not re.search(CRASH, text):
-            # Cemu's recompiler can die on a game's code, at the start or minutes in, with nothing wrong on the game's own log (3D Land, Paper
-            # Jam): its interpreter runs them. A crash of the game's would come back in the interpreter too.
-            notes.append(f"{name}: Cemu's recompiler died with nothing on the game's log; run with its interpreter")
+        crashed = bool(re.search(CRASH, text))
+        if not interp and (crashed or 'exited by itself' in said):
+            # Cemu's recompiler can run a game's code wrongly, at the start or minutes in: it dies with nothing on the game's own log (3D Land,
+            # Paper Jam), or the game stops on an instruction it mangled (Luigi's Mansion 2's undefined instruction at 003b4cec, Nov 14-15).
+            # Its interpreter runs them. A crash of the game's own comes back in the interpreter too.
+            notes.append(f"{name}: " + ("the game crashed in Cemu's recompiler" if crashed else "Cemu's recompiler died with nothing on the game's log")
+                         + '; run with its interpreter')
             interp = True
             said = cemu(t, secs * 2, interp)
             text = read_log()
