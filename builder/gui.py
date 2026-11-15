@@ -37,12 +37,14 @@ NO_WINDOW = 0x08000000 if WIN else 0  # the build's compilers would each open a 
 DUMPS = '3DS games (*.3ds *.cci *.cia *.cxi *.app);;All files (*.*)'
 DUMP_EXTS = ('.3ds', '.cci', '.cia', '.cxi', '.app')
 STAGE_OF = {n: i for i, (n, _) in enumerate(pipeline.STAGES)}
-NO_ART = "The game's own icon"
-NO_ICON_ART = 'Same as the art'  # the Wii U Menu icon without a picture of its own
+# What the art lines show of each choice: a word or two, so the Art menu's right column fits them whole
+NO_ART = "Game's icon"
+NO_ICON_ART = 'Same as art'  # the Wii U Menu icon without a picture of its own
 NO_BEZEL = 'Black'  # the GamePad beside the screens without a picture
-NO_PAD_ART = 'Same as the TV'  # the GamePad's start-up screen without a picture of its own
+NO_PAD_ART = 'Same as TV'  # the GamePad's start-up screen without a picture of its own
 NO_SAVE = 'None'  # no 3DS save packed in
-NO_GAME_SOUND = 'Same as all games'  # a game without a start-up sound of its own: the one for every game, if there is one
+NO_GAME_SOUND = 'Default'  # a game without a start-up sound of its own: the one for every game, if there is one
+CUSTOM = 'Custom'  # a picture or sound the player chose
 BOOT_SOUND = os.path.join(os.path.dirname(pipeline.ARCHIVES), 'boot_sound.btsnd')  # where every build picks it up (tools/make_game_title.py)
 GAME_SOUNDS = os.path.join(os.path.dirname(BOOT_SOUND), 'boot_sounds')  # a game's own, <title id>.btsnd
 LIBRARY_MAX = 40  # games the Games page remembers
@@ -87,7 +89,7 @@ def covers_folder():
     return os.path.join(os.path.dirname(settings_file()), 'covers')
 
 
-FROM_SGDB, FROM_TDB = 'From SteamGridDB', 'From GameTDB'
+FROM_SGDB, FROM_TDB = 'SteamGridDB', 'GameTDB'
 
 
 def picked(path):
@@ -96,9 +98,9 @@ def picked(path):
 
 
 def source(path):
-    """a picture's line in the window: where it was fetched from, or its file's name"""
+    """a picture's line in the window: where it was fetched from, or that the player chose it"""
     if picked(path):
-        return os.path.basename(path)
+        return CUSTOM
     return FROM_SGDB if os.path.basename(path).startswith('sgdb_') else FROM_TDB
 
 
@@ -634,7 +636,7 @@ class App(QObject):
         self.bezel = path
         if self.game and remember:
             self.keep_for_game('pad_bezel', path)
-        self.set(bezelText=os.path.basename(path) if path else NO_BEZEL, hasBezel=bool(path))
+        self.set(bezelText=CUSTOM if path else NO_BEZEL, hasBezel=bool(path))
 
     def keep_for_game(self, key, path):
         """a path chosen for the open game (settings[key][title id]), or forgotten with None"""
@@ -660,7 +662,7 @@ class App(QObject):
         self.pad_art = path
         if self.game and remember:
             self.keep_for_game('pad_art', path)
-        self.set(padArtText=os.path.basename(path) if path else NO_PAD_ART, hasPadArt=bool(path))
+        self.set(padArtText=CUSTOM if path else NO_PAD_ART, hasPadArt=bool(path))
 
     @Slot()
     def chooseGameSound(self):
@@ -682,7 +684,7 @@ class App(QObject):
         self.game_sound = path
         if self.game and remember:
             self.keep_for_game('boot_sound', path)
-        self.set(gameSoundText='Its own' if path else NO_GAME_SOUND, hasGameSound=bool(path))
+        self.set(gameSoundText=CUSTOM if path else NO_GAME_SOUND, hasGameSound=bool(path))
 
     @Slot()
     def bringSave(self):

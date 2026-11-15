@@ -90,7 +90,7 @@ try:
     assert not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the card menu'
     menu.setProperty('visible', False)
     state.set(hasGame=True, hasArt=True, artOwn=True, hasIconArt=True, hasBezel=True, hasPadArt=True, hasGameSound=True, artText='A picture.png', iconText='An icon.png',
-              bezelText='A bezel.png', padArtText='A GamePad picture.png', gameSoundText='Its own')  # every line of the art menu
+              bezelText='A bezel.png', padArtText='A GamePad picture.png', gameSoundText=gui.CUSTOM)  # every line of the art menu
     menu = win.findChild(QObject, 'artMenu')
     art_pill = next(p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'pill' and p.property('accessibleName') == 'Art and icon')
     QMetaObject.invokeMethod(menu, 'openAt', Q_ARG('QVariant', art_pill))  # as the pill does: under it, its first line focused
@@ -375,10 +375,10 @@ try:
     gui.QFileDialog.getOpenFileName = lambda *a, **k: (next(chosen), '')
     state.set_art(None, remember=False)
     state.chooseIcon()
-    assert state.icon_art == art and state.art is None and state.hasIconArt and (state.iconText, state.artText) == (os.path.basename(art), gui.NO_ART)
+    assert state.icon_art == art and state.art is None and state.hasIconArt and (state.iconText, state.artText) == (gui.CUSTOM, gui.NO_ART)
     assert title not in state.st['art'], 'an icon picked with no art marked the art as removed on purpose'
     state.chooseArt()
-    assert state.art == cover and state.icon_art == art and (state.artText, state.iconText) == (gui.FROM_TDB, os.path.basename(art))
+    assert state.art == cover and state.icon_art == art and (state.artText, state.iconText) == (gui.FROM_TDB, gui.CUSTOM)
     state.removeIcon()
     assert state.icon_art is None and state.art == cover and not state.hasIconArt and state.iconText == gui.NO_ICON_ART
     state.set_art(banner, square)  # SteamGridDB's banner and icon: art the player chooses now replaces both
@@ -388,7 +388,7 @@ try:
     assert (state.art, state.icon_art) == (banner, own_icon), 'fetched art took the place of the icon the player picked'
     state.set_art(banner, square)
     state.chooseArt()  # art
-    assert (state.art, state.icon_art) == (art, None) and state.artText == os.path.basename(art), "a fetched icon stayed beside the player's art"
+    assert (state.art, state.icon_art) == (art, None) and state.artText == gui.CUSTOM, "a fetched icon stayed beside the player's art"
     # the default art again: the player's pictures forgotten for the game, its art looked up again; offered after a removal too
     asked_again.clear()
     state.fetch_cover = lambda *a: asked_again.set()
@@ -404,12 +404,12 @@ try:
     # the GamePad's bezel: chosen, kept for the game, removed
     gui.QFileDialog.getOpenFileName = lambda *a, **k: (cover, '')
     state.chooseBezel()
-    assert state.bezel == cover and state.hasBezel and state.bezelText == os.path.basename(cover) and json.load(open(settings))['pad_bezel'][title] == cover
+    assert state.bezel == cover and state.hasBezel and state.bezelText == gui.CUSTOM and json.load(open(settings))['pad_bezel'][title] == cover
     state.removeBezel()
     assert state.bezel is None and not state.hasBezel and state.bezelText == gui.NO_BEZEL and title not in json.load(open(settings))['pad_bezel']
     # the GamePad's start-up picture and the game's start-up sound: chosen, kept for the game, removed (the sound's file with it)
     state.choosePadArt()
-    assert state.pad_art == cover and state.hasPadArt and state.padArtText == os.path.basename(cover) and json.load(open(settings))['pad_art'][title] == cover
+    assert state.pad_art == cover and state.hasPadArt and state.padArtText == gui.CUSTOM and json.load(open(settings))['pad_art'][title] == cover
     state.removePadArt()
     assert state.pad_art is None and not state.hasPadArt and state.padArtText == gui.NO_PAD_ART and title not in json.load(open(settings))['pad_art']
     import wave
@@ -424,7 +424,7 @@ try:
     state.chooseGameSound()
     kept = json.load(open(settings))['boot_sound'][title]
     assert kept == os.path.join(gui.GAME_SOUNDS, title + '.btsnd'), ('the game\'s sound went somewhere else, the sound for every game, say', kept)
-    assert state.game_sound == kept and os.path.isfile(kept) and state.hasGameSound and state.gameSoundText == 'Its own', kept
+    assert state.game_sound == kept and os.path.isfile(kept) and state.hasGameSound and state.gameSoundText == gui.CUSTOM, kept
     state.removeGameSound()
     assert state.game_sound is None and not state.hasGameSound and not os.path.exists(kept) and title not in json.load(open(settings))['boot_sound']
     assert state.gameSoundText == gui.NO_GAME_SOUND
