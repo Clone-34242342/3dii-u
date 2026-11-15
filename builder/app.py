@@ -38,9 +38,9 @@ def short_path(engine, work):
                 return link
             os.rmdir(link)  # a junction to where the app was before, or to nothing now: rmdir takes the link, never what it pointed to
         os.makedirs(work, exist_ok=True)
-        import subprocess
-        made = subprocess.run(['cmd', '/c', 'mklink', '/J', link, engine], capture_output=True, creationflags=0x08000000).returncode == 0
-        return link if made else engine
+        import _winapi
+        _winapi.CreateJunction(engine, link)  # not cmd's mklink: a hidden cmd.exe is one of the things antivirus guesses weigh
+        return link
     except OSError:
         return engine
 
