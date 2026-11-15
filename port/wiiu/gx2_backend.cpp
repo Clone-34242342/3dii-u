@@ -2416,14 +2416,19 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
     // segment that the decodes go on to leave behind
     for (const MSeg &seg : mb.segs)
         if (!seg.ds->skip && !seg.ds->shadow_mode && !seg.ds->gas) decode_textures_first(*seg.ds);
-    const u32 bytes = (u32)mb.cverts.size() * sizeof(OutVertex);
-    auto *v = (u32 *)ring_alloc(bytes + 64, 64);
-    memcpy(v, mb.cverts.data(), bytes);
-    DCFlushRange(v, bytes);
-    const u32 nidx = (u32)mb.idx.size();
-    auto *ix = (u32 *)ring_alloc(nidx * 4 + 64, 64);
-    for (u32 i = 0; i < nidx; i++) ix[i] = mb.idx[i] & 0x7fffffffu;
-    DCFlushRange(ix, nidx * 4);
+    const u32 bytes = (u32)mb.cverts.size() * sizeof(OutVertex), nidx = (u32)mb.idx.size();
+    // A batch too big for a third of the ring (a geometry shader's output shaded here: with its loop, Luigi's Mansion 2's rain made 33 MB in
+    // one draw) goes in parts, below.
+    const bool whole = bytes + 128 <= RING_SIZE / 3 && nidx * 4 + 128 <= RING_SIZE / 3;
+    u32 *v = nullptr, *ix = nullptr;
+    if (whole) {
+        v = (u32 *)ring_alloc(bytes + 64, 64);
+        memcpy(v, mb.cverts.data(), bytes);
+        DCFlushRange(v, bytes);
+        ix = (u32 *)ring_alloc(nidx * 4 + 64, 64);
+        for (u32 i = 0; i < nidx; i++) ix[i] = mb.idx[i] & 0x7fffffffu;
+        DCFlushRange(ix, nidx * 4);
+    }
     static GX2FetchShader *fetch;
     if (!fetch) {
         FetchKey k{};
@@ -2439,15 +2444,53 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         }
     GX2SetVertexShader(vs_passthrough);
     GX2SetFetchShader(fetch);
-    GX2SetAttribBuffer(0, bytes, sizeof(OutVertex), v);
+    if (whole) GX2SetAttribBuffer(0, bytes, sizeof(OutVertex), v);
+    static const V4 k_none[96] = {};
+    // A part: a run of a segment's triangles with just the vertices they use, renumbered, PART_VERTICES at most (and twice as many
+    // triangles, for meshes that share vertices). Each part sets its draw's state and uniforms again, so all a draw reads lies in the ring's
+    // segment it was submitted from or the one before (ring_next_segment).
+    constexpr u32 PART_VERTICES = 32768;
+    static std::vector<u32> part_of;  // a batch vertex's number in the part, ~0u if it has none
+    std::vector<u32> used, pidx;
+    if (!whole && part_of.size() < mb.cverts.size()) part_of.resize(mb.cverts.size(), ~0u);
     for (const MSeg &seg : mb.segs) {
         const DrawState &ds = *seg.ds;
         if (ds.skip || ds.shadow_mode || ds.gas) continue;
-        lap_start();
-        begin_draw_common(ds, find_ps(ds));
-        static const V4 k_none[96] = {};
-        set_vertex_uniforms(ds, k_none);
-        GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, seg.count, GX2_INDEX_TYPE_U32, ix + seg.first, 0, 1);
+        if (whole) {
+            lap_start();
+            begin_draw_common(ds, find_ps(ds));
+            set_vertex_uniforms(ds, k_none);
+            GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, seg.count, GX2_INDEX_TYPE_U32, ix + seg.first, 0, 1);
+            st_cpu_draws++;
+            continue;
+        }
+        for (u32 t = seg.first, end = seg.first + seg.count; t < end;) {
+            used.clear();
+            pidx.clear();
+            for (; t < end && used.size() + 3 <= PART_VERTICES && pidx.size() + 3 <= 6 * PART_VERTICES; t += 3)
+                for (u32 k = 0; k < 3; k++) {
+                    const u32 i = mb.idx[t + k] & 0x7fffffffu;
+                    if (part_of[i] == ~0u) {
+                        part_of[i] = (u32)used.size();
+                        used.push_back(i);
+                    }
+                    pidx.push_back(part_of[i]);
+                }
+            auto *pv = (OutVertex *)ring_alloc((u32)used.size() * sizeof(OutVertex) + 64, 64);
+            for (u32 k = 0; k < used.size(); k++) {
+                pv[k] = mb.cverts[used[k]];
+                part_of[used[k]] = ~0u;
+            }
+            DCFlushRange(pv, (u32)used.size() * sizeof(OutVertex));
+            auto *pi = (u32 *)ring_alloc((u32)pidx.size() * 4 + 64, 64);
+            memcpy(pi, pidx.data(), pidx.size() * 4);
+            DCFlushRange(pi, (u32)pidx.size() * 4);
+            lap_start();
+            begin_draw_common(ds, find_ps(ds));
+            set_vertex_uniforms(ds, k_none);
+            GX2SetAttribBuffer(0, (u32)used.size() * sizeof(OutVertex), sizeof(OutVertex), pv);
+            GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, (u32)pidx.size(), GX2_INDEX_TYPE_U32, pi, 0, 1);
+        }
         st_cpu_draws++;
     }
 }
