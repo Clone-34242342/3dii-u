@@ -52,12 +52,14 @@ LIBRARY_MAX = 40  # games the Games page remembers
 # Testers asked what the system files were and how to get seeddb.bin (Nov 9 and 10).
 HELP = {
     'keys': ('3DS keys',
-             'Two files from your own 3DS that unlock encrypted game dumps: boot9.bin and seeddb.bin. Decrypted dumps don\'t need them.\n\n'
-             'Both come from GodMode9 on a 3DS with custom firmware (boot9strap):\n'
+             'Press "Folder" and choose the folder with boot9.bin from your own 3DS (and seeddb.bin, if you have it). Only encrypted game '
+             'dumps need them.\n\n'
+             'Get them with GodMode9 on a 3DS with custom firmware:\n'
              '•  boot9.bin: open [M:] MEMORY VIRTUAL, highlight boot9.bin and press Y. Open [0:] SDCARD, press Y again and choose Copy.\n'
-             '•  seeddb.bin: press HOME, choose More..., then Build support files. It lands in gm9/out on the SD card. It holds the seeds of '
-             'the games installed on that 3DS, which some eShop games need.\n\n'
-             'On the PC, put both in one folder, .3ds in your user folder by default, or press "Folder" and choose where they are.'),
+             '•  seeddb.bin: press HOME, choose More..., then Build support files. It lands in gm9/out on the SD card. Some eShop games '
+             'need it.\n\n'
+             'One folder can hold everything from your 3DS: boot9.bin, seeddb.bin, and the 0004009b and 000400db folders. Choose it here or '
+             'under 3DS system files, and the builder takes all of it.'),
     'otp': ('Wii U otp.bin',
             'A small file (exactly 1024 bytes) from your own Wii U. The game is packed with a key from it so your console installs it. The '
             'builder never shows or stores that key.\n\n'
@@ -65,17 +67,15 @@ HELP = {
             'made a NAND backup when setting up Aroma, otp.bin is in that backup.\n\n'
             'On the PC, press "File" and choose it. Keep it private: it is unique to your console.'),
     'system': ('3DS system files',
-               'A few small files every 3DS keeps in its own memory: the system font many games write their text in, the parts (faces, '
-               'eyes, hair) Miis are drawn from, and the list of bad words games check typed names against. Games load them from the console, '
-               'so a game dump doesn\'t have them. The builder puts them in each game it makes and won\'t build a game without the ones it '
-               'reads: Mii games stop without the Mii parts, and Tomodachi Life without the word list.\n\n'
-               'They come from your own 3DS, either way:\n'
-               '•  Azahar: File > Set Up System Files, with the Artic Setup Tool running on your 3DS. The builder then finds them by itself.\n'
-               '•  GodMode9 on your 3DS: [1:] SYSNAND CTRNAND > title holds them in two folders, 0004009b (the font and the Mii parts) and '
-               '000400db (the word list). Highlight 0004009b and press Y, open [0:] SDCARD, press Y again and choose Copy (not Move); then '
-               'copy 000400db the same way, next to it. Back on the PC, press "Folder" here and choose that 0004009b folder on the SD '
-               'card. Copied this way they are encrypted, so the builder needs your 3DS keys to read them.\n\n'
-               'The builder copies them once and keeps them for every game after.'),
+               'Press "Folder" and choose the folder with the 0004009b and 000400db folders from your own 3DS, or Azahar\'s user folder. '
+               'They hold the 3DS font, the parts Miis are drawn from, and the word list games check names against. Games need them, and a '
+               'game dump doesn\'t have them.\n\n'
+               'Get them one of two ways:\n'
+               '•  GodMode9 on your 3DS: open [1:] SYSNAND CTRNAND, then title. Highlight 0004009b, press Y, open [0:] SDCARD, press Y '
+               'again and choose Copy (not Move). Copy 000400db the same way, next to it.\n'
+               '•  Azahar: File > Set Up System Files, with the Artic Setup Tool running on your 3DS. The builder then finds them by itself.\n\n'
+               'Copied with GodMode9 they are encrypted: put your boot9.bin in the same folder, and the builder opens them with it. It keeps '
+               'them for every game after.'),
 }
 
 
@@ -830,20 +830,21 @@ class App(QObject):
 
     @Slot()
     def chooseKeys(self):
-        p = QFileDialog.getExistingDirectory(None, 'Choose the folder with your 3DS keys (boot9.bin, seeddb.bin)', self.st['keys'])
+        p = QFileDialog.getExistingDirectory(None, 'Choose the folder with your boot9.bin', self.st['keys'])
         if p:
             if not decrypt.have_keys(p):
                 self.tell('No keys there', 'There\'s no boot9.bin in that folder.', 'warn')
             self.st['keys'] = p
             decrypt.use_keys(p)
-            if self.st.get('system') and not dumps.have_system_archives(pipeline.ARCHIVES):
-                self.import_system(self.st['system'])  # a 3DS's own copy, chosen before the keys that open it
+            # the system files, chosen before the keys that open them, or beside boot9.bin in one folder of the 3DS's files
+            for folder in (self.st.get('system'), p):
+                if folder and not dumps.have_system_archives(pipeline.ARCHIVES) and dumps.nand_titles(folder):
+                    self.import_system(folder)
             self.refresh_files()
 
     @Slot()
     def chooseSystem(self):
-        p = QFileDialog.getExistingDirectory(None, 'Choose your 3DS system files folder (Azahar\'s user folder, or the 0004009b folder from GodMode9)',
-                                             self.st.get('system', ''))
+        p = QFileDialog.getExistingDirectory(None, 'Choose the folder with 0004009b and 000400db, or Azahar\'s user folder', self.st.get('system', ''))
         if p:
             if not self.import_system(p):
                 if not self.system_locked:
@@ -852,9 +853,9 @@ class App(QObject):
                     self.tell('Those files didn\'t open', f'That is the right folder, but its files couldn\'t be decrypted with the boot9.bin in '
                               f'{self.st["keys"]}. They open with the keys of the same 3DS they were copied from.', 'warn')
                 else:
-                    self.tell('Those files need your 3DS keys', 'That is the right folder. A 3DS keeps these files encrypted, and they open with '
-                              'boot9.bin from your own 3DS.\n\nPress "Folder" next to 3DS keys and choose the folder with your boot9.bin: the '
-                              'builder then reads the system files from here by itself.', 'warn')
+                    self.tell('Those files need your boot9.bin', 'That is the right folder, but a 3DS keeps these files encrypted, and they '
+                              'open with boot9.bin from your own 3DS.\n\nPut boot9.bin in this folder and choose it again, or press "Folder" '
+                              'next to 3DS keys and choose the folder boot9.bin is in.', 'warn')
             self.refresh_files()
 
     @Slot(str)
@@ -862,7 +863,16 @@ class App(QObject):
         self.tell(*HELP[what])
 
     def import_system(self, folder):
-        """the system archives from a folder into the ones every build takes (pipeline.ARCHIVES), once: they stay for the next games"""
+        """the system archives from a folder into the ones every build takes (pipeline.ARCHIVES), once: they stay for the next games. A
+        boot9.bin there, or beside the 0004009b folder chosen, is taken for the keys when the builder has none: a tester kept all of the
+        3DS's files in one folder and chose it for the system files only"""
+        if not decrypt.have_keys(self.st['keys']):
+            for keys in (folder, os.path.dirname(os.path.normpath(folder))):
+                if decrypt.have_keys(keys):
+                    self.st['keys'] = keys
+                    decrypt.use_keys(keys)
+                    save_settings(self.st)
+                    break
         tmp = tempfile.mkdtemp(prefix='3diiu_sys_')  # for contents that need decrypting first
         self.system_locked = False  # the folder has them, as a 3DS keeps them, and they didn't decrypt: two testers were told "none there"
         try:
@@ -938,9 +948,10 @@ class App(QObject):
         have = decrypt.have_keys(keys)
         system = dumps.have_system_archives(pipeline.ARCHIVES)
         source = short(self.st['system'], 26) if self.st.get('system') else ''
-        self.set(sysOk=system, sysText=(source or 'Found') if system else 'Not found yet')  # short: the row has its pills beside it
+        # short, and what to choose while there's nothing: the row has its pills beside it
+        self.set(sysOk=system, sysText=(source or 'Found') if system else 'Folder with 0004009b')
         self.set(keysOk=have, keysNeeded=needed and not have,
-                 keysText=short(keys, 26) if have else 'Not found yet' if needed else 'Only for encrypted dumps',
+                 keysText=short(keys, 26) if have else 'Folder with boot9.bin' if needed else 'Only for encrypted dumps',
                  otpOk=otp_ok(otp), otpText=short(otp, 26) if otp_ok(otp) else 'Not found yet', destText=dest)
 
     # ---- updates (updater.py): every call that reaches the network or the disk runs on a worker, which reports through updateEvent

@@ -443,6 +443,31 @@ try:
     state.answer(True)  # the message closed
     state.game = None
 
+    # One folder of the 3DS's files (boot9.bin beside 0004009b and 000400db, as a tester kept them) fills both rows, from either Folder button.
+    # The archives' import itself is faked (test_system_archives.py checks it): only which folders are taken is looked at here.
+    three = os.path.join(base, '3DS files')
+    for d in ('0004009b', '000400db'):
+        os.makedirs(os.path.join(three, d))
+    open(os.path.join(three, 'boot9.bin'), 'wb').write(bytes(65536))
+    kept_env, kept_keys = os.environ.get('BOOT9_PATH'), state.st['keys']
+    real_import, real_have = gui.dumps.import_system_archives, gui.dumps.have_system_archives
+    imported = []
+    gui.dumps.import_system_archives = lambda folder, out, work: imported.append(folder) or ['0004009b00010202']
+    gui.dumps.have_system_archives = lambda folder: bool(imported)
+    for button in (state.chooseSystem, state.chooseKeys):
+        imported.clear()
+        state.st['keys'], state.st['system'] = os.path.join(base, 'no keys'), ''
+        gui.QFileDialog.getExistingDirectory = lambda *a, **k: three
+        button()
+        assert state.st['keys'] == three and imported == [three] and state.st['system'] == three, (button.__name__, state.st['keys'], imported)
+        assert not state.dialog, button.__name__
+    gui.dumps.import_system_archives, gui.dumps.have_system_archives = real_import, real_have
+    state.st['keys'] = kept_keys
+    if kept_env is None:
+        os.environ.pop('BOOT9_PATH', None)
+    else:
+        os.environ['BOOT9_PATH'] = kept_env
+
     # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a
     # question shown in it and answered; it comes back to the modern one the same way
     used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Simple.qml'), encoding='utf-8').read()))
