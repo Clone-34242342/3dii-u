@@ -49,6 +49,9 @@ ROUTES = {
     # Lagoon, whose water is where a console loses the most frames (the user, 2026-11-14). A course can't be swapped in for the first: the game
     # never finishes loading another course's file under Toad Circuit's name.
     'mario_kart_7_cup': MK7_RACE + ['A 600', 'WAIT 10'] * 60,
+    # the Shell Cup, the other cup a blank save has open (retro courses): down before A from the cc choice on, so the cup choice takes the
+    # second row; elsewhere it only picks the next cc, racer or part
+    'mario_kart_7_shell': ['WAIT 600'] + A(3, 120) + ['CDOWN 6', 'WAIT 30', 'A 6', 'WAIT 120'] * 8 + A(19, 120) + ['A 600', 'WAIT 10'] * 100,
     'usum_battle': USUM_BATTLE,
     # from the same save, into the game and no further: the place the save was made at, drawn frame after frame, the same in every run
     'usum_stand': ['WAIT 900'] + A(4, 90) + ['B 6', 'WAIT 60'] * 4 + ['WAIT 30000'],

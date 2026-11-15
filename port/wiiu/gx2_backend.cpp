@@ -3136,9 +3136,65 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
 // So is a copy of the whole target as it lies, with no gaps, into VRAM, when the target has a texture's height: a texture of the target's
 // own size, which Pokémon Ultra Sun makes of its screen every frame of a battle's opening. What the game later says it wrote there counts
 // as newer (Surface::copy).
+// A run of whole tiles from inside a target into a VRAM texture as wide, no gaps, starting partway along a row of tiles: Mario Kart 7 copies
+// N64 Luigi Raceway's big screen out of the target it drew it in, 1024 tiles from 351 tiles in, every frame. Through guest memory that was
+// a read back, which waits for the GPU, and a 128 KB upload, and the race ran at 20-30 fps in Cemu. Tile i of the run is tile i of the
+// texture, so the texture's rows of tiles are the target's from where the run starts, wrapping round a row: two rectangles, drawn on the
+// GPU at the target's scale as a whole copy is.
+static bool tile_run_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap) {
+    if ((in_width_gap >> 16) || (out_width_gap >> 16) || out_paddr < mem::VRAM_PADDR || out_paddr >= mem::VRAM_PADDR + mem::VRAM_SIZE) return false;
+    Surface *src = nullptr;
+    for (auto &x : surfaces)
+        if (!x->depth && x->gpu_newer && !x->guest_newer && x->sy > 1 && in_paddr >= x->addr && in_paddr + size <= x->addr + x->bytes()) src = x.get();
+    if (!src || src->w % 8) return false;
+    const u32 tile = src->bytes() / (src->w * src->h) * 64, per_row = src->w / 8, offset = in_paddr - src->addr;
+    if (offset % tile || size % (tile * per_row)) return false;
+    const u32 first = offset / tile, q = first / per_row, m = first % per_row, w = src->w, h = size / (tile * per_row) * 8;
+    if ((h & (h - 1)) || h > 1024) return false;  // a texture's height
+    Surface *dst = get_surface(out_paddr, w, h, src->fmt, false, src);
+    if (dst == src) return false;
+    take_dyn_level(*dst);
+    if (gxt()) LOG("[gxt] tile run on the GPU %08x -> %08x, %u tiles from tile %u\n", in_paddr, out_paddr, size / tile, first);
+    static u32 notes;
+    if (notes++ < 2) wiiu::note("copying tiles of surface %08x into texture %08x on the GPU", src->addr, out_paddr);
+    st_gpu_copies++;
+    gx2_flush_cpu_batch();
+    dst->gpu_chain = dst->copy = true;
+    flush_surface(*src);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, src->tex.surface.image, src->tex.surface.imageSize);
+    GX2SetColorBuffer(&dst->cb, GX2_RENDER_TARGET_0);
+    cur_color = nullptr;
+    begin_blit();
+    GX2SetPixelTexture(&src->tex, 0);
+    GX2SetPixelSampler(&blit_sampler, 0);
+    // columns dx0-dx1 of the texture's rows from columns sx0-sx1 of the target's rows from sy0 on, in pixels of memory; as in gx2_texture_copy,
+    // a surface's rows run bottom up from its first row in memory
+    const auto blit = [&](u32 dx0, u32 dx1, u32 sx0, u32 sx1, u32 sy0) {
+        if (dx1 <= dx0) return;
+        const u32 x = (u32)(dx0 * dst->sx), y = dst->sh - (u32)(h * dst->sy), cw = (u32)((dx1 - dx0) * dst->sx), ch = (u32)(h * dst->sy);
+        GX2SetViewport((float)x, (float)y, (float)cw, (float)ch, 0, 1);
+        GX2SetScissor(x, y, cw, ch);
+        const float u0 = (float)sx0 / src->w, u1 = (float)sx1 / src->w;
+        const float v_top = (float)(src->tex_h - (sy0 + h)) / src->tex_h, v_bottom = (float)(src->tex_h - sy0) / src->tex_h;
+        float *quad = (float *)ring_alloc(4 * 16 + 64, 64);
+        const float data[16] = {-1, 1, u0, v_top, 1, 1, u1, v_top, -1, -1, u0, v_bottom, 1, -1, u1, v_bottom};
+        memcpy(quad, data, sizeof data);
+        DCFlushRange(quad, sizeof data);
+        GX2SetAttribBuffer(0, sizeof data, 16, quad);
+        GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, 0, 1);
+    };
+    blit(0, w - 8 * m, 8 * m, w, 8 * q);            // the rest of the row of tiles the run starts in, and the same columns of the rows after
+    blit(w - 8 * m, w, 0, 8 * m, 8 * (q + 1));      // the start of each next row, which the run wraps round to
+    state_lost = true;
+    dst->gpu_newer = true;
+    dst->guest_newer = false;
+    dst->written_since_flush = true;
+    return true;
+}
+
 bool gx2_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap) {
     Surface *src = find_surface(in_paddr, false, [&](const Surface &t) { return t.gpu_newer && !t.guest_newer && t.sy > 1 && size == t.bytes(); });
-    if (!src) return false;
+    if (!src) return tile_run_copy(in_paddr, out_paddr, size, in_width_gap, out_width_gap);
     const u32 bpp = src->bytes() / (src->w * src->h), tile_row = src->w * 8 * bpp;
     const u32 in_w = (in_width_gap & 0xffff) * 16, in_gap = (in_width_gap >> 16) * 16;
     const u32 out_w = (out_width_gap & 0xffff) * 16, out_gap = (out_width_gap >> 16) * 16;
