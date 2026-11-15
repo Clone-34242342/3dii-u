@@ -1077,6 +1077,7 @@ ApplicationWindow {
                     ArtEntry { label: "GamePad start screen..."; chosen: app.padArtText; onPicked: { artMenu.visible = false; app.choosePadArt() } }
                     ArtEntry { label: "This game's sound..."; chosen: app.gameSoundText; onPicked: { artMenu.visible = false; app.chooseGameSound() } }
                     ArtEntry { label: "GamePad bezel..."; chosen: app.bezelText; onPicked: { artMenu.visible = false; app.chooseBezel() } }
+                    ArtEntry { label: "Restore the default art"; visible: app.artOwn; onPicked: { artMenu.visible = false; app.findArt() } }
                     ArtEntry { label: "Remove the bezel"; danger: true; visible: app.hasBezel; onPicked: { artMenu.visible = false; app.removeBezel() } }
                     ArtEntry { label: "Remove the game's sound"; danger: true; visible: app.hasGameSound; onPicked: { artMenu.visible = false; app.removeGameSound() } }
                     ArtEntry { label: "Remove the GamePad picture"; danger: true; visible: app.hasPadArt; onPicked: { artMenu.visible = false; app.removePadArt() } }

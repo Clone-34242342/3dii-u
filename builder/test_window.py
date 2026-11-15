@@ -89,7 +89,7 @@ try:
     settle('the card menu')
     assert not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the card menu'
     menu.setProperty('visible', False)
-    state.set(hasGame=True, hasArt=True, hasIconArt=True, hasBezel=True, hasPadArt=True, hasGameSound=True, artText='A picture.png', iconText='An icon.png',
+    state.set(hasGame=True, hasArt=True, artOwn=True, hasIconArt=True, hasBezel=True, hasPadArt=True, hasGameSound=True, artText='A picture.png', iconText='An icon.png',
               bezelText='A bezel.png', padArtText='A GamePad picture.png', gameSoundText='Its own')  # every line of the art menu
     menu = win.findChild(QObject, 'artMenu')
     art_pill = next(p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'pill' and p.property('accessibleName') == 'Art and icon')
@@ -97,7 +97,7 @@ try:
     settle('the art menu')
     assert menu.property('visible') and not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the art menu'
     menu.setProperty('visible', False)
-    state.set(hasGame=False, hasArt=False, hasIconArt=False, hasBezel=False, hasPadArt=False, hasGameSound=False, artText=gui.NO_ART, iconText=gui.NO_ART,
+    state.set(hasGame=False, hasArt=False, artOwn=False, hasIconArt=False, hasBezel=False, hasPadArt=False, hasGameSound=False, artText=gui.NO_ART, iconText=gui.NO_ART,
               bezelText=gui.NO_BEZEL, padArtText=gui.NO_PAD_ART, gameSoundText=gui.NO_GAME_SOUND)
     stages = ['Reading', 'Recompiling', 'Packing']
     for view in ('building', 'done', 'failed', 'form'):
@@ -389,6 +389,17 @@ try:
     state.set_art(banner, square)
     state.chooseArt()  # art
     assert (state.art, state.icon_art) == (art, None) and state.artText == os.path.basename(art), "a fetched icon stayed beside the player's art"
+    # the default art again: the player's pictures forgotten for the game, its art looked up again; offered after a removal too
+    asked_again.clear()
+    state.fetch_cover = lambda *a: asked_again.set()
+    assert state.artOwn
+    state.findArt()
+    assert asked_again.wait(5) and (state.art, state.icon_art) == (None, None) and title not in state.st['art'] and not state.artOwn
+    state.cover_ready(title, banner, square)
+    assert (state.art, state.icon_art) == (banner, square) and not state.artOwn, 'the fetched art was offered as the default again'
+    state.removeArt()
+    assert state.artOwn, 'art removed on purpose had no way back'
+    state.fetch_cover = fetch_cover
 
     # the GamePad's bezel: chosen, kept for the game, removed
     gui.QFileDialog.getOpenFileName = lambda *a, **k: (cover, '')

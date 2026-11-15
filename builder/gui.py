@@ -257,7 +257,7 @@ class App(QObject):
     note, meta, icon = _p(str, 'note'), _p(str, 'meta'), _p(str, 'icon')
     updateText, hasUpdate, dlcText, hasDlc = _p(str, 'updateText'), _p(bool, 'hasUpdate'), _p(str, 'dlcText'), _p(bool, 'hasDlc')
     modText, hasMod = _p(str, 'modText'), _p(bool, 'hasMod')
-    artText, hasArt, artUrl = _p(str, 'artText'), _p(bool, 'hasArt'), _p(str, 'artUrl')
+    artText, hasArt, artUrl, artOwn = _p(str, 'artText'), _p(bool, 'hasArt'), _p(str, 'artUrl'), _p(bool, 'artOwn')
     iconText, hasIconArt, iconArtUrl, tileUrl = _p(str, 'iconText'), _p(bool, 'hasIconArt'), _p(str, 'iconArtUrl'), _p(str, 'tileUrl')
     bezelText, hasBezel = _p(str, 'bezelText'), _p(bool, 'hasBezel')
     padArtText, hasPadArt, gameSoundText, hasGameSound = _p(str, 'padArtText'), _p(bool, 'hasPadArt'), _p(str, 'gameSoundText'), _p(bool, 'hasGameSound')
@@ -300,7 +300,7 @@ class App(QObject):
         theme_mode = self.st.get('theme')
         self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
-                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
+                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -614,6 +614,12 @@ class App(QObject):
         self.set_art(self.art, None)
 
     @Slot()
+    def findArt(self):
+        """the game's fetched art and icon again (fetch_cover), in place of pictures the player chose or removed"""
+        self.set_art(None, None)  # the game's choice forgotten, so its art is looked for again
+        threading.Thread(target=self.fetch_cover, args=(self.game, self._s['gameName']), daemon=True).start()
+
+    @Slot()
     def chooseBezel(self):
         path = self.ask_picture(f'Choose a GamePad bezel for {self._s["gameName"]}')
         if path:
@@ -748,7 +754,8 @@ class App(QObject):
                 icons.pop(title, None)
             save_settings(self.st)
         url = lambda p: QUrl.fromLocalFile(p).toString() if p else ''  # noqa: E731
-        self.set(artText=source(path) if path else NO_ART, hasArt=bool(path or icon), artUrl=url(path),
+        own = bool(self.game) and (picked(path) or picked(icon) or self.st.get('art', {}).get(f'{self.game.title_id:016x}') == '')  # findArt undoes it
+        self.set(artText=source(path) if path else NO_ART, hasArt=bool(path or icon), artUrl=url(path), artOwn=own,
                  iconText=source(icon) if icon else NO_ICON_ART if path else NO_ART, hasIconArt=bool(icon), iconArtUrl=url(icon),
                  tileUrl=url(icon or path))  # the Build page's tile: a square icon fills it best
         if remember:

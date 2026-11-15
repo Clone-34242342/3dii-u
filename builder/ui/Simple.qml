@@ -202,6 +202,7 @@ ApplicationWindow {
                     onChoose: app.hasGame ? app.chooseBezel() : app.chooseGame()
                     onRemove: app.removeBezel()
                 }
+                Button { text: "Restore the default art"; visible: app.artOwn; enabled: !win.busy; Layout.preferredWidth: 220; onClicked: app.findArt() }
                 RowLayout {
                     Label { text: "Start-up screens:" }
                     RadioButton { text: "Art on its own"; checked: app.artStyle === "picture"; onClicked: app.setArtStyle("picture") }
