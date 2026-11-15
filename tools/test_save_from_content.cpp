@@ -1,6 +1,6 @@
-// save_from_card (port/wiiu/save_storage.cpp) on folders of this PC standing in for the console's save and the SD card: what an import replaces and
-// keeps, that it is taken in once, what waits, an import that can't be read, and the export. Built and run by tools/selftest.py, with the Wii U's
-// headers stood in for.
+// save_from_content (port/wiiu/save_storage.cpp) on folders of this PC standing in for the title's content and the console's save: what the
+// packed save replaces and keeps, that it waits for the game's own save, that it is taken in once, and one that can't be copied in. Built and
+// run by tools/selftest.py, with the Wii U's headers stood in for.
 #undef NDEBUG
 #include <cassert>
 #include <cstdio>
@@ -55,22 +55,27 @@ static std::string get(const fs::path &p) {
 
 int main() {
     _fmode = _O_BINARY;  // as the console's files are
-    const fs::path root = fs::temp_directory_path() / "3dii_u_save_from_card";
+    const fs::path root = fs::temp_directory_path() / "3dii_u_save_from_content";
     fs::remove_all(root);
-    const fs::path card = root / "card", save = root / "save" / "savedata";
-    const auto run = [&] { wiiu::save_from_card(card.string(), save.string()); };
+    const fs::path packed = root / "content" / "save_import", save = root / "save" / "savedata", done = root / "common" / "save_imported";
+    const fs::path previous = root / "save" / "savedata_previous";
+    const auto run = [&] { wiiu::save_from_content(packed.string(), save.string(), done.string()); };
     const auto leftovers = [&] {
-        for (const char *d : {"importing", "previous_new", "previous_old"}) assert(!fs::exists(card / d));
-        for (const char *d : {"savedata_new", "savedata_old"}) assert(!fs::exists(save.parent_path() / d));
+        for (const char *d : {"savedata_new", "savedata_old", "savedata_previous_new", "savedata_previous_old"}) assert(!fs::exists(save.parent_path() / d));
     };
-    put(card / "import" / "main", "new" + BYTES);
-    put(card / "import" / "sub" / "more.bin", BYTES);
+    fs::create_directories(done.parent_path());
 
-    // no save folder: the game hasn't formatted on this console, so the import waits and nothing is made
+    // a game built with no save packed into it: nothing happens, and nothing is marked
     run();
-    assert(fs::exists(card / "import" / "main") && !fs::exists(card / "previous") && !fs::exists(save));
+    assert(!fs::exists(save) && !fs::exists(done));
+    put(packed / "main", "new" + BYTES);
+    put(packed / "sub" / "more.bin", BYTES);
 
-    // an import that can't be copied in (here a locked file where its copy goes) is tried once: the save stays as it was, and the import is set aside
+    // no save folder: the game hasn't formatted on this console, so the packed save waits and nothing is made
+    run();
+    assert(!fs::exists(save) && !fs::exists(previous) && !fs::exists(done));
+
+    // a packed save that can't be copied in (here a locked file where its copy goes) is tried once: the save stays as it was
     put(save / "old.bin", "old" + BYTES);
     const fs::path in_the_way = save.parent_path() / "savedata_new";
     put(in_the_way, "locked");
@@ -80,33 +85,25 @@ int main() {
     run();
     _close(locked);
     fs::remove(in_the_way);
-    assert(get(save / "old.bin") == "old" + BYTES && !fs::exists(save / "main") && get(card / "previous" / "old.bin") == "old" + BYTES);
-    assert(fs::exists(card / "import_failed" / "main") && !fs::exists(card / "import"));
+    assert(get(save / "old.bin") == "old" + BYTES && !fs::exists(save / "main") && get(previous / "old.bin") == "old" + BYTES);
+    assert(get(done) == "failed");
     leftovers();
     run();  // and not again
-    assert(get(save / "old.bin") == "old" + BYTES && fs::exists(card / "import_failed"));
+    assert(!fs::exists(save / "main"));
 
-    // taken in: the save is the import's files and only those, the one it had is on the card, the import kept as imported
-    fs::rename(card / "import_failed", card / "import");
+    // taken in: the save is the packed files and only those, the one it had kept beside it, marked taken
+    fs::remove(done);
     run();
     assert(get(save / "main") == "new" + BYTES && get(save / "sub" / "more.bin") == BYTES && !fs::exists(save / "old.bin"));
-    assert(get(card / "previous" / "old.bin") == "old" + BYTES && fs::exists(card / "imported" / "main") && !fs::exists(card / "import"));
+    assert(get(previous / "old.bin") == "old" + BYTES && get(done) == "taken" && get(packed / "main") == "new" + BYTES);
     leftovers();
 
     // and never again: the game's progress since stays
     put(save / "main", "played" + BYTES);
     run();
-    assert(get(save / "main") == "played" + BYTES && get(card / "previous" / "old.bin") == "old" + BYTES);
-
-    // an export asked for with an empty folder gets the save, whole; one already there is left alone
-    fs::create_directories(card / "export");
-    run();
-    assert(get(card / "export" / "main") == "played" + BYTES && get(card / "export" / "sub" / "more.bin") == BYTES && !fs::exists(card / "export_new"));
-    put(save / "main", "later");
-    run();
-    assert(get(card / "export" / "main") == "played" + BYTES && wiiu::files_copied > 0);
+    assert(get(save / "main") == "played" + BYTES && get(previous / "old.bin") == "old" + BYTES && wiiu::files_copied > 0);
 
     fs::remove_all(root);
-    puts("save_from_card: all good");
+    puts("save_from_content: all good");
     return 0;
 }

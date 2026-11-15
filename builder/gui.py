@@ -41,6 +41,7 @@ NO_ART = "The game's own icon"
 NO_ICON_ART = 'The same as the art'  # the Wii U Menu icon without a picture of its own
 NO_BEZEL = 'Black'  # the GamePad beside the screens without a picture
 NO_PAD_ART = 'The same as the TV'  # the GamePad's start-up screen without a picture of its own
+NO_SAVE = 'None: the game starts a save of its own'  # no 3DS save packed in
 NO_GAME_SOUND = 'The one for all games'  # a game without a start-up sound of its own: the one for every game, if there is one
 BOOT_SOUND = os.path.join(os.path.dirname(pipeline.ARCHIVES), 'boot_sound.btsnd')  # where every build picks it up (tools/make_game_title.py)
 GAME_SOUNDS = os.path.join(os.path.dirname(BOOT_SOUND), 'boot_sounds')  # a game's own, <title id>.btsnd
@@ -260,6 +261,7 @@ class App(QObject):
     iconText, hasIconArt, iconArtUrl, tileUrl = _p(str, 'iconText'), _p(bool, 'hasIconArt'), _p(str, 'iconArtUrl'), _p(str, 'tileUrl')
     bezelText, hasBezel = _p(str, 'bezelText'), _p(bool, 'hasBezel')
     padArtText, hasPadArt, gameSoundText, hasGameSound = _p(str, 'padArtText'), _p(bool, 'hasPadArt'), _p(str, 'gameSoundText'), _p(bool, 'hasGameSound')
+    saveText, hasSave = _p(str, 'saveText'), _p(bool, 'hasSave')
     artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
@@ -284,6 +286,7 @@ class App(QObject):
         self.game = self.update = self.dlc = self.mod = self.art = self.icon_art = None  # the mod, the banner art and the icon art are paths
         self.bezel = None  # the GamePad's picture beside the screens, a path
         self.pad_art = self.game_sound = None  # the GamePad's start-up picture and the game's start-up sound (a .btsnd), paths
+        self.save_in = None  # the folder of a 3DS save to pack into the build (saves.py)
         self.refused_key = None  # the SteamGridDB key it turned down, if it did (fetch_cover)
         self.proc, self.result, self.cancelled = None, None, False
         self.lines, self.log_lines, self.dialogs, self.flow = queue.Queue(), [], [], None
@@ -297,7 +300,7 @@ class App(QObject):
         theme_mode = self.st.get('theme')
         self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
-                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
+                       updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -455,6 +458,8 @@ class App(QObject):
         self.set_pad_art(pad_art if pad_art and os.path.isfile(pad_art) else None, remember=False)
         sound = self.st.get('boot_sound', {}).get(f'{d.title_id:016x}')
         self.set_game_sound(sound if sound and os.path.isfile(sound) else None, remember=False)
+        save = self.st.get('save_in', {}).get(f'{d.title_id:016x}')
+        self.set_save(save if save and os.path.isdir(save) else None, remember=False)
         if saved is None:  # nothing chosen yet: its cover art, fetched off the window's thread
             threading.Thread(target=self.fetch_cover, args=(d, info['name']), daemon=True).start()
         self.refresh_files()
@@ -673,66 +678,32 @@ class App(QObject):
             self.keep_for_game('boot_sound', path)
         self.set(gameSoundText='Its own' if path else NO_GAME_SOUND, hasGameSound=bool(path))
 
-    def save_card(self):
-        """the SD card and the game's Wii U title id for moving a save (saves.py), or None after saying what's missing"""
-        card = self.st.get('card', '')
-        if not self.game or self._s['building']:
-            return None
-        if not card or not os.path.isdir(card):
-            self.tell('Choose your SD card first', 'A save goes between this PC and the Wii U on its SD card: choose the card on the Build page.', 'warn')
-            return None
-        return card, (pipeline.profile_for(self.game) or pipeline.derived(self.game))['title_id'].lower()
-
     @Slot()
     def bringSave(self):
-        """a 3DS save onto the SD card, for the game to take in as it starts"""
-        where = self.save_card()
-        if not where:
-            return
-        name = self._s['gameName']
-        chosen = QFileDialog.getExistingDirectory(None, f'The folder with the save of {name}: Checkpoint\'s, JKSM\'s or an emulator\'s',
+        """a 3DS save to pack into the game's build, which the game takes in on the console (saves.py)"""
+        chosen = QFileDialog.getExistingDirectory(None, f"The folder with the save of {self._s['gameName']}: Checkpoint's, JKSM's or an emulator's",
                                                   self.st.get('save_folder', ''))
         if not chosen:
             return
         self.st['save_folder'] = os.path.dirname(chosen)
         save_settings(self.st)
         try:
-            taken, n = saves.bring_in(*where, chosen)
+            saves.checked(chosen)
         except (saves.SaveError, OSError) as e:
-            self.tell('The save couldn\'t be moved', str(e), 'error')
+            self.tell("That folder can't be used", str(e), 'error')
             return
-        self.tell('The save is on the SD card', f'{n} files from {taken}. Put the card in your Wii U and start {name}: it takes the save in as it '
-                  f'starts, and the save it had goes to the card first (3dii-u/{where[1]}/previous). Not started on the Wii U since it was installed? '
-                  'Start it once and quit first: the save waits on the card until the game has made its own.')
+        self.set_save(chosen)
 
     @Slot()
-    def takeSave(self):
-        """the game's save off the SD card, or the card set to ask the game for it"""
-        where = self.save_card()
-        if not where:
-            return
-        name = self._s['gameName']
-        if not saves.exported(*where):
-            try:
-                saves.ask_for_it(*where)
-            except OSError as e:
-                self.tell('The save couldn\'t be moved', str(e), 'error')
-                return
-            self.tell('The SD card asks for the save', f'Put the card in your Wii U and start {name}: it copies its save to the card as it starts. '
-                      'Then bring the card back here and choose Take back again.')
-            return
-        dest = QFileDialog.getExistingDirectory(None, f'Where to put the save of {name}', self.st.get('save_folder', ''))
-        if not dest:
-            return
-        self.st['save_folder'] = dest
-        save_settings(self.st)
-        try:
-            target = saves.take_out(*where, dest)
-        except (saves.SaveError, OSError) as e:
-            self.tell('The save couldn\'t be moved', str(e), 'error')
-            return
-        self.tell('The save is on this PC', f'In {target}. For Checkpoint on a 3DS, copy that folder into Checkpoint\'s folder of the game on '
-                  'the 3DS\'s SD card (3ds/Checkpoint/saves) and restore it from there.')
+    def removeSave(self):
+        self.set_save(None)
+
+    def set_save(self, path, remember=True):
+        """the folder of the save to pack into the build, remembered for the game"""
+        self.save_in = path
+        if self.game and remember:
+            self.keep_for_game('save_in', path)
+        self.set(saveText=os.path.basename(os.path.normpath(path)) if path else NO_SAVE, hasSave=bool(path))
 
     def fetch_cover(self, game, name):
         """on a thread of its own: the game's banner and icon from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
@@ -1138,6 +1109,8 @@ class App(QObject):
             argv += ['--pad-art', self.pad_art]
         if self.game_sound:
             argv += ['--boot-sound', self.game_sound]
+        if self.save_in:
+            argv += ['--save', self.save_in]
         self.log_lines, self.result, self.cancelled = [], None, False
         stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or self._s['target'] == 'card']
         self.set(building=True, view='building', stages=stages, stage=0, failed=False, progress=0.0, detail='Starting...', log='')

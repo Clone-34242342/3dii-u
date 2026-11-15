@@ -287,28 +287,26 @@ static bool copy_into_place(const std::string &from, const std::string &to) {
     return true;
 }
 
-// A save moved with the builder (builder/saves.py), before the game starts. card is the game's folder on the SD card, sd:/3dii-u/<title id>.
-// export, empty: the game's save is copied into it. import: the files of a 3DS save, as Checkpoint, JKSM or an emulator keep them, take the
-// place of the game's save, which is copied to previous first; nothing is replaced if that copy fails. Each import is tried once: renamed
-// importing before the save is touched, then imported once it is flushed, or import_failed with the save as it was. Imports wait for the
-// game's save folder, which is there once the game has formatted on this console (services/fs.cpp, OpenArchive): its first format would wipe them.
-void save_from_card(const std::string &card, const std::string &save) {
+// A 3DS save the builder packed into the game (builder/saves.py, the title's save_import), taken in once, before the game starts: its
+// files take the place of the game's save, which is kept as previous beside it first; nothing is replaced if that copy fails. It waits
+// for the game's save folder, there once the game has formatted on this console (services/fs.cpp, OpenArchive), whose first format would
+// wipe it: so the game starts once, then takes the save at its next start. done marks it taken, beside the save: it stays when the
+// software is deleted, as the save does, so a reinstall with the same save packed in leaves the progress made since alone.
+void save_from_content(const std::string &packed, const std::string &save, const std::string &done) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    const std::string import = card + "/import", taking = card + "/importing";
-    if (fs::is_directory(card + "/export", ec) && fs::is_empty(card + "/export", ec)) copy_into_place(save, card + "/export");
-    if (!fs::is_directory(import, ec) || fs::is_empty(import, ec) || !fs::is_directory(save, ec) || !copy_into_place(save, card + "/previous")) return;
-    fs::remove_all(taking, ec);
-    fs::rename(import, taking, ec);
-    if (ec) return;
-    const bool in = copy_into_place(taking, save);
+    if (!fs::is_directory(packed, ec) || fs::is_empty(packed, ec) || !fs::is_directory(save, ec) || fs::exists(done, ec)) return;
+    if (!copy_into_place(save, save + "_previous")) return;
+    const bool in = copy_into_place(packed, save);
     if (in) {
         save_dirty();
         save_flush(true);
     }
-    const std::string done = card + (in ? "/imported" : "/import_failed");
-    fs::remove_all(done, ec);
-    fs::rename(taking, done, ec);
+    if (FILE *f = fopen(done.c_str(), "wb")) {  // taken, or tried once: a save that can't be copied isn't tried at every start
+        fputs(in ? "taken" : "failed", f);
+        fclose(f);
+    }
+    LOG("[save] the 3DS save packed into the game: %s\n", in ? "taken in" : "COULD NOT BE COPIED, the game's own kept");
 }
 
 // A game's save file, from memory when it's been opened before: null for one too big to hold, which then goes to storage as before

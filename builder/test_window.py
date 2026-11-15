@@ -417,6 +417,19 @@ try:
     state.removeGameSound()
     assert state.game_sound is None and not state.hasGameSound and not os.path.exists(kept) and title not in json.load(open(settings))['boot_sound']
     assert state.gameSoundText == gui.NO_GAME_SOUND
+    # a 3DS save to pack into the build: chosen (an emulator's folder, its save taken from data/00000001), kept for the game, removed
+    emu = os.path.join(base, 'emu_save')
+    os.makedirs(os.path.join(emu, 'data', '00000001'))
+    open(os.path.join(emu, 'data', '00000001', 'main'), 'wb').write(b'save')
+    gui.QFileDialog.getExistingDirectory = lambda *a, **k: emu
+    state.bringSave()
+    assert state.save_in == emu and state.hasSave and state.saveText == 'emu_save' and json.load(open(settings))['save_in'][title] == emu
+    state.removeSave()
+    assert state.save_in is None and not state.hasSave and state.saveText == gui.NO_SAVE and title not in json.load(open(settings))['save_in']
+    gui.QFileDialog.getExistingDirectory = lambda *a, **k: os.path.join(base, 'keys')  # empty: not a save, said so
+    state.bringSave()
+    assert state.save_in is None and not state.hasSave and state.dialog
+    state.answer(True)  # the message closed
     state.game = None
 
     # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a

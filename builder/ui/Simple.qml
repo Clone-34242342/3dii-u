@@ -108,7 +108,6 @@ ApplicationWindow {
             TabButton { text: "Required Files" }
             TabButton { text: "Optional Files" }
             TabButton { text: "Art and Sound" }
-            TabButton { text: "Saves" }
             TabButton { text: "Build" }
         }
 
@@ -153,6 +152,11 @@ ApplicationWindow {
                     label: "DLC..."; text: app.dlcText; removable: app.hasDlc
                     onChoose: app.hasGame ? app.chooseExtra("dlc") : app.chooseGame()
                     onRemove: app.removeExtra("dlc")
+                }
+                PathRow {
+                    label: "3DS save..."; text: app.saveText; removable: app.hasSave
+                    onChoose: app.hasGame ? app.bringSave() : app.chooseGame()
+                    onRemove: app.removeSave()
                 }
                 RowLayout {
                     Layout.fillWidth: true
@@ -217,22 +221,6 @@ ApplicationWindow {
                     Button { text: "Start-up sound..."; Layout.preferredWidth: 220; onClicked: app.chooseSound() }
                     Label { Layout.fillWidth: true; text: app.soundSet ? "Your sound plays while a game starts." : "None: games start silently." }
                     Button { text: "Remove"; visible: app.soundSet; onClicked: app.removeSound() }
-                }
-                Item { Layout.fillHeight: true }
-            }
-
-            ColumnLayout {  // a save between a 3DS and the Wii U, on the SD card
-                spacing: 10
-                Label {
-                    Layout.fillWidth: true
-                    wrapMode: Text.WordWrap
-                    text: "Bring a save over from a 3DS (Checkpoint's or JKSM's backup, or an emulator's folder of the game), or take the Wii U's save back. "
-                        + "It goes by the SD card chosen on the Build tab. Start the game on the Wii U once after installing it before bringing a save in."
-                }
-                RowLayout {
-                    spacing: 6
-                    Button { text: "Bring in a 3DS save..."; enabled: app.hasGame && !win.busy; onClicked: app.bringSave() }
-                    Button { text: "Take the save back..."; enabled: app.hasGame && !win.busy; onClicked: app.takeSave() }
                 }
                 Item { Layout.fillHeight: true }
             }

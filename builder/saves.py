@@ -1,22 +1,15 @@
-"""A game's save, moved between a 3DS and the Wii U through the SD card. The builder puts the files of a 3DS save (as Checkpoint, JKSM or an
-emulator keep them) in sd:/3dii-u/<title id>/import, and the game takes them in as it next starts, its own save going to previous on the card
-first (port/wiiu/save_storage.cpp, save_from_card). The other way, an empty export folder there asks the game for its save, which it copies
-into it as it starts; the builder then copies it to the PC."""
+"""A 3DS save packed into a game as it is built: the files of a save, as Checkpoint, JKSM or an emulator keep them, go into the title as
+save_import, and the game takes them in on the console once it has made a save of its own (port/wiiu/save_storage.cpp, save_from_content).
+No SD card: the save travels inside the game."""
 import os
 import re
 import shutil
-import time
 
 ROOM = 8 << 20  # more than any 3DS game's save, and copied while the game starts within the watchdog's time (frontend_wiiu.cpp)
 
 
 class SaveError(Exception):
     """what to tell the player"""
-
-
-def card_folder(card, title_id):
-    """the game's folder on the card, as the game names it (port/wiiu/frontend_wiiu.cpp, card_dir)"""
-    return os.path.join(card.rstrip('\\/') + os.sep, '3dii-u', title_id.lower())
 
 
 def junk(name):
@@ -42,29 +35,8 @@ def the_save(folder):
     return folder
 
 
-def put_in_place(new, target):
-    """new, a complete copy, as target: what was there is moved aside first, then deleted, so a deletion cut short leaves nothing half there"""
-    old = target + '_old'
-    shutil.rmtree(old, ignore_errors=True)
-    if os.path.exists(target):
-        os.rename(target, old)
-    os.rename(new, target)
-    shutil.rmtree(old, ignore_errors=True)
-
-
-def copy_whole(source, target):
-    """source's files as target, by way of target_new, compared before anything is replaced"""
-    new = target + '_new'
-    shutil.rmtree(new, ignore_errors=True)
-    shutil.copytree(source, new, ignore=lambda _, names: [n for n in names if junk(n)])
-    if sorted(files_in(new)) != sorted(files_in(source)):
-        shutil.rmtree(new, ignore_errors=True)
-        raise SaveError('The copy came out different from the save: the card may be failing. Nothing was replaced.')
-    put_in_place(new, target)
-
-
-def bring_in(card, title_id, chosen):
-    """the save in the folder the player chose, onto the card for the game to take in: (the folder taken, the number of its files)"""
+def checked(chosen):
+    """the folder with the save's own files in the one the player chose, and how many there are; SaveError if it can't be a save"""
     source = the_save(chosen)
     found = files_in(source)
     if not found:
@@ -72,32 +44,13 @@ def bring_in(card, title_id, chosen):
                         'or the emulator\'s folder of it.')
     if sum(size for _, size in found) > ROOM:
         raise SaveError('That is bigger than any save of a 3DS game: choose the folder of this game\'s save alone.')
-    copy_whole(source, os.path.join(card_folder(card, title_id), 'import'))
     return source, len(found)
 
 
-def exported(card, title_id):
-    """whether the game has left its save on the card"""
-    export = os.path.join(card_folder(card, title_id), 'export')
-    return os.path.isdir(export) and bool(files_in(export))
-
-
-def ask_for_it(card, title_id):
-    """an empty export folder: the game copies its save into it as it next starts"""
-    os.makedirs(os.path.join(card_folder(card, title_id), 'export'), exist_ok=True)
-
-
-def take_out(card, title_id, dest):
-    """The save the game left in export, copied into a new folder in dest named as Checkpoint names a backup (20261114-050000), so it can go
-    straight into Checkpoint's folder for the game: that folder's path. The card's copy goes once it's here, so asking again gets a newer one."""
-    export = os.path.join(card_folder(card, title_id), 'export')
-    target = os.path.join(dest, time.strftime('%Y%m%d-%H%M%S'))
-    if os.path.exists(target):
-        raise SaveError('A folder of that name is already there: try again in a second.')
-    copy_whole(export, target)
-    try:
-        os.rename(export, export + '_taken')
-        shutil.rmtree(export + '_taken', ignore_errors=True)
-    except OSError:  # still on the card: taken again next time, which does no harm
-        pass
+def pack(chosen, content):
+    """the save's files into a title's content folder, as save_import: the folder they went to"""
+    source, _ = checked(chosen)
+    target = os.path.join(content, 'save_import')
+    shutil.rmtree(target, ignore_errors=True)
+    shutil.copytree(source, target, ignore=lambda _, names: [n for n in names if junk(n)])
     return target

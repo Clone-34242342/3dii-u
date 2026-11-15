@@ -566,7 +566,7 @@ static int watchdog_thread(int, void *) {
         // minutes before the screen says otherwise. Counted by drawing alone, any start slower than 30 s ended as "frozen": a tester's Mario
         // Kart 7 ended 30 s after its second list on its first start, its last note the save it had just written, and started the second
         // time (2026-11-12). Whether that one was at work or stopped, the screen couldn't say.
-        const u32 asking = kernel::svcs + (u32)kernel::gx_stats.transfers + wiiu::files_copied;  // and a save brought in as it starts (save_from_card)
+        const u32 asking = kernel::svcs + (u32)kernel::gx_stats.transfers + wiiu::files_copied;  // and saves copied as it starts (save_copy_tree, save_from_content)
         quiet = asking == asked ? quiet + 1 : 0;
         asked = asking;
         if (++seconds >= 41 && !drawn && (quiet >= 30 || seconds >= 180) && !wiiu::net_connected()) report_stuck("The game got stuck starting up.");
@@ -644,21 +644,6 @@ static void let_card_catch_up() {
     for (const OSTime until = OSGetSystemTime() + OSMillisecondsToTicks(ms); card_passes == seen && OSGetSystemTime() < until;) OSSleepTicks(OSMillisecondsToTicks(5));
 }
 
-// What this console has had to compile for the game, copied to the SD card as the game closes: sd:/3dii-u/<title id>/learned.bin. It lives in
-// the title's save, which nothing on a PC reads. The builder folds it into its next build of the game (builder/pipeline.py). With no card
-// in, or no room on it, nothing happens. The game's log stays in its save: it is not copied anywhere.
-static void copy_to_card(const std::string &from, const std::string &to) {
-    FILE *in = fopen(from.c_str(), "rb");
-    if (!in) return;
-    if (FILE *out = fopen(to.c_str(), "wb")) {
-        alignas(64) static char block[64 << 10];
-        for (size_t n; (n = fread(block, 1, sizeof block, in)) > 0;)
-            if (fwrite(block, 1, n, out) != n) break;
-        fclose(out);
-    }
-    fclose(in);
-}
-
 // Whether what a database slot held, as a 3DS game would read it, is a Mii: a name of printable characters, an author's name of them, the
 // padding empty, a birthday and a favourite colour that exist, a height and a build within their 127
 static bool looks_like_mii(const std::array<u8, 0x60> &m) {
@@ -690,22 +675,6 @@ static void read_mii_maker(FILE *f) {
         m[0x5F] = (u8)crc;
         if (kernel::mii_3ds(m, as_3ds) && looks_like_mii(as_3ds)) kernel::g_host_miis.push_back(m);
     }
-}
-
-// the game's folder on the SD card, which the builder reads and writes (builder/pipeline.py, builder/saves.py)
-static std::string card_dir() {
-    char dir[64];
-    snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
-    return dir;
-}
-
-static void leave_on_card() {
-    const std::string to = card_dir(), from = wiiu::data_dir();
-    wiiu::fs_begin(0xC00D);
-    mkdir("fs:/vol/external01/3dii-u", 0777);
-    mkdir(to.c_str(), 0777);
-    copy_to_card(from + "/shader_misses.bin", to + "/learned.bin");
-    wiiu::fs_end();
 }
 
 void frontend_run() {
@@ -803,7 +772,6 @@ void frontend_run() {
     rt_log_sync();  // the lines since the card thread's last look, these [quit] ones among them: they never reached the file before
     wiiu::fs_end();
     fflush(nullptr);
-    leave_on_card();
 }
 
 // a crash shows what happened on the screen, so it can be reported: the addresses can be looked up against build/game.nm
@@ -882,7 +850,8 @@ int main(int argc, char **argv) {
     load_game(CONTENT_DIR);
     stage("game loaded");
     std::filesystem::create_directories(kernel::save_root(), no_save);
-    if (!wiiu::test_run()) wiiu::save_from_card(card_dir(), kernel::save_root() + "/savedata");  // services/fs.cpp's folder for the game's save (archive_dir)
+    if (!wiiu::test_run())  // services/fs.cpp's folder for the game's save (archive_dir)
+        wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
     rt_log_open(wiiu::data_dir() + "/log.txt");
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);

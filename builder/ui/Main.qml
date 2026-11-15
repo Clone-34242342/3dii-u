@@ -729,9 +729,9 @@ ApplicationWindow {
                             Pill { text: "Remove"; tone: "red"; onClicked: app.removeExtra("mod") }
                         }
                         CardRow {
-                            label: "3DS save"; sub: "Bring a save over from a 3DS, or take the Wii U's back, on the SD card."; light: "grey"
-                            Pill { text: "Bring in"; accessibleName: "Bring a 3DS save in"; tone: "cyan"; onClicked: app.hasGame ? app.bringSave() : app.chooseGame() }
-                            Pill { text: "Take back"; accessibleName: "Take the save back"; onClicked: app.hasGame ? app.takeSave() : app.chooseGame() }
+                            label: "3DS save"; sub: app.saveText; light: app.hasSave ? "cyan" : "grey"
+                            Pill { text: "Choose"; accessibleName: "Choose a 3DS save to pack in"; tone: "cyan"; onClicked: app.hasGame ? app.bringSave() : app.chooseGame() }
+                            Pill { text: "Remove"; accessibleName: "Remove the 3DS save"; tone: "red"; onClicked: app.removeSave() }
                         }
                     }
 
