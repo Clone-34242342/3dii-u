@@ -29,6 +29,13 @@ def present_rule():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_present_rule.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def screen_layouts():
+    """port/wiiu/screen_layouts.h on the Wii U's TV sizes and its GamePad, built for this PC"""
+    exe = build3ds.WORK + '/selftest/test_screen_layouts.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_screen_layouts.cpp', '-o', exe], [exe]]
+
+
 def memory_fills():
     """port/wiiu/memory_fills.h against made-up fills and writes of a made-up memory, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_memory_fills.exe'
@@ -102,6 +109,7 @@ def main():
     checks = {
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
+        'screen layouts': screen_layouts(),
         'memory fills': memory_fills(),
         'module exports': ro_tree(),
         'game languages': languages(),

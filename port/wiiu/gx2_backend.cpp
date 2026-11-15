@@ -50,6 +50,7 @@
 #include "memory_fills.h"
 #include "loader.h"
 #include "present_rule.h"
+#include "screen_layouts.h"
 #include "settings.h"
 #include "shader_compile.h"
 #include "shadergen.h"
@@ -561,8 +562,10 @@ bool share_depth_block(GX2Surface &f) {
 
 // The top screen is drawn at 1200x720, three times the 3DS's, and the blit scales it up to the TV, as most Wii U games' pictures are (the user's choice, 2026-11-06). Under half the
 // pixels of 1800x1080, targets small enough for nearly all to fit in fast memory, and a whole-number scale, so 3DS pixel edges never land on TV pixel centres.
+// The options menu's RESOLUTION line can make it 800x480, twice the 3DS's, for a GPU with less to do (settings.ini, from the next start).
 // "top1080" (a file in the data folder, or a test run's flag) draws at 1800x1080 again, to compare.
-bool top_720 = true;
+u32 top_rows = 720;
+int start_resolution = 720;  // settings.ini's resolution as this start took it: the menu says when a change waits for the next
 
 // The screens' render targets are drawn larger: the top screen for the size above, the bottom one 1:1 on the GamePad. The game
 // renders some of them twice as wide and scales them down (cheap antialiasing), so the two axes scale differently.
@@ -572,17 +575,20 @@ void rt_scale(u32 w, u32 h, float &sx, float &sy, u32 vw = 0, u32 vh = 0) {
     // 256 and 512 wide, and 416 tall: some games draw a little more than the screen and crop it in the display transfer
     const u32 shown = w == 256 ? 240 : w == 512 ? 480 : w;
     if ((h == 400 || h == 416) && (shown == 240 || shown == 480)) {
-        sx = (top_720 ? 720.0f : 1080.0f) / shown;
-        sy = top_720 ? 3.0f : 4.5f;
+        sx = (float)top_rows / shown;
+        sy = top_rows / 240.0f;
     } else if (h == 320 && (shown == 240 || shown == 480)) {
         sx = 480.0f / shown;
         sy = 2.0f;
     } else if ((w & (w - 1)) == 0 && (h & (h - 1)) != 0 && h > 400 && h <= 1024) {
-        sx = sy = (top_720 ? 1200.0f : 1800.0f) / h;  // a screen drawn off-screen at about twice the size, for the game to draw as a texture: as sharp as that screen
+        // a screen drawn off-screen at about twice the size, for the game to draw as a texture: as sharp as that screen. Not below 720's
+        // scale: at 480 rows an 800-1024-row target would come out 1:1 or less, which the rest takes for a target not drawn larger, whose
+        // copies go through guest memory
+        sx = sy = std::max(top_rows, 720u) * 5 / 3.0f / h;
     } else if (w == 256 && h == 512 && vw == 240 && (vh == 400 || vh == 320)) {
         // Pokemon Ultra Sun and Moon draw both screens, one after the other, into one 256x512 target, and textures into others of that size:
         // a screen's viewport on the draw it's made for says which it is. The top screen's scale, whichever screen that draw is.
-        sx = sy = top_720 ? 3.0f : 4.5f;
+        sx = sy = top_rows / 240.0f;
     }
 }
 
@@ -2750,7 +2756,7 @@ bool dyn_test;  // a file named "dynres" in the data folder: changes level every
 // At full size, half a second of that goes to the lower level. There, nothing says how much room there is, so it tries full size again after a while, and each try that
 // fails (back below within 20 seconds) makes the next wait twice as long, up to about 3 minutes.
 void dyn_res_update() {
-    if (top_720) {  // only at 1080p ("top1080"): 720p targets fit, and draw at full size
+    if (top_rows <= 720) {  // only at 1080p ("top1080"): 720p targets fit, and draw at full size
         dyn_waited = 0;
         return;
     }
@@ -2851,44 +2857,14 @@ void present() {
 bool screen_fresh;
 PresentRule present_rule;  // when a finished frame is shown (present_rule.h, gfx_pump)
 
-// What the TV shows, from the options menu's SCREENS line (settings.ini's tv_layout): the top screen alone, or both, for play with a Pro
-// Controller or a GamePad set aside: side by side, one above the other, or the top one large with the bottom one at half its scale beside
-// it. The GamePad always shows the bottom screen, which it touches.
-constexpr int kLayouts = 4;
-volatile int tv_layout;      // the menu's (input thread)
-int tv_layout_shown = -1;    // what the TV buffer has been drawn for (GPU thread): another clears it first
-struct Rect {
-    u32 x, y, w, h;
-};
-// where a screen goes on a TV of tw x th; false where the layout leaves it off the TV
-bool tv_rect(int layout, int which, u32 tw, u32 th, Rect &r) {
-    auto fit = [&](float w, float h) { return std::min(tw / w, th / h); };  // scale of a w x h arrangement that fills the TV one way
-    switch (layout) {
-    case 1: {  // side by side: 720x240
-        const float k = fit(720, 240);
-        const u32 x0 = (u32)((tw - 720 * k) / 2), y = (u32)((th - 240 * k) / 2);
-        r = which == 0 ? Rect{x0, y, (u32)(400 * k), (u32)(240 * k)} : Rect{x0 + (u32)(400 * k), y, (u32)(320 * k), (u32)(240 * k)};
-        return true;
-    }
-    case 2: {  // the top screen above the bottom one: 400x480
-        const float k = fit(400, 480);
-        const u32 y0 = (u32)((th - 480 * k) / 2);
-        r = which == 0 ? Rect{(u32)((tw - 400 * k) / 2), y0, (u32)(400 * k), (u32)(240 * k)}
-                       : Rect{(u32)((tw - 320 * k) / 2), y0 + (u32)(240 * k), (u32)(320 * k), (u32)(240 * k)};
-        return true;
-    }
-    case 3: {  // the top screen large, the bottom one at half its scale beside its lower half: 560x240
-        const float k = fit(560, 240);
-        const u32 x0 = (u32)((tw - 560 * k) / 2), y = (u32)((th - 240 * k) / 2);
-        r = which == 0 ? Rect{x0, y, (u32)(400 * k), (u32)(240 * k)} : Rect{x0 + (u32)(400 * k), y + (u32)(120 * k), (u32)(160 * k), (u32)(120 * k)};
-        return true;
-    }
-    default:  // the top screen alone, as tall as the TV
-        if (which) return false;
-        r = Rect{(tw - th * 5 / 3) / 2, 0, th * 5 / 3, th};
-        return true;
-    }
-}
+// What the TV and the GamePad show (screen_layouts.h): the options menu's TV and GAMEPAD lines change them at once, and settings.ini keeps them.
+// A touch reaches the game where the GamePad shows the bottom screen.
+volatile int tv_layout, pad_layout;  // the menu's (input thread)
+int tv_layout_shown = -1;            // what the TV buffer has been drawn for (GPU thread): another clears it first
+using screens::Rect;
+
+void set_blit_colors(float r, float g2, float b, float add_r, float add_g, float add_b);
+void draw_rect(u32 w, u32 h, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1);
 
 void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_hi = 1, float u_hi = 1) {
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->surface.image, tex->surface.imageSize);
@@ -2905,18 +2881,29 @@ void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_
         tv_layout_shown = layout;
     }
     Rect r;
-    if (tv_rect(layout, which, tv_cb->surface.width, tv_cb->surface.height, r)) {
+    if (screens::tv_rect(layout, which, tv_cb->surface.width, tv_cb->surface.height, r)) {
         GX2SetColorBuffer(tv_cb, GX2_RENDER_TARGET_0);
         cur_color = nullptr;
         begin_blit();
         draw_screen(sc, r.x, r.y, r.w, r.h);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tv_cb->surface.image, tv_cb->surface.imageSize);
     }
-    if (which == 1) {
+    const u32 dw = drc_cb->surface.width, dh = drc_cb->surface.height;
+    u32 band0, band1;
+    if (screens::pad_rect(pad_layout, which, dw, dh, r, band0, band1)) {
         GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
         cur_color = nullptr;
         begin_blit();
-        draw_screen(sc, (drc_cb->surface.width - 640) / 2, 0, 640, 480);
+        // black beside the screen in its rows: what another layout, the menu or the keyboard left there goes, and never the other screen
+        GX2SetViewport(0, 0, (float)dw, (float)dh, 0, 1);
+        GX2SetScissor(0, 0, dw, dh);
+        GX2SetPixelTexture(&black_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(0, 0, 0, 0, 0, 0);
+        draw_rect(dw, dh, 0, (float)band0, (float)r.x, (float)band1, 0, 0, 1, 1);
+        draw_rect(dw, dh, (float)(r.x + r.w), (float)band0, (float)dw, (float)band1, 0, 0, 1, 1);
+        set_blit_colors(1, 1, 1, 0, 0, 0);
+        draw_screen(sc, r.x, r.y, r.w, r.h);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     }
     state_lost = true;
@@ -2924,7 +2911,7 @@ void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_
     present_rule.drew(which);
 }
 
-// ---- the options menu: drawn over the bottom screen on the GamePad, with a small built-in font
+// ---- the options menu: drawn over whatever the GamePad shows, with a small built-in font
 constexpr char k_font_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%:.-/>abcdefghijklmnopqrstuvwxyz,'!?()&+_<";
 const u8 k_font[][7] = {
     {0, 0, 0, 0, 0, 0, 0},
@@ -3512,7 +3499,9 @@ void gfx_thread_init() {
     // (NSMB2's world map lost its ground, 2026-11-11): there the CPU makes them. The console's GPU fetches them itself.
     in_cemu = wiiu::debug_flag("cemu");
     if (in_cemu) gxt_cpu_attr |= 1;
-    tv_layout = std::clamp(g_settings.tv_layout, 0, kLayouts - 1);
+    tv_layout = std::clamp(g_settings.tv_layout, 0, screens::kTvLayouts - 1);
+    pad_layout = std::clamp(g_settings.pad_layout, 0, screens::kPadLayouts - 1);
+    top_rows = start_resolution = g_settings.resolution == 480 ? 480 : 720;  // "top1080" below can still change top_rows
     if (wiiu::debug_flag("dynres")) dyn_test = true;
     if (wiiu::debug_flag("uberall")) uber_all = true;
     if (wiiu::debug_flag("glslforce")) glsl_force = true;
@@ -3526,7 +3515,7 @@ void gfx_thread_init() {
     prof_laps = !wiiu::debug_flag("nolaps");
     if (wiiu::debug_flag("kstats")) kernel::kstats.ipc = true;  // SVCs, switches and service requests per frame, on the log
     if (wiiu::debug_flag("top1080")) {
-        top_720 = false;
+        top_rows = 1080;
         LOG("[gx2] top screen drawn at 1800x1080\n");
     }
     if (wiiu::debug_flag("stalecheck")) stale_check = true;
@@ -3558,7 +3547,7 @@ void gfx_write_misses() {
 void gfx_vblank() { vblank_pending = true; }
 
 // ---- options menu state; the input thread changes it, the GPU thread draws it
-static constexpr int MENU_ITEMS = 6;
+static constexpr int MENU_ITEMS = 8;
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
@@ -3577,9 +3566,19 @@ static void next_language(int dir) {
     wiiu::settings_due = true;
 }
 
-// what the TV shows (tv_rect): at once, and from the next start too
-static void next_layout(int dir) {
-    tv_layout = g_settings.tv_layout = (tv_layout + dir + kLayouts) % kLayouts;
+// what the TV and the GamePad show (screen_layouts.h): at once, and from the next start too
+static void next_tv_layout(int dir) {
+    tv_layout = g_settings.tv_layout = screens::next_tv_layout(tv_layout, dir);
+    wiiu::settings_due = true;
+}
+static void next_pad_layout(int dir) {
+    pad_layout = g_settings.pad_layout = (pad_layout + dir + screens::kPadLayouts) % screens::kPadLayouts;
+    wiiu::settings_due = true;
+}
+
+// the rows the top screen is drawn at (top_rows), from the next start: the targets already made keep their size
+static void next_resolution() {
+    g_settings.resolution = g_settings.resolution == 480 ? 720 : 480;
     wiiu::settings_due = true;
 }
 
@@ -3609,10 +3608,12 @@ void menu_input(u32 pressed) {
         audio::set_volume(menu_volume / 100.0f);
     }
     if (menu_item == 3 && dir) next_language(dir);
-    if (menu_item == 4 && dir) next_layout(dir);
+    if (menu_item == 4 && dir) next_tv_layout(dir);
+    if (menu_item == 5 && dir) next_pad_layout(dir);
+    if (menu_item == 6 && dir) next_resolution();
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
-        if (menu_item == 5) menu_quit = true;
+        if (menu_item == 7) menu_quit = true;
     }
 }
 
@@ -3626,10 +3627,10 @@ static void draw_menu() {
     GX2SetPixelTexture(&black_tex, 0);
     GX2SetPixelSampler(&blit_sampler, 0);
     set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
-    draw_rect(w, h, 127, 60, 727, 420, 0, 0, 1, 1);
+    draw_rect(w, h, 127, 60, 727, 470, 0, 0, 1, 1);
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
-    const float rowh = 44, top = 126;
+    const float rowh = 40, top = 118;
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
     draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + 38, 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
@@ -3641,20 +3642,26 @@ static void draw_menu() {
     set_blit_colors(0.2f, 0.1f, 0.0f, 0, 0, 0);
     static const char *const k_languages[12] = {"JAPANESE", "ENGLISH", "FRENCH",  "GERMAN",     "ITALIAN", "SPANISH",
                                                 "CHINESE",  "KOREAN",  "DUTCH",   "PORTUGUESE", "RUSSIAN", "CHINESE (TW)"};
-    static const char *const k_layouts[kLayouts] = {"TOP ONLY", "SIDE BY SIDE", "STACKED", "LARGE + SMALL"};
-    char line[48], vol[32], lang[40], screens[40];
+    static const char *const k_tv_layouts[screens::kTvLayouts] = {"TOP SCREEN",      "SIDE BY SIDE",  "STACKED",
+                                                                  "BIG TOP + SMALL", "BOTTOM SCREEN", "BIG BOTTOM + SMALL"};
+    static const char *const k_pad_layouts[screens::kPadLayouts] = {"BOTTOM SCREEN", "TOP SCREEN", "BOTH SCREENS"};
+    char line[48], vol[32], lang[40], tv[40], pad[40], res[32];
     snprintf(line, sizeof line, "GAME SPEED: %d%%", menu_speed);
     snprintf(vol, sizeof vol, "VOLUME: %d%%", menu_volume);
     snprintf(lang, sizeof lang, "LANGUAGE: %s", k_languages[menu_language()]);
-    snprintf(screens, sizeof screens, "SCREENS: %s", k_layouts[tv_layout % kLayouts]);
-    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, screens, "QUIT TO WII U MENU"};
+    snprintf(tv, sizeof tv, "TV: %s", k_tv_layouts[tv_layout % screens::kTvLayouts]);
+    snprintf(pad, sizeof pad, "GAMEPAD: %s", k_pad_layouts[pad_layout % screens::kPadLayouts]);
+    snprintf(res, sizeof res, "RESOLUTION: %dP", g_settings.resolution);
+    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, "QUIT TO WII U MENU"};
     for (int i = 0; i < MENU_ITEMS; i++) {
         draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
     }
     set_blit_colors(0.45f, 0.3f, 0.15f, 0, 0, 0);
-    const bool later = menu_item == 3 && menu_language() != kernel::cfg_language();  // a game takes its language as it starts
-    const char *hint = later ? "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS" : "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
-    draw_text(w, h, hint, 165, 396, 2);
+    const char *hint = "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
+    if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS";  // a game takes its language as it starts
+    if (menu_item == 5 && pad_layout == 1) hint = "TOUCH IS OFF WHILE THE GAMEPAD SHOWS THE TOP";
+    if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "RESOLUTION CHANGES WHEN THE GAME NEXT STARTS";  // targets keep their size
+    draw_text(w, h, hint, 165, 446, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     state_lost = true;
 }
@@ -3984,11 +3991,11 @@ static void write_report() {
 }
 
 void touch_to_bottom(u16 x, u16 y, bool &touch, u16 &tx, u16 &ty) {
-    const u32 margin = (854 - 640) / 2;
-    if (x < margin || x >= margin + 640) return;
+    u32 px, py;
+    if (!screens::pad_touch(pad_layout, x, y, 854, 480, px, py)) return;  // not on the bottom screen
     touch = true;
-    tx = (u16)((x - margin) / 2);
-    ty = (u16)(y / 2);
+    tx = (u16)px;
+    ty = (u16)py;
 }
 void input_override(u32 &buttons, bool &touch, u16 &tx, u16 &ty) {
     (void)tx;

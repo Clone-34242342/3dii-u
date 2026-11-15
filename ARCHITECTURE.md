@@ -133,7 +133,7 @@ The rest of the backend, in the order of the file's sections:
 - draws with a compiled vertex shader
 - draws shaded on the CPU
 - reading the GPU's work back to guest memory
-- presenting: the top screen is drawn at 1200x720 and scaled to the TV, and the bottom screen goes to the GamePad
+- presenting: the top screen is drawn at 1200x720 (800x480 at the menu's 480p) and each screen is scaled to where the TV's and the GamePad's layouts put it (`screen_layouts.h`)
 - the options menu, with its own small font
 - the software keyboard
 
