@@ -217,6 +217,7 @@ def main():
     ap.add_argument('--pad-art', help="a picture of its own for the GamePad's start-up screen, shown as it is; the TV's otherwise")
     ap.add_argument('--boot-sound', help="the game's own start-up sound, a .btsnd (tools/make_boot_sound.py); the one for every game otherwise")
     ap.add_argument('--save', help="a 3DS save to pack in, which the game takes on the console (saves.py): Checkpoint's, JKSM's or an emulator's folder")
+    ap.add_argument('--no-menu', action='store_true', help='no options menu in the game: clicking the left stick does nothing (content/no_menu)')
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
     ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games, where the Virtual Console's screens find the year a game came out")
@@ -426,6 +427,8 @@ def main():
             saves.pack(a.save, os.path.join(out, 'title', 'content'))
         except (saves.SaveError, OSError) as e:
             fail(f"The 3DS save couldn't be packed in: {e}")
+    if a.no_menu:  # the game looks for it as it starts (frontend_wiiu.cpp)
+        open(os.path.join(out, 'title', 'content', 'no_menu'), 'wb').close()
 
     if b3.MEASURE:  # the checks' own kind of build, for Cemu (build3ds.py): never packed, so none can reach a console
         print('a measuring build: not packed', flush=True)

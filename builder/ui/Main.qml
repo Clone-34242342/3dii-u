@@ -952,7 +952,7 @@ ApplicationWindow {
                 Card {
                     width: 1030
                     title: "Art and sound"
-                    subtitle: "What your games show and play on the Wii U while they start."
+                    subtitle: "What your games show and play on the Wii U."
                     CardRow {
                         label: "Banners and icons"
                         sub: app.artKeySet ? "From SteamGridDB, with your key. GameTDB's covers fill in where it has nothing."
@@ -965,6 +965,12 @@ ApplicationWindow {
                                                         : "A game's art on its own, filling the screen."
                         Pill { text: "Art"; accessibleName: "Art on its own"; tone: app.artStyle === "picture" ? "cyan" : "grey"; onClicked: app.setArtStyle("picture") }
                         Pill { text: "Virtual Console"; accessibleName: "As the Virtual Console shows a game"; tone: app.artStyle === "console" ? "cyan" : "grey"; onClicked: app.setArtStyle("console") }
+                    }
+                    CardRow {
+                        label: "In-game menu"
+                        sub: app.gameMenu ? "Click the left stick in a game for its options, on the TV and the GamePad." : "Left out of the games you build."
+                        Pill { text: "On"; accessibleName: "In-game menu on"; tone: app.gameMenu ? "cyan" : "grey"; onClicked: app.setGameMenu(true) }
+                        Pill { text: "Off"; accessibleName: "In-game menu off"; tone: app.gameMenu ? "grey" : "cyan"; onClicked: app.setGameMenu(false) }
                     }
                     CardRow {
                         label: "Start-up sound"

@@ -204,6 +204,11 @@ ApplicationWindow {
                 }
                 Button { text: "Restore the default art"; visible: app.artOwn; enabled: !win.busy; Layout.preferredWidth: 220; onClicked: app.findArt() }
                 RowLayout {
+                    Label { text: "In-game menu:" }
+                    RadioButton { text: "On"; checked: app.gameMenu; onClicked: app.setGameMenu(true) }
+                    RadioButton { text: "Off"; checked: !app.gameMenu; onClicked: app.setGameMenu(false) }
+                }
+                RowLayout {
                     Label { text: "Start-up screens:" }
                     RadioButton { text: "Art on its own"; checked: app.artStyle === "picture"; onClicked: app.setArtStyle("picture") }
                     RadioButton { text: "Virtual Console"; checked: app.artStyle === "console"; onClicked: app.setArtStyle("console") }

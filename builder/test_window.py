@@ -468,6 +468,12 @@ try:
     else:
         os.environ['BOOT9_PATH'] = kept_env
 
+    # the in-game menu (click the left stick), on or left out of the games it builds, kept in the settings
+    state.setGameMenu(False)
+    assert state.st['game_menu'] is False and not state.gameMenu and json.load(open(settings))['game_menu'] is False
+    state.setGameMenu(True)
+    assert state.gameMenu and json.load(open(settings))['game_menu'] is True
+
     # The build folder (a tester's C: had no room): builds go to the one chosen, the old one's build files are offered for deletion and go only on
     # a yes, and Default comes back to the work folder. Nothing outside the build files is touched.
     kept_build, kept_work = os.environ.get('THREEDII_BUILD'), os.environ.get('THREEDII_WORK')
