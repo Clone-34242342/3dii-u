@@ -11,6 +11,7 @@ Lines starting with @ are for the app: @stage <name>, @progress <0-100>, @done <
 
 It builds with tools/win/build3ds.py, in folders of its own (builder_work/, build_win_builder/), so it never touches the nine ports' builds."""
 import argparse
+import errno
 import filecmp
 import io
 import json
@@ -161,6 +162,25 @@ def copy_to(source, target_dir):
     return target
 
 
+def card_error(e):
+    """what to tell the player when the SD card refuses a write (a tester's card was locked: Windows says WinError 19)"""
+    if getattr(e, 'winerror', None) == 19 or e.errno == errno.EROFS:
+        return 'The SD card is locked. Slide the little switch on its side up, away from "Lock", then put the card back in.'
+    return f'The SD card couldn\'t be written to: {e.strerror or e}'
+
+
+def check_card(card):
+    """a build that ends on the SD card finds out it can't write there first, not after minutes of building"""
+    probe = os.path.join(card.rstrip('\\/') + os.sep, 'install', '.3diiu_check')
+    try:
+        os.makedirs(os.path.dirname(probe), exist_ok=True)
+        with open(probe, 'wb') as f:
+            f.write(b'3Dii U')
+        os.remove(probe)
+    except OSError as e:
+        fail(card_error(e))
+
+
 PROGRESS = Progress()
 
 
@@ -211,6 +231,8 @@ def main():
     problem = user_files.check_otp(a.otp)
     if problem:
         fail(problem)
+    if a.card:
+        check_card(a.card)
 
     PROGRESS.stage('Reading your game')
     decrypt.use_keys(a.keys)
@@ -422,11 +444,14 @@ def main():
     if a.card:
         PROGRESS.stage('Copying')
         install = os.path.join(a.card.rstrip('\\/') + os.sep, 'install')
-        os.makedirs(install, exist_ok=True)
-        size = sum(os.path.getsize(os.path.join(wup, f)) for f in os.listdir(wup))
-        if shutil.disk_usage(install).free < size + (64 << 20):
-            fail(f'The SD card needs {size >> 20} MB free for this game.')
-        where = copy_to(wup, install)
+        try:
+            os.makedirs(install, exist_ok=True)
+            size = sum(os.path.getsize(os.path.join(wup, f)) for f in os.listdir(wup))
+            if shutil.disk_usage(install).free < size + (64 << 20):
+                fail(f'The SD card needs {size >> 20} MB free for this game.')
+            where = copy_to(wup, install)
+        except OSError as e:  # the WUP stays in the work folder, as with a folder build
+            fail(card_error(e) + f' The game is built: it is in {wup}.')  # one line: the window reads @error lines
         shutil.rmtree(wup, ignore_errors=True)
     if not a.keep:  # the runtime's objects stay: every game shares them
         shutil.rmtree(game_dir, ignore_errors=True)
