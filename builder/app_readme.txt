@@ -104,5 +104,7 @@ WHAT STAYS ON YOUR PC
 - A start-up sound is yours to add (Help page, "Art and sound"): choose a WAV file and every game you build plays it while it starts.
 - The builder asks GitHub for the list of its releases, and downloads one from there only when you press "Update".
 
+UI and art design by syntcity.
+
 The builder comes with no game, no game data and no keys. This is a beta, with no warranty.
 Third-party notices.txt lists the open-source software it carries.
