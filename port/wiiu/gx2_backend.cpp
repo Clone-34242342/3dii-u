@@ -2978,6 +2978,8 @@ void forget_unused() {
     }
 }
 
+void draw_fps();  // the frame rate counter (below, beside the text it draws)
+
 void present() {
     const OSTime tp = prof_now();
     if (dump_enabled && st_flips % 120 == 0) {
@@ -3012,6 +3014,7 @@ void present() {
         ps_seen.clear();
         ps_last_ds = nullptr;
     }
+    if (g_settings.show_fps) draw_fps();
     to_screen(tv_cb, GX2_SCAN_TARGET_TV);
     to_screen(drc_cb, GX2_SCAN_TARGET_DRC);
     restore_context();
@@ -3164,6 +3167,40 @@ void draw_text(u32 w, u32 h, const char *text, float x, float y, float scale) {
         const u32 g2 = (u32)(hit - k_font_chars);
         draw_rect(w, h, x, y, x + 5 * scale, y + 7 * scale, g2 * cu, 0, g2 * cu + 5.0f / (n * 6), 7.0f / 8);
     }
+}
+// The frame rate counter, the menu's FPS COUNTER: frames shown in the last second, white on black in the top left of the TV and the GamePad
+void draw_fps() {
+    static OSTime since;
+    static u64 flips_then;
+    static u32 fps;
+    const OSTime now = OSGetSystemTime();
+    if (!since || OSTicksToMilliseconds(now - since) >= 1000) {
+        if (since) fps = (u32)((st_flips - flips_then) * 1000 / OSTicksToMilliseconds(now - since));
+        since = now;
+        flips_then = st_flips;
+    }
+    char text[16];
+    snprintf(text, sizeof text, "%u FPS", fps);
+    const float wide = 6 * 3 * strlen(text);
+    for (GX2ColorBuffer *cb : {tv_cb, drc_cb}) {
+        GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
+        cur_color = nullptr;
+        begin_blit();
+        GX2SetViewport(0, 0, (float)cb->surface.width, (float)cb->surface.height, 0, 1);
+        GX2SetScissor(0, 0, cb->surface.width, cb->surface.height);
+        GX2SetPixelTexture(&black_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(0, 0, 0, 0.02f, 0.02f, 0.02f);
+        draw_rect(854, 480, 6, 6, 18 + wide, 35, 0, 0, 1, 1);
+        GX2SetPixelTexture(&font_tex, 0);
+        GX2SetPixelSampler(&lut_sampler, 0);
+        GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
+        GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+        set_blit_colors(1, 1, 1, 0, 0, 0);
+        draw_text(854, 480, text, 12, 10, 3);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+    }
+    state_lost = true;
 }
 }  // namespace
 
@@ -3879,7 +3916,7 @@ void gfx_write_misses() {
 void gfx_vblank() { vblank_pending = true; }
 
 // ---- options menu state; the input thread changes it, the GPU thread draws it
-static constexpr int MENU_ITEMS = 8;
+static constexpr int MENU_ITEMS = 9;
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
@@ -3914,14 +3951,16 @@ static void next_resolution() {
     wiiu::settings_due = true;
 }
 
+static bool menu_allowed = true;
 bool menu_open() { return menu_is_open; }
+void menu_disable() { menu_allowed = false; }
 int game_speed() { return menu_speed; }
 bool menu_wants_quit() { return menu_quit; }
 void menu_quit_now() { menu_quit = true; }
 
 void menu_input(u32 pressed) {
     if (!menu_is_open) {
-        if (pressed & VPAD_BUTTON_STICK_L) {
+        if (menu_allowed && (pressed & VPAD_BUTTON_STICK_L)) {
             menu_item = 0;
             menu_is_open = true;
         }
@@ -3943,26 +3982,32 @@ void menu_input(u32 pressed) {
     if (menu_item == 4 && dir) next_tv_layout(dir);
     if (menu_item == 5 && dir) next_pad_layout(dir);
     if (menu_item == 6 && dir) next_resolution();
+    if (menu_item == 7 && (dir || (pressed & VPAD_BUTTON_A))) {  // the frame rate counter (draw_fps), kept in settings.ini
+        g_settings.show_fps = !g_settings.show_fps;
+        wiiu::settings_due = true;
+    }
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
-        if (menu_item == 7) menu_quit = true;
+        if (menu_item == 8) menu_quit = true;
     }
 }
 
-static void draw_menu() {
-    const u32 w = drc_cb->surface.width, h = drc_cb->surface.height;
-    GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
+// The options menu on one picture: laid out in the GamePad's 854x480 and scaled to the buffer, the TV's being 16:9 too. It goes on both: on
+// the GamePad alone, a player looking at the TV saw nothing (the user, 2026-11-15).
+static void draw_menu_on(GX2ColorBuffer *cb) {
+    const u32 w = 854, h = 480;
+    GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
     cur_color = nullptr;
     begin_blit();
-    GX2SetViewport(0, 0, (float)w, (float)h, 0, 1);
-    GX2SetScissor(0, 0, w, h);
+    GX2SetViewport(0, 0, (float)cb->surface.width, (float)cb->surface.height, 0, 1);
+    GX2SetScissor(0, 0, cb->surface.width, cb->surface.height);
     GX2SetPixelTexture(&black_tex, 0);
     GX2SetPixelSampler(&blit_sampler, 0);
     set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
     draw_rect(w, h, 127, 60, 727, 470, 0, 0, 1, 1);
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
-    const float rowh = 40, top = 118;
+    const float rowh = 36, top = 114;
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
     draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + 38, 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
@@ -3984,7 +4029,8 @@ static void draw_menu() {
     snprintf(tv, sizeof tv, "TV: %s", k_tv_layouts[tv_layout % screens::kTvLayouts]);
     snprintf(pad, sizeof pad, "GAMEPAD: %s", k_pad_layouts[pad_layout % screens::kPadLayouts]);
     snprintf(res, sizeof res, "RESOLUTION: %dP", g_settings.resolution);
-    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, "QUIT TO WII U MENU"};
+    const char *items[MENU_ITEMS] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF",
+                                     "QUIT TO WII U MENU"};
     for (int i = 0; i < MENU_ITEMS; i++) {
         draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
     }
@@ -3994,7 +4040,12 @@ static void draw_menu() {
     if (menu_item == 5 && pad_layout == 1) hint = "TOUCH IS OFF WHILE THE GAMEPAD SHOWS THE TOP";
     if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "RESOLUTION CHANGES WHEN THE GAME NEXT STARTS";  // targets keep their size
     draw_text(w, h, hint, 165, 446, 2);
-    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+}
+static void draw_menu() {
+    draw_menu_on(drc_cb);
+    draw_menu_on(tv_cb);
+    tv_layout_shown = -1;  // once it closes, the TV is cleared before the game's next picture: the panel stood over the gaps between screens
     state_lost = true;
 }
 
