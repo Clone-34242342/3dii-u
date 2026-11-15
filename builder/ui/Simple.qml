@@ -136,8 +136,8 @@ ApplicationWindow {
                 Label { text: app.note; wrapMode: Text.WordWrap; Layout.fillWidth: true; opacity: 0.85 }
                 RowLayout {
                     spacing: 16
-                    Preview { caption: "Icon"; source: app.icon }
-                    Preview { caption: "Start-up screen art"; source: app.hasArt ? app.artUrl : ""; boxWidth: 228 }
+                    Preview { caption: "Wii U Menu icon"; source: app.iconArtUrl || app.artUrl || app.icon }
+                    Preview { caption: "Start-up screen art"; source: app.artUrl; boxWidth: 228 }
                 }
                 Item { Layout.fillHeight: true }
             }
@@ -171,12 +171,22 @@ ApplicationWindow {
                 Item { Layout.fillHeight: true }
             }
 
-            ColumnLayout {  // what the Wii U shows and plays while a game starts
+            ColumnLayout {  // what the Wii U shows and plays while a game starts, and the GamePad's bezel while it plays
                 spacing: 8
                 PathRow {
-                    label: "Art..."; text: app.artText; removable: app.hasArt
+                    label: "Start-up art..."; text: app.artText; removable: app.hasArt
                     onChoose: app.hasGame ? app.chooseArt() : app.chooseGame()
                     onRemove: app.removeArt()
+                }
+                PathRow {
+                    label: "Wii U Menu icon..."; text: app.iconText; removable: app.hasIconArt
+                    onChoose: app.hasGame ? app.chooseIcon() : app.chooseGame()
+                    onRemove: app.removeIcon()
+                }
+                PathRow {
+                    label: "GamePad bezel..."; text: app.bezelText; removable: app.hasBezel
+                    onChoose: app.hasGame ? app.chooseBezel() : app.chooseGame()
+                    onRemove: app.removeBezel()
                 }
                 RowLayout {
                     Label { text: "Start-up screens:" }

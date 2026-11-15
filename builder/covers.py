@@ -1,9 +1,10 @@
 """A game's art, for its start-up screens and Wii U Menu icon in place of the 48x48 icon scaled up, kept in a folder so each is fetched once.
 With a SteamGridDB key (each user's own, from steamgriddb.com > Preferences > API; the app keeps it in its settings file) a banner and an
-icon come from SteamGridDB, found by the game's name: the name and the key are all it sends there. Without one, or where SteamGridDB has
-nothing, the cover comes from GameTDB (art.gametdb.com), by the four letters at the end of the game's product code (CTR-P-AMKE: AMKE),
-which are all it sends. For the Virtual Console's start-up screens, the year a game came out comes from GameTDB's list of 3DS games, fetched
-once for all. These are the only things the builder downloads."""
+icon come from SteamGridDB, found by the game's name, or by its names in other regions where the site doesn't know this one: those names
+and the key are all it sends there. Without one, or where SteamGridDB has nothing, the cover comes from GameTDB (art.gametdb.com), by the
+four letters at the end of the game's product code (CTR-P-AMKE: AMKE), which are all it sends. GameTDB's list of 3DS games, fetched once for
+all, gives the year a game came out, for the Virtual Console's start-up screens, and its names in other regions. These are the only things
+the builder downloads."""
 import http.client
 import io
 import json
@@ -92,12 +93,10 @@ PLACES = {'E': 'North America', 'P': 'Europe', 'J': 'Japan', 'K': 'Korea', 'U': 
           'W': 'Taiwan', 'C': 'China'}
 
 
-def released(product, folder, url=TDB):
-    """'Released in North America: 2011' for the game of this product code, from GameTDB's list of 3DS games (3dstdb.zip, fetched into
-    folder the first time), or '' if the list has no year for it or can't be had"""
-    code = game_code(product)
-    if not code:
-        return ''
+def tdb_entries(code, folder, url=TDB):
+    """GameTDB's list of 3DS games (3dstdb.zip, fetched into folder the first time): the entries of this game in every region, those whose
+    code starts with the same three letters (AGGP's: AGGE, AGGJ, AGGP), as (code, element), each element cleared once the next is asked
+    for; none if the list can't be had"""
     path = os.path.join(folder, '3dstdb.zip')
     if not os.path.isfile(path):
         try:
@@ -107,25 +106,47 @@ def released(product, folder, url=TDB):
             with open(path + '.part', 'wb') as f:
                 f.write(data)
             os.replace(path + '.part', path)
-        except (OSError, http.client.HTTPException, zipfile.BadZipFile):  # no connection, no such file, or cut short: no year this build
-            return ''
+        except (OSError, http.client.HTTPException, zipfile.BadZipFile):  # no connection, no such file, or cut short: nothing this time
+            return
     try:
         with zipfile.ZipFile(path) as z:
             xml = next((n for n in z.namelist() if n.lower().endswith('.xml')), None)
             if not xml:
-                return ''
+                return
             for _, e in ElementTree.iterparse(io.BytesIO(z.read(xml))):
                 if e.tag != 'game':
                     continue
-                if (e.findtext('id') or '').strip().upper().startswith(code):
-                    year = (e.find('date').get('year') if e.find('date') is not None else '') or ''
-                    if not year.isdigit():
-                        return ''
-                    return f'Released in {PLACES[code[3]]}: {year}' if code[3] in PLACES else f'Released: {year}'
+                gid = (e.findtext('id') or '').strip().upper()
+                if gid[:3] == code[:3]:
+                    yield gid, e
                 e.clear()
     except (OSError, zipfile.BadZipFile, ElementTree.ParseError):
+        return
+
+
+def released(product, folder, url=TDB):
+    """'Released in North America: 2011' for the game of this product code, from GameTDB's list of 3DS games, or '' if the list has no year
+    for it or can't be had"""
+    code = game_code(product)
+    if not code:
         return ''
+    for gid, e in tdb_entries(code, folder, url):
+        if gid.startswith(code):
+            year = (e.find('date').get('year') if e.find('date') is not None else '') or ''
+            if not year.isdigit():
+                return ''
+            return f'Released in {PLACES[code[3]]}: {year}' if code[3] in PLACES else f'Released: {year}'
     return ''
+
+
+def other_names(product, folder, url=TDB):
+    """the game's English names in GameTDB's other regions (AGGP's "Luigi's Mansion 2" is North America's "Luigi's Mansion: Dark Moon"),
+    North America's first: a site may know a game by another region's name"""
+    code = game_code(product)
+    if not code:
+        return []
+    found = [(gid, (e.findtext("locale[@lang='EN']/title") or '').strip()) for gid, e in tdb_entries(code, folder, url) if gid[:4] != code]
+    return list(dict.fromkeys(name for _, name in sorted(found, key=lambda f: f[0][3:4] != 'E') if name))
 
 
 def plain(name):
@@ -153,18 +174,31 @@ def first(items, sizes):
     return None
 
 
-def steamgriddb(name, key, folder, title_id, base=SGDB):
+def steamgriddb(name, key, folder, title_id, base=SGDB, also=None):
     """This game's banner and icon from SteamGridDB, as {'banner': path or None, 'icon': path or None}, downloaded into folder if they
-    aren't there yet. The game is the one of that name, or the first whose name holds it or is held by it (a subtitle more or less): the
-    site's other answers are other games. None without a connection; BadKey if the key is wrong."""
+    aren't there yet. The game is the one of that name, or of one of its names elsewhere (also: a function giving them, asked only when the
+    site has nothing by this one), or else the first whose name holds one of them or is held by one (a subtitle more or less): the site's
+    other answers are other games. None without a connection; BadKey if the key is wrong."""
     stems = {what: os.path.join(folder, f'sgdb_{title_id}_{what}') for what in ('banner', 'icon')}
     have = {what: kept(stem) for what, stem in stems.items()}
     if all(have.values()):
         return have
     try:
-        games = asked('/search/autocomplete/' + urllib.parse.quote(name, safe=''), key, base)
-        names = [(plain(g.get('name', '')), g) for g in games]
-        game = next((g for n, g in names if n == plain(name)), next((g for n, g in names if n and (n in plain(name) or plain(name) in n)), None))
+        answers = []  # (a name of the game, the site's games for it)
+
+        def ask(n):
+            """the site's games for this name, kept in answers: whether one has exactly that name"""
+            wanted = plain(n)
+            games = [(plain(g.get('name', '')), g) for g in asked('/search/autocomplete/' + urllib.parse.quote(n, safe=''), key, base)]
+            answers.append((wanted, games))
+            return any(found == wanted for found, _ in games)
+
+        if not ask(name) and also:
+            for other in also():
+                if plain(other) not in (wanted for wanted, _ in answers) and ask(other):
+                    break
+        game = next((g for wanted, games in answers for found, g in games if found == wanted),
+                    next((g for wanted, games in answers for found, g in games if found and (found in wanted or wanted in found)), None))
         if not game:
             return have
         filters = 'types=static&nsfw=false&humor=false&mimes=image/png,image/jpeg'

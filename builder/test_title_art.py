@@ -1,5 +1,6 @@
 """Self-check for the start-up screens in the Virtual Console's manner (tools/make_game_title.py, console_screens): their sizes, the band and the
-art where they go, a GameTDB case scan's strip left out and its whole height kept, the release line, and the names read from a made-up SMDH. Run: python builder/test_title_art.py"""
+art where they go, a GameTDB case scan's strip left out and its whole height kept, the release line, and the names read from a made-up SMDH;
+and the GamePad's bezel picture (bezel_pixels): its size, scale, cut, row order and see-through parts. Run: python builder/test_title_art.py"""
 import os
 import struct
 import sys
@@ -90,4 +91,26 @@ with tempfile.TemporaryDirectory() as tmp:
 
     open(os.path.join(tmp, 'bad.png'), 'wb').write(b'not a picture')
     assert title.console_screens(os.path.join(tmp, 'bad.png'), icon) is None
+
+    # the GamePad's bezel: 854x480 RGBA, row 0 the top. A 3416x960 picture is halved, then cut at its sides and centred; its top rows yellow,
+    # a see-through part black.
+    wide = QImage(3416, 960, QImage.Format_RGBA8888)
+    wide.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(wide)
+    painter.fillRect(0, 0, 854, 960, QColor(255, 0, 0))  # cut off
+    painter.fillRect(854, 0, 1708, 960, QColor(0, 0, 255))  # kept: the middle
+    painter.fillRect(2562, 0, 854, 960, QColor(255, 0, 0))  # cut off
+    painter.fillRect(854, 0, 1708, 40, QColor(255, 255, 0))  # the top rows
+    painter.setCompositionMode(QPainter.CompositionMode_Source)
+    painter.fillRect(854, 0, 200, 960, QColor(0, 255, 0, 0))  # see-through within it
+    painter.end()
+    wide_path = os.path.join(tmp, 'bezel.png')
+    assert wide.save(wide_path)
+    px = title.bezel_pixels(wide_path)
+    assert px and len(px) == 854 * 480 * 4, len(px or b'')
+    at = lambda x, y: tuple(px[(y * 854 + x) * 4:(y * 854 + x) * 4 + 4])
+    assert at(2, 2)[:3] == (0, 0, 0) and at(50, 240) == (0, 0, 0, 255), 'a see-through part is not black'
+    assert near(at(400, 5)[:3], (255, 255, 0)) and near(at(400, 470)[:3], (0, 0, 255)), ('upside down, or not scaled', at(400, 5), at(400, 470))
+    assert near(at(850, 240)[:3], (0, 0, 255)), ('not cut at the sides', at(850, 240))
+    assert title.bezel_pixels(os.path.join(tmp, 'bad.png')) is None
 print('title art: ok')

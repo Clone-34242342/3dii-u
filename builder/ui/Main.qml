@@ -22,7 +22,7 @@ ApplicationWindow {
     // device pixels per design pixel, what layers render at to stay sharp: at most 2 (memory on old integrated GPUs), in half steps so a
     // resize reallocates them a few times, not at every pixel
     readonly property real px: Math.min(2, Math.ceil(s * Screen.devicePixelRatio * 2) / 2)
-    readonly property bool blocked: dialogLayer.visible || cardMenu.visible  // the shortcuts wait while a dialog or the card menu is open
+    readonly property bool blocked: dialogLayer.visible || cardMenu.visible || artMenu.visible  // the shortcuts wait while a dialog or a menu is open
     property string page: "build"
     readonly property bool restarting: app.updateState === "restarting"
     readonly property bool busy: app.building || restarting  // the game controls wait while a build runs or the new version starts
@@ -190,7 +190,7 @@ ApplicationWindow {
         signal clicked
         implicitWidth: Math.max(102, ink_.implicitWidth + 30)
         implicitHeight: 42
-        opacity: enabled || win.blocked ? 1 : 0.45  // under a dialog or the card menu the page is out of reach but keeps its look
+        opacity: enabled || win.blocked ? 1 : 0.45  // under a dialog or a menu the page is out of reach but keeps its look
         Item {
             anchors.fill: parent
             anchors.topMargin: ma.pressed ? 1 : 0
@@ -207,6 +207,26 @@ ApplicationWindow {
         }
         Hit { id: ma; name: p.accessibleName; description: p.tip; ringRadius: p.height / 2; onActivated: p.clicked() }
         Tip { visible: ma.containsMouse && p.tip.length > 0; text: p.tip }
+    }
+
+    // a line of the Art pill's menu: what it does, and on the right what's chosen now
+    component ArtEntry: Rectangle {
+        id: e
+        property string label
+        property string chosen
+        property bool danger: false
+        signal picked
+        function focusIn() { entryHit.forceActiveFocus() }
+        width: 356; height: 42; radius: 21
+        color: entryHover.hovered ? pal.gloss : "transparent"
+        HoverHandler { id: entryHover }
+        Label { x: 16; anchors.verticalCenter: parent.verticalCenter; text: e.label; color: e.danger ? pal.redText : pal.label; font.pixelSize: 17 }
+        Label {
+            anchors.right: parent.right; anchors.rightMargin: 16; anchors.verticalCenter: parent.verticalCenter
+            width: 130; horizontalAlignment: Text.AlignRight; elide: Text.ElideMiddle
+            text: e.chosen; color: pal.subLabel; font.pixelSize: 14
+        }
+        Hit { id: entryHit; ringRadius: 21; name: e.label; description: e.chosen; role: Accessible.MenuItem; onActivated: e.picked() }
     }
 
     // a glossy status light in a grey socket ring: red = none or missing, cyan = chosen or found, grey = optional and absent
@@ -419,9 +439,9 @@ ApplicationWindow {
 
         Item {
         id: pages
-        objectName: "pages"  // test_window.py checks it is out of reach under the card menu
+        objectName: "pages"  // test_window.py checks it is out of reach under the menus
         anchors.fill: parent
-        enabled: !win.blocked  // Tab stays in the dialog or the card menu
+        enabled: !win.blocked  // Tab stays in the dialog or the menu
 
         // ---- the rail: logo, Build, Games, Help
         // the rail is rounded on its right: each block that meets a rounded corner is a rounded rectangle with its other corner squared off
@@ -519,7 +539,7 @@ ApplicationWindow {
             anchors.fill: parent
             Item { id: buildStart }
             visible: win.page === "build"
-            readonly property string art: app.hasArt ? app.artUrl : app.icon
+            readonly property string art: app.tileUrl || app.icon
 
             Rectangle {
                 x: 250; y: 470; width: 368; height: 80; radius: 75
@@ -568,8 +588,7 @@ ApplicationWindow {
                     visible: app.hasGame && !app.building
                     enabled: !win.restarting
                     Pill { text: "Change game"; onClicked: app.chooseGame() }
-                    Pill { text: "Art"; tip: app.artText; onClicked: app.chooseArt() }
-                    Pill { text: "Remove art"; tone: "red"; visible: app.hasArt; onClicked: app.removeArt() }
+                    Pill { id: artPill; text: "Art"; accessibleName: "Art and icon"; tip: app.artText; onClicked: artMenu.openAt(artPill) }
                 }
                 ProgressPill {
                     anchors.horizontalCenter: parent.horizontalCenter
@@ -1034,6 +1053,33 @@ ApplicationWindow {
                 }
             }
         }
+
+        // ---- the game's pictures, under the Art pill: the start-up screens', the Wii U Menu icon's (each its own if the player likes) and
+        // the GamePad's bezel
+        Item {
+            id: artMenu
+            objectName: "artMenu"  // test_window.py opens it
+            anchors.fill: parent
+            visible: false
+            property point at
+            function openAt(item) { at = item.mapToItem(surface, item.width, item.height + 6); visible = true; artFirst.focusIn() }
+            MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; onClicked: artMenu.visible = false; onWheel: (wheel) => wheel.accepted = true }
+            Item {
+                x: Math.max(10, Math.min(artMenu.at.x - width, 1270 - width)); y: Math.max(10, Math.min(artMenu.at.y, 710 - height))
+                width: 380; height: artCol.height + 24
+                GlassFace { anchors.fill: parent; radius: 24; glossEdge: 40; bulge: 14 }
+                Column {
+                    id: artCol
+                    x: 12; y: 12; width: 356
+                    ArtEntry { id: artFirst; label: "Start-up screen art..."; chosen: app.artText; onPicked: { artMenu.visible = false; app.chooseArt() } }
+                    ArtEntry { label: "Wii U Menu icon..."; chosen: app.iconText; onPicked: { artMenu.visible = false; app.chooseIcon() } }
+                    ArtEntry { label: "GamePad bezel..."; chosen: app.bezelText; onPicked: { artMenu.visible = false; app.chooseBezel() } }
+                    ArtEntry { label: "Remove the bezel"; danger: true; visible: app.hasBezel; onPicked: { artMenu.visible = false; app.removeBezel() } }
+                    ArtEntry { label: "Remove the icon picture"; danger: true; visible: app.hasIconArt; onPicked: { artMenu.visible = false; app.removeIcon() } }
+                    ArtEntry { label: "Remove the art and icon"; danger: true; visible: app.hasArt; onPicked: { artMenu.visible = false; app.removeArt() } }
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------- a question or a message, over the dimmed window
@@ -1092,5 +1138,5 @@ ApplicationWindow {
     Shortcut { sequences: [StandardKey.Open]; enabled: !win.blocked; onActivated: { win.page = "build"; app.chooseGame() } }
     Shortcut { sequence: "F1"; enabled: !win.blocked; onActivated: win.page = "help" }
     Shortcut { sequences: ["Return", "Enter"]; enabled: dialogLayer.visible && !noPill.hasFocus; onActivated: app.answer(true) }
-    Shortcut { sequence: "Escape"; enabled: dialogLayer.visible || cardMenu.visible; onActivated: dialogLayer.visible ? app.answer(false) : cardMenu.visible = false }
+    Shortcut { sequence: "Escape"; enabled: win.blocked; onActivated: dialogLayer.visible ? app.answer(false) : cardMenu.visible = artMenu.visible = false }
 }

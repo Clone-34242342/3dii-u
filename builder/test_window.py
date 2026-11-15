@@ -16,7 +16,7 @@ if sys.platform == 'win32':
     os.environ['QT_QPA_FONTDIR'] = os.path.join(os.environ.get('WINDIR', r'C:\Windows'), 'Fonts')  # Qt ships no fonts for the offscreen platform
 sys.path.insert(0, HERE)
 
-from PySide6.QtCore import QCoreApplication, QMetaObject, QObject, QUrl, qInstallMessageHandler  # noqa: E402
+from PySide6.QtCore import Q_ARG, QCoreApplication, QMetaObject, QObject, QUrl, qInstallMessageHandler  # noqa: E402
 from PySide6.QtGui import QColor, QImage  # noqa: E402
 from PySide6.QtQuick import QQuickWindow  # noqa: E402
 import shiboken6  # noqa: E402
@@ -89,6 +89,14 @@ try:
     settle('the card menu')
     assert not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the card menu'
     menu.setProperty('visible', False)
+    state.set(hasGame=True, hasArt=True, hasIconArt=True, hasBezel=True, artText='A picture.png', iconText='An icon.png', bezelText='A bezel.png')  # every line of the art menu
+    menu = win.findChild(QObject, 'artMenu')
+    art_pill = next(p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'pill' and p.property('accessibleName') == 'Art and icon')
+    QMetaObject.invokeMethod(menu, 'openAt', Q_ARG('QVariant', art_pill))  # as the pill does: under it, its first line focused
+    settle('the art menu')
+    assert menu.property('visible') and not win.findChild(QObject, 'pages').property('enabled'), 'Tab reaches the pages behind the art menu'
+    menu.setProperty('visible', False)
+    state.set(hasGame=False, hasArt=False, hasIconArt=False, hasBezel=False, artText=gui.NO_ART, iconText=gui.NO_ART, bezelText=gui.NO_BEZEL)
     stages = ['Reading', 'Recompiling', 'Packing']
     for view in ('building', 'done', 'failed', 'form'):
         state.set(view=view, stages=stages, stage=1, failed=view == 'failed', building=view == 'building', resultText='x', log='a\nb')
@@ -317,7 +325,7 @@ try:
     gui.covers.cover = lambda product, folder: cover
 
     def pick(found, key='a key'):
-        def site(name, key, folder, title_id):
+        def site(name, key, folder, title_id, also=None):
             if found is None:
                 raise gui.covers.BadKey
             return found
@@ -327,31 +335,65 @@ try:
         state.fetch_cover(picked, 'A game')
         return state.art, state.icon_art, state.artText
 
-    assert pick(dict(banner=banner, icon=square)) == (banner, square, 'Its art, from SteamGridDB')
-    assert pick(dict(banner=banner, icon=None)) == (banner, cover, 'Its art, from GameTDB and SteamGridDB')
-    assert pick(dict(banner=None, icon=square)) == (cover, square, 'Its art, from GameTDB and SteamGridDB')
-    assert pick(dict(banner=None, icon=None)) == (cover, None, 'Its art, from GameTDB')
-    assert pick(dict(banner=banner, icon=square), key='') == (cover, None, 'Its art, from GameTDB'), 'SteamGridDB asked without a key'
-    assert pick(None) == (cover, None, 'Its art, from GameTDB') and 'SteamGridDB' in state.dialog['title']
+    assert pick(dict(banner=banner, icon=square)) == (banner, square, gui.FROM_SGDB) and state.iconText == gui.FROM_SGDB
+    assert pick(dict(banner=banner, icon=None)) == (banner, cover, gui.FROM_SGDB) and state.iconText == gui.FROM_TDB
+    assert pick(dict(banner=None, icon=square)) == (cover, square, gui.FROM_TDB) and state.iconText == gui.FROM_SGDB
+    assert pick(dict(banner=None, icon=None)) == (cover, None, gui.FROM_TDB) and state.iconText == gui.NO_ICON_ART
+    assert pick(dict(banner=banner, icon=square), key='') == (cover, None, gui.FROM_TDB), 'SteamGridDB asked without a key'
+    assert pick(None) == (cover, None, gui.FROM_TDB) and 'SteamGridDB' in state.dialog['title']
     state.answer(True)
-    assert pick(None) == (cover, None, 'Its art, from GameTDB') and not state.dialog, 'a key turned down is said once, not for every game'
+    assert pick(None) == (cover, None, gui.FROM_TDB) and not state.dialog, 'a key turned down is said once, not for every game'
 
     # a new key fetches the open game's art again, unless the player chose its picture or removed it on purpose
     asked_again = threading.Event()
+    fetch_cover = state.fetch_cover
     state.fetch_cover = lambda *a: asked_again.set()
     gui.QInputDialog.getText = lambda *a, **k: (' another key ', True)
-    state.set_art(None)  # removed: '' is remembered for the game
+    state.set_art(None, removed=True)  # removed: '' is remembered for the game
     state.setArtKey()
     assert state.st['sgdb_key'] == 'another key' and state.artKeySet and not asked_again.wait(0.3), 'art removed on purpose came back'
     state.set_art(art)  # the player's own picture
     state.setArtKey()
     assert not asked_again.wait(0.3) and state.art == art, "the player's own picture was dropped"
-    state.set_art(cover)
+    own_icon = os.path.join(base, 'icon.png')
+    img.save(own_icon)
+    state.set_art(cover, own_icon)  # GameTDB's cover with an icon the player picked: the cover is looked up again, the icon stays
     state.setArtKey()
     assert asked_again.wait(5), "GameTDB's cover wasn't looked up again with the new key"
+    assert state.icon_art == own_icon, 'a new key dropped the icon the player picked'
     gui.QInputDialog.getText = lambda *a, **k: ('', True)
     state.setArtKey()
     assert state.st['sgdb_key'] == '' and not state.artKeySet
+    state.fetch_cover = fetch_cover
+
+    # An icon picture of its own. Each line says what its own picture is; choosing the art keeps an icon the player picked, not a fetched one;
+    # removing the icon keeps the art; an icon picked with no art leaves the game's art to be fetched, and fetched art keeps that icon.
+    title = f'{picked.title_id:016x}'
+    chosen = iter([art, cover, own_icon, art])
+    gui.QFileDialog.getOpenFileName = lambda *a, **k: (next(chosen), '')
+    state.set_art(None, remember=False)
+    state.chooseIcon()
+    assert state.icon_art == art and state.art is None and state.hasIconArt and (state.iconText, state.artText) == (os.path.basename(art), gui.NO_ART)
+    assert title not in state.st['art'], 'an icon picked with no art marked the art as removed on purpose'
+    state.chooseArt()
+    assert state.art == cover and state.icon_art == art and (state.artText, state.iconText) == (gui.FROM_TDB, os.path.basename(art))
+    state.removeIcon()
+    assert state.icon_art is None and state.art == cover and not state.hasIconArt and state.iconText == gui.NO_ICON_ART
+    state.set_art(banner, square)  # SteamGridDB's banner and icon: art the player chooses now replaces both
+    state.chooseIcon()  # own_icon
+    state.set_art(None, own_icon)  # and with no art, what's fetched for it comes in beside that icon
+    state.cover_ready(title, banner, square)
+    assert (state.art, state.icon_art) == (banner, own_icon), 'fetched art took the place of the icon the player picked'
+    state.set_art(banner, square)
+    state.chooseArt()  # art
+    assert (state.art, state.icon_art) == (art, None) and state.artText == os.path.basename(art), "a fetched icon stayed beside the player's art"
+
+    # the GamePad's bezel: chosen, kept for the game, removed
+    gui.QFileDialog.getOpenFileName = lambda *a, **k: (cover, '')
+    state.chooseBezel()
+    assert state.bezel == cover and state.hasBezel and state.bezelText == os.path.basename(cover) and json.load(open(settings))['pad_bezel'][title] == cover
+    state.removeBezel()
+    assert state.bezel is None and not state.hasBezel and state.bezelText == gui.NO_BEZEL and title not in json.load(open(settings))['pad_bezel']
     state.game = None
 
     # the simple window (ui/Simple.qml): asked for, kept in the settings, and it loads cleanly with every app.<name> it uses on App, a

@@ -16,7 +16,10 @@ import covers  # noqa: E402
 
 PNG, JPG = b'\x89PNG\r\n\x1a\n' + bytes(32), b'\xff\xd8\xff\xe0' + bytes(32)
 GAMES = {'pokemon ultra': [{'id': 7, 'name': 'Pokémon Ultra Moon'}, {'id': 8, 'name': 'Pokemon Ultra Sun'}],
-         'bare': [{'id': 9, 'name': 'Bare'}]}
+         'bare': [{'id': 9, 'name': 'Bare'}],
+         # Europe's name finds only the Switch remake, a subtitle more; North America's finds the game itself (art as id 8's)
+         "luigi's mansion 2": [{'id': 11, 'name': "Luigi's Mansion 2 HD"}],
+         "luigi's mansion: dark": [{'id': 8, 'name': "Luigi's Mansion: Dark Moon"}]}
 asked = []
 cut = []  # when set, GameTDB's list comes short: this many bytes of it, and a length that promises all
 
@@ -39,7 +42,13 @@ class Site(http.server.BaseHTTPRequestHandler):
             z = io.BytesIO()
             with zipfile.ZipFile(z, 'w') as f:
                 f.writestr('3dstdb.xml', '<datafile><WiiTDB version="1"/><game name="Mario Kart 7"><id>AMKE</id><date year="2011" month="12" day="4"/></game>'
-                                         '<game name="Undated"><id>BXXP</id><date year="" month="" day=""/></game></datafile>')
+                                         '<game name="Undated"><id>BXXP</id><date year="" month="" day=""/></game>'
+                                         '<game name="LM2 (J)"><id>AGGJ</id><locale lang="EN"><title>Luigi Mansion 2</title></locale></game>'
+                                         '<game name="LM2 (E)"><id>AGGP</id><locale lang="EN"><title>Luigi\'s Mansion 2</title></locale></game>'
+                                         '<game name="LM2 (U)"><id>AGGE</id><locale lang="EN"><title>Luigi\'s Mansion: Dark Moon</title></locale></game>'
+                                         '<game name="LM2 (K)"><id>AGGK</id><locale lang="KO"><title>x</title></locale></game>'
+                                         '<game name="LM2 (T)"><id>AGGW</id><locale lang="EN"><title>Luigi\'s Mansion: Dark Moon</title></locale></game>'
+                                         '<game name="Short"><id>AG</id></game></datafile>')
             if cut:
                 self.send_response(200)
                 self.send_header('Content-Length', str(len(z.getvalue())))
@@ -103,6 +112,14 @@ with tempfile.TemporaryDirectory() as tmp:
         raise AssertionError('a wrong key went through')
     except covers.BadKey:
         pass
+    # a game the site knows by another region's name: that name's exact game, not this one's remake, and no name asked past it
+    others = []
+    lm2 = covers.steamgriddb("Luigi's Mansion 2", 'good', tmp, 'lm2', base, also=lambda: others.append(1) or ["Luigi's Mansion: Dark Moon", 'Luigi Mansion 2'])
+    assert lm2 == {'banner': os.path.join(tmp, 'sgdb_lm2_banner.jpg'), 'icon': os.path.join(tmp, 'sgdb_lm2_icon.png')} and others == [1], lm2
+    assert '/search/autocomplete/Luigi Mansion 2' not in asked and '/grids/game/11' not in asked, asked
+    # the other names are asked for only where this one finds nothing exactly
+    covers.steamgriddb('Pokémon Ultra Sun', 'good', tmp, 'us2', base, also=lambda: others.append(2) or [])
+    assert others == [1], others
     # the year a game came out, from GameTDB's list, fetched once; a game it has without a year, or not at all, gets no line
     tdb = base + '/3dstdb.zip'
     elsewhere = os.path.join(tmp, 'short')
@@ -117,6 +134,9 @@ with tempfile.TemporaryDirectory() as tmp:
     assert covers.released('CTR-N-AMKP', tmp, tdb) == '' and covers.released('CTR-P-BXXP', tmp, tdb) == '' and covers.released('x', tmp, tdb) == ''
     assert len(asked) == before  # kept: nothing asked again
     assert covers.released('CTR-P-AMKE', os.path.join(tmp, 'elsewhere'), base + '/nothing.zip') == ''  # nothing there
+    # the game's names in the other regions, North America's first, its own left out, each once, none without an English title
+    assert covers.other_names('CTR-P-AGGP', tmp, tdb) == ["Luigi's Mansion: Dark Moon", 'Luigi Mansion 2'], covers.other_names('CTR-P-AGGP', tmp, tdb)
+    assert covers.other_names('CTR-P-AMKE', tmp, tdb) == [] and covers.other_names('x', tmp, tdb) == []
     server.shutdown()
     server.server_close()
     assert covers.steamgriddb('bare', 'good', tmp, 'offline', base) is None  # no connection, nothing kept

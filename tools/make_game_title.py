@@ -218,7 +218,29 @@ def write_art_tga(path, rows, bpp):
         f.write(header + bytes(pixels) + TGA_FOOTER + (bytes(4) if bpp == 24 else b''))
 
 
-def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False):
+PAD_W, PAD_H = 854, 480  # the GamePad's screen
+
+
+def bezel_pixels(path):
+    """A picture for the GamePad where it shows no screen (gx2_backend.cpp, pad_bezel), filling 854x480 (scaled to cover it, centred, the
+    overflow cut off) over black, as RGBA bytes row by row; None if it can't be read. Read with Qt, which the builder carries."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QColor, QImage, QPainter
+    src = QImage(path)
+    if src.isNull():
+        return None
+    cover = src.scaled(PAD_W, PAD_H, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+    canvas = QImage(PAD_W, PAD_H, QImage.Format_RGBA8888)
+    canvas.fill(QColor(0, 0, 0))  # what a picture leaves see-through is black, as without one
+    painter = QPainter(canvas)
+    painter.drawImage(0, 0, cover, (cover.width() - PAD_W) // 2, (cover.height() - PAD_H) // 2, PAD_W, PAD_H)
+    painter.end()
+    stride, data = canvas.bytesPerLine(), bytes(canvas.constBits())
+    return b''.join(data[y * stride:y * stride + PAD_W * 4] for y in range(PAD_H))
+
+
+def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False,
+               pad_bezel=None):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
     art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
     picture for the icon alone (a square one, where art is a wide banner). style: 'picture' shows art as it is on the start-up screens,
@@ -280,6 +302,12 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
             f.write(font)
     for f in ('shaders.gsh', 'shaders.idx'):
         shutil.copyfile(os.path.join(shaders, f), os.path.join(content, f))
+    bezel = bezel_pixels(pad_bezel) if pad_bezel else None
+    if bezel:  # the GamePad's picture where no screen is: the console reads its bytes as they are
+        with open(os.path.join(content, 'pad_bezel.rgba'), 'wb') as f:
+            f.write(bezel)
+    elif pad_bezel:
+        print(f'the picture {pad_bezel} could not be read: the GamePad stays black beside the screens')
     print('title folder:', title)
 
 

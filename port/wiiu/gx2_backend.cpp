@@ -1287,6 +1287,31 @@ GX2Sampler *get_sampler(const TexUnitState &t, u32 levels) {
 }
 
 GX2Texture black_tex;
+// The picture the GamePad shows where no screen is: a bezel or overlay the player chose in the builder, which tools/make_game_title.py puts in
+// the title as 854x480 RGBA bytes (pad_bezel.rgba). Without one its image stays null, and those parts are black.
+GX2Texture pad_bezel;
+constexpr u32 PAD_W = 854, PAD_H = 480;  // the GamePad's screen, the bezel's size
+void load_pad_bezel() {
+    const std::vector<u8> b = read_whole("fs:/vol/content/pad_bezel.rgba", 0);
+    if (b.size() != PAD_W * PAD_H * 4) return;
+    GX2Surface &s = pad_bezel.surface;
+    s.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    s.width = PAD_W;
+    s.height = PAD_H;
+    s.depth = s.mipLevels = 1;
+    s.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    s.aa = GX2_AA_MODE1X;
+    s.use = GX2_SURFACE_USE_TEXTURE;
+    s.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    pad_bezel.viewNumMips = pad_bezel.viewNumSlices = 1;
+    pad_bezel.compMap = 0x00010203;
+    GX2CalcSurfaceSizeAndAlignment(&s);
+    GX2InitTextureRegs(&pad_bezel);
+    s.image = memalign(s.alignment, s.imageSize);
+    if (!s.image) return;
+    for (u32 y = 0; y < PAD_H; y++) memcpy((u8 *)s.image + (size_t)y * s.pitch * 4, &b[(size_t)y * PAD_W * 4], PAD_W * 4);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, s.image, s.imageSize);
+}
 GX2Sampler lut_sampler;
 
 GX2Texture make_float_lut(u32 w, u32 h) {
@@ -2863,7 +2888,6 @@ volatile int tv_layout, pad_layout;  // the menu's (input thread)
 int tv_layout_shown = -1;            // what the TV buffer has been drawn for (GPU thread): another clears it first
 using screens::Rect;
 
-void set_blit_colors(float r, float g2, float b, float add_r, float add_g, float add_b);
 void draw_rect(u32 w, u32 h, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1);
 
 void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_hi = 1, float u_hi = 1) {
@@ -2894,15 +2918,15 @@ void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_
         GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
         cur_color = nullptr;
         begin_blit();
-        // black beside the screen in its rows: what another layout, the menu or the keyboard left there goes, and never the other screen
+        // beside the screen in its rows, the bezel picture, or black: what another layout, the menu or the keyboard left there goes, and never
+        // the other screen
         GX2SetViewport(0, 0, (float)dw, (float)dh, 0, 1);
         GX2SetScissor(0, 0, dw, dh);
-        GX2SetPixelTexture(&black_tex, 0);
+        GX2SetPixelTexture(pad_bezel.surface.image ? &pad_bezel : &black_tex, 0);
         GX2SetPixelSampler(&blit_sampler, 0);
-        set_blit_colors(0, 0, 0, 0, 0, 0);
-        draw_rect(dw, dh, 0, (float)band0, (float)r.x, (float)band1, 0, 0, 1, 1);
-        draw_rect(dw, dh, (float)(r.x + r.w), (float)band0, (float)dw, (float)band1, 0, 0, 1, 1);
-        set_blit_colors(1, 1, 1, 0, 0, 0);
+        const float v0 = (float)band0 / dh, v1 = (float)band1 / dh, u_left = (float)r.x / dw, u_right = (float)(r.x + r.w) / dw;
+        draw_rect(dw, dh, 0, (float)band0, (float)r.x, (float)band1, 0, v0, u_left, v1);
+        draw_rect(dw, dh, (float)(r.x + r.w), (float)band0, (float)dw, (float)band1, u_right, v0, 1, v1);
         draw_screen(sc, r.x, r.y, r.w, r.h);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     }
@@ -3455,6 +3479,7 @@ void gfx_thread_init() {
     drc_cb = WHBGfxGetDRCColourBuffer();
     tv_buffer_to_mem2();
     load_shader_tables();
+    load_pad_bezel();
     shader_compile_init();  // what the set lacks, the console compiles as it goes
     vs_ubo_loc = vs_passthrough->uniformBlockCount ? vs_passthrough->uniformBlocks[0].offset : 0;
     ps_ubo_loc = ps_blit->uniformBlockCount ? ps_blit->uniformBlocks[0].offset : 0;

@@ -65,7 +65,7 @@ inline bool tv_rect(int layout, int which, uint32_t tw, uint32_t th, Rect &r) {
 
 // The GamePad's layouts: 0 the bottom screen, which it touches, 1 the top screen, 2 both at the 3DS's own size, the top above the bottom.
 // Where screen `which` goes on a GamePad of dw x dh (854x480), and the rows [band0, band1) it alone has there, which it fills from side to side
-// when drawn (with black beside it); false where the layout leaves it off the GamePad.
+// when drawn (with black, or the game's bezel picture, beside it); false where the layout leaves it off the GamePad.
 constexpr int kPadLayouts = 3;
 inline bool pad_rect(int layout, int which, uint32_t dw, uint32_t dh, Rect &r, uint32_t &band0, uint32_t &band1) {
     switch (layout) {
