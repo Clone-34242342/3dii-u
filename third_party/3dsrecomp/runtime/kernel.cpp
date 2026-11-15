@@ -642,7 +642,9 @@ static u32 svc_control_memory(CPU *c) {
             if (!a) return RES_OUT_OF_MEMORY;
         } else {
             a = addr0;
-            if (a < mem::HEAP_BASE || a + size > mem::STACK_TOP - 0x04000000) {
+            // Extended-memory applications can commit beyond the standard 64 MiB heap.
+            const u32 heap_end = mem::HEAP_BASE + std::max(0x04000000u, g_game.application_memory);
+            if (a < mem::HEAP_BASE || a > heap_end || size > heap_end - a) {
                 LOG("[svc] ControlMemory: bad heap address %08x\n", a);
                 return RES_INVALID_ADDRESS;
             }
@@ -1102,7 +1104,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             bool limit = imm == 0x39;
             switch (name) {
             case 0: v = limit ? 0x18 : 0x18; break;                                   // priority
-            case 1: v = limit ? 0x04000000 : heap_size + linear_used + 0x00400000; break;  // commit
+            case 1: v = limit ? g_game.application_memory : heap_size + linear_used + 0x00400000; break;  // commit
             case 2: v = limit ? 32 : threads.size(); break;
             case 3: v = limit ? 32 : 8; break;
             case 4: v = limit ? 32 : 8; break;

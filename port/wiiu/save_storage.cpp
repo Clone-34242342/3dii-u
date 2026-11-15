@@ -210,9 +210,12 @@ void save_flush(bool now) {
     const bool mine = !account_dir.empty() && under(g_save_base, account_dir);
     fs_begin(0xC007);
     int r = 0;
-    if (!account_dir.empty() && (mine || now)) r = fsa_direct_flush_quota(account_dir.c_str()) ? 0 : flush_quota(&client, &block, account_slot, FS_ERROR_FLAG_ALL);
+    if (!account_dir.empty() && (mine || now) && !fsa_direct_flush_quota(account_dir.c_str(), r))
+        r = flush_quota(&client, &block, account_slot, FS_ERROR_FLAG_ALL);
     if (!mine || now) {
-        const int c = fsa_direct_flush_quota("/vol/save/common") ? 0 : flush_quota(&client, &block, COMMON, FS_ERROR_FLAG_ALL);
+        int c;
+        if (!fsa_direct_flush_quota("/vol/save/common", c))
+            c = flush_quota(&client, &block, COMMON, FS_ERROR_FLAG_ALL);
         if (!r) r = c;
     }
     fs_end();

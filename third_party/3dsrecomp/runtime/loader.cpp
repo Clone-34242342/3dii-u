@@ -27,9 +27,9 @@ static void init_config_mem() {
     w8(c + 0x14, 1);       // unit info: retail
     w8(c + 0x16, 1);       // prev firm
     w32(c + 0x18, 0x0000F297);
-    w32(c + 0x30, 0);      // app memory type: 64 MB
-    w32(c + 0x40, 0x04000000);  // app memory
-    w32(c + 0x44, 0x02C00000);  // system memory
+    w32(c + 0x30, g_game.memory_mode);
+    w32(c + 0x40, g_game.application_memory);
+    w32(c + 0x44, g_game.system_memory);
     w32(c + 0x48, 0x01400000);  // base memory
     w8(c + 0x61, 0);
     w8(c + 0x62, 0x34);
@@ -149,6 +149,12 @@ void load_game(const std::string &dir) {
     memcpy(&g_game.program_id, &ex[0x200], 8);
     g_game.program_id = le64(g_game.program_id);
     g_game.priority = ex[0x20F];
+    // Old 3DS memory modes share 128 MiB, with 20 MiB reserved for base memory.
+    static constexpr u32 application_memory_mb[] = {64, 0, 96, 80, 72, 32};
+    const u32 mode = ex[0x20E] >> 4;
+    g_game.memory_mode = mode < std::size(application_memory_mb) && application_memory_mb[mode] != 0 ? mode : 0;
+    g_game.application_memory = application_memory_mb[g_game.memory_mode] << 20;
+    g_game.system_memory = (108u << 20) - g_game.application_memory;
     u32 base = g_game.text_addr;
     // code.bin is the three segments at their page-aligned offsets
     auto copy = [&](u32 addr, u32 size) {

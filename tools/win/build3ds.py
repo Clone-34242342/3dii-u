@@ -17,6 +17,7 @@ build_layton/<game>/. Needs tools/win/install_toolchain.sh run once, C:\\msys64 
 Game and runtime objects came out byte-identical to the ones WSL's copy of the same compiler made.
 """
 import argparse
+import hashlib
 import ctypes
 import functools
 import glob
@@ -296,6 +297,11 @@ class Game:
         # goes through memory at calls: safe mode. gcc -O2 turns that C into code Cemu's recompiler runs wrong (a compare reused across a jump), so -O1.
         decoder = mobiclip_sites(self.dir)
         safe = len(decoder) >= 8 or coroutine_switches(self.dir) > 0
+        # In Mario Maker USA Rev 3, setjmp and longjmp are in separate functions.
+        # The proximity scan misses the return to the translated setjmp caller.
+        if self.name == 'g_ajhe':
+            with open(self.dir + '/code.bin', 'rb') as code:
+                safe |= hashlib.sha256(code.read()).hexdigest() == '5c107329883fbe0a2738ff0b200506fe8be6b2a236308f8fdff48c51cc6f8fd5'
         self.gen, self.mode, self.opt = ('gen_safe', 'safe', ['-O1']) if safe else ('gen_abi', 'abi', [])
         self.gen_dir = f'{self.dir}/{self.gen}'
         self.safe_ranges = []  # with mode 'abi': address ranges generated the safe way (mixed)

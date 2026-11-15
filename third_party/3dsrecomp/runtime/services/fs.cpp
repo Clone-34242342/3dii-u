@@ -434,6 +434,7 @@ static std::string archive_dir(u32 id, const LowPath &p) {
 struct FileSession : Service {
     int fd = -1;
     bool romfs = false, written = false;
+    bool extdata = false;
     bool gamedata = false;  // read-only game data in a file of its own (an update's RomFS, DLC, system archives, ExeFS files): the RomFS's lock, never behind a save write-out
     u64 base = 0, size = 0;
     std::string path;
@@ -510,6 +511,12 @@ struct FileSession : Service {
             ipc.set(3, (len << 4) | 0xC);
             ipc.set(4, dst);
             if (romfs) romfs_read_delay(ipc, len, spent_ns);
+            if (extdata) {
+                // Azahar's extdata timing keeps these reads asynchronous to
+                // the game. Mario Maker advances its startup after the read.
+                const u64 delay = std::max<u64>((u64)len * 183 + 524879, 631826);
+                if (spent_ns < delay) sleep_current(delay - spent_ns, *ipc.lk);
+            }
             break;
         }
         case 0x0803: {  // Write(offset u64, size, flush, mapped buffer)
@@ -787,6 +794,7 @@ struct FsUser : Service {
 
     u32 open_file(Archive *a, const LowPath &p, u32 flags, ObjPtr *out) {
         auto fs = std::make_shared<FileSession>();
+        fs->extdata = a->id == 6 || a->id == 7;
         if (a->id == 0x2345678A) {
             std::string host = a->host;
             if (a->dlc) {  // the file path: open type, content index, section (0 RomFS), ExeFS name
@@ -885,9 +893,11 @@ struct FsUser : Service {
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             LowPath p = read_path(ipc[4], ipc[5], ipc[9]);
             ObjPtr f;
+            const bool extdata = a->id == 6 || a->id == 7;
             u32 r = open_file(a, p, ipc[6], &f);
             ipc.result(r, 1, 2);
             ipc.handles(2, {f}, true);
+            if (extdata) sleep_current(3085068, *ipc.lk);
             break;
         }
         case 0x0803: {  // OpenFileDirectly

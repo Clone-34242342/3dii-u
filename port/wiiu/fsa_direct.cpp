@@ -6,6 +6,7 @@
 #include <coreinit/cache.h>
 #include <coreinit/filesystem_fsa.h>
 #include <coreinit/ios.h>
+#include <coreinit/debug.h>
 
 #include <cstring>
 
@@ -305,14 +306,26 @@ void fsa_direct_report() {
     else LOG("[fs] file calls go through the system's functions: %s\n", why);
 }
 
-// What SAVEFlushQuota asks for in the end, without the FS layer's hook. false: it wasn't done this way, so do it that way.
-bool fsa_direct_flush_quota(const char *path) {
+// Once direct I/O has been validated, keep quota flushes on that route too.
+// Propagate failures so the save worker retries without entering Aroma's hooked FS layer.
+bool fsa_direct_flush_quota(const char *path, int &result) {
     if (route != DIRECT) return false;
-    static FSAClientHandle client = FSAAddClient(nullptr);
-    if (client < 0) return false;
+    static FSAClientHandle client = -1;  // save worker serializes quota requests
+    if (client < 0) client = FSAAddClient(nullptr);
+    if (client < 0) {
+        result = client;
+        return true;
+    }
     alignas(64) FSAShimBuffer s;
     memset(&s, 0, sizeof s);
     put_path(s.request.flushQuota.path, path);
-    return ask(client, FSA_COMMAND_FLUSH_QUOTA, s) == FS_ERROR_OK;
+    result = ask(client, FSA_COMMAND_FLUSH_QUOTA, s);
+    if (result < 0) {
+        static int last_error;
+        if (result != last_error)
+            OSReport("[3dii-u save] direct quota flush failed: %d\n", result);
+        last_error = result;
+    }
+    return true;
 }
 }  // namespace wiiu
