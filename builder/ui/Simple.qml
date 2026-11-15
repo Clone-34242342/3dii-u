@@ -266,7 +266,11 @@ ApplicationWindow {
                             : app.view === "done" ? app.resultText : ""
                     }
                 }
-                ProgressBar { Layout.fillWidth: true; from: 0; to: 1; value: app.progress; visible: app.view !== "form" }
+                RowLayout {
+                    visible: app.view !== "form"
+                    ProgressBar { Layout.fillWidth: true; from: 0; to: 1; value: app.progress }
+                    Label { text: Math.round(app.progress * 100) + "%"; Layout.preferredWidth: 44; horizontalAlignment: Text.AlignRight }
+                }
                 ScrollView {
                     Layout.fillWidth: true
                     Layout.fillHeight: true

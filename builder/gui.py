@@ -219,7 +219,7 @@ def theme():
     light = {'pageTop': '#ffffff', 'pageBottom': '#eef1f0', 'card': '#cbd2d0', 'gloss': '#dde1e0', 'shadow': '#40000000',
              'title': '#7e8b88', 'sub': '#a8b3b0', 'label': '#6c7976', 'subLabel': '#a3aeab',
              'cyanBase': '#9fdde8', 'cyanText': '#35b5cb', 'redBase': '#eba3aa', 'redText': '#c93a4c', 'greyBase': '#bfc7c5', 'greyText': '#6c7976',
-             'lightRed': '#c9283c', 'lightCyan': '#2fb4cc', 'lightGrey': '#aab4b1', 'socket': '#98a3a0',
+             'lightRed': '#c9283c', 'lightCyan': '#2fb4cc', 'lightGreen': '#3aa856', 'lightGrey': '#aab4b1', 'socket': '#98a3a0',
              'tileGloss': '#ffffff', 'tileBase': '#cdd3d1', 'plus': '#8b9996', 'buildText': '#3c4846',
              'rail': '#e6e9e8', 'railTop': '#dde1e0', 'railActive': '#f3f5f4', 'railLine': '#fbfcfc', 'railEdge': '#cfd5d3', 'railText': '#7b8885',
              'help': '#5c6a67', 'helpActive': '#6e7d7a', 'helpText': '#ffffff', 'helpRing': '#3c4846', 'helpFace': '#ffffff',
@@ -1105,7 +1105,7 @@ class App(QObject):
                     if name in self._s['stages']:
                         self.set(stage=self._s['stages'].index(name))
                 elif line.startswith('@progress '):
-                    self.set(progress=float(line.split()[1]))
+                    self.set(progress=float(line.split()[1]) / 100)  # the pipeline's 0-100; the window's bars go 0 to 1
                 elif line.startswith(('@done ', '@error ')):
                     self.result = line
                 else:

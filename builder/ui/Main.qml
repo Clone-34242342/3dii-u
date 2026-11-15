@@ -46,7 +46,7 @@ ApplicationWindow {
         a = Qt.color(a); b = Qt.color(b)
         return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t, 1)
     }
-    function stageTone(i) { return i < app.stage ? "cyan" : i === app.stage ? (app.failed ? "red" : "cyan") : "grey" }
+    function stageTone(i) { return i < app.stage ? "green" : i === app.stage ? (app.failed ? "red" : "cyan") : "grey" }  // done, now, to come
 
     // ---------------------------------------------------------------- pieces
     // rounded glass: a base with a lighter top whose lower edge bulges down in the middle, and a soft shadow; `content` sits under the gloss.
@@ -229,12 +229,12 @@ ApplicationWindow {
         Hit { id: entryHit; ringRadius: 21; name: e.label; description: e.chosen; role: Accessible.MenuItem; onActivated: e.picked() }
     }
 
-    // a glossy status light in a grey socket ring: red = none or missing, cyan = chosen or found, grey = optional and absent
+    // a glossy status light in a grey socket ring: red = none or missing, cyan = chosen or found, grey = optional and absent, green = a build's step done
     component Light: Item {
         id: l
         property string tone: "grey"
         property bool pulse: false
-        readonly property color hue: tone === "red" ? pal.lightRed : tone === "cyan" ? pal.lightCyan : pal.lightGrey
+        readonly property color hue: tone === "red" ? pal.lightRed : tone === "cyan" ? pal.lightCyan : tone === "green" ? pal.lightGreen : pal.lightGrey
         width: 26; height: 26
         Rectangle {
             anchors.fill: parent
@@ -789,7 +789,8 @@ ApplicationWindow {
                         Item {
                             width: 560; height: 44
                             visible: app.view === "building"
-                            ProgressPill { x: 26; y: 6; width: 508; value: app.progress }
+                            ProgressPill { x: 26; y: 6; width: 448; value: app.progress }
+                            Label { x: 482; y: 3; width: 52; text: Math.round(app.progress * 100) + "%"; horizontalAlignment: Text.AlignRight; color: pal.label; font.pixelSize: 17 }
                             Label { x: 26; y: 26; width: 508; text: app.detail; color: pal.subLabel; font.pixelSize: 15; elide: Text.ElideRight }
                         }
                         Item {
