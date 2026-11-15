@@ -87,10 +87,10 @@ ApplicationWindow {
                 Label {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
-                    text: app.updateState === "available" ? "A newer Builder is out: " + app.updateTitle
-                        : app.updateState === "downloading" ? "Downloading the newer Builder... " + app.updateProgress + "%"
-                        : app.updateState === "unpacking" ? "Unpacking the newer Builder..."
-                        : app.updateState === "ready" ? "The newer Builder is ready. It opens the next time you start the Builder."
+                    text: app.updateState === "available" ? "An update is out: " + app.updateTitle
+                        : app.updateState === "downloading" ? "Downloading the update... " + app.updateProgress + "%"
+                        : app.updateState === "unpacking" ? "Unpacking the update..."
+                        : app.updateState === "ready" ? "The update is ready. It opens the next time you start the Builder."
                         : "The update stopped: " + app.updateMessage
                 }
                 Button { text: "Update"; visible: app.updateState === "available"; onClicked: app.startUpdate() }

@@ -671,7 +671,7 @@ ApplicationWindow {
                         id: updateCard
                         readonly property string st: app.updateState
                         visible: ["available", "downloading", "unpacking", "ready", "restarting", "failed"].indexOf(st) >= 0
-                        title: st === "failed" ? "The update stopped" : "A newer Builder is out"
+                        title: st === "failed" ? "The update stopped" : "An update is out"
                         titleColor: st === "failed" ? pal.redText : pal.title
                         subtitle: app.updateTitle
                         Column {
@@ -991,10 +991,10 @@ ApplicationWindow {
                         readonly property string st: app.updateState
                         readonly property bool offered: ["available", "downloading", "unpacking", "ready", "restarting", "failed"].indexOf(st) >= 0
                         label: app.releaseTag ? "Release " + app.releaseTag : "A test build"
-                        sub: st === "checking" ? "Checking..." : st === "none" ? "No newer version found."  // also what a check that couldn't reach GitHub ends in
-                            : st === "downloading" || st === "unpacking" ? "A newer version is being downloaded."
-                            : st === "ready" || st === "restarting" ? "A newer version is ready."
-                            : offered ? "A newer version is out." : ""
+                        sub: st === "checking" ? "Checking..." : st === "none" ? "Up to date."  // also what a check that couldn't reach GitHub ends in
+                            : st === "downloading" || st === "unpacking" ? "The update is downloading."
+                            : st === "ready" || st === "restarting" ? "The update is ready."
+                            : offered ? "An update is out." : ""
                         Pill { text: "Show"; accessibleName: "Show the update on the Build page"; tone: "cyan"; visible: updatesRow.offered; onClicked: win.page = "build" }
                         Pill { text: "Check for updates"; enabled: app.updateState !== "checking"; onClicked: app.checkUpdate() }
                     }

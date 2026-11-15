@@ -56,7 +56,7 @@ HELP = {
              'Both come from GodMode9 on a 3DS with custom firmware (boot9strap):\n'
              '•  boot9.bin: open [M:] MEMORY VIRTUAL, highlight boot9.bin and press Y. Open [0:] SDCARD, press Y again and choose Copy.\n'
              '•  seeddb.bin: press HOME, choose More..., then Build support files. It lands in gm9/out on the SD card. It holds the seeds of '
-             'the games installed on that 3DS, which newer eShop games need.\n\n'
+             'the games installed on that 3DS, which some eShop games need.\n\n'
              'On the PC, put both in one folder, .3ds in your user folder by default, or press "Folder" and choose where they are.'),
     'otp': ('Wii U otp.bin',
             'A small file (exactly 1024 bytes) from your own Wii U. The game is packed with a key from it so your console installs it. The '
