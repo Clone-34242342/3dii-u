@@ -170,7 +170,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     opacity: 0.85
-                    text: "A mod is one made for Luma on a 3DS: a .zip or a folder with luma/titles/<title id>/ in it. Plugins (.3gx) can't be built in."
+                    text: "Mods made for Luma on a 3DS work: a .zip or a folder with luma/titles/<title id>/ inside. Plugins (.3gx) aren't supported."
                 }
                 Item { Layout.fillHeight: true }
             }

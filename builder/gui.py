@@ -38,11 +38,11 @@ DUMPS = '3DS games (*.3ds *.cci *.cia *.cxi *.app);;All files (*.*)'
 DUMP_EXTS = ('.3ds', '.cci', '.cia', '.cxi', '.app')
 STAGE_OF = {n: i for i, (n, _) in enumerate(pipeline.STAGES)}
 NO_ART = "The game's own icon"
-NO_ICON_ART = 'The same as the art'  # the Wii U Menu icon without a picture of its own
+NO_ICON_ART = 'Same as the art'  # the Wii U Menu icon without a picture of its own
 NO_BEZEL = 'Black'  # the GamePad beside the screens without a picture
-NO_PAD_ART = 'The same as the TV'  # the GamePad's start-up screen without a picture of its own
-NO_SAVE = 'None: the game starts a save of its own'  # no 3DS save packed in
-NO_GAME_SOUND = 'The one for all games'  # a game without a start-up sound of its own: the one for every game, if there is one
+NO_PAD_ART = 'Same as the TV'  # the GamePad's start-up screen without a picture of its own
+NO_SAVE = 'None'  # no 3DS save packed in
+NO_GAME_SOUND = 'Same as all games'  # a game without a start-up sound of its own: the one for every game, if there is one
 BOOT_SOUND = os.path.join(os.path.dirname(pipeline.ARCHIVES), 'boot_sound.btsnd')  # where every build picks it up (tools/make_game_title.py)
 GAME_SOUNDS = os.path.join(os.path.dirname(BOOT_SOUND), 'boot_sounds')  # a game's own, <title id>.btsnd
 LIBRARY_MAX = 40  # games the Games page remembers
@@ -570,7 +570,7 @@ class App(QObject):
         if how == 'zip':
             path = QFileDialog.getOpenFileName(None, f'Choose the mod for {self._s["gameName"]}', start, 'Mods (*.zip);;All files (*.*)')[0]
         else:
-            path = QFileDialog.getExistingDirectory(None, f'The mod\'s folder for {self._s["gameName"]}', start)
+            path = QFileDialog.getExistingDirectory(None, f'Choose the mod folder for {self._s["gameName"]}', start)
         if not path:
             return
         try:
@@ -595,13 +595,13 @@ class App(QObject):
 
     @Slot()
     def chooseArt(self):
-        path = self.ask_picture(f'A picture for {self._s["gameName"]}: its cover art, say')
+        path = self.ask_picture(f'Choose start-up art for {self._s["gameName"]}')
         if path:
             self.set_art(path, self.icon_art if picked(self.icon_art) else None)  # an icon the player picked stays, a fetched one goes with the old art
 
     @Slot()
     def chooseIcon(self):
-        path = self.ask_picture(f'A square picture for the Wii U Menu icon of {self._s["gameName"]}')
+        path = self.ask_picture(f'Choose a Wii U Menu icon for {self._s["gameName"]}')
         if path:
             self.set_art(self.art, path)
 
@@ -615,7 +615,7 @@ class App(QObject):
 
     @Slot()
     def chooseBezel(self):
-        path = self.ask_picture(f'A bezel or overlay for the GamePad beside the screens of {self._s["gameName"]}: any picture, scaled to fill it')
+        path = self.ask_picture(f'Choose a GamePad bezel for {self._s["gameName"]}')
         if path:
             self.set_bezel(path)
 
@@ -641,7 +641,7 @@ class App(QObject):
 
     @Slot()
     def choosePadArt(self):
-        path = self.ask_picture(f'A picture for the GamePad while {self._s["gameName"]} starts, shown as it is')
+        path = self.ask_picture(f'Choose a GamePad start-up picture for {self._s["gameName"]}')
         if path:
             self.set_pad_art(path)
 
@@ -659,7 +659,7 @@ class App(QObject):
     @Slot()
     def chooseGameSound(self):
         sound = os.path.join(GAME_SOUNDS, f'{self.game.title_id:016x}.btsnd')
-        if self.ask_sound(f'A sound to play while {self._s["gameName"]} starts', sound):
+        if self.ask_sound(f'Choose a start-up sound for {self._s["gameName"]}', sound):
             self.set_game_sound(sound)
 
     @Slot()
@@ -681,7 +681,7 @@ class App(QObject):
     @Slot()
     def bringSave(self):
         """a 3DS save to pack into the game's build, which the game takes in on the console (saves.py)"""
-        chosen = QFileDialog.getExistingDirectory(None, f"The folder with the save of {self._s['gameName']}: Checkpoint's, JKSM's or an emulator's",
+        chosen = QFileDialog.getExistingDirectory(None, f"Choose the folder with your 3DS save of {self._s['gameName']}",
                                                   self.st.get('save_folder', ''))
         if not chosen:
             return
@@ -756,8 +756,8 @@ class App(QObject):
 
     @Slot()
     def setArtKey(self):
-        key, ok = QInputDialog.getText(None, 'SteamGridDB', 'Your SteamGridDB API key: the long code on steamgriddb.com under Preferences, API.\n'
-                                       "It stays on this PC, in the builder's settings. Leave it empty to stop asking SteamGridDB.")
+        key, ok = QInputDialog.getText(None, 'SteamGridDB', 'Paste your SteamGridDB API key (on steamgriddb.com, under Preferences > API).\n'
+                                       'It is only saved on this PC. Leave it empty to stop using SteamGridDB.')
         if not ok:
             return
         self.st['sgdb_key'] = key.strip()
@@ -788,7 +788,7 @@ class App(QObject):
 
     @Slot()
     def chooseSound(self):
-        if self.ask_sound('A sound to play while your games start', BOOT_SOUND):
+        if self.ask_sound('Choose a start-up sound for all games', BOOT_SOUND):
             self.set(soundSet=True)
 
     @Slot()
@@ -821,7 +821,7 @@ class App(QObject):
 
     @Slot()
     def chooseKeys(self):
-        p = QFileDialog.getExistingDirectory(None, 'The folder with your 3DS keys (boot9.bin, seeddb.bin)', self.st['keys'])
+        p = QFileDialog.getExistingDirectory(None, 'Choose the folder with your 3DS keys (boot9.bin, seeddb.bin)', self.st['keys'])
         if p:
             if not decrypt.have_keys(p):
                 self.tell('No keys there', 'There\'s no boot9.bin in that folder.', 'warn')
@@ -833,7 +833,7 @@ class App(QObject):
 
     @Slot()
     def chooseSystem(self):
-        p = QFileDialog.getExistingDirectory(None, 'Your 3DS system files: Azahar\'s user folder, or the 0004009b folder GodMode9 copied off your 3DS',
+        p = QFileDialog.getExistingDirectory(None, 'Choose your 3DS system files folder (Azahar\'s user folder, or the 0004009b folder from GodMode9)',
                                              self.st.get('system', ''))
         if p:
             if not self.import_system(p):
@@ -884,7 +884,7 @@ class App(QObject):
 
     @Slot()
     def chooseOtp(self):
-        p = QFileDialog.getOpenFileName(None, 'Your Wii U\'s otp.bin', os.path.dirname(self.st.get('otp', '')), 'otp.bin (otp.bin);;All files (*.*)')[0]
+        p = QFileDialog.getOpenFileName(None, 'Choose your Wii U\'s otp.bin', os.path.dirname(self.st.get('otp', '')), 'otp.bin (otp.bin);;All files (*.*)')[0]
         if p:
             self.st['otp'] = p
             self.refresh_files()
@@ -897,7 +897,7 @@ class App(QObject):
 
     @Slot()
     def chooseFolder(self):
-        p = QFileDialog.getExistingDirectory(None, 'Where the WUP goes', self.st.get('folder', ''))
+        p = QFileDialog.getExistingDirectory(None, 'Choose where to save the game', self.st.get('folder', ''))
         if p:
             self.st['folder'] = p
             self.setTarget('folder')

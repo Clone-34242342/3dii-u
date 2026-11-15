@@ -890,7 +890,7 @@ ApplicationWindow {
                 Repeater {
                     model: [
                         { title: "Complete", sub: "Confirmed finished on a real Wii U.", list: app.games.filter(g => g.status === "Complete"), light: "cyan" },
-                        { title: "Plays", sub: "Tested on a real Wii U, without their updates.", list: app.games.filter(g => g.status === "Plays"), light: "grey" },
+                        { title: "Plays", sub: "Tested on a real Wii U.", list: app.games.filter(g => g.status === "Plays"), light: "grey" },
                         { title: "Runs in Cemu", sub: "Built with this builder and played in the Cemu emulator, not yet on a real Wii U.", list: app.others, light: "grey" }
                     ]
                     Card {
@@ -978,11 +978,11 @@ ApplicationWindow {
                     title: "About"
                     subtitle: "3Dii U Builder " + app.version
                     CardRow {
-                        label: "Version " + app.version; sub: "Free and open-source: the licences and the software it carries."
+                        label: "Version " + app.version; sub: "Free and open source. See the licenses and the software it includes."
                         Pill { text: "About and licences"; onClicked: app.about() }
                     }
                     CardRow {
-                        label: "Window"; sub: "This one, or a simple one of plain tabs, buttons and file paths."
+                        label: "Window"; sub: "Switch between this window and a simple one with tabs and buttons."
                         Pill { text: "This one"; accessibleName: "Keep this window"; tone: "cyan" }
                         Pill { text: "Simple"; accessibleName: "Switch to the simple window"; enabled: !app.building; onClicked: app.setLayout("simple") }
                     }
