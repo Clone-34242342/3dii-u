@@ -24,7 +24,7 @@ void register_hid();
 void register_dsp();
 void register_misc();
 void register_ro();
-bool ro_has_modules();  // whether the game came with CRO modules, which ldr:ro maps where the game says
+bool ro_has_modules();  // whether ldr:ro maps a static or dynamic module where the game says
 
 std::shared_ptr<SharedMem> load_shared_font();
 // a file of a system archive (system_archives/<title id>.romfs), empty if missing
