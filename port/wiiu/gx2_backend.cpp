@@ -3536,20 +3536,25 @@ void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tv_cb->surface.image, tv_cb->surface.imageSize);
     }
     const u32 dw = drc_cb->surface.width, dh = drc_cb->surface.height;
-    u32 band0, band1;
-    if (screens::pad_rect(pad_layout, which, dw, dh, r, band0, band1)) {
+    Rect own;
+    if (screens::pad_rect(pad_layout, which, dw, dh, r, own)) {
         GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
         cur_color = nullptr;
         begin_blit();
-        // beside the screen in its rows, the bezel picture, or black: what another layout, the menu or the keyboard left there goes, and never
-        // the other screen
+        // around the screen in the part of the GamePad it alone has, the bezel picture, or black: what another layout, the menu or the keyboard
+        // left there goes, and never the other screen
         GX2SetViewport(0, 0, (float)dw, (float)dh, 0, 1);
         GX2SetScissor(0, 0, dw, dh);
         GX2SetPixelTexture(pad_bezel.surface.image ? &pad_bezel : &black_tex, 0);
         GX2SetPixelSampler(&blit_sampler, 0);
-        const float v0 = (float)band0 / dh, v1 = (float)band1 / dh, u_left = (float)r.x / dw, u_right = (float)(r.x + r.w) / dw;
-        draw_rect(dw, dh, 0, (float)band0, (float)r.x, (float)band1, 0, v0, u_left, v1);
-        draw_rect(dw, dh, (float)(r.x + r.w), (float)band0, (float)dw, (float)band1, u_right, v0, 1, v1);
+        auto paint = [&](u32 x0, u32 y0, u32 x1, u32 y1) {
+            if (x0 < x1 && y0 < y1) draw_rect(dw, dh, (float)x0, (float)y0, (float)x1, (float)y1, (float)x0 / dw, (float)y0 / dh, (float)x1 / dw, (float)y1 / dh);
+        };
+        const u32 ox1 = own.x + own.w, oy1 = own.y + own.h, rx1 = r.x + r.w, ry1 = r.y + r.h;
+        paint(own.x, own.y, r.x, oy1);  // left of it
+        paint(rx1, own.y, ox1, oy1);    // right
+        paint(r.x, own.y, rx1, r.y);    // above
+        paint(r.x, ry1, rx1, oy1);      // below
         draw_screen(sc, r.x, r.y, r.w, r.h);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     }
@@ -4591,7 +4596,7 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
                                                 "CHINESE",  "KOREAN",  "DUTCH",   "PORTUGUESE", "RUSSIAN", "CHINESE (TW)"};
     static const char *const k_tv_layouts[screens::kTvLayouts] = {"TOP SCREEN",      "SIDE BY SIDE",  "STACKED",
                                                                   "BIG TOP + SMALL", "BOTTOM SCREEN", "BIG BOTTOM + SMALL"};
-    static const char *const k_pad_layouts[screens::kPadLayouts] = {"BOTTOM SCREEN", "TOP SCREEN", "BOTH SCREENS"};
+    static const char *const k_pad_layouts[screens::kPadLayouts] = {"BOTTOM SCREEN", "TOP SCREEN", "STACKED", "SIDE BY SIDE"};
     char line[48], vol[32], lang[40], tv[40], pad[40], res[32], cap[40];
     snprintf(line, sizeof line, "GAME SPEED: %d%%", menu_speed);
     snprintf(vol, sizeof vol, "VOLUME: %d%%", menu_volume);

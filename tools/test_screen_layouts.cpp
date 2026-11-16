@@ -1,6 +1,7 @@
 // port/wiiu/screen_layouts.h on every TV size a Wii U gives (480p, 720p, 1080p) and its GamePad: every screen a layout shows lies inside the
-// display with its own shape, the two never overlap, the GamePad's rows a screen keeps black beside it are its alone and hold it, a touch's
-// corners land on the bottom screen's own, and the menu steps through every TV layout once. Built and run by tools/selftest.py.
+// display with its own shape, the two never overlap, the part of the GamePad a screen paints around it holds it and no part of the other
+// screen's, the two parts cover the GamePad, a touch's corners land on the bottom screen's own, and the menu steps through every TV layout
+// once. Built and run by tools/selftest.py.
 #include <cstdio>
 #include <cstdlib>
 
@@ -42,20 +43,28 @@ int main() {
 
     const unsigned dw = 854, dh = 480;
     for (int layout = 0; layout < screens::kPadLayouts; layout++) {
-        Rect r[2];
-        unsigned b0[2], b1[2];
+        Rect r[2], own[2];
         bool shown[2];
         for (int which = 0; which < 2; which++) {
-            shown[which] = screens::pad_rect(layout, which, dw, dh, r[which], b0[which], b1[which]);
+            shown[which] = screens::pad_rect(layout, which, dw, dh, r[which], own[which]);
             if (!shown[which]) continue;
-            CHECK(inside(r[which], dw, dh), "GamePad layout %d screen %d at %u,%u %ux%u", layout, which, r[which].x, r[which].y, r[which].w, r[which].h);
-            CHECK(shaped(r[which], which), "GamePad layout %d screen %d is %ux%u", layout, which, r[which].w, r[which].h);
-            CHECK(b0[which] <= r[which].y && r[which].y + r[which].h <= b1[which] && b1[which] <= dh, "GamePad layout %d screen %d outside its rows %u-%u", layout, which,
-                  b0[which], b1[which]);
-            CHECK(r[which].y == b0[which] && r[which].y + r[which].h == b1[which], "GamePad layout %d screen %d leaves rows of its band unpainted", layout, which);
+            const Rect &a = r[which], &o = own[which];
+            CHECK(inside(a, dw, dh), "GamePad layout %d screen %d at %u,%u %ux%u", layout, which, a.x, a.y, a.w, a.h);
+            CHECK(shaped(a, which), "GamePad layout %d screen %d is %ux%u", layout, which, a.w, a.h);
+            CHECK(inside(o, dw, dh) && o.x <= a.x && o.y <= a.y && a.x + a.w <= o.x + o.w && a.y + a.h <= o.y + o.h, "GamePad layout %d screen %d outside its part %u,%u %ux%u",
+                  layout, which, o.x, o.y, o.w, o.h);
         }
         CHECK(shown[0] == (layout != 0) && shown[1] == (layout != 1), "GamePad layout %d shows top %d bottom %d", layout, shown[0], shown[1]);
-        if (shown[0] && shown[1]) CHECK(b1[0] <= b0[1] || b1[1] <= b0[0], "GamePad layout %d: the screens' rows overlap", layout);
+        if (shown[0] && shown[1]) {
+            CHECK(!overlap(r[0], r[1]), "GamePad layout %d: the screens overlap", layout);
+            CHECK(!overlap(own[0], own[1]), "GamePad layout %d: one screen paints over the other's part", layout);
+        }
+        if (layout == 3)  // side by side: one scale for both, touching, on one line
+            CHECK(r[0].y == r[1].y && r[0].h == r[1].h && r[0].x + r[0].w == r[1].x, "GamePad side by side: top %u,%u %ux%u, bottom %u,%u %ux%u", r[0].x,
+                  r[0].y, r[0].w, r[0].h, r[1].x, r[1].y, r[1].w, r[1].h);
+        unsigned area = 0;  // the parts cover the GamePad, so nothing an earlier layout or the menu left there stays
+        for (int which = 0; which < 2; which++) area += shown[which] ? own[which].w * own[which].h : 0;
+        CHECK(area == dw * dh, "GamePad layout %d: its parts cover %u of %u pixels", layout, area, dw * dh);
 
         unsigned tx, ty;
         if (shown[1]) {
