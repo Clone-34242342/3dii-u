@@ -130,6 +130,8 @@ u64 shader_program_hash(const ShaderProgram *p);  // of the code and swizzle wor
 std::string shader_msl(const ShaderProgram *p, u32 entry, const char *name);
 // the same for one set of bool/int uniforms (flow resolved statically), or "" if it cannot be done exactly
 std::string shader_msl_spec(const ShaderProgram *p, u32 entry, const char *name, u32 b, const u8 (*iu)[4]);
+// false only if no run from entry with the bools b reaches END: a set no game draws with (a build makes every set of an entry's bools)
+bool shader_ends(const ShaderProgram *p, u32 entry, u32 b);
 // open: the bools not decided here. The code reads those as it runs, each a bit of the uniform block's uInt[0].w, so one shader serves every set of them.
 std::string shader_glsl_spec(const ShaderProgram *p, u32 entry, u32 b, const u8 (*iu)[4], u32 *inputs, u32 open = 0);
 // A geometry shader's body for the GLSL vertex shader that draws what it emits, one corner of one triangle a vertex: its registers are named

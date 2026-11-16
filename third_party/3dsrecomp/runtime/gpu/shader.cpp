@@ -1140,6 +1140,33 @@ u32 shader_static_uniforms(const ShaderProgram *P, u32 *loops) {
     return bmask;
 }
 
+// Over every way a run could go (each condition both ways, every call's body, both ends of every if, every loop's exit), so false only where
+// no run ends: the jumps the bools take go round for ever.
+bool shader_ends(const ShaderProgram *P, u32 entry, u32 b) {
+    const u32 n = (u32)P->ins.size();
+    std::vector<char> seen(n + 1, 0);
+    std::vector<u32> todo{std::min(entry, n)};
+    while (!todo.empty()) {
+        u32 i = todo.back();
+        todo.pop_back();
+        while (!seen[i]) {
+            seen[i] = 1;
+            if (i == n || P->ins[i].op == OP_END) return true;
+            const DInst &I = P->ins[i];
+            auto at = [&](u32 a) { return std::min(a, n); };
+            if (I.op == OP_JMPU && ((b >> I.bid) & 1) == !(I.fnum & 1)) {
+                i = at(I.fdst);
+                continue;
+            }
+            if (I.op == OP_JMPC || I.op == OP_CALL || I.op == OP_CALLC || I.op == OP_CALLU) todo.push_back(at(I.fdst));
+            if (I.op == OP_IFU || I.op == OP_IFC) todo.insert(todo.end(), {at(I.fdst), at(I.fdst + I.fnum)});
+            if (I.op == OP_LOOP) todo.push_back(at(I.fdst + 1));
+            i++;
+        }
+    }
+    return false;
+}
+
 // The same program specialized for one set of bool and int uniforms: their if/call/jump decisions and
 // loop counts are resolved here, so the kernel is plain structured code (if/else, for, break) with only
 // the per-vertex conditions left, which the GPU runs far faster than the program-counter loop. Programs
