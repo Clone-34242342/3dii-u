@@ -219,6 +219,9 @@ int main(int argc, char **argv) {
             if ((mask >> i) & 1) bits.push_back(i);
         const u32 combos = bits.size() <= kVsBoolsMade ? 1u << bits.size() : 1;
         const u8 (*iu)[4] = (const u8 (*)[4])r.iu;
+        u32 own = 0;  // the record's own set
+        for (u32 i = 0; i < 16; i++)
+            if (r.b[i]) own |= 1u << i;
         for (u32 c = 0; c < combos; c++) {
             bool b[16];
             memcpy(b, r.b, 16);
@@ -227,6 +230,8 @@ int main(int argc, char **argv) {
             u32 bm = 0;
             for (u32 i = 0; i < 16; i++)
                 if (b[i]) bm |= 1u << i;
+            // a made-up set under which the program never ends: no game draws with it
+            if (bm != own && !shader_ends(p, r.entry, bm)) continue;
             u32 inputs = 0;
             const std::string src = gen_vs_glsl(p, r.entry, bm, iu, r.slots, &inputs);
             if (src.empty()) {
