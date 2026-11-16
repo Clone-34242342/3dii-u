@@ -345,14 +345,13 @@ def main():
     sys.modules['build3ds'] = b3
     spec.loader.exec_module(b3)
     b3.WORK = os.path.join(BUILD, 'build_win_builder').replace('\\', '/')
-    prepare_logs = b3.prepare_logs
+    prepare_vertex_logs = b3.prepare_vertex_logs
 
     def with_vertex_programs(g, shadergen):  # the standalone app's logs name vertex programs by fingerprint: this dump's own dvlb.bin has their code
-        prepare_logs(g, shadergen)
+        prepare_vertex_logs(g, shadergen)
         made, left = shaderlogs.restore(g.dir + '/shader_logs')
         if made or left:
             print(f'vertex records from earlier runs: {made}, and {left} whose program this dump hasn\'t', flush=True)
-    b3.prepare_logs = with_vertex_programs
     if not os.path.exists(b3.BIN + 'gcc.exe'):
         fail('The build tools aren\'t installed: see builder/README.md.')
     g = b3.Game(info['slug'], game_dir)  # the recipe every game gets, read from this game's own code (build3ds.py)
@@ -402,6 +401,15 @@ def main():
     alongside = threading.Thread(target=shaders, daemon=True)
     try:
         PROGRESS.stage('Recompiling')
+        # Before the code: build_game_code makes native code of the geometry shaders in the logs' GSX records, which the app's logs hold as
+        # fingerprints until restore() (about a second). build_shaders' prepare_logs then does only the fragment part, alongside the code.
+        try:
+            with_vertex_programs(g, b3.build_shadergen(args))
+        except Exception as e:  # the build's stated reason, as with the shaders thread's own
+            import traceback
+            traceback.print_exc()
+            raise SystemExit(f'shader logs: {e!r}') from e
+        b3.prepare_vertex_logs = lambda g, shadergen: None
         alongside.start()
         b3.build_code(g, args)
         PROGRESS.stage('Shaders')
