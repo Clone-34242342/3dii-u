@@ -27,6 +27,8 @@
                        "status": "Plays", "note": "About 58 fps on a console."},
   "00040000000A8500": {"slug": "layton_mask", "title_id": "0005000010334486", "name": "Professor Layton and the Miracle Mask", "product": "WUP-N-LTMM", "folder": "Layton_Miracle_Mask",
                        "status": "Plays", "note": "About 57 fps on a console."},
+  "0004000000055F00": {"slug": "darkmoon", "title_id": "000500003D00055F", "name": "Luigi's Mansion: Dark Moon", "product": "WUP-N-AGGE", "folder": "Luigis_Mansion_Dark_Moon",
+                       "status": "Untested", "note": "Plays 20 minutes into Gloomy Manor in the PC trial without freezing. Not yet tried in Cemu or on a console."},
   "0004000000030800": {"slug": "g_amke", "title_id": "000500003D000308", "name": "MARIO KART 7", "product": "WUP-N-AMKE", "folder": "MARIO_KART_7",
                        "status": "Plays", "note": "Plays on a Wii U, with its update."},
   "00040000001B5000": {"slug": "g_a2aa", "title_id": "000500003D001B50", "name": "Pokémon Ultra Sun", "product": "WUP-N-A2AA", "folder": "Pok_mon_Ultra_Sun",

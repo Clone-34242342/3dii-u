@@ -236,7 +236,8 @@ def main():
         fail('Building on Linux isn\'t ready yet: this version builds on Windows.')
     if not (a.card or a.out):
         fail('Choose an SD card or a folder for the WUP.')
-    problem = user_files.check_otp(a.otp)
+    # a measuring build for Cemu is never packed (THREEDII_MEASURE, build3ds.py), so it needs no common key
+    problem = None if os.environ.get('THREEDII_MEASURE', '') not in ('', 'console') else user_files.check_otp(a.otp)
     if problem:
         fail(problem)
     if a.card:
@@ -433,7 +434,7 @@ def main():
     if a.no_menu:  # the game looks for it as it starts (frontend_wiiu.cpp)
         open(os.path.join(out, 'title', 'content', 'no_menu'), 'wb').close()
 
-    if b3.MEASURE:  # the checks' own kind of build, for Cemu (build3ds.py): never packed, so none can reach a console
+    if b3.MEASURE and not b3.MEASURE_CONSOLE:  # the checks' own kind of build, for Cemu (build3ds.py): packed only when asked by name
         print('a measuring build: not packed', flush=True)
         PROGRESS.done, PROGRESS.share = 100, 0
         PROGRESS.at(1)
