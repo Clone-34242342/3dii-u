@@ -413,11 +413,13 @@ def build_runtime(g, args):
     return obj_dir
 
 
-# A game's translated code is 15 to 25 times the size of its ARM code, and a console's core has 32 KB of instruction cache: for size, then
-# (NSMB2's code is 25.3 MB at -O2 and 21.5 MB at -Os). No frame pointer and no position-independent code, which are this compiler's defaults, said so.
-GAME_OPT = ['-Os', '-fomit-frame-pointer', '-fno-pic']
+# -O2, not -Os: Cemu's recompiler runs some code of either wrong: -Os stops Luigi's Mansion 2 at its start, -O2 Super Mario 3D Land, and such a
+# game's checks run in its interpreter. -Os was only ever measured in Cemu, at NSMB2's 60 fps either way, for code 15% smaller; on a console
+# neither is measured.
+# No frame pointer and no position-independent code, which are this compiler's defaults, said so.
+GAME_OPT = ['-O2', '-fomit-frame-pointer', '-fno-pic']
 # the other half of THREEDII_OS_ONLY (build_game_code), for finding which files a game's trouble at -Os is in
-GAME_OPT_O2 = ['-O2', '-fomit-frame-pointer', '-fno-pic']
+GAME_OPT_OS = ['-Os', '-fomit-frame-pointer', '-fno-pic']
 
 
 def game_flags(g, opt=None):
@@ -433,7 +435,7 @@ def build_game_code(g, args):
     split = os.environ.get('THREEDII_OS_ONLY')
     if split:
         lo, hi = map(int, split.split('-'))
-        flag_os, flag_o2 = game_flags(g, ' '.join(GAME_OPT)), game_flags(g, ' '.join(GAME_OPT_O2))
+        flag_os, flag_o2 = game_flags(g, ' '.join(GAME_OPT_OS)), game_flags(g, ' '.join(GAME_OPT))
     items = []
     for i, c in enumerate(sorted(glob.glob(g.gen_dir + '/*.c'))):
         c = c.replace('\\', '/')
