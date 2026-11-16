@@ -593,6 +593,22 @@ static int watchdog_thread(int, void *) {
 
 volatile bool wiiu::settings_due;
 
+// The log of a measuring build played on a console: on the SD card, sd:/3dii-u/<title id>/log.txt, for the PC to read, kept up to date every
+// 10 s (card_thread) so a freeze leaves what led up to it. In storage of its own in a test run the PC drives (live.txt), or with no card to write.
+static std::string log_path() {
+    const std::string own = wiiu::data_dir() + "/log.txt";
+    struct stat st;
+    if (!kMeasure || stat((wiiu::data_dir() + "/live.txt").c_str(), &st) == 0) return own;
+    char dir[64];
+    snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
+    wiiu::fs_begin(0xC00D);
+    mkdir("fs:/vol/external01/3dii-u", 0777);
+    mkdir(dir, 0777);
+    const bool there = stat(dir, &st) == 0;
+    wiiu::fs_end();
+    return there ? std::string(dir) + "/log.txt" : own;
+}
+
 // Slow work for later, at the lowest priority on its core: flushing saves, and the log, which only reaches storage when the game ends: the PC and the report on the screen don't need it.
 static int card_thread(int, void *) {
     for (u32 pass = 1;; pass++) {
@@ -615,7 +631,7 @@ static int card_thread(int, void *) {
         }
         wiiu::save_flush(false);
         // a live.txt means a test run, likely in Cemu, which gets killed rather than quit
-        if (want_log_sync || (kernel::g_live_path && pass % 150 == 0)) {
+        if (want_log_sync || (kernel::g_live_path && pass % 150 == 0) || (kMeasure && pass % 50 == 0)) {
             const bool leaving = want_log_sync;
             want_log_sync = false;
             wiiu::fs_begin(0xC001);
@@ -855,7 +871,7 @@ int main(int argc, char **argv) {
         wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
     struct stat no_menu;
     if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
-    rt_log_open(wiiu::data_dir() + "/log.txt");
+    rt_log_open(log_path());
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);
         extern bool g_log_each_line;

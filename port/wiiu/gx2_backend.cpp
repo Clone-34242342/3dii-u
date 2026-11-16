@@ -3125,13 +3125,14 @@ static bool left_done, right_follows_left;
 // - into a framebuffer no screen shows (the Laytons, which clear their targets, draw the scene again, and on the title and save screens read it back and make
 //   mipmaps of it too): it starts with the first clear after the left eye, unless that's the bottom screen's, which those games draw first when there's no right eye.
 static bool right_eye_hidden;
+static bool skip_seen;  // a pass was left undrawn since the last top screen picture (note_top_picture)
 
 // a fill of a whole render target is a clear
 bool gx2_memory_fill(u32 start, u32 end, u32 value, u32 control) {
     if (left_done && right_follows_left && right_eye_hidden) {
         const u32 size = end - start;
         if (size == 240 * 320 * 4 || size == 240 * 320 * 3) left_done = false;  // on to the bottom screen, so no right eye this time
-        else gx2_skip_pass = gx2_skip_copies = true;
+        else gx2_skip_pass = gx2_skip_copies = skip_seen = true;
     }
     if (gx2_skip_pass) return true;
     const Fill f{start, end, value, control};
@@ -4053,6 +4054,7 @@ static bool right_eye_transfer(int screen) {
     if (was_skipping) right_follows_left = false;
     left_done = screen == 0;
     gx2_skip_pass = left_done && right_follows_left && !right_eye_hidden;
+    skip_seen |= gx2_skip_pass;
     return false;
 }
 
@@ -4103,6 +4105,25 @@ static bool passed_over(u32 pa, u32 count) {
         if (x.pa == pa) return x.count != count;
     spares[next++ % 4] = {pa, count};
     return false;
+}
+
+// (measuring builds) a top screen picture with far fewer draws behind it than the ones before: what a frame missing its scene looks like on
+// the TV, with what might have left it out
+static void note_top_picture(u32 src, u32 out_paddr, int known_screen) {
+    static u64 last_draws;
+    static u32 last_src;
+    static float usual;
+    static u32 told;
+    const u32 n = (u32)(st_draws - last_draws);
+    last_draws = st_draws;
+    const bool again = src == last_src && !n;  // the same picture sent to the other buffer too (Metroid: Samus Returns): nothing missing
+    last_src = src;
+    if (again) return;
+    if (usual > 20 && n < usual / 4 && told++ < 300)
+        LOG("[gx2] thin picture at frame %u: %u draws (usually %.0f), %08x to %08x screen %d, pass skipped %d, right eye %d %d %d\n", (u32)g_frame, n,
+            usual, src, out_paddr, known_screen, skip_seen, right_follows_left, right_eye_hidden, left_done);
+    usual = usual ? usual * 0.9f + n * 0.1f : (float)n;
+    skip_seen = false;
 }
 
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
@@ -4180,6 +4201,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     const bool spare = known_screen < 0 && passed_over(out_paddr, shown[which]);
     if (known_screen >= 0) shown[which]++;
     if (!spare) show_screen(which, &s->tex, flags & 1, (h - first_row - skip_rows - shown_h) / h, (h - first_row - skip_rows) / h, (float)shown_w / in_w);
+    if (kMeasure && !spare && which == 0) note_top_picture(in_paddr, out_paddr, known_screen);
     last_transfer[spare ? 2 : which] = {s, in_paddr, out_paddr, in_dims, out_dims, flags, out_size};
     return true;
 }
