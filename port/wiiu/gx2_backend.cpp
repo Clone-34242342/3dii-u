@@ -844,6 +844,9 @@ struct Tex {
     u32 dirty_rows[4];  // a bit per tile row (up to 1024 rows of texels) that definite writes touched since the last upload
     u32 lag_rows[4];    // the tile rows the spare image lacks (see replace_image)
     u64 last_use;
+    u64 next_turn;      // when it is hashed in turn next (get_texture)
+    bool unflushed;     // it changed with no notice: hashed at its first use every flip, until TURN_QUIET flips pass with no change
+    u64 changed_at;     // when it last did
     u32 mem;
     GX2Texture t;
     bool changed_before;  // see replace_image
@@ -858,6 +861,12 @@ std::unordered_map<u64, Tex *> tex_index;
 inline u64 tex_key(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) { return (u64)addr << 32 | w << 20 | h << 8 | fmt << 4 | levels; }
 u64 tex_memory;
 constexpr u64 TEX_MEMORY_LIMIT = 128ull << 20;
+// A game may write a texture with the CPU and never flush it, as a 3DS's small cache puts the bytes in memory within a frame anyway: Animal
+// Crossing's design canvas, Brain Age's handwriting. So small textures are hashed in turn, up to TURN_BYTES a flip (one up to TURN_LARGEST
+// when it's the flip's first), each at most every TURN_FLIPS; one found changed with no notice is hashed at its first use every flip, until
+// it stays the same for TURN_QUIET flips.
+constexpr u32 TURN_BYTES = 32 << 10, TURN_LARGEST = 64 << 10, TURN_FLIPS = 30, TURN_QUIET = 300;
+u32 turn_budget = TURN_BYTES;
 
 constexpr u8 k_fmt_bits[16] = {32, 24, 16, 16, 16, 16, 16, 8, 8, 8, 4, 4, 4, 8, 8, 8};
 
@@ -1175,6 +1184,16 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
             if (logged++ < 400) LOG("STALE tex %08x %ux%u fmt %u levels %u bytes %u, flip %llu\n", addr, w, h, fmt, levels, e.bytes, (unsigned long long)st_flips);
             e.maybe_dirty = true;
         }
+        bool turn = false;
+        if (e.unflushed && use_counter - e.changed_at > TURN_QUIET) e.unflushed = false;
+        if (e.last_use != use_counter && !e.dirty && !e.maybe_dirty
+            && (e.unflushed || (e.bytes <= TURN_LARGEST && use_counter >= e.next_turn && (e.bytes <= turn_budget || turn_budget == TURN_BYTES)))) {
+            if (!e.unflushed) {
+                turn_budget -= std::min(turn_budget, e.bytes);
+                e.next_turn = use_counter + TURN_FLIPS;
+            }
+            turn = e.maybe_dirty = true;  // checked below as after a flush
+        }
         e.last_use = use_counter;
         if (e.heap_flushes != heap_flushes) {
             e.heap_flushes = heap_flushes;
@@ -1209,6 +1228,10 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
             // A stale hash (the last upload took a definite write's word for it) with the same sample: the image is current, only the hash is
             // unknown, so it's taken now. Uploading instead redid NSMB2's whole 1 MB atlas after nearly every partial update.
             if (changed || (!e.hash_stale && hh != e.hash)) {
+                if (turn) {
+                    e.unflushed = true;
+                    e.changed_at = use_counter;
+                }
                 // the GPU may be reading the old contents
                 if (gxt()) LOG("[gxt] reupload %08x %ux%u fmt %u, %u bytes, dirty %d\n", addr, w, h, fmt, e.bytes, e.dirty);
                 last_reupload = {addr, w, h, fmt, levels, e.dirty};
@@ -1247,6 +1270,7 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
     e.dirty = e.maybe_dirty = e.hash_stale = false;
     e.row_bytes = w / 8 * (64 * k_fmt_bits[fmt & 15] / 8);
     e.last_use = use_counter;
+    e.next_turn = use_counter + TURN_FLIPS;
     memset(&e.t, 0, sizeof e.t);
     GX2Surface &f = e.t.surface;
     e.gpu = gpu_decoded(w, h, fmt, levels);
@@ -3024,6 +3048,7 @@ void present() {
     GX2SetDRCEnable(TRUE);
     st_flips++;
     use_counter++;
+    turn_budget = TURN_BYTES;
     forget_unused();
     ring_next_segment();
     dyn_res_update();
