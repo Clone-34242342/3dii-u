@@ -73,8 +73,8 @@ void settings_load() {
     s.pip_size = std::clamp(s.pip_size, 15, 80);
     s.hud = std::clamp(s.hud, 0, 2);
     s.language = std::clamp(s.language, -1, 11);
-    s.tv_layout = std::clamp(s.tv_layout, 0, 5);
-    s.pad_layout = std::clamp(s.pad_layout, 0, 2);
+    s.tv_layout = std::max(s.tv_layout, 0);  // (the frontend clamps these to its layouts)
+    s.pad_layout = std::max(s.pad_layout, 0);
     s.resolution = s.resolution == 480 ? 480 : 720;
     // the GPU backend reads these once at startup; an environment variable given at launch wins
     setenv("GPU_MSAA", std::to_string(s.msaa).c_str(), 0);
