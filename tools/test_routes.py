@@ -64,6 +64,8 @@ ROUTES = {
     'nsmb2_run': NSMB2_INTO_1_1 + run_right(150),
     # in World 1-1 the options menu opens (a route's KEY menu, as a click of the left stick) and stays up, on the TV and the GamePad
     'nsmb2_menu': NSMB2_INTO_1_1 + ['WAIT 300', 'KEY menu', 'WAIT 30000'],
+    # Animal Crossing from a kept town save: the title's Continue, the first player, into town, then the Touch Screen's menus
+    'acnl_design': ['WAIT 900'] + A(100, 60) + ['WAIT 600', 'X 6', 'WAIT 300', 'T@78/11 10', 'WAIT 300', 'T@35/82 10', 'WAIT 300', 'T@50/182 10', 'WAIT 400', 'A 6', 'WAIT 400', 'T@35/82 10', 'WAIT 400', 'T@50/182 10', 'WAIT 600', 'DRAG 120/70 200/70 40', 'WAIT 120', 'DRAG 120/100 200/160 40', 'WAIT 120', 'DRAG 200/100 120/160 40', 'WAIT 120', 'T@160/120 10', 'WAIT 600', 'WAIT 30000'],
     # standing where the level starts for the whole run: one place, drawn frame after frame, for timing a level against another
     'nsmb2_stand': NSMB2_INTO_1_1 + ['WAIT 30000'],
     'dream_team': A(8) + ['DDOWN 6', 'WAIT 40', 'A 6', 'WAIT 80'] * 6 + A(440, 30) + sweep(WALK) + A(500, 30),
