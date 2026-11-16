@@ -197,6 +197,9 @@ class ShowCredits(argparse.Action):
 
 
 def main():
+    if os.name == 'nt':  # a tool that can't load something ends with an error code, not a Windows box that holds the build until clicked
+        import ctypes  # (issue 1); the build tools inherit it
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)  # SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--version', action='version', version=f'{credits.APP} {credits.VERSION} ({credits.LICENCE}, {credits.SOURCE})')
     ap.add_argument('--credits', nargs=0, action=ShowCredits, help='the projects the builder is built on, and their licences')
