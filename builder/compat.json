@@ -2,7 +2,7 @@
   "_about": "Games tested on a real Wii U, by 3DS program id. title_id, name, product and slug keep the builds the same as the ones already installed; status and note are shown in the app: \"Complete\" for a game that is finished here, \"Plays\" for one that was tested and plays. Anything not listed builds as untested.",
   "_cemu": [
     {"name": "The Legend of Zelda: A Link Between Worlds", "status": "Cemu", "note": "57 fps. From this build: its top screen no longer flashes onto the GamePad, and 142 shaders met in longer Cemu runs are built in ahead (its lowest fps there went from 26 to 53), against the stutter seen on a console."},
-    {"name": "Metroid: Samus Returns", "status": "Cemu", "note": "30 fps. Objects vanishing for a moment on a console is fixed from this build."},
+    {"name": "Metroid: Samus Returns", "status": "Cemu", "note": "30 fps. On a console, everything could vanish for a moment: this build fixes the cause found, not yet tried on a console."},
     {"name": "Kirby: Triple Deluxe", "status": "Cemu", "note": "59 fps. From this build, 300 more shaders are built in ahead. No console report yet."},
     {"name": "Rhythm Heaven Megamix", "status": "Cemu", "note": "60 fps. No console report yet."},
     {"name": "Phoenix Wright: Ace Attorney Trilogy", "status": "Cemu", "note": "54 fps, from this build on: its script threads switch stacks, and it now builds the way that needs."},
@@ -38,5 +38,5 @@
   "0004000000054000": {"slug": "g_aree", "title_id": "000500003D000540", "name": "SUPER MARIO 3D LAND", "product": "WUP-N-AREE", "folder": "SUPER_MARIO_3D_LAND",
                        "status": "Plays", "note": "Plays on a Wii U."},
   "0004000000086300": {"slug": "g_egde", "title_id": "000500003D000863", "name": "Animal Crossing: New Leaf", "product": "WUP-N-EGDE", "folder": "Animal_Crossing_New_Leaf",
-                       "status": "Plays", "note": "Plays on a Wii U, with its update. Busy towns run slower."}
+                       "status": "Plays", "note": "Plays on a Wii U, with its update. Busy towns run slower, and Mii faces and hair don't show."}
 }
