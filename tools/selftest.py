@@ -115,7 +115,7 @@ def main():
         'game languages': languages(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
-        'geometry shaders': gsx(),
+        'geometry shaders': gsx() + [[py, ROOT + '/tools/gsx_to_gsl.py', '--self-check']],
         'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
         'program rules': [[py, ROOT + '/tools/gsh_rules.py', '--self-check']],
         'fragment variants': [[py, ROOT + '/tools/fs_variants.py', '--self-check']],

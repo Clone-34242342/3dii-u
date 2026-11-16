@@ -441,9 +441,21 @@ def build_game_code(g, args):
         c = c.replace('\\', '/')
         n = os.path.basename(c)[:-2]
         items.append((n, c, f'{obj_dir}/{n}.o', (flag_os if lo <= i < hi else flag_o2) if split else flags))
-    # The geometry shaders this game's runs met on the CPU (.gsl files in its shader logs) as C, which the runtime runs instead of its
-    # interpreter (vertex.cpp: gs_native_find): the game's own code, made here from the user's logs, never shared.
+    # The geometry shaders this game's runs met on the CPU (.gsl files in its shader logs), and those its logs hold with a vertex shader (GSX
+    # records, tools/gsx_to_gsl.py), as C, which the runtime runs instead of its interpreter (vertex.cpp: gs_native_find) wherever the pack has
+    # no GPU shader for a draw's own set: the game's own code, made here from the user's logs, never shared.
     gsl = sorted(glob.glob(g.dir + '/shader_logs/*.gsl'))
+    from_gsx = f'{obj_dir}/from_gsx.gsl'
+    if os.path.exists(from_gsx):
+        os.remove(from_gsx)
+    logs = sorted(glob.glob(g.dir + '/shader_logs/*.bin'))
+    if logs:
+        r = run([sys.executable, ROOT + '/tools/gsx_to_gsl.py', from_gsx] + logs, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+        print(r.stdout.strip(), flush=True)
+        if r.returncode:
+            sys.exit('gsx_to_gsl failed')
+        if os.path.exists(from_gsx):
+            gsl.append(from_gsx)
     if gsl:
         made = f'{obj_dir}/gs_native.c'
         tmp = made + '.new'
