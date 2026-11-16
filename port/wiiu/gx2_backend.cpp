@@ -54,6 +54,7 @@
 #include "settings.h"
 #include "shader_compile.h"
 #include "shadergen.h"
+#include "mii_select.h"
 #include "swkbd.h"
 #include "vertex_arrays.h"
 #include "wiiu.h"
@@ -4771,6 +4772,77 @@ static void draw_keyboard() {
     state_lost = true;
 }
 
+// ---- the Mii selector the game asks for (mii_select.h), on the GamePad: the console's Miis by name; up, down and A, a touch, or B where the game
+// lets the player cancel. Names keep only the letters the menu's font has.
+static constexpr float MS_X = 107, MS_Y = 92, MS_W = 640, MS_ROW = 42;
+static constexpr int MS_ROWS = 8;
+static volatile bool ms_active;
+static volatile int ms_sel, ms_top;  // the Mii picked, the first row shown
+static mii_select::Request ms_req;
+
+static void ms_choose(int index) {
+    ms_active = false;
+    mii_select::finish(index);
+}
+
+bool mii_selector_open() { return ms_active; }
+
+void mii_selector_input(u32 pressed, bool touch_began, u16 x, u16 y) {
+    if (!ms_active) {
+        if (mii_select::pending(&ms_req) && !ms_req.names.empty()) {
+            ms_sel = std::clamp(ms_req.initial, 0, (int)ms_req.names.size() - 1);
+            ms_top = std::max(0, ms_sel - MS_ROWS + 1);
+            ms_active = true;
+        }
+        return;
+    }
+    const int n = (int)ms_req.names.size();
+    if (touch_began && x >= MS_X && x < MS_X + MS_W && y >= MS_Y) {
+        const int row = (int)((y - MS_Y) / MS_ROW);
+        if (row < MS_ROWS && ms_top + row < n) return ms_choose(ms_top + row);
+    }
+    if (pressed & VPAD_BUTTON_UP) ms_sel = (ms_sel + n - 1) % n;
+    if (pressed & VPAD_BUTTON_DOWN) ms_sel = (ms_sel + 1) % n;
+    if (ms_sel < ms_top) ms_top = ms_sel;
+    if (ms_sel >= ms_top + MS_ROWS) ms_top = ms_sel - MS_ROWS + 1;
+    if (pressed & VPAD_BUTTON_A) ms_choose(ms_sel);
+    else if ((pressed & VPAD_BUTTON_B) && ms_req.can_cancel) ms_choose(-1);
+}
+
+static void draw_mii_selector() {
+    const u32 w = drc_cb->surface.width, h = drc_cb->surface.height;
+    GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
+    cur_color = nullptr;
+    begin_blit();
+    GX2SetViewport(0, 0, (float)w, (float)h, 0, 1);
+    GX2SetScissor(0, 0, w, h);
+    GX2SetPixelTexture(&black_tex, 0);
+    GX2SetPixelSampler(&blit_sampler, 0);
+    set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
+    draw_rect(w, h, MS_X, 0, MS_X + MS_W, 480, 0, 0, 1, 1);
+    const int n = (int)ms_req.names.size();
+    for (int r = 0; r < MS_ROWS && ms_top + r < n; r++) {
+        const float y = MS_Y + r * MS_ROW;
+        set_blit_colors(0, 0, 0, 0.35f, 0.2f, 0.05f);
+        draw_rect(w, h, MS_X + 16, y + 2, MS_X + MS_W - 16, y + MS_ROW - 2, 0, 0, 1, 1);
+        if (ms_top + r == ms_sel) set_blit_colors(0, 0, 0, 1.0f, 0.75f, 0.2f);
+        else set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
+        draw_rect(w, h, MS_X + 19, y + 5, MS_X + MS_W - 19, y + MS_ROW - 5, 0, 0, 1, 1);
+    }
+    GX2SetPixelTexture(&font_tex, 0);
+    GX2SetPixelSampler(&lut_sampler, 0);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    set_blit_colors(0.1f, 0.05f, 0.0f, 0, 0, 0);
+    draw_text(w, h, ms_req.title.empty() ? "Choose a Mii" : ms_req.title.c_str(), MS_X + 20, 22, 3);
+    for (int r = 0; r < MS_ROWS && ms_top + r < n; r++) draw_text(w, h, ms_req.names[ms_top + r].c_str(), MS_X + 32, MS_Y + r * MS_ROW + 11, 3);
+    draw_text(w, h, ms_req.can_cancel ? "A: CHOOSE   B: CANCEL" : "A: CHOOSE", MS_X + 20, 446, 2);
+    if (ms_top > 0) draw_text(w, h, "-", MS_X + MS_W - 40, 60, 3);
+    if (ms_top + MS_ROWS < n) draw_text(w, h, "+", MS_X + MS_W - 40, 424, 3);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
+    state_lost = true;
+}
+
 // The report is asked for by the frontend's thread and written by this one, between frames: the counters it prints and starts over are this
 // thread's, and read from the other they came out torn (a count taken mid-draw, a reset that lost what was added meanwhile).
 static std::atomic<bool> report_due;
@@ -4887,8 +4959,8 @@ static void show_lcd_from_memory() {
 // (the GPU thread, after each look at its queue) quiet: it had nothing to do for its whole wait. present_rule.h says when a frame is shown.
 void gfx_pump(bool quiet) {
     if (!vblank_pending) {
-        // the menu and the keyboard are drawn at a VBlank's look only, so while one is up nothing is shown in between
-        if (!menu_is_open && !kb_active && present_rule.between(quiet)) {
+        // the menu, the keyboard and the Mii list are drawn at a VBlank's look only, so while one is up nothing is shown in between
+        if (!menu_is_open && !kb_active && !ms_active && present_rule.between(quiet)) {
             screen_fresh = false;
             present();
         }
@@ -4905,6 +4977,9 @@ void gfx_pump(bool quiet) {
     } else if (kb_active) {
         draw_keyboard();
         screen_fresh = true;
+    } else if (ms_active) {
+        draw_mii_selector();
+        screen_fresh = true;
     }
     static u32 swaps_seen[2];  // each screen's swaps (services/gsp.cpp) up to the last VBlank's look
     unsigned swapped = 0;
@@ -4913,7 +4988,7 @@ void gfx_pump(bool quiet) {
         if (swaps != swaps_seen[s]) swapped |= 1u << s;
         swaps_seen[s] = swaps;
     }
-    if (present_rule.vblank(screen_fresh, swapped, menu_is_open || kb_active)) {
+    if (present_rule.vblank(screen_fresh, swapped, menu_is_open || kb_active || ms_active)) {
         screen_fresh = false;
         present();
     }
@@ -5106,10 +5181,15 @@ void touch_to_bottom(u16 x, u16 y, bool &touch, u16 &tx, u16 &ty) {
     tx = (u16)px;
     ty = (u16)py;
 }
+// The game gets nothing while the menu, the keyboard or the Mii list is up, nor the press or touch that closed one (an A that picked a Mii
+// would be the game's next A) until everything is let go
 void input_override(u32 &buttons, bool &touch, u16 &tx, u16 &ty) {
     (void)tx;
     (void)ty;
-    if (menu_is_open || kb_active) {
+    static bool held_back;
+    if (menu_is_open || kb_active || ms_active) held_back = true;
+    else if (!buttons && !touch) held_back = false;
+    if (held_back) {
         buttons = 0;
         touch = false;
     }

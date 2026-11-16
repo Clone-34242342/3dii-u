@@ -242,12 +242,16 @@ static u32 map_pro(u32 h) {
     return b;
 }
 
-// its presses as the GamePad's, for the options menu (menu_input): the left stick in to open it, the D-pad, A and B
+// its presses as the GamePad's, for the options menu (menu_input): the left stick in to open it, the D-pad, A and B; and for the keyboard and
+// the Mii list, X, Y and +
 static u32 pro_as_gamepad(u32 t) {
     u32 v = 0;
     if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
     if (t & WPAD_PRO_BUTTON_A) v |= VPAD_BUTTON_A;
     if (t & WPAD_PRO_BUTTON_B) v |= VPAD_BUTTON_B;
+    if (t & WPAD_PRO_BUTTON_X) v |= VPAD_BUTTON_X;
+    if (t & WPAD_PRO_BUTTON_Y) v |= VPAD_BUTTON_Y;
+    if (t & WPAD_PRO_BUTTON_PLUS) v |= VPAD_BUTTON_PLUS;
     if (t & WPAD_PRO_BUTTON_UP) v |= VPAD_BUTTON_UP;
     if (t & WPAD_PRO_BUTTON_DOWN) v |= VPAD_BUTTON_DOWN;
     if (t & WPAD_PRO_BUTTON_LEFT) v |= VPAD_BUTTON_LEFT;
@@ -272,6 +276,12 @@ static u32 map_buttons(u32 h) {
     if (h & VPAD_BUTTON_Y) b |= 1u << 11;
     return b;
 }
+
+// whether the last read found a GamePad, which the keyboard and the Mii list are drawn on
+static volatile bool gamepad_there = true;
+
+// Without a GamePad the game gets the player's Mii at once, as it does from ports without a list (services/apt.cpp)
+bool mii_select_shown() { return gamepad_there; }
 
 static int hid_thread(int, void *) {
     wiiu::profile_this_core();
@@ -301,8 +311,11 @@ static int hid_thread(int, void *) {
     u16 tx = 0, ty = 0;
     for (;;) {
         u32 presses = 0;  // the GamePad's way, from either, for the options menu
+        bool tap = false;  // a touch on the GamePad began, at px, py
+        u16 px = 0, py = 0;
         VPADReadError err = VPAD_READ_SUCCESS;
         VPADRead(VPAD_CHAN_0, &st, 1, &err);
+        gamepad_there = err != VPAD_READ_INVALID_CONTROLLER;
         if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
             pad_buttons = 0;
             pad_x = pad_y = 0;
@@ -322,7 +335,6 @@ static int hid_thread(int, void *) {
             kernel::hid_motion(accel, gyro);
             touch = false;
             bool down = false;
-            u16 px = 0, py = 0;
             if (st.tpNormal.touched && !st.tpNormal.validity) {
                 VPADGetTPCalibratedPoint(VPAD_CHAN_0, &cal, &st.tpNormal);
                 px = (u16)(cal.x * 854 / 1280);
@@ -330,7 +342,7 @@ static int hid_thread(int, void *) {
                 down = true;
                 wiiu::touch_to_bottom(px, py, touch, tx, ty);
             }
-            wiiu::keyboard_input(st.trigger, down && !touch_was, px, py);
+            tap = down && !touch_was;
             touch_was = down;
         }
         buttons = pad_buttons;
@@ -356,6 +368,11 @@ static int hid_thread(int, void *) {
         }
         cx = (s16)(sx * 156.0f);
         cy = (s16)(sy * 156.0f);
+        // the keyboard and the Mii list a game asked for take either controller's presses, but nothing while the options menu is over them
+        if (!wiiu::menu_open()) {
+            wiiu::keyboard_input(presses, tap, px, py);
+            wiiu::mii_selector_input(presses, tap, px, py);
+        }
         wiiu::menu_input(presses);
         if (!leaving && wiiu::menu_wants_quit()) {
             leaving = true;
@@ -367,6 +384,7 @@ static int hid_thread(int, void *) {
                 wiiu::keyboard_input(0, true, 107 + 64 * 8 + 10, 150 + 62 * 4 + 10);  // OK, with what's typed
                 if (wiiu::keyboard_open()) wiiu::keyboard_input(0, true, 107 + 10, 150 + 62 * 2 + 10);  // or type something first
             }
+            if (wiiu::mii_selector_open()) wiiu::mii_selector_input(VPAD_BUTTON_A, false, 0, 0);  // the Mii offered first, at once: a route's timing stays
         }
         if (autoplay) {
             const u32 phase = tick % 468;
@@ -572,7 +590,7 @@ static int watchdog_thread(int, void *) {
         asked = asking;
         if (++seconds >= 41 && !drawn && (quiet >= 30 || seconds >= 180) && !wiiu::net_connected()) report_stuck("The game got stuck starting up.");
         const u64 lists = kernel::gx_stats.cmdlists;
-        if (lists != last || gpu_pause || wiiu::menu_open() || wiiu::keyboard_open()) {
+        if (lists != last || gpu_pause || wiiu::menu_open() || wiiu::keyboard_open() || wiiu::mii_selector_open()) {
             if (lists && !drawn) {
                 drawn = true;
                 stage("the game is drawing");
