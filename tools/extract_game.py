@@ -97,24 +97,27 @@ def main():
         with open(os.path.join(out_dir, 'icon.bin'), 'wb') as o:
             o.write(files['icon'])
 
-    # RomFS: the header's hash covers its first region; the rest is proven by the hash tree inside it.
+    # RomFS: the header's hash covers its first region (the IVFC header and the master hashes). Only level 3, the file system itself, is
+    # written: what the runtime, the recompiler's CRO reader and builder/dumps.py all take. The whole IVFC image stopped the recompiler
+    # (cro.py) before a first trial could run.
     start = offset + romfs_off * MEDIA_UNIT
     f.seek(start)
-    total = romfs_size * MEDIA_UNIT
-    digest = hashlib.sha256()
-    remaining_hash = romfs_hashed * MEDIA_UNIT
+    assert hashlib.sha256(f.read(romfs_hashed * MEDIA_UNIT)).digest() == romfs_hash, 'RomFS hash'
+    f.seek(start)
+    ivfc = f.read(0x60)
+    assert ivfc[:4] == b'IVFC', 'RomFS without an IVFC header'
+    master = struct.unpack('<I', ivfc[8:12])[0]
+    l3_size = struct.unpack('<Q', ivfc[0x44:0x4C])[0]
+    l3_block = 1 << struct.unpack('<I', ivfc[0x4C:0x50])[0]
+    f.seek(start + ((0x60 + master + l3_block - 1) & ~(l3_block - 1)))
     written = 0
     with open(os.path.join(out_dir, 'romfs.bin'), 'wb') as o:
-        while written < total:
-            block = f.read(min(1 << 22, total - written))
-            if remaining_hash:
-                take = block[:remaining_hash]
-                digest.update(take)
-                remaining_hash -= len(take)
+        while written < l3_size:
+            block = f.read(min(1 << 22, l3_size - written))
+            assert block, 'RomFS ended early'
             o.write(block)
             written += len(block)
-    assert digest.digest() == romfs_hash, 'RomFS hash'
-    print(f'romfs: {written} bytes, header hash verified')
+    print(f'romfs: level 3, {written} bytes, header hash verified')
 
     info = {
         'program_id': n[0x118:0x120][::-1].hex().upper(),
