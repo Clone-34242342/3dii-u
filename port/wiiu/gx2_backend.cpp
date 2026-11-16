@@ -78,6 +78,8 @@ namespace {
 // ---------------------------------------------------------------- timers: where a draw's time goes, for the log
 enum { P_KEY, P_BIND, P_PS, P_STATE, P_UNI, P_TEX, P_VSUNI, P_RANGE, P_ATTR, P_DRAW, P_HASH, P_WAIT, P_PRESENT, P_SYNC, P_TEXUP, P_TEXFL, P_COUNT };
 u32 prof[P_COUNT], st_syncs, st_luts, st_flushes, st_rehashes;
+u64 st_top_pictures;  // top screen pictures shown so far (show_screen)
+u32 st_pace[5];       // (measuring builds) the top screen's pictures by the VBlanks each stayed up, 4 for 4 and more (present)
 // The clock is read for these only in a build that measures (kMeasure): the time now, the time since then added to one of the counters
 // above, and a draw's steps one after another (lap). "nolaps" in the data folder leaves the steps out of a measuring build, to see
 // what reading the clock a dozen times a draw costs.
@@ -3475,6 +3477,15 @@ void present() {
     gt_flip(cur_color ? cur_color->addr : 0);
     dyn_res_update();
     vtx_cache_flip();
+    if (kMeasure) {  // how long the last new picture stayed up: a steady game's are all alike (2 at thirty a second), 0 never reached the TV
+        static u64 seen;
+        static u32 since;
+        if (st_top_pictures != seen) {
+            st_pace[std::min((u32)g_frame - since, 4u)]++;
+            seen = st_top_pictures;
+            since = (u32)g_frame;
+        }
+    }
     prof_add(P_PRESENT, tp);
 }
 
@@ -3512,7 +3523,7 @@ using screens::Rect;
 void draw_rect(u32 w, u32 h, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1);
 
 void show_screen(int which, GX2Texture *tex, bool flip, float v_lo = 0, float v_hi = 1, float u_hi = 1) {
-    if (which == 0) top_shown = true;
+    if (which == 0) top_shown = true, st_top_pictures++;
     else frame_cap_wait();
     st_pictures[which]++;
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tex->surface.image, tex->surface.imageSize);
@@ -5107,6 +5118,8 @@ static void write_report() {
     last_list_ns = list_ns;
     LOG("[prof] the game's pictures a second: top screen %.1f, bottom screen %.1f\n", st_pictures[0] / secs, st_pictures[1] / secs);
     st_pictures[0] = st_pictures[1] = 0;
+    LOG("[prof] VBlanks a top screen picture stayed up: 0 (never shown) %u, 1 %u, 2 %u, 3 %u, 4+ %u\n", st_pace[0], st_pace[1], st_pace[2], st_pace[3], st_pace[4]);
+    memset(st_pace, 0, sizeof st_pace);
     {
         u64 surf = 0;
         for (const auto &x : surfaces) surf += x->mem1 ? 0 : (x->depth ? x->db.surface.imageSize : x->cb.surface.imageSize);
