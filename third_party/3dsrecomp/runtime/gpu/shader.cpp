@@ -1266,7 +1266,32 @@ struct SpecGen {
         ends.push_back(x);
         return true;
     }
+    // Whether an active region ends at x. Control that arrives there other than by running the word before it (a jump onto it, a return
+    // to it, the end of an inner region) pops nothing in shader_run, so the region stays open; anywhere else, the code just goes on from x.
+    bool region_end(u32 x) const { return std::find(ends.begin(), ends.end(), x) != ends.end(); }
     static bool plain(const DInst &I) { return I.op <= OP_MAD || I.op == OP_NOP; }
+    // whether every jump, if and loop in [s, d) stays within [s, d]: then a forward jump from s - 1 to d is an if around [s, d)
+    bool nests(u32 s, u32 d) const {
+        for (u32 x = s; x < d && x < n; x++) {
+            const DInst &J = P->ins[x];
+            switch (J.op) {
+            case OP_JMPC:
+            case OP_JMPU:
+                if (J.fdst <= x || J.fdst > d) return false;
+                break;
+            case OP_IFC:
+            case OP_IFU:
+                if (J.fdst < x + 1 || J.fdst + J.fnum > d) return false;
+                break;
+            case OP_LOOP:
+                if (J.fdst < x + 1 || J.fdst + 1 > d) return false;
+                break;
+            default:
+                break;
+            }
+        }
+        return true;
+    }
     bool emits_in(u32 s, u32 e) const {
         for (u32 k = s; k < e && k < n; k++)
             if (P->ins[k].op == OP_EMIT) return true;
@@ -1484,7 +1509,8 @@ struct SpecGen {
                     cont = dst;
                     break;
                 }
-                if (dst <= i || dst >= e) {
+                // to e itself, where no region ends (the end of a stretch written as an if, or of the program): the rest of it skipped
+                if (dst <= i || dst > e || (dst == e && region_end(e))) {
                     fail = true;
                     return false;
                 }
@@ -1493,8 +1519,19 @@ struct SpecGen {
                     break;
                 }
                 // JMPU jumps on its bool being set, or with the low bit of num on its being clear
+                const std::string jumps = I.op == OP_JMPC ? w.cond(I) : (num & 1) ? "!(" + open_bool(I) + ")" : open_bool(I);
                 const Emit before = now();
-                w.o += "    if (" + (I.op == OP_JMPC ? w.cond(I) : (num & 1) ? "!(" + open_bool(I) + ")" : open_bool(I)) + ") {\n";
+                // Over a stretch that nests (nests()): the stretch when the jump isn't taken, then the code from dst once. Writing the rest
+                // on both ways, as below, doubles it at each such jump after another, until the program is past what a shader can be.
+                if (nests(i + 1, dst)) {
+                    w.o += "    if (!(" + jumps + ")) {\n";
+                    const bool r = block(i + 1, dst, in_loop, inc);
+                    w.o += "    }\n";
+                    join(before, true, now(), r);
+                    cont = dst;
+                    break;
+                }
+                w.o += "    if (" + jumps + ") {\n";
                 const bool r1 = block(dst, e, in_loop, inc);
                 const Emit jumped = now();
                 set(before);
@@ -1527,7 +1564,7 @@ struct SpecGen {
                     w.o += "    }\n";
                     join(now(), returns, before, true);
                 }
-                if (cont == e) {  // shader_run would not pop the enclosing region on the return
+                if (cont == e && region_end(e)) {  // shader_run would not pop the enclosing region on the return
                     fail = true;
                     return false;
                 }
@@ -1569,7 +1606,7 @@ struct SpecGen {
                 }
                 if (taken) ends.pop_back();
                 ifs--;
-                if (cont == e && cont != i + 1) {
+                if (cont == e && cont != i + 1 && region_end(e)) {
                     fail = true;
                     return false;
                 }
@@ -1588,7 +1625,7 @@ struct SpecGen {
                     const bool made = emitting_loop(I, i + 1, dst + 1);
                     ends.pop_back();
                     cont = dst + 1;
-                    if (!made || cont == e) {
+                    if (!made || (cont == e && region_end(e))) {
                         fail = true;
                         return false;
                     }
@@ -1618,7 +1655,7 @@ struct SpecGen {
                 es.temps = before.temps;
                 es.flags = before.flags;
                 cont = dst + 1;
-                if (cont == e) {
+                if (cont == e && region_end(e)) {
                     fail = true;
                     return false;
                 }
