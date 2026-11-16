@@ -87,6 +87,7 @@ def bundle_logs(src, dst):
     os.makedirs(out, exist_ok=True)
     dvlb = os.path.join(logs, 'dvlb.bin')
     progs = shaderlogs.programs(dvlb) if os.path.isfile(dvlb) else set()
+    stale = progs and not os.path.isfile(os.path.join(logs, 'dvlb.gsl'))  # a dvlb.bin from before dvlb_to_log.py kept geometry programs whole
     recipes, shipped = 0, set()
     for f in [f for f in os.listdir(logs) if f.endswith('.vsr')]:  # made from a dump this repository doesn't keep (shaderlogs.py --recipes)
         shutil.copy2(os.path.join(logs, f), os.path.join(out, f))
@@ -99,7 +100,11 @@ def bundle_logs(src, dst):
         if not f.endswith('.bin') or f == 'dvlb.bin' or f.startswith('other_'):
             continue
         with open(os.path.join(logs, f), 'rb') as h:
-            frag, vsf, vsr, missing = shaderlogs.split(h.read(), progs, srcs, cache)
+            d = h.read()
+        if stale and any(r[0] == 'gsx' for r in shaderlogs.records(d)):
+            print(f'{os.path.basename(src)}: its geometry shader records ship cut short (no dvlb.gsl beside its dvlb.bin): build the game again')
+            stale = False
+        frag, vsf, vsr, missing = shaderlogs.split(d, progs, srcs, cache)
         recipes += sum(1 for _ in shaderlogs.recipes(vsr))
         left += sum(1 for code, swz in missing if shaderlogs.fingerprint(code, swz) not in shipped)
         for name, data in ((f, frag), (f[:-4] + '.vsf', vsf), (f[:-4] + '.vsr', vsr)):

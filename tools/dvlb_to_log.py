@@ -4,8 +4,8 @@
 Walks code.bin and the whole romfs, inside LZ10, LZ11 and Yaz0 streams and whatever they hold, for shader binaries (DVLB), and writes them as shader log records, which the shader
 generator reads like any other log: one for each vertex program and each one that can draw an outline. Which output each register feeds comes from the program's own table, as a game
 sets it up. With --lists and the shader generator's path, the programs a game loads with GPU command lists kept in its files go in too (Game Freak's model files: the generator
-finds them, tools/shadergen_lists.cpp). dvlb_to_log.py <game dir> [--check] [--lists <shadergen>]. Output: <game dir>/shader_logs/dvlb.bin. --check only compares with what runs
-have logged, and writes nothing.
+finds them, tools/shadergen_lists.cpp). dvlb_to_log.py <game dir> [--check] [--lists <shadergen>]. Output: <game dir>/shader_logs/dvlb.bin, and dvlb.gsl
+with each geometry program whole (gs_record). --check only compares with what runs have logged, and writes nothing.
 """
 import bisect
 import glob
@@ -219,6 +219,13 @@ def slots_for(outs):
     return s
 
 
+def gs_record(entry, code, swz):
+    """a geometry program as a .gsl file's "GS  " record (tools/pica_to_c.py): the whole code and swizzles, as its unit holds them, past the
+    512 words a vertex shader's unit takes: Luigi's Mansion 2's geometry shader starts at word 505 of its binary's 1338"""
+    out = b'GS  ' + struct.pack('<III', entry, len(code), len(swz))
+    return out + struct.pack(f'<{len(code)}I', *code) + struct.pack(f'<{len(swz)}I', *swz)
+
+
 def record(entry, code, swz, b, slots):
     out = b'VS  ' + struct.pack('<III', entry, len(code), len(swz))
     out += struct.pack(f'<{len(code)}I', *code) + struct.pack(f'<{len(swz)}I', *swz)
@@ -282,10 +289,10 @@ def main():
     game = sys.argv[1]
     check = '--check' in sys.argv
     lists = listed(game, sys.argv[sys.argv.index('--lists') + 1]) if '--lists' in sys.argv[:-1] else b''
-    out = b''
+    out = gs_out = b''
     table = {}
     done = set()
-    binaries = kept = 0
+    binaries = kept = geometry = 0
     for blob in programs(game):
         try:
             code, swz, entries = parse(blob)
@@ -294,6 +301,11 @@ def main():
         binaries += 1
         vs = code[:512]
         for kind, entry, outs in entries:
+            gkey = (entry, code, tuple(swz))
+            if kind == 1 and entry < len(code) and gkey not in done:
+                done.add(gkey)
+                gs_out += gs_record(entry, code, swz)
+                geometry += 1
             if kind != 0 or entry >= len(vs):
                 continue
             slots = slots_for(outs)
@@ -328,7 +340,9 @@ def main():
     if not check:
         with open(f'{game}/shader_logs/dvlb.bin', 'wb') as f:
             f.write(out)
-        print(f'{len(out) >> 10} KB written')
+        with open(f'{game}/shader_logs/dvlb.gsl', 'wb') as f:  # even empty: it says this dvlb.bin was made since (make_app.py)
+            f.write(gs_out)
+        print(f'{len(out) >> 10} KB written, and {geometry} geometry programs')
 
 
 if __name__ == '__main__':

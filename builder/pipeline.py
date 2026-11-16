@@ -425,6 +425,9 @@ def main():
     if not known and not a.cold and WORK == ROOT and os.path.isfile(dvlb):  # its vertex programs, where its runs' logs go: make_app.py fingerprints the
         os.makedirs(learned, exist_ok=True)  # shipped logs' vertex records by them (shaderlogs.py), and ships no dvlb.bin
         shutil.copyfile(dvlb, os.path.join(learned, 'dvlb.bin'))
+        gsl = os.path.splitext(dvlb)[0] + '.gsl'  # and its geometry programs, the same way
+        if os.path.isfile(gsl):
+            shutil.copyfile(gsl, os.path.join(learned, 'dvlb.gsl'))
 
     PROGRESS.stage('Making the title')
     released, case_scan = '', False

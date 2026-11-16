@@ -49,19 +49,24 @@ def gsx(vprog, gprog, tail):  # a vertex shader and the geometry shader after it
 
 
 # a geometry shader record ships as both programs' fingerprints, after the vertex records, and comes back whole; one with a program the
-# game's DVLB lacks is left out
-gprog = ([0x55, 0x66, 0x88000000, 0x77], [0xD])
+# game's binaries lack is left out. The geometry program is its binary's whole code (dvlb_to_log.py's dvlb.gsl), which the vertex program's
+# first 512 words only start: the memory is named by the longest program that starts it, or it came back cut short
+gprog = (prog[0] + [0x55, 0x66, 0x88000000, 0x77], prog[1] + [0xD])
 gtail = bytes(range(88))
 base = tempfile.mkdtemp()
 try:
-    dvlb = vs(1, *prog, bytes(56)) + vs(0, *gprog, bytes(56))
-    progs = {r[2:4] for r in shaderlogs.records(dvlb) if r[0] == 'vs'}
+    with open(os.path.join(base, 'dvlb.bin'), 'wb') as f:
+        f.write(vs(1, *prog, bytes(56)))
+    with open(os.path.join(base, 'dvlb.gsl'), 'wb') as f:
+        f.write(shaderlogs._dvlb_tool().gs_record(2, gprog[0], gprog[1]))
+    progs = shaderlogs.programs(os.path.join(base, 'dvlb.bin'))
+    packed = lambda p: (struct.pack(f'<{len(p[0])}I', *p[0]), struct.pack(f'<{len(p[1])}I', *p[1]))  # noqa: E731
+    assert progs == {packed(prog), packed(gprog)}, 'the vertex program and the whole geometry program'
     log = gsx(prog, gprog, gtail) + vs(1, *prog, tail) + gsx(prog, other, gtail)
     shipped, vsf, vsr, left = shaderlogs.split(log, progs)
     assert not shipped and not vsr and not left and len(vsf) == shaderlogs.VSF + shaderlogs.GSF, len(vsf)
     assert vsf.startswith(b'VSF ') and vsf[shaderlogs.VSF:].startswith(b'GSF ') and b'\x55\x00\x00\x00' not in vsf, 'fingerprints, no code'
-    with open(os.path.join(base, 'dvlb.bin'), 'wb') as f:
-        f.write(dvlb)
+    assert shaderlogs.fingerprint(*packed(gprog)) in vsf, 'the geometry memory named by the whole program'
     with open(os.path.join(base, 'run.vsf'), 'wb') as f:
         f.write(vsf)
     assert shaderlogs.restore(base) == (2, 0)

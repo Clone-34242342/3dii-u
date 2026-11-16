@@ -444,7 +444,8 @@ def build_game_code(g, args):
     # The geometry shaders this game's runs met on the CPU (.gsl files in its shader logs), and those its logs hold with a vertex shader (GSX
     # records, tools/gsx_to_gsl.py), as C, which the runtime runs instead of its interpreter (vertex.cpp: gs_native_find) wherever the pack has
     # no GPU shader for a draw's own set: the game's own code, made here from the user's logs, never shared.
-    gsl = sorted(glob.glob(g.dir + '/shader_logs/*.gsl'))
+    # (not dvlb.gsl: the dump's own geometry programs, for the app's fingerprints, made by the shader step, after this one on the command line)
+    gsl = sorted(f for f in glob.glob(g.dir + '/shader_logs/*.gsl') if os.path.basename(f) != 'dvlb.gsl')
     from_gsx = f'{obj_dir}/from_gsx.gsl'
     if os.path.exists(from_gsx):
         os.remove(from_gsx)

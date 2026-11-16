@@ -75,9 +75,22 @@ def records(d):
 
 
 def programs(dvlb):
-    """the game's vertex programs as (code, swizzles), from dvlb_to_log.py's dvlb.bin"""
+    """the game's programs as (code, swizzles), from dvlb_to_log.py's dvlb.bin (vertex programs, 512 words at most) and the dvlb.gsl beside it
+    (geometry programs whole): a memory is named by the longest that starts it"""
     with open(dvlb, 'rb') as f:
-        return {(r[2], r[3]) for r in records(f.read()) if r[0] == 'vs'}
+        found = {(r[2], r[3]) for r in records(f.read()) if r[0] == 'vs'}
+    gsl = os.path.splitext(dvlb)[0] + '.gsl'
+    if os.path.isfile(gsl):
+        with open(gsl, 'rb') as f:
+            d = f.read()
+        p = 0
+        while p + 16 <= len(d) and d[p:p + 4] == b'GS  ':  # tools/pica_to_c.py's records
+            nc, ns = struct.unpack_from('<II', d, p + 8)
+            if p + 16 + (nc + ns) * 4 > len(d):  # a file cut short as it was written
+                break
+            found.add((d[p + 16:p + 16 + nc * 4], d[p + 16 + nc * 4:p + 16 + (nc + ns) * 4]))
+            p += 16 + (nc + ns) * 4
+    return found
 
 
 def fingerprint(code, swz):
