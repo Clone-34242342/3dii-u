@@ -1535,7 +1535,8 @@ struct SpecGen {
             }
             case OP_IFU:
             case OP_IFC: {
-                if (dst < i + 1 || dst + num > e || ifs >= 7 || !ends_plain(i + 1, dst) || !ends_plain(dst, dst + num)) {
+                // ifs: the PICA's if stack holds 8 (shader_run's ifs[8]); Ocarina of Time 3D's vertex programs nest all 8
+                if (dst < i + 1 || dst + num > e || ifs >= 8 || !ends_plain(i + 1, dst) || !ends_plain(dst, dst + num)) {
                     fail = true;
                     return false;
                 }
