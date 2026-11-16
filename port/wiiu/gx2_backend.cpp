@@ -1027,6 +1027,36 @@ const void *vtx_cached(u32 addr, const u8 *src, u32 src_stride, u32 count, u32 k
     return buf;
 }
 
+// A draw's indices as the GPU reads them, kept like vertex data: 16-bit ones as the game has them (little-endian), 8-bit ones made 16-bit, and
+// after them the lowest and highest vertex they use. Reading them for that range and copying them were 1.9 to 3 us of every draw of Luigi's
+// Mansion 2 in Cemu on a PC. Kinds 0x90 and 0x91 keep them apart from the attribute copies' (0x80, and fmt | elems << 4).
+const u16 *draw_indices(u32 addr, const u8 *ip, u32 count, bool u16_in, u32 &minv, u32 &maxv) {
+    const u16 *w = (const u16 *)vtx_cached(addr, ip, u16_in ? 2 : 1, count, u16_in ? 0x90 : 0x91, count * 2 + 4, [&](void *out, const u8 *src) {
+        u16 *dst = (u16 *)out;
+        u32 lo = 0xffff, hi = 0;
+        if (u16_in) {
+            memcpy(dst, src, count * 2);
+            for (u32 i = 0; i < count; i++) {
+                const u32 v = le16(dst[i]);
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+        } else {
+            for (u32 i = 0; i < count; i++) {
+                const u32 v = src[i];
+                dst[i] = (u16)v;
+                lo = std::min(lo, v);
+                hi = std::max(hi, v);
+            }
+        }
+        dst[count] = (u16)lo;
+        dst[count + 1] = (u16)hi;
+    });
+    minv = w[count];
+    maxv = w[count + 1];
+    return w;
+}
+
 // A target the game draws at twice the size it uses and scales down with a display transfer (its own antialiasing): Luigi's Mansion 2 draws
 // each half of its top screen 256 wide for 128 columns of the LCD, twice a frame. At the screens' scale that is 768x1248 for a strip the TV
 // shows as 369x1200, 2.2 times the pixels, and those draws took 54 of the GPU's 64 ms a frame on the title screen and in the rain on a
@@ -2630,29 +2660,23 @@ bool gx2_draw(const Gx2Draw &d) {
         return true;
     }
 
-    // the range of vertices used, to make sure the GPU sees them
-    u32 minv, maxv;
-    if (d.indexed) {
+    // the range of vertices used, to make sure the GPU sees them, and the indices as it reads them
+    if (!draw_count) return true;  // no vertices
+    u32 minv = d.first, maxv = d.first + d.count - 1;
+    const void *gpu_ip = ip;
+    if (d.indexed && d.outline_color) {  // an outline's list, in the ring already
         minv = 0xffff;
         maxv = 0;
-        if (index_u16) {
-            for (u32 i = 0; i < draw_count; i++) {
-                u16 v;
-                memcpy(&v, ip + 2 * i, 2);
-                v = le16(v);
-                if (v < minv) minv = v;
-                if (v > maxv) maxv = v;
-            }
-        } else {
-            for (u32 i = 0; i < draw_count; i++) {
-                const u32 v = ip[i];
-                if (v < minv) minv = v;
-                if (v > maxv) maxv = v;
-            }
+        for (u32 i = 0; i < draw_count; i++) {
+            u16 v;
+            memcpy(&v, ip + 2 * i, 2);
+            v = le16(v);
+            if (v < minv) minv = v;
+            if (v > maxv) maxv = v;
         }
-    } else {
-        minv = d.first;
-        maxv = d.first + d.count - 1;
+        DCFlushRange((void *)ip, draw_count * 2);
+    } else if (d.indexed) {
+        gpu_ip = draw_indices(d.index_addr, ip, draw_count, index_u16, minv, maxv);
     }
 
     lap(P_RANGE);
@@ -2819,24 +2843,10 @@ bool gx2_draw(const Gx2Draw &d) {
     lap(P_ATTR);
     GX2SetFetchShader(get_fetch(fk));
     const GX2PrimitiveMode mode = d.topology == 1 ? GX2_PRIMITIVE_MODE_TRIANGLE_STRIP : d.topology == 2 ? GX2_PRIMITIVE_MODE_TRIANGLE_FAN : GX2_PRIMITIVE_MODE_TRIANGLES;
-    if (d.indexed) {
-        if (index_u16) {
-            void *w = (void *)ip;  // an outline's list is in the ring already
-            if (!d.outline_color) {
-                w = ring_alloc(draw_count * 2 + 64, 64);
-                memcpy(w, ip, draw_count * 2);
-            }
-            DCFlushRange(w, draw_count * 2);
-            GX2DrawIndexedEx(mode, draw_count, GX2_INDEX_TYPE_U16_LE, w, 0, 1);
-        } else {
-            u16 *w = (u16 *)ring_alloc(d.count * 2 + 64, 64);
-            for (u32 i = 0; i < d.count; i++) w[i] = ip[i];
-            DCFlushRange(w, d.count * 2);
-            GX2DrawIndexedEx(mode, d.count, GX2_INDEX_TYPE_U16, w, 0, 1);
-        }
-    } else {
+    if (d.indexed)
+        GX2DrawIndexedEx(mode, draw_count, index_u16 ? GX2_INDEX_TYPE_U16_LE : GX2_INDEX_TYPE_U16, (void *)gpu_ip, 0, 1);
+    else
         GX2DrawEx(mode, d.count, d.first, 1);
-    }
     lap(P_DRAW);
     st_draws++;
     return true;
