@@ -4041,19 +4041,38 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
 bool gx2_skip_pass, gx2_skip_copies;
 
 // New Super Mario Bros. 2 draws a right eye every frame though the slider says 3D is off, and the Wii U couldn't show it: half its draws.
-// Once a right eye is seen right after a left one, the pass between those transfers isn't drawn. If something else turns up there, it stops.
-// Returns true if this transfer needs nothing more.
+// The pass between a left eye's transfer and the right eye's after it isn't drawn once 30 frames in a row have drawn both eyes, each with
+// draws of its own and the left at least a quarter of the right. Metroid: Samus Returns sends a picture to the right LCD and then to the
+// left, its scene drawn before the first and next to nothing between them: there the pass after a left eye is the next frame's scene, and
+// leaving it undrawn showed the TV runs of frames with nothing in them (2026-11-16). A left eye with next to nothing drawn since the right
+// one stops it, as does a pass left undrawn that no right eye follows. Returns true if this transfer needs nothing more.
 static bool right_eye_transfer(int screen) {
+    static u64 at_left, at_right;  // st_draws at the last left and right eye transfers
+    static u32 right_draws;        // the draws of the last right eye drawn
+    static u32 stereo;             // frames in a row that drew both eyes in full
+    static bool right_seen;        // a right eye straight after the last left one
     const bool was_skipping = gx2_skip_pass;
     gx2_skip_pass = gx2_skip_copies = false;
     if (screen == 2) {
+        if (left_done && !was_skipping) right_draws = (u32)(st_draws - at_left);
+        right_seen = left_done;
         right_follows_left |= left_done;
+        at_right = st_draws;
         left_done = false;
         return true;
     }
-    if (was_skipping) right_follows_left = false;
+    if (was_skipping) {
+        right_follows_left = false;
+        stereo = 0;
+    }
+    if (screen == 0) {
+        const u32 left_draws = (u32)(st_draws - at_right);
+        stereo = right_seen && right_draws >= 4 && left_draws >= 4 && left_draws * 4 >= right_draws ? stereo + 1 : 0;
+        right_seen = false;
+        at_left = st_draws;
+    }
     left_done = screen == 0;
-    gx2_skip_pass = left_done && right_follows_left && !right_eye_hidden;
+    gx2_skip_pass = left_done && right_follows_left && stereo >= 30 && !right_eye_hidden;
     skip_seen |= gx2_skip_pass;
     return false;
 }
