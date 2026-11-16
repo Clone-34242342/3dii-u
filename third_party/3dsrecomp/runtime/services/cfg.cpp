@@ -8,13 +8,13 @@ namespace kernel {
 
 int g_system_language = -1;
 
-static u32 cfg_region() {
-    // 0 JPN, 1 USA, 2 EUR, 3 AUS, 4 CHN, 5 KOR, 6 TWN: the game's own region (SMDH), EUR for region-free ones
-    if (const char *r = getenv("RECOMP_REGION")) return (u32)atoi(r);
-    return g_game.region >= 0 && g_game.region != 3 ? (u32)g_game.region : 2;
-}
+u32 cfg_languages() { return regions_languages(g_game.regions); }
 
-u32 cfg_languages() { return region_languages(cfg_region()); }
+// 0 JPN, 1 USA, 2 EUR, 3 AUS, 4 CHN, 5 KOR, 6 TWN: of the game's own regions (SMDH), one that has its language (languages.h)
+static u32 cfg_region() {
+    if (const char *r = getenv("RECOMP_REGION")) return (u32)atoi(r);
+    return pick_region(g_game.regions, cfg_language());
+}
 
 // The game's language, the same all run, as a game may ask more than once (languages.h): the one picked in the options menu
 // (settings.ini), else the console's own
