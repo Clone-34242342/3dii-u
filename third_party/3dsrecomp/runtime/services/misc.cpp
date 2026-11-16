@@ -82,18 +82,18 @@ const std::vector<std::array<u8, 0x60>> &console_miis(int *mine) {
 // The player's Mii: the current account's (the console's first, if that account has none a game can take), naming the place it has in
 // Mii Maker's database (fs.cpp). With no Mii on the console at all, a plain male Mii named "Mario" (made-up console and Mii ids and a
 // placeholder MAC; games mostly check the flags and the checksum).
+std::array<u8, 0x60> console_mii(u32 n) {
+    std::array<u8, 0x60> mii = console_miis(nullptr)[n];
+    if (const int place = mii_maker_place(n); place >= 0) mii[0x02] = (u8)(place / 10 | place % 10 << 4);
+    const u16 crc = mii_crc16(mii.data(), 0x5E);
+    mii[0x5E] = (u8)(crc >> 8);
+    mii[0x5F] = (u8)crc;
+    return mii;
+}
+
 std::array<u8, 0x60> player_mii() {
     int mine;
-    const auto &miis = console_miis(&mine);
-    if (!miis.empty()) {
-        const u32 n = mine < 0 ? 0 : (u32)mine;
-        std::array<u8, 0x60> mii = miis[n];
-        if (const int place = mii_maker_place(n); place >= 0) mii[0x02] = (u8)(place / 10 | place % 10 << 4);
-        const u16 crc = mii_crc16(mii.data(), 0x5E);
-        mii[0x5E] = (u8)(crc >> 8);
-        mii[0x5F] = (u8)crc;
-        return mii;
-    }
+    if (!console_miis(&mine).empty()) return console_mii(mine < 0 ? 0 : (u32)mine);
     std::array<u8, 0x60> m{};
     auto be32 = [&](size_t o, u32 v) { m[o] = (u8)(v >> 24); m[o + 1] = (u8)(v >> 16); m[o + 2] = (u8)(v >> 8); m[o + 3] = (u8)v; };
     auto be16 = [&](size_t o, u16 v) { m[o] = (u8)(v >> 8); m[o + 1] = (u8)v; };

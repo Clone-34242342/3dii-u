@@ -1,10 +1,15 @@
 // APT: applet manager. Only the application slot exists; the home menu and the applets are absent (library applets
 // run as HLE, system applets such as the browser close as soon as they start).
+#include <algorithm>
+#include <climits>
 #include <deque>
 
+#include "../mii_select.h"
 #include "../service.h"
 #include "../swkbd.h"
 #include "services.h"
+
+__attribute__((weak)) bool mii_select_shown() { return false; }
 
 namespace kernel {
 
@@ -58,12 +63,15 @@ static void system_applet_receive(u32 id, u32 signal) {
     send_parameter({id, 0x300, 10, nullptr, {}});  // WakeupByExit: back to the application
 }
 
-// The Mii selector returns the player's Mii (misc.cpp: the console account's, or a stand-in "Mario")
-static std::vector<u8> mii_selector_result() {
+// What the Mii selector returns (MiiSelectorReturn, 0x84 bytes): the Mii picked (misc.cpp), or none when the player cancelled
+static std::vector<u8> mii_selector_result(const std::array<u8, 0x60> *mii) {
     std::vector<u8> r(0x84, 0);
-    r[8] = r[9] = r[10] = r[11] = 0xFF;  // a Mii was selected (0), not a guest (0), guest index -1
-    const auto mii = player_mii();
-    memcpy(&r[0x0C], mii.data(), 0x60);
+    r[8] = r[9] = r[10] = r[11] = 0xFF;  // not a guest (4), guest index -1
+    if (!mii) {
+        r[0] = 1;  // no Mii selected
+        return r;
+    }
+    memcpy(&r[0x0C], mii->data(), 0x60);
     return r;
 }
 
@@ -184,11 +192,57 @@ static bool swkbd_run(u32 id, std::vector<u8> &cfg, ObjPtr mem) {
     return false;
 }
 
+// The game's request (MiiSelectorConf, 0x104 bytes: cancel allowed at 0, its title at 8, the first pick at 0x90), held until the player
+// picks one of the console's Miis in the port's list (mii_select.h); with no list, or no Mii to pick, the player's Mii at once.
+// shortcut: the game's own list of the Miis it takes (100 flags at 0x9A) isn't followed; games found so far take them all.
+namespace {
+std::mutex mii_m;  // guards the request the list reads (the rest is under the kernel lock)
+mii_select::Request mii_req;
+std::vector<u32> mii_rows;  // the list's rows: which of console_miis() each is
+bool mii_active = false;
+u32 mii_wait_id = 0;
+unsigned mii_serial = 0;
+}  // namespace
+
+static void mii_select_run(u32 id, const std::vector<u8> &cfg) {
+    const auto &miis = console_miis(nullptr);
+    if (!mii_select_shown() || miis.empty() || cfg.size() < 0x94) {
+        LOG("[apt] Mii selector: returning the player's Mii\n");
+        const auto mii = player_mii();
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(&mii)});
+        return;
+    }
+    mii_select::Request r;
+    std::u16string title;
+    for (size_t o = 0x08; o + 1 < 0x88 && (cfg[o] | cfg[o + 1]); o += 2) title += (char16_t)(cfg[o] | cfg[o + 1] << 8);
+    r.title = utf8(title);
+    // in Mii Maker's order, as a 3DS lists them and counts the game's first pick (the player's own first: fs.cpp); one without a place last
+    std::vector<u32> rows(miis.size());
+    for (u32 i = 0; i < rows.size(); i++) rows[i] = i;
+    const auto place = [](u32 i) { const int p = mii_maker_place(i); return p < 0 ? INT_MAX : p; };
+    std::stable_sort(rows.begin(), rows.end(), [&](u32 a, u32 b) { return place(a) < place(b); });
+    for (const u32 i : rows) {
+        const auto &m = miis[i];
+        std::u16string name;
+        for (size_t o = 0x1A; o < 0x2E && (m[o] | m[o + 1]); o += 2) name += (char16_t)(m[o] | m[o + 1] << 8);
+        r.names.push_back(utf8(name));
+    }
+    const u32 first = cfg[0x90] | cfg[0x91] << 8 | cfg[0x92] << 16 | (u32)cfg[0x93] << 24;
+    r.initial = first < miis.size() ? (int)first : 0;
+    r.can_cancel = cfg[0] != 0;
+    LOG("[apt] Mii selector: waiting for the player (%zu Miis, \"%s\")\n", miis.size(), r.title.c_str());
+    mii_wait_id = id;
+    std::lock_guard<std::mutex> g(mii_m);
+    r.serial = ++mii_serial;
+    mii_req = r;
+    mii_rows = std::move(rows);
+    mii_active = true;
+}
+
 static void applet_run(u32 id, std::vector<u8> buf, ObjPtr mem = nullptr) {
     u32 kind = id & 0xFF;
     if (kind == 0x02) {
-        LOG("[apt] Mii selector: returning the standard Mii\n");
-        send_parameter({id, 0x300, 10, nullptr, mii_selector_result()});
+        mii_select_run(id, buf);
         return;
     }
     if (kind == 0x06 && buf.size() >= 8) {
@@ -225,6 +279,36 @@ void swkbd::finish(const std::string &text, bool ok) {
     run_when_quiescent([w, t, ok] {
         swkbd_result(w->cfg, w->mem, t, ok);
         send_parameter({w->id, 0x300, 10, nullptr, std::move(w->cfg)});  // WakeupByExit
+    });
+    schedule_async();
+}
+
+bool mii_select::pending(Request *out) {
+    std::lock_guard<std::mutex> g(kernel::mii_m);
+    if (kernel::mii_active && out) *out = kernel::mii_req;
+    return kernel::mii_active;
+}
+
+void mii_select::finish(int index) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    std::string name;
+    int mii = -1;  // which of console_miis()
+    {
+        std::lock_guard<std::mutex> g(mii_m);
+        if (!mii_active) return;
+        mii_active = false;
+        if ((index < 0 || (size_t)index >= mii_rows.size()) && !mii_req.can_cancel) index = 0;  // a game that can't take "none" gets the first
+        if (index >= 0 && (size_t)index < mii_rows.size()) {
+            name = mii_req.names[index];
+            mii = (int)mii_rows[index];
+        }
+    }
+    LOG("[apt] Mii selector: %s\n", mii >= 0 ? name.c_str() : "cancelled");
+    const u32 id = mii_wait_id;
+    run_when_quiescent([id, mii] {
+        const auto data = mii >= 0 ? console_mii((u32)mii) : std::array<u8, 0x60>{};
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(mii >= 0 ? &data : nullptr)});  // WakeupByExit
     });
     schedule_async();
 }
