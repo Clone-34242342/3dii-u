@@ -607,8 +607,10 @@ std::vector<HalfKey> half_keys;
 
 // scale_as: a copy of that surface's picture (gx2_texture_copy and its mipmaps), made at its scale so what the game draws from it stays as sharp.
 // first: the draw a colour target is made for. with: the colour target a depth buffer is bound with, whose scale it has to have: a game uses one
-// depth buffer's memory with targets this draws at different scales.
-Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface *scale_as = nullptr, const DrawState *first = nullptr, const Surface *with = nullptr) {
+// depth buffer's memory with targets this draws at different scales. linear: a display transfer's picture in rows (Surface::linear), which no
+// draw can go into.
+Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface *scale_as = nullptr, const DrawState *first = nullptr, const Surface *with = nullptr,
+                     bool linear = false) {
     for (auto &s : surfaces)
         if (s->addr == addr && s->w == w && s->h == h && s->depth == depth && (!with || (s->base_sx == with->base_sx && s->base_sy == with->base_sy))) {
             s->fmt = fmt;
@@ -641,7 +643,8 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
     s->sw = (u32)(w * s->sx);
     s->sh = (u32)(s->tex_h * s->sy);
     s->row0 = s->sh - (u32)(h * s->sy);
-    const bool screen = s->sy > 1 && !scale_as;  // copies go in MEM2: Metroid's four are 4.5 MB each, and fast memory is for the targets it draws into
+    // copies and pictures in rows go in MEM2: fast memory is for the targets a game draws into (Metroid's four copies are 4.5 MB each)
+    const bool screen = s->sy > 1 && !scale_as && !linear;
     if (depth) {
         memset(&s->db, 0, sizeof s->db);
         GX2Surface &f = s->db.surface;
@@ -3264,13 +3267,14 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     used(*src);
     const bool own_size_copy = own_size && src->sy <= 1 && !src->gpu_chain;
     if (sy <= 1 && !src->gpu_chain && !own_size_copy) return false;
-    Surface *dst = get_surface(out_paddr, out_w, out_h, cbuf_to_pixfmt((flags >> 12) & 7), false, src->gpu_chain ? src : nullptr);
+    // Neither bit 1 (linear in) nor bit 5 (left tiled): the picture lands in memory row by row, for whatever reads its bytes. Paper Mario's goes on to another
+    // transfer here on the GPU; Luigi's Mansion 2's top screen halves go to texture copies into its LCD buffer, which read them back, and tiled they came out black.
+    const bool linear_out = !(flags & 0x22);
+    Surface *dst = get_surface(out_paddr, out_w, out_h, cbuf_to_pixfmt((flags >> 12) & 7), false, src->gpu_chain ? src : nullptr, nullptr, nullptr, linear_out);
     if (dst == src) return false;
     dst->gpu_chain |= src->gpu_chain;
     dst->copy = own_size_copy;
-    // Neither bit 1 (linear in) nor bit 5 (left tiled): the picture lands in memory row by row, for whatever reads its bytes. Paper Mario's goes on to another
-    // transfer here on the GPU; Luigi's Mansion 2's top screen halves go to texture copies into its LCD buffer, which read them back, and tiled they came out black.
-    dst->linear = !(flags & 0x22);
+    dst->linear = linear_out;
     take_dyn_level(*dst);
     static u32 notes;
     if (gxt()) LOG("[gxt] gpu copy %08x -> %08x, %08x %08x flags %08x\n", in_paddr, out_paddr, in_dims, out_dims, flags);
