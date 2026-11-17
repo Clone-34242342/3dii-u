@@ -63,6 +63,10 @@ the game and puts it on your SD card. Releases of the standalone app need no Pyt
 and `pipeline.py --credits`, list the projects it's built on. Its UI and art design are by syntcity, and sennecaelen and
 Clone-34242342 contributed code.
 
+[creeper88-boy](https://github.com/creeper88-boy) contributed Ocarina of Time 3D build-mode support in
+[#42](https://github.com/J-Glitch2502/3dii-u/pull/42) and the Circle Pad Pro/New 3DS input foundation in
+[#44](https://github.com/J-Glitch2502/3dii-u/pull/44). Integration corrections and validation are tracked separately.
+
 ## Working on it
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) explains how a dump becomes a WUP, and what each part of the code does.
