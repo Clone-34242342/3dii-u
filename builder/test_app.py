@@ -4,6 +4,8 @@ import importlib.util
 import os
 import shutil
 import tempfile
+import types
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('app', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'app.py'))
 app = importlib.util.module_from_spec(spec)
@@ -38,6 +40,29 @@ try:
     stamp('2')
     app.fresh_cache(engine, work)
     assert not os.path.exists(cache), 'another engine starts it over again'
+    compiled()
+    stamp('3')
+    with mock.patch.object(shutil, 'rmtree', return_value=None):  # Windows can leave locked objects behind
+        try:
+            app.fresh_cache(engine, work)
+        except OSError:
+            pass
+        else:
+            raise AssertionError('a failed cache cleanup allowed the build to use old objects')
+    with open(os.path.join(work, 'engine_stamp.txt')) as f:
+        assert f.read() == '2', 'a failed cache cleanup advanced the engine stamp'
+    app.fresh_cache(engine, work)
+    assert not os.path.exists(cache), 'cleanup was not retried after the lock was released'
+    other = os.path.join(base, 'other-build-folder')
+    other_cache = os.path.join(other, 'build_win_builder')
+    os.makedirs(other_cache)
+    open(os.path.join(other_cache, 'old.o'), 'w').close()
+    with open(os.path.join(other, 'engine_stamp.txt'), 'w') as f:
+        f.write('older engine')
+    with mock.patch.dict(os.environ, {'THREEDII_ROOT': engine, 'THREEDII_WORK': work, 'THREEDII_BUILD': other}), \
+            mock.patch.object(app.sys, 'argv', ['Builder.exe', '--pipeline', '--game', 'unused']):
+        app.use_engine(engine)
+    assert not os.path.exists(other_cache), 'a pipeline inherited the engine but reused another build folder\'s stale objects'
     print('fresh_cache ok')
     # what a build prints reaches the window as UTF-8 whatever the PC's code page: a name with ★ or ™ used to end the build
     import subprocess
@@ -61,6 +86,31 @@ try:
             continue
         raise AssertionError(f'{bad} was taken as a release tag')
     print('release tag ok')
+    # Collection must not prefer an unrelated tool's DLLs over Windows' own ICU.
+    # A failed collector must also restore PATH for the remaining build tools.
+    class Collected(Exception):
+        pass
+
+    def collect(args):
+        assert os.environ['PATH'].split(os.pathsep)[0] == os.path.join(os.environ['WINDIR'], 'System32')
+        raise Collected
+
+    installer = types.ModuleType('PyInstaller')
+    installer.__main__ = types.ModuleType('PyInstaller.__main__')
+    installer.__main__.run = collect
+    with mock.patch.dict(sys.modules, {'PyInstaller': installer, 'PyInstaller.__main__': installer.__main__,
+                                      'gui': types.SimpleNamespace(VERSION='1.0')}), \
+            mock.patch.dict(os.environ, {'PATH': 'unrelated-tools', 'WINDIR': os.environ.get('WINDIR', 'C:/Windows')}), \
+            mock.patch.object(make_app, 'make_icon'), mock.patch.object(make_app, 'version_resource'), \
+            mock.patch.object(make_app.os, 'makedirs'):
+        try:
+            make_app.main()
+        except Collected:
+            pass
+        else:
+            raise AssertionError('did not reach the collector')
+        assert os.environ['PATH'] == 'unrelated-tools'
+    print('packaging DLL search order ok')
     # a game called Complete must have its confirmed shader list before the app is made; the list's notes and other games don't count
     games = os.path.join(base, 'games')
     compat = {'_about': 'notes', '_cemu': [{'status': 'Cemu'}], '1': {'slug': 'done', 'status': 'Complete'}, '2': {'slug': 'plays', 'status': 'Plays'}}

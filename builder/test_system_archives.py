@@ -4,6 +4,7 @@ import os
 import struct
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumps  # noqa: E402
@@ -51,4 +52,40 @@ with tempfile.TemporaryDirectory() as tmp:
     assert sorted(dumps.import_system_archives(out, again, tmp)) == sorted(dumps.ESSENTIAL_ARCHIVES)
     assert dumps.import_system_archives(out, out, tmp)  # importing a folder into itself leaves it as it was
     assert not dumps.have_system_archives(os.path.join(tmp, 'nothing'))
+
+    # A full-looking cache must not suppress the system files the player explicitly supplied.
+    import pipeline
+    cached = os.path.join(tmp, 'cached')
+    os.makedirs(cached)
+    for i in range(len(dumps.SYSTEM_ARCHIVES)):
+        open(os.path.join(cached, f'unrelated-{i}.txt'), 'wb').close()
+
+    class Game:
+        path, kind, size = 'made-up.3ds', 'game', 0
+        title_id, unique = 0x0004000000086300, 0x00086300
+        product, name = 'CTR-P-TEST', 'Archive import test'
+        encrypted = lambda self: False
+        dlp_source = lambda self: None
+        read_names = lambda self: None
+        f = mock.Mock()
+
+    class Imported(Exception):
+        pass
+
+    with mock.patch.object(pipeline, 'ARCHIVES', cached), \
+            mock.patch.object(pipeline, 'WORK_GAMES', os.path.join(tmp, 'work')), \
+            mock.patch.object(pipeline, 'profile_for', return_value=None), \
+            mock.patch.object(pipeline.user_files, 'check_otp', return_value=None), \
+            mock.patch.object(pipeline.shutil, 'disk_usage', return_value=mock.Mock(free=1 << 40)), \
+            mock.patch.object(dumps, 'Dump', return_value=Game()), \
+            mock.patch.object(dumps, 'extract_program'), \
+            mock.patch.object(dumps, 'import_system_archives', side_effect=Imported) as requested, \
+            mock.patch.object(sys, 'platform', 'win32'), \
+            mock.patch.object(sys, 'argv', ['pipeline.py', '--game', 'made-up.3ds', '--otp', 'unused', '--out', tmp, '--emulator', user]):
+        try:
+            pipeline.main()
+        except (Imported, SystemExit):
+            pass
+        requested.assert_called_once()
+        assert requested.call_args.args[:2] == (user, cached)
 print('system archives: ok')

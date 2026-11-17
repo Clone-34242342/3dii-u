@@ -10,6 +10,9 @@ OTP_COMMON_KEY = slice(0xE0, 0xF0)  # where the Wii U common key sits in the OTP
 BOOT9_SIZES = (0x10000, 0x8000)  # the whole boot ROM, or only its protected half
 # What a user's own console gives them, and what must never be shipped or committed.
 NAMES = ('otp.bin', 'seeprom.bin', 'boot9.bin', 'boot11.bin', 'seeddb.bin', 'aes_keys.txt', 'movable.sed', 'keys.txt')
+# Recognizable raw game/system dumps; other .bin files include required shader records.
+DUMP_NAMES = ('code.bin', '.code', 'romfs.bin', 'exefs.bin', 'exheader.bin')
+DUMP_EXTENSIONS = ('.3ds', '.cia', '.cci', '.cxi', '.romfs')
 
 
 def _size(path):
@@ -59,8 +62,9 @@ def check_key_folder(folder):
 
 
 def bundled(root):
-    """every file under root named like one of the user's own key or console files: what an app or release must not contain"""
+    """Files named like private keys, console data or raw game dumps: an app or release must not contain these."""
     found = []
     for d, _, files in os.walk(root):
-        found += [os.path.join(d, f) for f in files if f.lower() in NAMES]
+        found += [os.path.join(d, f) for f in files
+                  if f.lower() in NAMES + DUMP_NAMES or f.lower().endswith(DUMP_EXTENSIONS)]
     return found

@@ -221,7 +221,17 @@ def main():
         args += ['--hidden-import', m]
     for m in EXCLUDE:
         args += ['--exclude-module', m]
-    PyInstaller.__main__.run(args)
+    # Match Windows' DLL search order: a tool on PATH (such as Poppler) can carry
+    # an incompatible icuuc.dll that PyInstaller otherwise bundles instead of using Windows' own.
+    previous_path = os.environ.get('PATH')
+    os.environ['PATH'] = os.path.join(os.environ['WINDIR'], 'System32') + os.pathsep + (previous_path or '')
+    try:
+        PyInstaller.__main__.run(args)
+    finally:
+        if previous_path is None:
+            os.environ.pop('PATH', None)
+        else:
+            os.environ['PATH'] = previous_path
     shutil.rmtree(WORK, ignore_errors=True)
     freed = prune(os.path.join(OUT, NAME, '_internal', 'PySide6'))
     engine = bundle_engine(os.path.join(OUT, NAME, 'engine'))

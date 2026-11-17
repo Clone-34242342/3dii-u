@@ -42,6 +42,18 @@ with tempfile.TemporaryDirectory() as tmp:
     put(clean, 'engine/deep/SeedDB.bin', b'x')
     assert [os.path.basename(p) for p in uf.bundled(clean)] == ['SeedDB.bin']
 
+    # Release checks reject recognizable raw dumps anywhere in the engine, without
+    # rejecting the shader records and resources the builder deliberately ships.
+    release = os.path.join(tmp, 'release')
+    for name in ('pipelines.bin', 'fs_123.bin', 'vs_123.vsf', 'vs_123.vsr',
+                 'iconTex.tga', 'bench.rpx', 'import_system_archives.py'):
+        put(release, 'engine/resources/' + name, b'synthetic resource')
+    assert uf.bundled(release) == []
+    raw = ('code.bin', '.code', 'ROMFS.bin', 'exefs.bin', 'exheader.bin',
+           'game.3ds', 'game.CIA', 'game.cci', 'game.cxi', '0004009b00010202.romfs')
+    expected = {os.path.normpath(put(release, 'engine/deep/private/' + name, b'synthetic dump')) for name in raw}
+    assert set(uf.bundled(release)) == expected, 'raw game/system data would be released'
+
     # the SD card a build goes onto, checked before it starts: a locked card (Windows' error 19) is said in plain words
     import pipeline  # noqa: E402
     locked = OSError(None, 'The media is write protected', 'D:\\3dii-u', 19)

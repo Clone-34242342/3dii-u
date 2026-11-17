@@ -25,12 +25,13 @@ def files_in(folder):
 
 def the_save(folder):
     """The folder that holds the save's own files, from the one the player chose: an emulator's title folder holds it in data/00000001, and
-    Checkpoint's folder for a game holds one dated folder per backup (20261114-050000), the newest taken. Any other is taken as it is."""
+    Checkpoint's folder for a game holds one dated folder per backup (20261114-050000, optionally followed by a label), the newest taken.
+    Any other is taken as it is."""
     inner = os.path.join(folder, 'data', '00000001')
     if os.path.isdir(inner):
         return inner
     names = [n for n in os.listdir(folder) if not junk(n)]
-    if names and all(re.fullmatch(r'\d{8}-\d{6}', n) and os.path.isdir(os.path.join(folder, n)) for n in names):
+    if names and all(re.fullmatch(r'\d{8}-\d{6}(?:\D.*)?', n) and os.path.isdir(os.path.join(folder, n)) for n in names):
         return os.path.join(folder, max(names))
     return folder
 

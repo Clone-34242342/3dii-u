@@ -11,6 +11,7 @@ Lines starting with @ are for the app: @stage <name>, @progress <0-100>, @done <
 
 It builds with tools/win/build3ds.py, in folders of its own (builder_work/, build_win_builder/), so it never touches the nine ports' builds."""
 import argparse
+from contextlib import contextmanager
 import errno
 import filecmp
 import io
@@ -20,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 
@@ -132,38 +134,76 @@ def tool(name):
 
 def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
                boot_sound=None, screen_art=None):
-    """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
+    """the title every game gets, then its update, DLC and optional Download Play archive"""
     tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
                                        info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel,
                                        pad_art, boot_sound, screen_art)
     content = os.path.join(out, 'title', 'content')
     for f in os.listdir(game_dir):
-        if f.startswith(('update_', 'dlc_')):
+        if f.startswith(('update_', 'dlc_')) or f == 'dlp_child.romfs':
             os.link(os.path.join(game_dir, f), os.path.join(content, f))
+
+
+@contextmanager
+def staged_output(target):
+    """Build beside the destination; retain its last good contents until the replacement is in place."""
+    target = os.path.abspath(target)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, exist_ok=True)
+    if os.path.lexists(target) and not os.path.isdir(target):
+        raise FileExistsError(f'The output path is not a folder: {target}')
+    work = tempfile.mkdtemp(prefix='.3diiu-', dir=parent)
+    new, previous = os.path.join(work, 'new'), os.path.join(work, 'previous')
+    try:
+        yield new
+        if os.path.lexists(target):
+            print(f'Keeping the previous build at {previous} until replacement finishes.', flush=True)
+            os.rename(target, previous)
+        try:
+            os.rename(new, target)
+        except BaseException:
+            if os.path.lexists(previous):
+                try:
+                    os.rename(previous, target)
+                except OSError as e:
+                    raise OSError(f'The previous build could not be restored to {target}; it is safe at {previous}.') from e
+            raise
+        shutil.rmtree(previous, ignore_errors=True)
+    finally:
+        # A failed rollback (or interrupted swap) must never clean up the only remaining good copy.
+        if not os.path.lexists(previous):
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def copy_to(source, target_dir):
     """the WUP folder into target_dir, compared file by file; what was there is replaced only once the new copy is right"""
     name = os.path.basename(source)
     target = os.path.join(target_dir, name)
-    new = target + '_new'
-    shutil.rmtree(new, ignore_errors=True)
-    os.makedirs(new)
-    names = sorted(os.listdir(source))
-    total, done = sum(os.path.getsize(os.path.join(source, n)) for n in names), 0
-    for n in names:
-        with open(os.path.join(source, n), 'rb') as i, open(os.path.join(new, n), 'wb') as o:
-            while chunk := i.read(8 << 20):
-                o.write(chunk)
-                done += len(chunk)
-                PROGRESS.at(done / total * 0.8)
-    if any(filecmp.cmpfiles(source, new, names, shallow=False)[1:]):
-        shutil.rmtree(new, ignore_errors=True)
-        fail('The copy came out different from the original: the card may be failing. Nothing was replaced.')
-    if os.path.isdir(target):
-        shutil.rmtree(target)
-    os.rename(new, target)
+    with staged_output(target) as new:
+        os.makedirs(new)
+        names = sorted(os.listdir(source))
+        total, done = sum(os.path.getsize(os.path.join(source, n)) for n in names), 0
+        for n in names:
+            with open(os.path.join(source, n), 'rb') as i, open(os.path.join(new, n), 'wb') as o:
+                while chunk := i.read(8 << 20):
+                    o.write(chunk)
+                    done += len(chunk)
+                    PROGRESS.at(done / total * 0.8)
+        if any(filecmp.cmpfiles(source, new, names, shallow=False)[1:]):
+            fail('The copy came out different from the original: the card may be failing. Nothing was replaced.')
     return target
+
+
+def pack_wup(otp, title, target):
+    try:
+        with staged_output(target) as new:
+            r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'pack_game_wup.py'), otp, title, new], cwd=ROOT,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+            print(r.stdout.strip()[-400:], flush=True)
+            if r.returncode:  # a failed pack can leave a title.tmd behind: only the exit code counts
+                fail('Packing the WUP failed.')
+    except OSError as e:
+        fail(f'The WUP could not be replaced: {e}')
 
 
 def card_error(e):
@@ -298,6 +338,7 @@ def main():
 
         PROGRESS.stage('Unpacking')
         dumps.extract_program(plain[game], game_dir, lambda d, t: PROGRESS.at(d / t * (0.6 if extras else 1)))
+        dumps.copy_dlp(plain[game], game_dir)
         if update:
             info_u = dumps.add_update(update, plain[update], game_dir, lambda d, t: PROGRESS.at(0.6 + d / t * 0.2))
             print(f'update v{update.version}: its code runs as {info_u["program_id"]}', flush=True)
@@ -305,7 +346,7 @@ def main():
             print(f'DLC: {dumps.add_dlc(dlc, sources, game_dir, lambda d, t: PROGRESS.at(0.8 + d / t * 0.2))} contents', flush=True)
         archives = ARCHIVES
         os.makedirs(archives, exist_ok=True)  # the title takes whatever is in it, even if that's nothing
-        if len(os.listdir(archives)) < len(dumps.SYSTEM_ARCHIVES) and a.emulator:
+        if a.emulator:
             got = dumps.import_system_archives(a.emulator, archives, tmp)
             print(f'system archives from your emulator\'s files: {len(got)}', flush=True)
         # mods go on before anything's recompiled, so their code is recompiled with the game's
@@ -455,14 +496,9 @@ def main():
         return
 
     PROGRESS.stage('Packing the WUP')
-    wup = os.path.join(a.out or game_dir, info['folder'])
-    shutil.rmtree(wup, ignore_errors=True)
-    r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'pack_game_wup.py'), a.otp, os.path.join(out, 'title'), wup], cwd=ROOT,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
-    print(r.stdout.strip()[-400:], flush=True)
-    if r.returncode:  # a failed pack can leave a title.tmd behind: only the exit code counts
-        shutil.rmtree(wup, ignore_errors=True)
-        fail('Packing the WUP failed.')
+    # A failed card copy leaves this completed output outside the extraction folder that the next attempt clears.
+    wup = os.path.join(a.out or os.path.join(WORK_GAMES, '_wup', info['slug']), info['folder'])
+    pack_wup(a.otp, os.path.join(out, 'title'), wup)
 
     where = wup
     if a.card:

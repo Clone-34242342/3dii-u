@@ -65,6 +65,19 @@ try:
         return len(pills)
 
     settle('loading')
+    # Selected save folders must remain readable, including names with no spaces.
+    save_name = '20520623-074459_Animal_Crossing_New_Leaf_Checkpoint_backup_for_import'
+    state.set(saveText=save_name, hasSave=True)
+    for width, height in ((960, 540), (1280, 720), (1600, 900)):
+        win.setWidth(width)
+        win.setHeight(height)
+        settle('the save row resized')
+        subtitle = next(p for p in items(QQuickWindow.contentItem(win)) if p.property('text') == save_name)
+        assert not subtitle.property('truncated'), 'the selected save folder is cut off'
+        assert subtitle.y() + subtitle.height() <= subtitle.parentItem().height(), 'save text overlaps the next row'
+    state.set(saveText=gui.NO_SAVE, hasSave=False)
+    win.setWidth(1280)
+    win.setHeight(720)
     used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Main.qml'), encoding='utf-8').read()))
     missing = sorted(n for n in used if not hasattr(state, n))
     assert not missing, f'Main.qml uses app.{missing}, which App lacks'

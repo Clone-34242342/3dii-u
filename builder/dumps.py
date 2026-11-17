@@ -5,12 +5,14 @@ and leave its "encrypted" flags on: the hashes decide, not the flags.
 
 A game's folder gets what tools/win/build3ds.py and the runtime read: exheader.bin, code.bin, romfs.bin (the RomFS level 3 image), exefs/<name>.bin,
 info.json. An update adds its own code and exheader and update_romfs.bin, which the game lays over the base RomFS itself (SelfNCCH path type 5).
-DLC adds dlc_<content index>.romfs per content and the records am:app hands out (runtime/services/misc.cpp)."""
+DLC adds dlc_<content index>.romfs per content and the records am:app hands out (runtime/services/misc.cpp).
+Download Play's optional content 2 is retained as dlp_child.romfs, for a future service; it is not executable support."""
 import hashlib
 import json
 import os
 import shutil
 import struct
+import tempfile
 
 import decrypt
 
@@ -168,6 +170,27 @@ class Dump:
     def program(self):
         return ncch(self.program_source())
 
+    def dlp_source(self):
+        """DLP's special content: NCSD partition 2 or CIA content index 2 (not TMD row 2)."""
+        if self.cia:
+            matches = [c for c in self.cia.contents if c[1] == 2 and c[4] is not None]
+            if not matches:
+                return None
+            if len(matches) != 1:
+                raise DumpError('The Download Play content index is repeated.')
+            _, _, _, size, off = matches[0]
+        else:
+            self.f.seek(0)
+            head = self.f.read(0x200)
+            if head[0x100:0x104] != b'NCSD':
+                return None
+            off, size = (u32(head, n) * MU for n in (0x130, 0x134))
+            if not off and not size:
+                return None
+        if off < MU or size < MU or off + size > os.fstat(self.f.fileno()).st_size:
+            raise DumpError('The Download Play content lies outside the dump.')
+        return FileSlice(self.f, off, size)
+
     def read_names(self):
         """name, publisher, product code and icon, from the program's header and ExeFS (decrypted on the fly if needed)"""
         if self.encrypted():
@@ -229,25 +252,62 @@ def copy_romfs(p, nh, out_path, progress=None):
     off, size, hashed = u32(nh, 0x1B0) * MU, u32(nh, 0x1B4) * MU, u32(nh, 0x1B8) * MU
     if not size:
         return False
+    available = min(p.size, os.fstat(p.f.fileno()).st_size - p.off)
+    declared = u32(nh, 0x104) * MU
+    if not MU <= declared <= available or off < MU or off + size > declared or not 0 < hashed <= size:
+        raise DumpError('The RomFS section lies outside its NCCH.')
     if hashlib.sha256(p.pread(off, hashed)).digest() != nh[0x1E0:0x200]:
         raise DumpError('The RomFS fails its hash: a bad decryption or a damaged dump.')
     ivfc = p.pread(off, 0x60)
-    if ivfc[:4] != b'IVFC':
+    if len(ivfc) != 0x60 or ivfc[:4] != b'IVFC':
         raise DumpError('The RomFS has no IVFC header.')
-    block = 1 << u32(ivfc, 0x4C)
+    block_bits = u32(ivfc, 0x4C)
+    if block_bits > 31:
+        raise DumpError('The RomFS block size is invalid.')
+    block = 1 << block_bits
     l3_size = struct.unpack_from('<Q', ivfc, 0x44)[0]
     l3_off = off + ((0x60 + u32(ivfc, 8) + block - 1) & ~(block - 1))
+    if l3_off > off + size or l3_size > off + size - l3_off:
+        raise DumpError('The RomFS level 3 image lies outside its section.')
     tmp = out_path + '.part'
-    with open(tmp, 'wb') as o:
-        done = 0
-        while done < l3_size:
-            n = min(8 << 20, l3_size - done)
-            o.write(p.pread(l3_off + done, n))
-            done += n
-            if progress:
-                progress(done, l3_size)
-    os.replace(tmp, out_path)
+    try:
+        with open(tmp, 'wb') as o:
+            done = 0
+            while done < l3_size:
+                n = min(8 << 20, l3_size - done)
+                data = p.pread(l3_off + done, n)
+                if len(data) != n:
+                    raise DumpError('The RomFS ended before its declared size.')
+                o.write(data)
+                done += n
+                if progress:
+                    progress(done, l3_size)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return True
+
+
+def copy_dlp(dump, out_dir):
+    """Preserve DLP's opaque RomFS for a future service, not working Download Play.
+
+    Checks the NCCH envelope, RomFS superblock hash and image bounds, not the full
+    IVFC tree or the inner child CIA. A future distributor must validate that child.
+    """
+    p = dump.dlp_source()
+    if p is None:
+        return False
+    with tempfile.TemporaryDirectory(prefix='.dlp-', dir=out_dir) as tmp:
+        try:
+            ncch(p)
+        except DumpError:
+            path = os.path.join(tmp, 'content.ncch')
+            decrypt._full_decrypted(dump.path, 2, path)
+            with open(path, 'rb') as f:
+                p = ncch(FileSlice(f, 0, os.fstat(f.fileno()).st_size))
+                return copy_romfs(p, p.pread(0, MU), os.path.join(out_dir, 'dlp_child.romfs'))
+        return copy_romfs(p, p.pread(0, MU), os.path.join(out_dir, 'dlp_child.romfs'))
 
 
 def extract_program(dump, out_dir, progress=None, romfs_name='romfs.bin'):

@@ -304,11 +304,11 @@ ApplicationWindow {
         signal tapped
         default property alias pills: pillRow.data
         width: parent ? parent.width : 560
-        height: 50
+        height: Math.max(50, subLabel.y + subLabel.implicitHeight + 8)
         Hit { enabled: row.tappable; visible: row.tappable; anchors.margins: 6; name: row.label; description: row.description; role: row.role; checked: row.checked; onActivated: row.tapped() }
         Light { x: 26; y: 14; tone: row.light; pulse: row.pulse }
         Label { id: lab; x: 64; y: 3; width: pillRow.x - 72; text: row.label; color: pal.label; font.pixelSize: 18; elide: Text.ElideRight }
-        Label { x: 64; y: 22; width: lab.width; text: row.sub; color: pal.subLabel; font.pixelSize: 17; elide: Text.ElideRight }
+        Label { id: subLabel; x: 64; y: 22; width: lab.width; text: row.sub; color: pal.subLabel; font.pixelSize: 17; wrapMode: Text.Wrap }
         Row { id: pillRow; anchors.right: parent.right; anchors.rightMargin: 21; y: 7; spacing: 8 }
     }
 
@@ -711,19 +711,19 @@ ApplicationWindow {
                         visible: app.view === "form"
                         enabled: !win.restarting
                         title: "Extras"
-                        subtitle: "Allows you to build with an update, DLC or a Mod.\nYou'll be asked about each when a game is picked."
+                        subtitle: "Optional updates, DLC, mods and 3DS saves.\nChoose a game to add its files."
                         CardRow {
-                            label: "Update"; sub: app.hasUpdate ? app.updateText : "None Selected."; light: app.hasUpdate ? "cyan" : "red"
+                            label: "Update"; sub: app.hasUpdate ? app.updateText : "None selected"; light: app.hasUpdate ? "cyan" : "red"
                             Pill { text: "Choose"; tone: "cyan"; onClicked: app.hasGame ? app.chooseExtra("update") : app.chooseGame() }
                             Pill { text: "Remove"; tone: "red"; onClicked: app.removeExtra("update") }
                         }
                         CardRow {
-                            label: "DLC"; sub: app.hasDlc ? app.dlcText : "None Selected."; light: app.hasDlc ? "cyan" : "red"
+                            label: "DLC"; sub: app.hasDlc ? app.dlcText : "None selected"; light: app.hasDlc ? "cyan" : "red"
                             Pill { text: "Choose"; tone: "cyan"; onClicked: app.hasGame ? app.chooseExtra("dlc") : app.chooseGame() }
                             Pill { text: "Remove"; tone: "red"; onClicked: app.removeExtra("dlc") }
                         }
                         CardRow {
-                            label: "Mod"; sub: app.hasMod ? app.modText : "None Selected."; light: app.hasMod ? "cyan" : "red"
+                            label: "Mod"; sub: app.hasMod ? app.modText : "None selected"; light: app.hasMod ? "cyan" : "red"
                             Pill { text: ".zip"; onClicked: app.hasGame ? app.chooseMod("zip") : app.chooseGame() }
                             Pill { text: "Folder"; tone: "cyan"; onClicked: app.hasGame ? app.chooseMod("folder") : app.chooseGame() }
                             Pill { text: "Remove"; tone: "red"; onClicked: app.removeExtra("mod") }

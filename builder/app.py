@@ -53,17 +53,20 @@ def fresh_cache(engine, work):
     try:
         with open(os.path.join(engine, 'stamp.txt')) as f:  # make_app.py writes one into each engine
             stamp = f.read()
-        if os.path.isfile(mark):
-            with open(mark) as f:
-                if f.read() == stamp:
-                    return
-        import shutil
-        shutil.rmtree(os.path.join(work, 'build_win_builder'), ignore_errors=True)
-        os.makedirs(work, exist_ok=True)
-        with open(mark, 'w') as f:
-            f.write(stamp)
-    except OSError:  # an engine with no stamp, or no work folder: builds go on with the cache as it is
-        pass
+    except FileNotFoundError:  # older/source engines without a stamp keep their existing behavior
+        return
+    if os.path.isfile(mark):
+        with open(mark) as f:
+            if f.read() == stamp:
+                return
+    import shutil
+    cache = os.path.join(work, 'build_win_builder')
+    shutil.rmtree(cache, ignore_errors=True)
+    if os.path.exists(cache):
+        raise OSError(f'Old compiled files are still in {cache}. Close other Builder windows and try again.')
+    os.makedirs(work, exist_ok=True)
+    with open(mark, 'w') as f:
+        f.write(stamp)
 
 
 def chosen_build():
@@ -82,7 +85,7 @@ def use_engine(root):
         base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), '.local', 'share')
         work = os.environ.setdefault('THREEDII_WORK', os.path.join(base, '3Dii U Builder'))
         build = os.environ.setdefault('THREEDII_BUILD', chosen_build() or work)  # the big build files, pipeline.BUILD
-        if 'THREEDII_ROOT' not in os.environ:  # once, in the window: the builds it starts inherit the cache as it left it
+        if 'THREEDII_ROOT' not in os.environ or '--pipeline' in sys.argv[1:]:  # a build rechecks its selected folder; compiler children don't
             fresh_cache(root, build)
         root = short_path(root, work)
         os.environ.setdefault('THREEDII_DEVKITPRO', os.path.join(root, 'devkitpro').replace('\\', '/'))
@@ -115,7 +118,14 @@ def hand_over():
 
 
 hand_over()
-use_engine(find_root())
+try:
+    use_engine(find_root())
+except OSError as e:
+    why = f'The compiled cache could not be refreshed.\n\n{e}'
+    if FROZEN and os.name == 'nt' and len(sys.argv) == 1:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, why, '3Dii U Builder cannot start', 0x10)
+    raise SystemExit(why) from e
 
 
 def quiet_children():
