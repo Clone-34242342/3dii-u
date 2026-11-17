@@ -15,7 +15,8 @@ SIZES = (0, 1, 0x1F, 0x20, 0x21, BLOCK - 1, BLOCK, BLOCK + 1, 16 * BLOCK, 16 * B
 
 
 def make_title(title):
-    files = {'code/app.xml': APP.encode(), 'code/cos.xml': b'<app/>', 'code/game.rpx': os.urandom(100001), 'meta/meta.xml': b'<menu/>',
+    files = {'code/app.xml': APP.encode(), 'code/cos.xml': b'<app/>', 'code/game.rpx': os.urandom(100001),
+             'meta/meta.xml': b'<menu><title_id type="hexBinary" length="8">000500003D0000FF</title_id></menu>',
              'meta/bootMovie.h264': os.urandom(0x8000), 'meta/bootLogoTex.tga': os.urandom(77), 'meta/iconTex.tga': os.urandom(0xFC00 * 2)}
     files.update({f'content/file{i:02d}.bin': os.urandom(n) for i, n in enumerate(SIZES)})
     # folders in content, as a 3DS save packed into a build is (content/save_import), one inside another, with files after them

@@ -29,6 +29,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get('THREEDII_ROOT') or os.path.dirname(HERE)  # the standalone app runs from elsewhere: app.py finds the repository
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(ROOT, 'tools', 'win'))
+sys.path.append(os.path.join(ROOT, 'tools'))
+import wup_safety  # noqa: E402
 import credits  # noqa: E402
 import decrypt  # noqa: E402
 import dumps  # noqa: E402
@@ -147,11 +149,10 @@ def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', re
 @contextmanager
 def staged_output(target):
     """Build beside the destination; retain its last good contents until the replacement is in place."""
+    wup_safety.check_output(target, replace=True)
     target = os.path.abspath(target)
     parent = os.path.dirname(target)
     os.makedirs(parent, exist_ok=True)
-    if os.path.lexists(target) and not os.path.isdir(target):
-        raise FileExistsError(f'The output path is not a folder: {target}')
     work = tempfile.mkdtemp(prefix='.3diiu-', dir=parent)
     new, previous = os.path.join(work, 'new'), os.path.join(work, 'previous')
     try:
@@ -179,6 +180,10 @@ def copy_to(source, target_dir):
     """the WUP folder into target_dir, compared file by file; what was there is replaced only once the new copy is right"""
     name = os.path.basename(source)
     target = os.path.join(target_dir, name)
+    try:
+        wup_safety.check_output(target, source, replace=True)
+    except ValueError as e:
+        fail(str(e))
     with staged_output(target) as new:
         os.makedirs(new)
         names = sorted(os.listdir(source))
@@ -196,13 +201,14 @@ def copy_to(source, target_dir):
 
 def pack_wup(otp, title, target):
     try:
+        wup_safety.check_output(target, title, replace=True)
         with staged_output(target) as new:
             r = subprocess.run([sys.executable, os.path.join(ROOT, 'tools', 'pack_game_wup.py'), otp, title, new], cwd=ROOT,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
             print(r.stdout.strip()[-400:], flush=True)
             if r.returncode:  # a failed pack can leave a title.tmd behind: only the exit code counts
                 fail('Packing the WUP failed.')
-    except OSError as e:
+    except (OSError, ValueError) as e:
         fail(f'The WUP could not be replaced: {e}')
 
 
@@ -217,10 +223,13 @@ def check_card(card):
     """a build that ends on the SD card finds out it can't write there first, not after minutes of building"""
     probe = os.path.join(card.rstrip('\\/') + os.sep, 'install', '.3diiu_check')
     try:
+        wup_safety.check_output(probe)
         os.makedirs(os.path.dirname(probe), exist_ok=True)
         with open(probe, 'wb') as f:
             f.write(b'3Dii U')
         os.remove(probe)
+    except ValueError as e:
+        fail(str(e))
     except OSError as e:
         fail(card_error(e))
 
@@ -277,6 +286,12 @@ def main():
         fail('Building on Linux isn\'t ready yet: this version builds on Windows.')
     if not (a.card or a.out):
         fail('Choose an SD card or a folder for the WUP.')
+    try:
+        for path in (WORK_GAMES, ARCHIVES, a.out):
+            if path:
+                wup_safety.check_output(path)
+    except ValueError as e:
+        fail(str(e))
     # a measuring build for Cemu is never packed (THREEDII_MEASURE, build3ds.py), so it needs no common key
     problem = None if os.environ.get('THREEDII_MEASURE', '') not in ('', 'console') else user_files.check_otp(a.otp)
     if problem:

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
+from wup_safety import check_output
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 FOLDERS = {'sticker_star': 'Paper_Mario_Sticker_Star', 'nsmb2': 'New_Super_Mario_Bros_2', 'dream_team': 'Mario_Luigi_Dream_Team', 'paper_jam': 'Mario_Luigi_Paper_Jam',
@@ -21,6 +22,7 @@ PREVIOUS = ROOT + '/dist/previous'  # the build each title had on the card befor
 def pack(otp, game):
     target = f'{ROOT}/dist/{FOLDERS[game]}'
     title = f'{ROOT}/{OUT.get(game, "build_mario/" + game)}/title'
+    check_output(target, title, replace=True)
     shutil.rmtree(target, ignore_errors=True)
     r = subprocess.run([sys.executable, ROOT + '/tools/pack_game_wup.py', otp, title, target], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     if r.returncode == 0:
@@ -33,10 +35,13 @@ def pack(otp, game):
 def copy(source, card):
     name = os.path.basename(source)
     target = f'{card}/install/{name}'
+    check_output(source, replace=True)
+    check_output(target, source, replace=True)
     # what was there is kept on this PC, compared, and leaves the card, so the card only ever holds one build of each (the user's rule, 2026-11-07): a build that
     # disappoints can go back without a rebuild
     if os.path.isdir(target):
         kept = f'{PREVIOUS}/{name}'
+        check_output(kept, replace=True)
         shutil.rmtree(kept, ignore_errors=True)
         shutil.copytree(target, kept)
         if any(filecmp.cmpfiles(target, kept, os.listdir(target), shallow=False)[1:]):
