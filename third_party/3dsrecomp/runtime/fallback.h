@@ -64,6 +64,79 @@ inline u32 ror32_val(u32 val, u32 rot) {
     return rot ? (val >> rot) | (val << (32 - rot)) : val;
 }
 
+// A call out of interpreted code into compiled code, back at return_pc: the callee keeps r4-r11 and sp (AAPCS), restored here all the same.
+inline void call_compiled(CPU *c, u32 target, u32 return_pc) {
+    u32 saved[9];
+    for (int i = 0; i < 8; i++) saved[i] = c->r[4 + i];
+    saved[8] = c->r[13];
+    c->r[14] = return_pc;
+    c->pc = target;
+    rt_dispatch(c, 0);
+    assert(c->pc == return_pc);
+    for (int i = 0; i < 8; i++) c->r[4 + i] = saved[i];
+    c->r[13] = saved[8];
+}
+
+// A call to code that may or may not be compiled: compiled code runs as such, the rest is interpreted here, one function deep.
+inline void call_any(CPU *c, u32 target, u32 return_pc) {
+    if (dispatch_lookup(target) || dispatch_lookup(target ^ 1u)) {
+        call_compiled(c, target, return_pc);
+        return;
+    }
+    c->r[14] = return_pc;
+    c->pc = target;
+}
+
+// The ARM data-processing operand 2 and the shifter's carry out (carry in: the C flag, which an unshifted operand keeps).
+// Register-specified shifts (bit 4) take the low byte of Rs; an immediate shift of 0 means LSR #32, ASR #32 or RRX for types 1 to 3.
+inline u32 shifter_operand(const CPU *c, u32 op, u32 at, bool &carry) {
+    carry = c->cf;
+    if (op & 0x02000000u) {
+        const u32 rot = ((op >> 8) & 0xFu) * 2;
+        const u32 val = ror32_val(op & 0xFFu, rot);
+        if (rot) carry = val >> 31;
+        return val;
+    }
+    const u32 rm = op & 0xFu;
+    u32 val = rm == 15 ? at + 8 : c->r[rm];
+    const u32 type = (op >> 5) & 3u;
+    u32 n;
+    if (op & 0x10u) {  // by register
+        if (rm == 15) val = at + 12;
+        n = c->r[(op >> 8) & 0xFu] & 0xFFu;
+        if (n == 0) return val;
+    } else {
+        n = (op >> 7) & 0x1Fu;
+        if (n == 0) {
+            if (type == 0) return val;
+            if (type == 3) {  // RRX
+                carry = val & 1;
+                return (u32)c->cf << 31 | val >> 1;
+            }
+            n = 32;
+        }
+    }
+    switch (type) {
+    case 0:  // LSL
+        if (n >= 32) { carry = n == 32 ? val & 1 : 0; return 0; }
+        carry = (val >> (32 - n)) & 1;
+        return val << n;
+    case 1:  // LSR
+        if (n >= 32) { carry = n == 32 ? val >> 31 : 0; return 0; }
+        carry = (val >> (n - 1)) & 1;
+        return val >> n;
+    case 2:  // ASR
+        if (n >= 32) { carry = val >> 31; return (u32)((s32)val >> 31); }
+        carry = (val >> (n - 1)) & 1;
+        return (u32)((s32)val >> n);
+    default:  // ROR
+        n &= 31;
+        if (n == 0) { carry = val >> 31; return val; }
+        carry = (val >> (n - 1)) & 1;
+        return ror32_val(val, n);
+    }
+}
+
 // Bounded ARM/Thumb fallback execution engine for missed code
 inline void execute(CPU *c, u32 entry_pc) {
     u8 *M = g_mem;
@@ -90,6 +163,16 @@ inline void execute(CPU *c, u32 entry_pc) {
             const u32 op = RD32(at);
             const u32 cond = op >> 28;
 
+            if (cond == 15) {  // ARMv5+: the unconditional space, not "never"
+                if ((op & 0xFE000000u) == 0xFA000000u) {  // BLX <imm24>: to Thumb, the H bit the halfword
+                    s32 offset = op & 0x00FFFFFFu;
+                    if (offset & 0x00800000) offset |= 0xFF000000;
+                    const u32 target = (at + 8 + (u32)(offset << 2) + ((op >> 23) & 2u)) | 1u;
+                    call_any(c, target, next_pc);
+                    continue;
+                }
+                FATAL("fallback interpreter unsupported unconditional ARM instruction 0x%08x at 0x%08x", op, at);
+            }
             if (cond != 14 && !eval_cond(c, cond)) {
                 c->pc = next_pc;
                 continue;
@@ -103,17 +186,7 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
             if ((op & 0x0FFFFFF0u) == 0x012FFF30u) {
-                const u32 rm = op & 0xFu;
-                const u32 target = c->r[rm];
-                u32 saved[9];
-                for (int i = 0; i < 8; i++) saved[i] = c->r[4 + i];
-                saved[8] = c->r[13];
-                c->r[14] = next_pc;
-                c->pc = target;
-                rt_dispatch(c, 0);
-                assert(c->pc == next_pc);
-                for (int i = 0; i < 8; i++) c->r[4 + i] = saved[i];
-                c->r[13] = saved[8];
+                call_compiled(c, c->r[op & 0xFu], next_pc);
                 continue;
             }
 
@@ -155,18 +228,31 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
 
-            // B / BL <imm24>
+            // B / BL <imm24>: a BL into compiled code runs it compiled (call_any); the rest of a BL's callee is interpreted
             if ((op & 0x0E000000u) == 0x0A000000u) {
                 const bool link = (op & 0x01000000u) != 0;
                 s32 offset = op & 0x00FFFFFFu;
                 if (offset & 0x00800000) offset |= 0xFF000000;
-                offset = (offset << 2) + 8;
-                if (link) c->r[14] = next_pc;
-                c->pc = (at + offset);
+                const u32 target = at + 8 + (u32)(offset << 2);
+                if (link) call_any(c, target, next_pc);
+                else c->pc = target;
                 continue;
             }
 
-            // Halfword and Signed Data Transfer (LDRH, STRH, LDRSB, LDRSH)
+            // Multiplies share the halfword transfers' shape (bits 7:4 = 1001) with bits 6:5 = 00: MUL and MLA here, the rest stop
+            if ((op & 0x0FC000F0u) == 0x00000090u) {
+                const u32 rd = (op >> 16) & 0xFu, rn = (op >> 12) & 0xFu, rs = (op >> 8) & 0xFu, rm = op & 0xFu;
+                const u32 res = c->r[rm] * c->r[rs] + ((op & 0x00200000u) ? c->r[rn] : 0);
+                c->r[rd] = res;
+                if (op & 0x00100000u) set_nz(c, res);
+                c->pc = next_pc;
+                continue;
+            }
+            if ((op & 0x0E000090u) == 0x00000090u && !(op & 0x60u)) {  // long multiplies, swaps
+                FATAL("fallback interpreter unsupported ARM opcode 0x%08x at 0x%08x", op, at);
+            }
+
+            // Halfword and Signed Data Transfer (LDRH, STRH, LDRSB, LDRSH), and the doubleword pair (LDRD, STRD)
             if ((op & 0x0E000090u) == 0x00000090u) {
                 const bool p = (op & 0x01000000u) != 0;
                 const bool u = (op & 0x00800000u) != 0;
@@ -190,6 +276,12 @@ inline void execute(CPU *c, u32 entry_pc) {
                     c->r[rd] = (s32)(s8)RD8(addr);
                 } else if (s && h && l) {
                     c->r[rd] = (s32)(s16)RD16(addr);
+                } else if (s && !h) {  // LDRD: Rd and Rd+1 (Rd even)
+                    c->r[rd] = RD32(addr);
+                    c->r[rd + 1] = RD32(addr + 4);
+                } else {  // STRD
+                    WR32(addr, c->r[rd]);
+                    WR32(addr + 4, c->r[rd + 1]);
                 }
 
                 if (!p || w) {
@@ -205,55 +297,61 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
 
-            // Data processing (MOV, ADD, SUB, RSB, CMP, CMN, TST, AND, ORR, EOR, BIC)
-            if ((op & 0x0C000000u) == 0x00000000u) {
-                const bool imm = (op & 0x02000000u) != 0;
+            // Data processing. Rn = 15 reads PC+8 (ADR: add r0, pc, #n); Rd = 15 branches (mov pc, lr; add pc, pc, r0, lsl #2).
+            // The MSR/MRS and BX space (bits 24:23 = 10 with S = 0) is not data processing.
+            if ((op & 0x0C000000u) == 0x00000000u && (op & 0x01900000u) != 0x01000000u) {
                 const u32 opcode = (op >> 21) & 0xFu;
                 const bool s = (op & 0x00100000u) != 0;
                 const u32 rn = (op >> 16) & 0xFu;
                 const u32 rd = (op >> 12) & 0xFu;
-                u32 op2 = 0;
-
-                if (imm) {
-                    const u32 val = op & 0xFFu;
-                    const u32 rot = (op >> 8) & 0xFu;
-                    op2 = ror32_val(val, rot * 2);
-                } else {
-                    const u32 rm = op & 0xFu;
-                    const u32 shift_type = (op >> 5) & 3u;
-                    const u32 shift_imm = (op >> 7) & 0x1Fu;
-                    op2 = c->r[rm];
-                    if (shift_imm) {
-                        if (shift_type == 0) op2 = op2 << shift_imm;
-                        else if (shift_type == 1) op2 = op2 >> shift_imm;
-                        else if (shift_type == 2) op2 = (s32)op2 >> shift_imm;
-                        else if (shift_type == 3) op2 = ror32_val(op2, shift_imm);
-                    }
-                }
-
+                bool carry;
+                const u32 op2 = shifter_operand(c, op, at, carry);
+                const u32 a = rn == 15 ? at + 8 : c->r[rn];
+                const u32 cin = c->cf;
                 u32 res = 0;
+                bool logical = false;
                 switch (opcode) {
-                    case 0x0: res = c->r[rn] & op2; break;         // AND
-                    case 0x1: res = c->r[rn] ^ op2; break;         // EOR
-                    case 0x2: res = c->r[rn] - op2; if (s) set_sub_flags(c, c->r[rn], op2, res); break; // SUB
-                    case 0x3: res = op2 - c->r[rn]; if (s) set_sub_flags(c, op2, c->r[rn], res); break; // RSB
-                    case 0x4: res = c->r[rn] + op2; if (s) set_add_flags(c, c->r[rn], op2, res); break; // ADD
-                    case 0x8: set_nz(c, c->r[rn] & op2); break;    // TST
-                    case 0xA: set_sub_flags(c, c->r[rn], op2, c->r[rn] - op2); break; // CMP
-                    case 0xB: set_add_flags(c, c->r[rn], op2, c->r[rn] + op2); break; // CMN
-                    case 0xC: res = c->r[rn] | op2; break;         // ORR
-                    case 0xD: res = op2; if (s) set_nz(c, res); break; // MOV
-                    case 0xE: res = c->r[rn] & ~op2; break;        // BIC
-                    default:
-                        FATAL("fallback interpreter unsupported ARM opcode 0x%08x at 0x%08x", op, at);
-                }
-
-                if (opcode != 0x8 && opcode != 0xA && opcode != 0xB) {
-                    c->r[rd] = res;
-                    if (s && opcode != 0x2 && opcode != 0x3 && opcode != 0x4 && opcode != 0xD) {
-                        set_nz(c, res);
+                    case 0x0: res = a & op2; logical = true; break;                                                   // AND
+                    case 0x1: res = a ^ op2; logical = true; break;                                                   // EOR
+                    case 0x2: res = a - op2; if (s) set_sub_flags(c, a, op2, res); break;                             // SUB
+                    case 0x3: res = op2 - a; if (s) set_sub_flags(c, op2, a, res); break;                             // RSB
+                    case 0x4: res = a + op2; if (s) set_add_flags(c, a, op2, res); break;                             // ADD
+                    case 0x5: {                                                                                      // ADC
+                        const u64 sum = (u64)a + op2 + cin;
+                        res = (u32)sum;
+                        if (s) { set_nz(c, res); c->cf = (u32)(sum >> 32); c->vf = ((~(a ^ op2) & (a ^ res)) >> 31) & 1; }
+                        break;
                     }
+                    case 0x6: case 0x7: {                                                                            // SBC, RSC
+                        const u32 x = opcode == 0x6 ? a : op2, y = opcode == 0x6 ? op2 : a, borrow = cin ? 0 : 1;
+                        res = x - y - borrow;
+                        if (s) { set_nz(c, res); c->cf = (u64)x >= (u64)y + borrow; c->vf = (((x ^ y) & (x ^ res)) >> 31) & 1; }
+                        break;
+                    }
+                    case 0x8: res = a & op2; logical = true; break;                                                   // TST
+                    case 0x9: res = a ^ op2; logical = true; break;                                                   // TEQ
+                    case 0xA: set_sub_flags(c, a, op2, a - op2); break;                                               // CMP
+                    case 0xB: set_add_flags(c, a, op2, a + op2); break;                                               // CMN
+                    case 0xC: res = a | op2; logical = true; break;                                                   // ORR
+                    case 0xD: res = op2; logical = true; break;                                                       // MOV
+                    case 0xE: res = a & ~op2; logical = true; break;                                                  // BIC
+                    default: res = ~op2; logical = true; break;                                                       // MVN
                 }
+                if (logical && (s || opcode == 0x8 || opcode == 0x9)) {
+                    set_nz(c, res);
+                    c->cf = carry;
+                }
+                if (opcode >= 0x8 && opcode <= 0xB) {  // the comparisons write no register
+                    c->pc = next_pc;
+                    continue;
+                }
+                if (rd == 15) {
+                    if (s) FATAL("fallback interpreter: an exception return (S with Rd = pc) 0x%08x at 0x%08x", op, at);
+                    c->pc = res;
+                    if (c->pc == stop_pc || c->pc == kMagicCallReturn) return;
+                    continue;
+                }
+                c->r[rd] = res;
                 c->pc = next_pc;
                 continue;
             }
@@ -364,17 +462,20 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
             if ((op & 0xFF87u) == 0x4780u) {
-                const u32 rm = (op >> 3) & 0xFu;
-                const u32 target = c->r[rm];
-                u32 saved[9];
-                for (int i = 0; i < 8; i++) saved[i] = c->r[4 + i];
-                saved[8] = c->r[13];
-                c->r[14] = next_pc;
-                c->pc = target;
-                rt_dispatch(c, 0);
-                assert(c->pc == next_pc);
-                for (int i = 0; i < 8; i++) c->r[4 + i] = saved[i];
-                c->r[13] = saved[8];
+                call_compiled(c, c->r[(op >> 3) & 0xFu], next_pc);
+                continue;
+            }
+
+            // BL / BLX <imm22>: two halfwords, the first (0xF000) holds the high part of the offset from this pair's PC+4
+            if ((op & 0xF800u) == 0xF000u) {
+                const u16 second = RD16(at + 2);
+                if ((second & 0xE800u) != 0xE800u) FATAL("fallback interpreter: a BL prefix without its suffix at 0x%08x", at);
+                s32 high = op & 0x07FFu;
+                if (high & 0x0400) high |= (s32)0xFFFFF800;
+                const u32 return_pc = (at + 4) | 1u;
+                u32 target = at + 4 + (u32)(high << 12) + ((second & 0x07FFu) << 1);
+                target = (second & 0x1000u) ? target | 1u : target & ~3u;  // BL stays Thumb, BLX goes to ARM
+                call_any(c, target, return_pc);
                 continue;
             }
 
@@ -388,11 +489,17 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
 
-            // MOV Rd, Rm (high/low registers)
+            // MOV Rd, Rm (high/low registers); Rd = pc branches and stays Thumb (ARMv6: no interworking here, that's BX)
             if ((op & 0xFF00u) == 0x4600u) {
                 const u32 rd = (op & 7u) | ((op >> 4) & 8u);
                 const u32 rm = (op >> 3) & 0xFu;
-                c->r[rd] = c->r[rm];
+                const u32 val = rm == 15 ? at + 4 : c->r[rm];
+                if (rd == 15) {
+                    c->pc = (val & ~1u) | 1u;
+                    if (c->pc == stop_pc || c->pc == kMagicCallReturn || (c->pc & ~1u) == (stop_pc & ~1u)) return;
+                    continue;
+                }
+                c->r[rd] = val;
                 c->pc = next_pc;
                 continue;
             }

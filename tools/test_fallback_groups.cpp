@@ -39,7 +39,7 @@ static const GuestEntry test_entries[] = {
 };
 
 const GuestEntry *dispatch_lookup(u32 addr) {
-    if (addr == 0x100200) return &test_entries[0];
+    if ((addr & ~1u) == 0x100200) return &test_entries[0];  // reached as ARM or as Thumb, like the runtime's lookup
     return nullptr;
 }
 
@@ -189,6 +189,64 @@ int main() {
         assert(c.r[3] == 0x21);       // loaded 8-bit byte
         assert(c.r[4] == 0x4321);     // loaded 16-bit halfword
         assert(c.r[5] == 0xCAFEBABE); // loaded literal from pool
+        assert(c.pc == 0xFFFF0004u);
+    }
+
+    // 6. ARM decodes that once went wrong silently, at 0x100300:
+    // add r0, pc, #8         (0xe28f0008) -> PC+8 read as 0x100310, not r15
+    // mul r1, r0, r2         (0xe0010290) -> a multiply, not a halfword transfer with write-back
+    // mov r3, r0, lsl r4     (0xe1a03410) -> a register-specified shift
+    // movs r5, r0, lsr #32   (0xe1b05020) -> #0 means #32 for LSR: 0, C = bit 31
+    // mov pc, lr             (0xe1a0f00e) -> a return through Rd = pc
+    {
+        const u32 code[] = {0xe28f0008, 0xe0010290, 0xe1a03410, 0xe1b05020, 0xe1a0f00e};
+        memcpy(g_mem + 0x100300, code, sizeof code);
+        c.r[0] = 0;
+        c.r[2] = 3;
+        c.r[4] = 4;
+        c.r[5] = 0xDEAD;
+        c.cf = 1;
+        c.r[14] = 0xFFFF0004u;
+        c.pc = 0x100300;
+        fallback::execute(&c, 0x100300);
+        assert(c.r[0] == 0x100310);
+        assert(c.r[1] == 0x100310 * 3);
+        assert(c.r[3] == (0x100310u << 4));
+        assert(c.r[5] == 0 && c.cf == 0 && c.zf == 1);
+        assert(c.pc == 0xFFFF0004u);
+    }
+
+    // 7. ARM calls into compiled code by BL and by BLX <imm24> (condition field 0xF), at 0x100340:
+    // push {lr}; mov r0, #10; bl 0x100200; add r0, r0, #1; mov r0, #10; blx 0x100201; add r0, r0, #2; pop {pc}
+    {
+        const u32 code[] = {0xe92d4000, 0xe3a0000a, 0xebffffac, 0xe2800001, 0xe3a0000a, 0xfaffffa9, 0xe2800002, 0xe8bd8000};
+        memcpy(g_mem + 0x100340, code, sizeof code);
+        const int before = helper_invocations;
+        c.r[13] = 0x180000;
+        c.r[14] = 0xFFFF0004u;
+        c.pc = 0x100340;
+        fallback::execute(&c, 0x100340);
+        assert(c.r[0] == 17);
+        assert(helper_invocations == before + 2);
+        assert(c.r[13] == 0x180000);
+        assert(c.pc == 0xFFFF0004u);
+    }
+
+    // 8. Thumb: a BL pair into compiled code, a BL pair into a leaf that is interpreted inline and returns by mov pc, lr, at 0x100380:
+    // push {lr}; movs r0, #10; bl 0x100200; bl 0x1003a0; adds r0, #1; pop {pc}   leaf: adds r0, #2; mov pc, lr
+    {
+        const u16 code[] = {0xb500, 0x200a, 0xf7ff, 0xff3c, 0xf000, 0xf80a, 0x3001, 0xbd00};
+        const u16 leaf[] = {0x3002, 0x46f7};
+        memcpy(g_mem + 0x100380, code, sizeof code);
+        memcpy(g_mem + 0x1003a0, leaf, sizeof leaf);
+        const int before = helper_invocations;
+        c.r[13] = 0x180000;
+        c.r[14] = 0xFFFF0004u;
+        c.pc = 0x100381;
+        fallback::execute(&c, 0x100381);
+        assert(c.r[0] == 18);
+        assert(helper_invocations == before + 1);
+        assert(c.r[13] == 0x180000);
         assert(c.pc == 0xFFFF0004u);
     }
 
