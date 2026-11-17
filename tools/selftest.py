@@ -193,6 +193,7 @@ def main():
         'motion input': motion_input(),
         'audio DSP': audio_dsp(),
         'module exports': ro_tree(),
+        'legacy extra data': [[py, ROOT + '/tools/test_fs_extdata.py']],
         'game languages': languages(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
