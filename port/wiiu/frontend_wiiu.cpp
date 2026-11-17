@@ -59,9 +59,31 @@ static char crash_msg[512];
 static OSTime trace_start;
 static const char *volatile trace_stage = "before main";
 
+// (measuring builds) the start, step by step, in sd:/3dii-u/<title id>/start.txt, each line written and closed at once from the first line of
+// main on, before the log is up: a title that stops starting (a console's error 199-9999 on a new title) still says how far it got
+static void start_mark(const char *what) {
+    static bool done;
+    if (!kMeasure || done) return;
+    static char path[80];
+    if (!path[0]) {
+        char dir[64];
+        snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
+        mkdir("fs:/vol/external01/3dii-u", 0777);
+        mkdir(dir, 0777);
+        snprintf(path, sizeof path, "%s/start.txt", dir);
+        remove(path);
+    }
+    if (FILE *f = fopen(path, "a")) {
+        fprintf(f, "%u ms %s\n", (u32)OSTicksToMilliseconds(OSGetSystemTime() - trace_start), what);
+        fclose(f);
+    }
+    done = !strcmp(what, "the game is drawing");
+}
+
 static void stage(const char *name) {
     trace_stage = name;
     LOG("[stage] %s at %u ms\n", name, (u32)OSTicksToMilliseconds(OSGetSystemTime() - trace_start));
+    start_mark(name);
 }
 
 static char last_note[80];
@@ -866,11 +888,13 @@ int main(int argc, char **argv) {
         OSFatal(m);
     };
     host_threads[0] = OSGetCurrentThread();
+    start_mark(g_build_stamp);
     trace_stage = "starting the watchdog";
     spawn(watchdog_thread, 0, 13, 64 << 10, "watchdog");
     if (kMeasure) spawn(wiiu::net_thread, 0, 12, 64 << 10, "net");
     trace_stage = "system libraries";
     WHBProcInit();
+    start_mark("system libraries up");
     // WHB registers its own at priority 100 from the GPU thread, on core 2. Each core has its own list, highest first: the GPU stops before WHB's goes, and starts after WHB's has made the screens again.
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, on_release, nullptr, 1000, 2);
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, on_acquire, nullptr, 50, 2);
@@ -878,6 +902,7 @@ int main(int argc, char **argv) {
     OSEnableHomeButtonMenu(TRUE);
     trace_stage = "save storage";
     wiiu::save_mount();
+    start_mark(last_note);  // what the save storage said
     stage("system up");
     std::error_code no_save;
     g_save_base = wiiu::save_folder();
