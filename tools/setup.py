@@ -8,12 +8,18 @@ Maintainers: --pack writes the dependencies zip from this PC's copies, for a new
 import argparse
 import hashlib
 import importlib.util
+import ntpath
 import os
+from pathlib import Path, PureWindowsPath
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import zipfile
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'win'))
+from objcache import _checked
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MSYS2 = 'C:/msys64'
@@ -30,6 +36,11 @@ DEPS_SHA256 = '9cad1a44cfd2322cbc1c269e6774adb136cf57c5b1eb2d0273a4fa1c0a9caa0e'
 DEPS = ['third_party/cafeglsl/glslcompiler.exe', 'third_party/cafeglsl/libwinpthread-1.dll', 'third_party/cafeglsl/zlib1.dll',
         'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc', 'builder/bin/makerom.exe']
 NOTICE = 'third_party/DEPS-NOTICES.txt'
+# These directories are not installed merely because an empty/partial folder exists.
+REQUIRED = {
+    DEPS[3]: ('lib/libcafeglsl.a', 'include/cafeglsl/CafeGLSLCompiler.h', 'include/cafeglsl/cafe_gx2.h', 'include/cafeglsl/gfd.h'),
+    DEPS[4]: ('lib/libavcodec.a', 'lib/libavutil.a', 'include/libavcodec/avcodec.h', 'include/libavutil/avutil.h'),
+}
 NOTICES = """Build dependencies for 3Dii U, unpacked by tools/setup.py. Each is under its own licence.
 
 third_party/cafeglsl/glslcompiler.exe: CafeGLSL v0.2.0 by Exzap (MIT), built for Windows by tools/win/build_cafeglsl.ps1.
@@ -59,7 +70,91 @@ def pip_missing():
 
 
 def deps_missing():
-    return [p for p in DEPS if not os.path.exists(os.path.join(ROOT, p))]
+    missing = []
+    for group in DEPS:
+        try:
+            for name in required_files(group):
+                _, info = _checked(Path(ROOT) / name)
+                if info is None or not info.st_size:
+                    missing.append(group)
+                    break
+        except (OSError, ValueError):
+            missing.append(group)
+    return missing
+
+
+def required_files(group):
+    return [group + '/' + leaf for leaf in REQUIRED[group]] if group in REQUIRED else [group]
+
+
+def install_archive(z):
+    """Validate the whole archive, then publish only absent files in incomplete groups.
+
+    Present tools are never replaced, including in a partial group. An empty required file
+    needs manual repair; silently mixing a replacement library with existing headers is unsafe.
+    """
+    root, _ = _checked(ROOT, directory=True)
+    missing = set(deps_missing())
+    members, selected = {}, []
+    for item in z.infolist():
+        name = item.filename[:-1] if item.is_dir() else item.filename
+        parts = name.split('/')
+        if (item.orig_filename != item.filename or not name or '\\' in name or
+                any(p in ('', '.', '..') or p.rstrip(' .') != p or
+                    any(c in ':<>"|?*' or ord(c) < 32 for c in p) or
+                    (ntpath.isreserved(p) if hasattr(ntpath, 'isreserved') else PureWindowsPath(p).is_reserved())
+                    for p in parts)):
+            raise ValueError(f'Unsafe dependency archive path: {item.filename!r}')
+        group = next((g for g in DEPS if name == g or (g in REQUIRED and name.startswith(g + '/'))), None)
+        if group is None and name != NOTICE:
+            raise ValueError(f'Undeclared dependency archive path: {name}')
+        mode = stat.S_IFMT(item.external_attr >> 16)
+        if (mode not in (0, stat.S_IFDIR if item.is_dir() else stat.S_IFREG) or
+                item.external_attr & 0x400 or (item.is_dir() and group not in REQUIRED)):
+            raise ValueError(f'Dependency archive member is not an ordinary file/folder: {name}')
+        key = name.casefold()
+        if key in members:
+            raise ValueError(f'Duplicate dependency archive path: {name}')
+        destination, info = _checked(root / name, directory=item.is_dir())
+        if not destination.is_relative_to(root):
+            raise ValueError(f'Dependency archive path escapes the workspace: {name}')
+        members[key] = item
+        if not item.is_dir() and info is None and (group in missing or name == NOTICE):
+            selected.append((item, destination))
+    for key, item in members.items():
+        for parent in Path(key).parents:
+            ancestor = members.get(parent.as_posix())
+            if ancestor is not None and not ancestor.is_dir():
+                raise ValueError(f'Dependency archive file is also a parent: {item.filename}')
+    for group in missing:
+        for name in required_files(group):
+            _, info = _checked(root / name)
+            item = members.get(name.casefold())
+            if info is not None:
+                if not info.st_size:
+                    raise ValueError(f'Existing dependency is empty; repair it before setup: {name}')
+            elif item is None or item.is_dir() or not item.file_size:
+                raise ValueError(f'Dependency archive is incomplete: {name}')
+    # Reading all selected files before publication checks CRC/truncation too. The staging
+    # directory is on the destination volume so publication cannot become a cross-volume copy.
+    with tempfile.TemporaryDirectory(prefix='.3dii-deps-', dir=root) as temporary:
+        staged = []
+        for index, (item, destination) in enumerate(selected):
+            source = Path(temporary) / str(index)
+            with z.open(item) as reader, source.open('xb') as writer:
+                shutil.copyfileobj(reader, writer)
+            staged.append((source, destination))
+        for source, destination in staged:
+            _checked(destination.parent, directory=True)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            _, info = _checked(destination)
+            if info is not None:
+                raise ValueError(f'Dependency appeared during installation: {destination}')
+            if os.name == 'nt':
+                os.rename(source, destination)  # Windows rename refuses an existing target.
+            else:
+                os.link(source, destination)  # Same no-overwrite guarantee in host tests.
+                source.unlink()
 
 
 def install_mingw():
@@ -81,8 +176,12 @@ def fetch_deps():
         if sha256(path) != DEPS_SHA256:
             print(f'  {DEPS_ZIP} is not the file this script expects (SHA-256 {sha256(path)}), so nothing was unpacked')
             return False
-        with zipfile.ZipFile(path) as z:
-            z.extractall(ROOT)
+        try:
+            with zipfile.ZipFile(path) as z:
+                install_archive(z)
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile) as error:
+            print(f'  Dependencies were not fully installed: {error}')
+            return False
     return True
 
 
@@ -113,7 +212,7 @@ CHECKS = [  # name, test, what installs it (or None), what to do by hand
     ('wut 1.9.2 or newer', wut_current, update_wut,
      'this wut is older than the port needs: in devkitPro\'s MSYS2 shell, run  pacman -Syu wut wut-tools'),
     ('CafeGLSL, the AAC decoder and makerom', lambda: not deps_missing(), fetch_deps,
-     f'gh release download {DEPS_TAG} --pattern {DEPS_ZIP}, then unzip it into the repository'),
+     'sign in to gh, then rerun python tools/setup.py (existing tools are preserved)'),
 ]
 
 
