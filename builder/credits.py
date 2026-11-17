@@ -23,6 +23,7 @@ UPSTREAM = [
      'https://www.pycryptodome.org'),
     ('Qt and PySide6', 'The Qt Company and contributors', 'LGPL-3.0', 'https://www.qt.io'),
     ('Python', 'Python Software Foundation', 'PSF-2.0', 'https://www.python.org'),
+    ('stb_truetype, which draws the in-game menu\'s text', 'Sean Barrett', 'MIT or public domain', 'https://github.com/nothings/stb'),
     ('PyInstaller\'s bootloader', 'PyInstaller Development Team', 'GPL-2.0-or-later with its bootloader exception',
      'https://pyinstaller.org'),
     ('woomïnstaller\'s boot movie', 'shinyquagsire23', 'LGPL-2.1', 'https://github.com/shinyquagsire23/woominstaller'),

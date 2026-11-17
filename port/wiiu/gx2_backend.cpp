@@ -56,6 +56,7 @@
 #include "shadergen.h"
 #include "mii_select.h"
 #include "swkbd.h"
+#include "ui_font.h"
 #include "vertex_arrays.h"
 #include "wiiu.h"
 
@@ -3655,6 +3656,49 @@ void draw_text(u32 w, u32 h, const char *text, float x, float y, float scale) {
         draw_rect(w, h, x, y, x + 5 * scale, y + 7 * scale, g2 * cu, 0, g2 * cu + 5.0f / (n * 6), 7.0f / 8);
     }
 }
+
+// The menu's round shapes, white with their coverage as alpha, smooth at the edges: a disk, whose quarters are the corners of round
+// rectangles and whose middle is solid, and an arrow pointing right
+GX2Texture disk_tex, arrow_tex;
+void make_shape(GX2Texture &t, u32 n, float (*coverage)(float x, float y, float n)) {
+    GX2Surface &s = t.surface;
+    s.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    s.width = s.height = n;
+    s.depth = s.mipLevels = 1;
+    s.format = GX2_SURFACE_FORMAT_UNORM_R8;
+    s.aa = GX2_AA_MODE1X;
+    s.use = GX2_SURFACE_USE_TEXTURE;
+    s.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    t.viewNumMips = t.viewNumSlices = 1;
+    t.compMap = 0x05050500;  // white, the coverage as alpha
+    GX2CalcSurfaceSizeAndAlignment(&s);
+    GX2InitTextureRegs(&t);
+    s.image = memalign(s.alignment, s.imageSize);
+    if (!s.image) return;
+    for (u32 y = 0; y < n; y++)
+        for (u32 x = 0; x < n; x++) ((u8 *)s.image)[y * s.pitch + x] = (u8)(std::clamp(coverage(x + 0.5f, y + 0.5f, (float)n), 0.0f, 1.0f) * 255);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, s.image, s.imageSize);
+}
+void make_shapes() {
+    make_shape(disk_tex, 64, [](float x, float y, float n) { return n / 2 - std::hypot(x - n / 2, y - n / 2); });
+    make_shape(arrow_tex, 32, [](float x, float y, float) {  // the triangle (4,4) (28,16) (4,28)
+        const float left = x - 4, top = (y - 4) - (x - 4) / 2, bottom = (28 - y) - (x - 4) / 2;
+        return std::min({left, top * 0.894f, bottom * 0.894f}) + 0.5f;  // 0.894: 1/|(1, 1/2)|, a distance from the slanted sides
+    });
+}
+
+// a rectangle with round corners of radius r, in the colour set_blit_colors gave, disk_tex bound
+void draw_round_rect(u32 w, u32 h, float x0, float y0, float x1, float y1, float r) {
+    r = std::max(0.0f, std::min(r, std::min(x1 - x0, y1 - y0) / 2));
+    const float c = 0.5f;  // the disk's middle
+    draw_rect(w, h, x0 + r, y0, x1 - r, y1, c, c, c, c);
+    draw_rect(w, h, x0, y0 + r, x0 + r, y1 - r, c, c, c, c);
+    draw_rect(w, h, x1 - r, y0 + r, x1, y1 - r, c, c, c, c);
+    draw_rect(w, h, x0, y0, x0 + r, y0 + r, 0, 0, c, c);
+    draw_rect(w, h, x1 - r, y0, x1, y0 + r, c, 0, 1, c);
+    draw_rect(w, h, x0, y1 - r, x0 + r, y1, 0, c, c, 1);
+    draw_rect(w, h, x1 - r, y1 - r, x1, y1, c, c, 1, 1);
+}
 // The frame rate counter, the menu's FPS COUNTER: frames shown in the last second, white on black in the top left of the TV and the GamePad
 void draw_fps() {
     static OSTime since;
@@ -4412,6 +4456,7 @@ void gfx_thread_init() {
     for (u32 i = 0; i < ps_blit->uniformBlockCount; i++) LOG("[gx2] ps block %s at %u size %u\n", ps_blit->uniformBlocks[i].name, ps_blit->uniformBlocks[i].offset, ps_blit->uniformBlocks[i].size);
     for (u32 i = 0; i < ps_blit->samplerVarCount; i++) LOG("[gx2] ps sampler %s at %u\n", ps_blit->samplerVars[i].name, ps_blit->samplerVars[i].location);
     make_font();
+    make_shapes();
     GX2InitSampler(&blit_sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_LINEAR);
     GX2InitSampler(&lut_sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
     {
@@ -4542,15 +4587,18 @@ int game_speed() { return menu_speed; }
 bool menu_wants_quit() { return menu_quit; }
 void menu_quit_now() { menu_quit = true; }
 
-void menu_input(u32 pressed) {
+void menu_input(u32 pressed, u32 held) {
+    // ZL and ZR together, as the Virtual Console's menu opens, or a click of the left stick: it opens, and closes again
+    constexpr u32 kTriggers = VPAD_BUTTON_ZL | VPAD_BUTTON_ZR;
+    const bool toggle = (pressed & VPAD_BUTTON_STICK_L) || ((held & kTriggers) == kTriggers && (pressed & kTriggers));
     if (!menu_is_open) {
-        if (menu_allowed && (pressed & VPAD_BUTTON_STICK_L)) {
+        if (menu_allowed && toggle) {
             menu_item = 0;
             menu_is_open = true;
         }
         return;
     }
-    if (pressed & (VPAD_BUTTON_STICK_L | VPAD_BUTTON_B)) menu_is_open = false;
+    if (toggle || (pressed & VPAD_BUTTON_B)) menu_is_open = false;
     const int count = menu_items();
     if (pressed & VPAD_BUTTON_UP) menu_item = (menu_item + count - 1) % count;
     if (pressed & VPAD_BUTTON_DOWN) menu_item = (menu_item + 1) % count;
@@ -4578,57 +4626,163 @@ void menu_input(u32 pressed) {
     }
 }
 
-// The options menu on one picture: laid out in the GamePad's 854x480 and scaled to the buffer, the TV's being 16:9 too. It goes on both: on
-// the GamePad alone, a player looking at the TV saw nothing (the user, 2026-11-15).
+// The options menu as the Wii U's Virtual Console draws its own (the user, 2026-11-16: "use the Wii U VC style for the menu"): a blue
+// ground, a heading band, the lines as light tiles in a dark frame with the chosen one ringed in cyan, and the buttons in a dark bar at the
+// foot, in the console's own font. It fills the screen on the TV and the GamePad alike: laid out for 480 rows, drawn in each one's pixels.
 static void draw_menu_on(GX2ColorBuffer *cb) {
-    const u32 w = 854, h = 480;
+    const float W = (float)cb->surface.width, H = (float)cb->surface.height, k = H / 480;
+    const u32 w = (u32)W, h = (u32)H;
+    const auto at = [&](float v) { return std::floor(v * k + 0.5f); };
+    const bool font = ui_font::load();
+    const auto pixel_scale = [&](float size) { return std::max(1.0f, std::floor(size * k / 8)); };  // the built-in font, without the console's
+    const auto text_w = [&](const char *s, float size) { return font ? ui_font::width(s, size * k) : (6.0f * strlen(s) - 1) * pixel_scale(size); };
+    const auto text = [&](const char *s, float x, float y, float size, float r, float g, float b) {
+        set_blit_colors(r, g, b, 0, 0, 0);
+        if (!font) {
+            GX2SetPixelTexture(&font_tex, 0);
+            GX2SetPixelSampler(&lut_sampler, 0);
+            draw_text(w, h, s, std::floor(x), std::floor(y + (size * k - 7 * pixel_scale(size)) / 2), pixel_scale(size));
+            return;
+        }
+        GX2SetPixelTexture(&ui_font::texture(), 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        ui_font::Quad q[64];
+        const int n = ui_font::quads(s, size * k, std::floor(x), std::floor(y), q, 64);
+        for (int i = 0; i < n; i++) draw_rect(w, h, q[i].x0, q[i].y0, q[i].x1, q[i].y1, q[i].u0, q[i].v0, q[i].u1, q[i].v1);
+    };
+    const auto paint = [&](float r, float g, float b) {  // round shapes and plain areas after it
+        GX2SetPixelTexture(&disk_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(r, g, b, 0, 0, 0);
+    };
+    const auto fill = [&](float x0, float y0, float x1, float y1) { draw_rect(w, h, x0, y0, x1, y1, 0.5f, 0.5f, 0.5f, 0.5f); };
+    const auto arrow = [&](float x, float y, float size, bool left, float r, float g, float b) {
+        GX2SetPixelTexture(&arrow_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(r, g, b, 0, 0, 0);
+        draw_rect(w, h, x, y, x + size, y + size, left ? 1 : 0, 0, left ? 0 : 1, 1);
+    };
+
+    // the lines: what each is, and what it's set to (nothing for the two that act)
+    static const char *const k_languages[12] = {"Japanese", "English", "French",  "German",     "Italian", "Spanish",
+                                                "Chinese",  "Korean",  "Dutch",   "Portuguese", "Russian", "Chinese (Taiwan)"};
+    static const char *const k_tv_layouts[screens::kTvLayouts] = {"Top Screen",      "Side by Side",  "Stacked",
+                                                                  "Big Top + Small", "Bottom Screen", "Big Bottom + Small"};
+    static const char *const k_pad_layouts[screens::kPadLayouts] = {"Bottom Screen", "Top Screen", "Stacked", "Side by Side"};
+    const int count = menu_items(), quit = count - 1;
+    char speed[16], vol[16], res[16], cap[16];
+    snprintf(speed, sizeof speed, "%d%%", menu_speed);
+    snprintf(vol, sizeof vol, "%d%%", menu_volume);
+    snprintf(res, sizeof res, "%dp", g_settings.resolution);
+    if (cap_fps) snprintf(cap, sizeof cap, "%u fps", (unsigned)cap_fps);
+    else snprintf(cap, sizeof cap, "Off");
+    const char *labels[10] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit", ""};
+    const char *values[10] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
+                              k_pad_layouts[pad_layout % screens::kPadLayouts], res, g_settings.show_fps ? "On" : "Off", cap, ""};
+    labels[quit] = "Return to Wii U Menu";
+    values[quit] = "";
+
     GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
     cur_color = nullptr;
     begin_blit();
-    GX2SetViewport(0, 0, (float)cb->surface.width, (float)cb->surface.height, 0, 1);
-    GX2SetScissor(0, 0, cb->surface.width, cb->surface.height);
-    GX2SetPixelTexture(&black_tex, 0);
-    GX2SetPixelSampler(&blit_sampler, 0);
-    set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
-    draw_rect(w, h, 127, 60, 727, 470, 0, 0, 1, 1);
-    set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
-    draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
-    const int count = menu_items();
-    const float rowh = count == 10 ? 33 : 36, top = 114;  // a tenth line (the frame limit): closer together, in the same box
-    set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
-    draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + (count == 10 ? 32 : 38), 0, 0, 1, 1);
-    GX2SetPixelTexture(&font_tex, 0);
-    GX2SetPixelSampler(&lut_sampler, 0);
+    GX2SetViewport(0, 0, W, H, 0, 1);
+    GX2SetScissor(0, 0, w, h);
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
-    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
-    set_blit_colors(1, 1, 1, 0, 0, 0);
-    draw_text(w, h, "OPTIONS", 165, 68, 4);
-    set_blit_colors(0.2f, 0.1f, 0.0f, 0, 0, 0);
-    static const char *const k_languages[12] = {"JAPANESE", "ENGLISH", "FRENCH",  "GERMAN",     "ITALIAN", "SPANISH",
-                                                "CHINESE",  "KOREAN",  "DUTCH",   "PORTUGUESE", "RUSSIAN", "CHINESE (TW)"};
-    static const char *const k_tv_layouts[screens::kTvLayouts] = {"TOP SCREEN",      "SIDE BY SIDE",  "STACKED",
-                                                                  "BIG TOP + SMALL", "BOTTOM SCREEN", "BIG BOTTOM + SMALL"};
-    static const char *const k_pad_layouts[screens::kPadLayouts] = {"BOTTOM SCREEN", "TOP SCREEN", "STACKED", "SIDE BY SIDE"};
-    char line[48], vol[32], lang[40], tv[40], pad[40], res[32], cap[40];
-    snprintf(line, sizeof line, "GAME SPEED: %d%%", menu_speed);
-    snprintf(vol, sizeof vol, "VOLUME: %d%%", menu_volume);
-    snprintf(lang, sizeof lang, "LANGUAGE: %s", k_languages[menu_language()]);
-    snprintf(tv, sizeof tv, "TV: %s", k_tv_layouts[tv_layout % screens::kTvLayouts]);
-    snprintf(pad, sizeof pad, "GAMEPAD: %s", k_pad_layouts[pad_layout % screens::kPadLayouts]);
-    snprintf(res, sizeof res, "RESOLUTION: %dP", g_settings.resolution);
-    if (cap_fps) snprintf(cap, sizeof cap, "FRAME LIMIT: %u", (unsigned)cap_fps);
-    else snprintf(cap, sizeof cap, "FRAME LIMIT: OFF");
-    const char *items[10] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF",
-                             count == 10 ? cap : "QUIT TO WII U MENU", "QUIT TO WII U MENU"};
-    for (int i = 0; i < count; i++) {
-        draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE,
+                       GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    // the blue ground, lighter at the top
+    for (int b = 0; b < 24; b++) {
+        const float f = b / 23.0f;
+        paint(0.45f - 0.18f * f, 0.59f - 0.20f * f, 0.86f - 0.16f * f);
+        fill(0, std::floor(H * b / 24), W, std::floor(H * (b + 1) / 24));
     }
-    set_blit_colors(0.45f, 0.3f, 0.15f, 0, 0, 0);
-    const char *hint = "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
-    if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS";  // a game takes its language as it starts
-    if (menu_item == 5 && pad_layout == 1) hint = "TOUCH IS OFF WHILE THE GAMEPAD SHOWS THE TOP";
-    if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "RESOLUTION CHANGES WHEN THE GAME NEXT STARTS";  // targets keep their size
-    draw_text(w, h, hint, 165, 446, 2);
+    // the heading band, its light edge, and the title on a shadow
+    for (int b = 0; b < 4; b++) {
+        paint(0.17f - 0.015f * b, 0.24f - 0.02f * b, 0.44f - 0.03f * b);
+        fill(0, at(14 * b), W, at(14 * (b + 1)));
+    }
+    paint(0.64f, 0.73f, 0.93f);
+    fill(0, at(56), W, at(58));
+    const char *title = "3Dii U Menu";
+    const float title_x = std::floor((W - text_w(title, 30)) / 2);
+    text(title, title_x + at(2), at(11) + at(2), 30, 0.04f, 0.07f, 0.16f);
+    text(title, title_x, at(11), 30, 1, 1, 1);
+    // the dark frame and its tiles
+    paint(0.47f, 0.58f, 0.84f);
+    draw_round_rect(w, h, at(24), at(68), W - at(24), H - at(56), at(16));
+    paint(0.11f, 0.17f, 0.35f);
+    draw_round_rect(w, h, at(27), at(71), W - at(27), H - at(59), at(13));
+    const float gap = 5, first = 82, room = 480 - 68 - first, tile = (room - (count - 1) * gap) / count;
+    const float x0 = at(40), x1 = W - at(40), side = at(16), bar = at(9), bar_gap = at(3), arrow_size = at(11);
+    for (int i = 0; i < count; i++) {
+        const float y0 = at(first + i * (tile + gap)), y1 = at(first + i * (tile + gap) + tile), mid = (y0 + y1) / 2;
+        const bool chosen = i == menu_item, adjustable = i != 0 && i != quit;
+        if (chosen) {
+            paint(0.18f, 0.76f, 1.0f);
+            draw_round_rect(w, h, x0 - at(4), y0 - at(4), x1 + at(4), y1 + at(4), at(11));
+            paint(1, 1, 1);
+            draw_round_rect(w, h, x0, y0, x1, y1, at(7));
+        } else {
+            paint(0.63f, 0.67f, 0.77f);
+            draw_round_rect(w, h, x0, y0, x1, y1, at(7));
+            paint(0.93f, 0.94f, 0.96f);
+            draw_round_rect(w, h, x0 + at(1.5f), y0 + at(1.5f), x1 - at(1.5f), y1 - at(1.5f), at(6));
+        }
+        const float ty = mid - 19 * k / 2;
+        if (i == quit) text(labels[i], x0 + side, ty, 19, 0.78f, 0.16f, 0.12f);
+        else text(labels[i], x0 + side, ty, 19, 0.17f, 0.19f, 0.24f);
+        if (!adjustable) continue;
+        float end = x1 - side;
+        if (chosen) {
+            arrow(end - arrow_size, mid - arrow_size / 2, arrow_size, false, 0.10f, 0.60f, 0.92f);
+            end -= arrow_size + at(10);
+        }
+        const float vw = text_w(values[i], 19);
+        text(values[i], end - vw, ty, 19, chosen ? 0.04f : 0.33f, chosen ? 0.38f : 0.37f, chosen ? 0.68f : 0.47f);
+        float start = end - vw;
+        if (i == 2) {  // the volume, as ten blocks before its number
+            for (int s = 9; s >= 0; s--) {
+                const float bx1 = start - at(12) - (9 - s) * (bar + bar_gap);
+                if (s < menu_volume / 10) paint(0.12f, 0.65f, 0.95f);
+                else paint(0.78f, 0.80f, 0.86f);
+                draw_round_rect(w, h, bx1 - bar, mid - at(7), bx1, mid + at(7), at(2));
+            }
+            start -= at(12) + 10 * (bar + bar_gap) - bar_gap;
+        }
+        if (chosen) arrow(start - at(10) - arrow_size, mid - arrow_size / 2, arrow_size, true, 0.10f, 0.60f, 0.92f);
+    }
+    // the dark bar at the foot: B to close, A to choose, left and right to change
+    const float by0 = H - at(46), by1 = H - at(10), bmid = (by0 + by1) / 2, ball = at(24), note = 16;
+    const char *const k_words[3] = {"Close", "Choose", "Change"};
+    float wide_bar = at(18);
+    for (int i = 0; i < 3; i++) wide_bar += ball + at(8) + text_w(k_words[i], note) + at(22);
+    paint(0.06f, 0.06f, 0.08f);
+    draw_round_rect(w, h, -at(30), by0, wide_bar, by1, (by1 - by0) / 2);
+    float x = at(18);
+    for (int i = 0; i < 3; i++) {
+        if (i < 2) {
+            paint(1, 1, 1);
+            draw_round_rect(w, h, x, bmid - ball / 2, x + ball, bmid + ball / 2, ball / 2);
+            const char *letter = i == 0 ? "B" : "A";
+            text(letter, x + (ball - text_w(letter, note)) / 2, bmid - note * k / 2, note, 0.12f, 0.12f, 0.15f);
+        } else {
+            arrow(x, bmid - ball / 4, ball / 2, true, 1, 1, 1);
+            arrow(x + ball / 2, bmid - ball / 4, ball / 2, false, 1, 1, 1);
+        }
+        x += ball + at(8);
+        text(k_words[i], x, bmid - note * k / 2, note, 1, 1, 1);
+        x += text_w(k_words[i], note) + at(22);
+    }
+    // what a change waits for, beside the bar
+    const char *hint = nullptr;
+    if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "The game changes language when it next starts.";  // a game takes its language as it starts
+    if (menu_item == 5 && pad_layout == 1) hint = "Touch is off while the GamePad shows the top screen.";
+    if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "The resolution changes when the game next starts.";  // targets keep their size
+    if (hint) {
+        const float hx = wide_bar + at(16), hy = bmid - note * k / 2;
+        text(hint, hx + at(1), hy + at(1), note, 0.04f, 0.07f, 0.16f);
+        text(hint, hx, hy, note, 1, 1, 1);
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
 }
 static void draw_menu() {

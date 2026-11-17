@@ -242,11 +242,13 @@ static u32 map_pro(u32 h) {
     return b;
 }
 
-// its presses as the GamePad's, for the options menu (menu_input): the left stick in to open it, the D-pad, A and B; and for the keyboard and
-// the Mii list, X, Y and +
+// its buttons as the GamePad's, for the options menu (menu_input): ZL and ZR or the left stick to open it, the D-pad, A and B; and for the
+// keyboard and the Mii list, X, Y and +
 static u32 pro_as_gamepad(u32 t) {
     u32 v = 0;
     if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
+    if (t & WPAD_PRO_TRIGGER_ZL) v |= VPAD_BUTTON_ZL;
+    if (t & WPAD_PRO_TRIGGER_ZR) v |= VPAD_BUTTON_ZR;
     if (t & WPAD_PRO_BUTTON_A) v |= VPAD_BUTTON_A;
     if (t & WPAD_PRO_BUTTON_B) v |= VPAD_BUTTON_B;
     if (t & WPAD_PRO_BUTTON_X) v |= VPAD_BUTTON_X;
@@ -304,7 +306,7 @@ static int hid_thread(int, void *) {
     bool touch_was = false, leaving = false;
     VPADStatus st{};
     VPADTouchData cal{};
-    u32 buttons = 0, pad_buttons = 0, pro_hold[4] = {};
+    u32 buttons = 0, pad_buttons = 0, pad_held = 0, pro_hold[4] = {};
     float pad_x = 0, pad_y = 0, pro_x[4] = {}, pro_y[4] = {};
     s16 cx = 0, cy = 0;
     bool touch = false;
@@ -317,12 +319,13 @@ static int hid_thread(int, void *) {
         VPADRead(VPAD_CHAN_0, &st, 1, &err);
         gamepad_there = err != VPAD_READ_INVALID_CONTROLLER;
         if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
-            pad_buttons = 0;
+            pad_buttons = pad_held = 0;
             pad_x = pad_y = 0;
             touch = false;
         }
         if (err == VPAD_READ_SUCCESS) {
             pad_buttons = map_buttons(st.hold);
+            pad_held = st.hold;
             presses |= st.trigger;
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
             pad_x = st.leftStick.x;
@@ -346,6 +349,7 @@ static int hid_thread(int, void *) {
             touch_was = down;
         }
         buttons = pad_buttons;
+        u32 held = pad_held;  // the GamePad's way too
         float sx = pad_x, sy = pad_y;
         for (int ch = 0; ch < 4; ch++) {
             KPADStatus ks{};
@@ -361,6 +365,7 @@ static int hid_thread(int, void *) {
                 pro_x[ch] = pro_y[ch] = 0;
             }
             buttons |= map_pro(pro_hold[ch]);
+            held |= pro_as_gamepad(pro_hold[ch]);
             if (std::fabs(pro_x[ch]) + std::fabs(pro_y[ch]) > std::fabs(sx) + std::fabs(sy)) {
                 sx = pro_x[ch];
                 sy = pro_y[ch];
@@ -373,7 +378,7 @@ static int hid_thread(int, void *) {
             wiiu::keyboard_input(presses, tap, px, py);
             wiiu::mii_selector_input(presses, tap, px, py);
         }
-        wiiu::menu_input(presses);
+        wiiu::menu_input(presses, held);
         if (!leaving && wiiu::menu_wants_quit()) {
             leaving = true;
             SYSLaunchMenu();

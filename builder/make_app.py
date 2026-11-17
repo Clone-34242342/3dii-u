@@ -26,7 +26,7 @@ ROOT = os.path.dirname(HERE)
 OUT = os.path.join(HERE, 'dist')
 DEVKITPRO = 'C:/devkitPro/opt/devkitpro'
 ENGINE_DIRS = ('tools', 'phase0/tools', 'phase0/title_code', 'port','third_party/3dsrecomp/runtime', 'third_party/3dsrecomp/tools', 'third_party/3dsrecomp/games',
-               'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
+               'third_party/stb', 'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
 ENGINE_FILES = ('third_party/cafeglsl/glslcompiler.exe', 'third_party/cafeglsl/libwinpthread-1.dll', 'third_party/cafeglsl/zlib1.dll',
                 'third_party/3dsrecomp/LICENSE')
 WORK = os.path.join(HERE, 'build_app')  # PyInstaller's own work folder, gone afterwards
