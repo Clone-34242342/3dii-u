@@ -224,7 +224,8 @@ def main():
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
     ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games, where the Virtual Console's screens find the year a game came out")
-    ap.add_argument('--mixed', action='store_true', help='trial: fast code with only the video decoder in safe mode (build3ds.Game.mixed)')
+    ap.add_argument('--mixed', action='store_true', help='trial: fast code with only the video decoder in safe mode (build3ds.Game.mixed); a game '
+                                                         'compat.json marks "mixed" always builds this way')
     ap.add_argument('--cold', action='store_true', help="for the checks: build it as a game nobody has built before, with none of this PC's lists of "
                                                         'its code and shaders (tools/check_ports.py --cold)')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
@@ -358,7 +359,9 @@ def main():
     g = b3.Game(info['slug'], game_dir)  # the recipe every game gets, read from this game's own code (build3ds.py)
     if a.cold:
         g.twin = derived(game)['slug']  # its own folder in games/ is no other game's: nothing of it is borrowed
-    if a.mixed:
+    # --mixed, or a game compat.json says builds that way: the fast code but for the video decoder, as it was played. Not with an update,
+    # whose code wasn't.
+    if a.mixed or (known and known.get('mixed') and not update):
         g.mixed()
     if g.mode == 'safe':
         print('hand-written code that keeps values in any register across its calls (Mobiclip\'s video decoder): every register goes through memory', flush=True)

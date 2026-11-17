@@ -1,5 +1,5 @@
 {
-  "_about": "Games tested on a real Wii U, by 3DS program id. title_id, name, product and slug keep the builds the same as the ones already installed; status and note are shown in the app: \"Complete\" for a game that is finished here, \"Plays\" for one that was tested and plays. Anything not listed builds as untested.",
+  "_about": "Games tested on a real Wii U, by 3DS program id. title_id, name, product and slug keep the builds the same as the ones already installed; status and note are shown in the app: \"Complete\" for a game that is finished here, \"Plays\" for one that was tested and plays. \"mixed\": true builds the game the way it was played, the fast code everywhere but its video decoder (build3ds.Game.mixed). Anything not listed builds as untested.",
   "_cemu": [
     {"name": "The Legend of Zelda: A Link Between Worlds", "status": "Cemu", "note": "57 fps. From this build: its top screen no longer flashes onto the GamePad, and 142 shaders met in longer Cemu runs are built in ahead (its lowest fps there went from 26 to 53), against the stutter seen on a console."},
     {"name": "Metroid: Samus Returns", "status": "Cemu", "note": "30 fps. Objects vanishing for a moment on a console is fixed from this build."},
@@ -38,5 +38,11 @@
   "0004000000054000": {"slug": "g_aree", "title_id": "000500003D000540", "name": "SUPER MARIO 3D LAND", "product": "WUP-N-AREE", "folder": "SUPER_MARIO_3D_LAND",
                        "status": "Plays", "note": "Plays on a Wii U."},
   "0004000000086300": {"slug": "g_egde", "title_id": "000500003D000863", "name": "Animal Crossing: New Leaf", "product": "WUP-N-EGDE", "folder": "Animal_Crossing_New_Leaf",
-                       "status": "Plays", "note": "Plays on a Wii U, with its update. Busy towns run slower."}
+                       "status": "Plays", "note": "Plays on a Wii U, with its update. Busy towns run slower."},
+  "0004000000033500": {"slug": "g_aqee", "title_id": "000500003D000335", "name": "The Legend of Zelda Ocarina of Time 3D", "product": "WUP-N-AQEE",
+                       "folder": "The_Legend_of_Zelda_Ocarina_of_Time_3D", "mixed": true,
+                       "status": "Plays", "note": "Plays on a Wii U: 30 fps in Cemu, and no texture problems on a console."},
+  "0004000000033600": {"slug": "g_aqep", "title_id": "000500003D000336", "name": "The Legend of Zelda Ocarina of Time 3D", "product": "WUP-N-AQEP",
+                       "folder": "The_Legend_of_Zelda_Ocarina_of_Time_3D", "mixed": true,
+                       "status": "Untested", "note": "The European version: built the same way as the American one, which plays on a Wii U. Plays in Cemu, not yet tried on a console."}
 }
