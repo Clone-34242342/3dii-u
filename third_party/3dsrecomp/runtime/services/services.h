@@ -66,3 +66,7 @@ void dsp_tick();  // (host thread, lock not held) one audio frame, played whethe
 void mic_host_start();
 void mic_host_stop();
 void mic_host_read(s16 *out, u32 n, u32 rate);  // the latest n samples, at this rate
+// The host's camera (lock held). A fresh immutable 640x480 NV12 snapshot, pitch 768; false means unavailable/no new frame.
+bool cam_host_start();
+void cam_host_stop();
+bool cam_host_frame(u8 *out, u32 capacity);
