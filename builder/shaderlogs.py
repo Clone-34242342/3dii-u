@@ -117,6 +117,7 @@ class Sources(list):
     def __init__(self, files):
         super().__init__(files)
         self._files, self._unpacked = None, {}
+        self._raw_runs = {}  # reuse whole-file searches when retrying with unpacked buffers
 
     def romfs_files(self):
         """(offset, size) of each file in the romfs, by index (tools/dvlb_to_log.py's order)"""
@@ -220,7 +221,7 @@ def _run_anywhere(buf, words, i):
     return lo, found
 
 
-def _cover(words, bufs, strides, windows, most, far_below):
+def _cover(words, bufs, strides, windows, most, far_below, raw_runs=None):
     """Pieces (source, stride, words, offset) that lay words out of bufs, at most `most` of them, or None. First the runs long enough to say where
     they're from: in a window, or else anywhere and contiguous, looked for when the longest run in the windows is shorter than far_below (each
     look is a pass over the file). Then the words between them, from near those runs."""
@@ -233,13 +234,20 @@ def _cover(words, bufs, strides, windows, most, far_below):
                     best = (k, s, st, at)
         return best
 
+    whole = b''.join(words) if raw_runs is not None else None
     long_runs, i, short = {}, 0, 0
     while i < len(words):
         best = near(i)
         if best[0] < far_below:
             for s, buf in enumerate(bufs):
                 if buf:
-                    k, at = _run_anywhere(buf, words, i)
+                    if raw_runs is not None and s < UNPACKED:
+                        key = s, whole, i
+                        if key not in raw_runs:
+                            raw_runs[key] = _run_anywhere(buf, words, i)
+                        k, at = raw_runs[key]
+                    else:
+                        k, at = _run_anywhere(buf, words, i)
                     if k > best[0]:
                         best = (k, s, 4, at)
         k, s, st, at = best
@@ -291,24 +299,24 @@ def _probes(code):
     return [b''.join(cw[i:i + LONG]) for i in range(0, len(cw) - LONG + 1, max(1, len(cw) // 8))]
 
 
-def _layout(code, swz, bufs):
+def _layout(code, swz, bufs, raw_runs=None):
     """(code pieces, swizzle pieces) over these buffers, or None. Swizzles are looked for near the code first, where a program keeps its table:
     plain words, or every other word in a DVLB."""
     windows = [[] for _ in bufs]
     cw, sw = _words(code), _words(swz)
-    pc = _cover(cw, bufs, (4,), windows, len(cw) // 16 + 4, far_below=LONG)
-    ps = _cover(sw, bufs, (4, 8), windows, len(sw) // 4 + 4, far_below=1) if pc else None
+    pc = _cover(cw, bufs, (4,), windows, len(cw) // 16 + 4, far_below=LONG, raw_runs=raw_runs)
+    ps = _cover(sw, bufs, (4, 8), windows, len(sw) // 4 + 4, far_below=1, raw_runs=raw_runs) if pc else None
     return (pc, ps) if pc and ps else None
 
 
-def recipe(code, swz, srcs, unpacked=()):
+def recipe(code, swz, srcs, unpacked=(), *, raw=True):
     """(code pieces, swizzle pieces) that put this shader memory together from a game's own files, or None: from code.bin and the romfs as they
-    lie, or else from these romfs files unpacked (Sources.holding finds them)"""
-    got = _layout(code, swz, list(srcs))
+    lie, or else from these romfs files unpacked (Sources.holding finds them). raw=False retries a known raw-layout miss."""
+    got = _layout(code, swz, list(srcs), srcs._raw_runs) if raw else None
     if not got and unpacked:
         probes = _probes(code)
         files = [i for i in unpacked if any(p in srcs.unpacked(i) for p in probes)]
-        got = _layout(code, swz, list(srcs) + [srcs.unpacked(i) for i in files]) if files else None
+        got = _layout(code, swz, list(srcs) + [srcs.unpacked(i) for i in files], srcs._raw_runs) if files else None
         if got:  # a piece from an unpacked file names it by its index in the romfs
             got = tuple([p if p[0] < UNPACKED else (UNPACKED, p[1], p[2], files[p[0] - UNPACKED] << 32 | p[3]) for p in part] for part in got)
     if got and (_assemble(got[0], srcs, 512) != code or _assemble(got[1], srcs, 128) != swz):
@@ -452,10 +460,15 @@ def write_recipes(game_dir, logs):
             with open(os.path.join(logs, f), 'rb') as h:
                 yield split(h.read(), progs, srcs, **kw)
 
-    missed = {m for *_, missing in each_split(cache={}) for m in missing}  # from the files as they lie first
+    cache = {}
+    missed = {m for *_, missing in each_split(cache=cache) for m in missing}  # from the files as they lie first
     unpacked = srcs.holding([p for code, _ in missed for p in _probes(code)]) if missed else []  # then the romfs files that hold the rest
+    # Keep raw successes; only unresolved memories need the newly unpacked files.
+    if unpacked:
+        for code, swz in missed:
+            cache[code, swz] = recipe(code, swz, srcs, unpacked, raw=False)
     out, left = bytearray(), 0
-    for _, _, vsr, missing in each_split(cache={}, unpacked=unpacked):
+    for _, _, vsr, missing in each_split(cache=cache):
         out += vsr
         left += len(missing)
     close(srcs)

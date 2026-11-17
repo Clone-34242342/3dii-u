@@ -9,6 +9,7 @@ import shutil
 import struct
 import sys
 import tempfile
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shaderlogs  # noqa: E402
@@ -147,6 +148,88 @@ try:
     assert shaderlogs.restore(os.path.join(game2, 'shader_logs')) == (1, 0)
     assert open(os.path.join(game2, 'shader_logs', 'recipes_vsr.bin'), 'rb').read()[16:16 + 224] == packed_prog + packed_swz
 
+    # Harvest two overlapping logs: raw, compressed, mixed raw/compressed, and foreign memories.
+    # The old two-pass algorithm is the output oracle, including record order and duplicates.
+    raw_code, raw_swz = words(40), words(6)
+    unknown_code, unknown_swz = words(40), words(6)
+    with open(os.path.join(game2, 'code.bin'), 'wb') as f:
+        f.write(raw_code + words(10) + raw_swz)
+    memories = [(raw_code, raw_swz), (packed_prog, packed_swz),
+                (raw_code + packed_prog, raw_swz + packed_swz), (unknown_code, unknown_swz)]
+    harvest_log = b''.join(shaderlogs.vs_record(0, c, s, tail) for c, s in memories)
+    logs = os.path.join(game2, 'shader_logs')
+    # Ignore prior round-trip output by replacing it with this same known fixture.
+    for name in ('run.bin', 'recipes_vsr.bin'):
+        with open(os.path.join(logs, name), 'wb') as f:
+            f.write(harvest_log)
+    oracle = shaderlogs.sources(game2)
+    oracle._raw_runs = None  # original algorithm searched rather than memoizing raw runs
+    try:
+        missed = shaderlogs.split(harvest_log, set(), oracle)[3]
+        unpacked = oracle.holding([p for c, _ in missed for p in shaderlogs._probes(c)])
+        expected = shaderlogs.split(harvest_log, set(), oracle, unpacked=unpacked)
+        assert len(list(shaderlogs.recipes(expected[2]))) == 3 and len(expected[3]) == 1
+    finally:
+        shaderlogs.close(oracle)
+
+    opened, layouts, searches, probe_calls, holdings = [], [], [], [], []
+    real_sources, real_layout = shaderlogs.sources, shaderlogs._layout
+    real_anywhere, real_probes, real_holding = shaderlogs._run_anywhere, shaderlogs._probes, shaderlogs.Sources.holding
+
+    def track_sources(folder):
+        src = real_sources(folder)
+        opened.append(src)
+        return src
+
+    def track_layout(c, s, bufs, *args, **kwargs):
+        layouts.append((c, s, len(bufs)))
+        return real_layout(c, s, bufs, *args, **kwargs)
+
+    def track_search(buf, ws, i):
+        searches.append((id(buf), b''.join(ws), i))
+        return real_anywhere(buf, ws, i)
+
+    def track_probes(c):
+        probe_calls.append(c)
+        return real_probes(c)
+
+    def track_holding(src, probes):
+        holdings.append(list(probes))
+        return real_holding(src, probes)
+
+    with mock.patch.object(shaderlogs, 'sources', side_effect=track_sources), \
+         mock.patch.object(shaderlogs, '_layout', side_effect=track_layout), \
+         mock.patch.object(shaderlogs, '_run_anywhere', side_effect=track_search), \
+         mock.patch.object(shaderlogs, '_probes', side_effect=track_probes), \
+         mock.patch.object(shaderlogs.Sources, 'holding', track_holding):
+        assert shaderlogs.write_recipes(game2, logs) == (6, 2)
+    with open(os.path.join(logs, 'recipes.vsr'), 'rb') as f:
+        assert f.read() == expected[2] * 2, 'same recipes, fingerprints, order, and duplicates as the old two passes'
+    assert len(opened) == len(holdings) == 1, 'source mapping and unpacked-file search happen once'
+    assert all(layouts.count((c, s, 2)) == 1 for c, s in memories), 'each unique memory searches raw layout once'
+    assert len(layouts) == 6, 'only compressed and mixed memories need a combined layout; foreign probes match no file'
+    assert all(probe_calls.count(c) == 2 for c, _ in memories[1:]) and raw_code not in probe_calls
+    raw_ids = {id(buf) for buf in opened[0]}
+    raw_searches = [key for key in searches if key[0] in raw_ids]
+    assert len(raw_searches) == len(set(raw_searches)), 'combined retry reuses each raw whole-file search, including misses'
+    assert shaderlogs.restore(logs) == (6, 0), 'all retained and newly resolved recipes still reconstruct exactly'
+
+    # No match after unpacking must still remove an obsolete recipe, as before.
+    for name in ('run.bin', 'recipes_vsr.bin'):
+        with open(os.path.join(logs, name), 'wb') as f:
+            f.write(shaderlogs.vs_record(0, unknown_code, unknown_swz, tail))
+    with open(os.path.join(logs, 'recipes.vsr'), 'wb') as f:
+        f.write(expected[2])
+    assert shaderlogs.write_recipes(game2, logs) == (0, 2)
+    assert not os.path.exists(os.path.join(logs, 'recipes.vsr'))
+
+    # Many misses must not retain a separate near-full shader suffix for every word offset.
+    missing_code = words(512)
+    empty_sources = shaderlogs.Sources([bytes(64), bytes(64)])
+    assert shaderlogs.recipe(missing_code, words(6), empty_sources) is None
+    retained = {id(key[1]): key[1] for key in empty_sources._raw_runs}
+    assert len(empty_sources._raw_runs) > 2 and sum(map(len, retained.values())) <= len(missing_code)
+
     # a finished game's list (confirm): a build's fragment states once each, an earlier list's first, without a miss list's tags, the
     # vertex records, a file with another extension, or the last record of a log cut short
     def state(name):
@@ -178,5 +261,7 @@ try:
             continue
         raise AssertionError(why + ' was confirmed')
 finally:
+    assert os.path.dirname(os.path.realpath(tmp)) == os.path.realpath(tempfile.gettempdir())
+    assert os.path.basename(tmp).startswith('shaderlogs_test_')
     shutil.rmtree(tmp, ignore_errors=True)
 print('shaderlogs ok: fingerprints, recipes and a finished game\'s list')
