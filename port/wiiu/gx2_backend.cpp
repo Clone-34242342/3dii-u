@@ -51,6 +51,7 @@
 #include "loader.h"
 #include "present_rule.h"
 #include "screen_layouts.h"
+#include "surface_readback.h"
 #include "settings.h"
 #include "shader_compile.h"
 #include "shadergen.h"
@@ -629,9 +630,8 @@ struct Surface {
     bool first_use = true;                             // nothing has drawn into it yet: see upload_target
     bool gpu_chain = false;                            // made by gx2_texture_copy, or from one: the transfers that make its mipmaps stay on the GPU too
     bool copy = false;                                 // a texture a transfer or a copy made on the GPU, its bytes not in guest memory (gpu_copy_transfer, gx2_texture_copy): whatever the game says it wrote there is newer
-    // What of its memory the game has written since the GPU last made it newer (metal_guest_read). shortcut: one span, so bytes between two
-    // writes or in a copy's gaps count as written; track rows (as Tex::dirty_rows) once a game needs it
-    u32 written_lo = 0, written_hi = 0;
+    surface_readback::Spans written;  // newer guest bytes, including retired aliases, since the GPU last drew this surface
+    u64 written_after = 0;
     u64 drawn = 0;                                     // when the GPU last wrote it (gpu_writes): of targets sharing memory, the latest holds what's there
     u64 last_use = 0;                                  // use_counter when it was last drawn into, sampled, copied or shown (forget_unused)
     bool linear = false;                               // its memory holds the picture row by row, not in tiles: a display transfer's linear output (gpu_copy_transfer)
@@ -1903,7 +1903,7 @@ void bind_targets(const RTConfig &rt, const DrawState *ds = nullptr) {
     }
     c->copy = false;         // drawn into: a target like any other
     c->guest_newer = false;  // shortcut: a target the game writes into after its first use keeps what the GPU drew, as in Cemu; upload it too once a game shows it must
-    c->written_lo = c->written_hi = 0;
+    c->written.clear();
     if (d && d->guest_newer) d->guest_newer = false;
     if (c != cur_color) {
         if (gxt()) LOG("[gxt] target %08x %ux%u fmt %u, depth %08x\n", rt.color_addr, rt.w, rt.h, rt.color_fmt, rt.depth_addr);
@@ -2975,15 +2975,6 @@ static void mark_textures(u32 paddr, u32 size, bool definite) {
     }
 }
 
-// The game wrote these bytes of a surface's memory: newer than what the GPU holds there. The span starts again once GPU work has made the
-// surface newer since (a draw, a fill, a copy on the GPU: each clears guest_newer).
-static void guest_wrote(Surface &s, u32 paddr, u32 size) {
-    const bool fresh = !s.guest_newer || !s.written_hi;
-    s.written_lo = fresh ? paddr : std::min(s.written_lo, paddr);
-    s.written_hi = fresh ? paddr + size : std::max(s.written_hi, paddr + size);
-    s.guest_newer = true;
-}
-
 // The game's last texture copies and display transfers through guest memory (gpu/transfer.cpp), numbered: a top screen the game puts together
 // in its LCD buffer itself is shown from there (show_lcd_from_memory). Copies under 4 KB are a few tiles, never a screen's rows, and fills
 // don't count: a game may clear an LCD buffer that a transfer fills later.
@@ -3030,13 +3021,13 @@ void metal_guest_written(u32 paddr, u32 size, bool definite) {
     mark_textures(paddr, size, definite);
     if (definite)
         for (auto &s : surfaces)
-            if (s->addr < paddr + size && paddr < s->addr + s->bytes()) guest_wrote(*s, paddr, size);
+            if (surface_readback::overlaps(surface_readback::bounds(s->addr, s->bytes()), surface_readback::bounds(paddr, size)))
+                surface_readback::guest_wrote(*s, paddr, size);
 }
 
 // ---------------------------------------------------------------- reading the GPU's work back to guest memory
 namespace {
-void write_back(Surface &s) {
-    if (s.depth || !s.gpu_newer) return;
+bool read_back_pixels(Surface &s, u8 *dst) {
     st_readbacks++;
     static u32 notes;
     static u32 told;
@@ -3059,9 +3050,7 @@ void write_back(Surface &s) {
     st.tileMode = in_cemu ? GX2_TILE_MODE_LINEAR_SPECIAL : GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&st);
     st.image = memalign(st.alignment, st.imageSize);
-    if (!st.image) return;  // still newer on the GPU: the next read back tries again
-    s.gpu_newer = false;
-    s.written_lo = s.written_hi = 0;
+    if (!st.image) return false;  // still newer on the GPU: the next read back tries again
     DCInvalidateRange(st.image, st.imageSize);
     if (in_cemu) draw_done();
     GX2CopySurface(&s.cb.surface, 0, 0, &st, 0, 0);
@@ -3069,11 +3058,9 @@ void write_back(Surface &s) {
     draw_done();
     if (notes < 4) wiiu::note("read back %u done", ++notes);
     DCInvalidateRange(st.image, st.imageSize);
-    u8 *dst = pptr(s.addr);
     const u32 pf = cbuf_to_pixfmt(s.fmt);
     const u32 bpp = pixel_bytes(pf);
     if (dst) {
-        memory_fills.forget(s.addr, s.bytes());
         // Azran's title and save screens read the whole screen back every frame, so the usual format doesn't go through a pixel at a time
         u16 column[1024];
         if (pf == 0)
@@ -3099,24 +3086,34 @@ void write_back(Surface &s) {
                 encode_pixel(pf, rgba(c >> 24, (c >> 16) & 255, (c >> 8) & 255, c & 255), dst + tiled_offset(x, my, s.w, bpp));
             }
         }
-        DCFlushRange(dst, s.bytes());
     }
     free(st.image);
+    return true;
+}
+
+void write_back(Surface &s, const surface_readback::Spans &owned) {
+    if (s.depth || !s.gpu_newer || owned.empty()) return;
+    u8 *guest = pptr(s.addr);
+    if (!guest) return;
+    const bool whole = owned.size() == 1 && owned[0].lo == s.addr && owned[0].hi == (u64)s.addr + s.bytes();
+    std::unique_ptr<u8, decltype(&free)> converted(whole ? nullptr : (u8 *)malloc(s.bytes()), &free);
+    if (!whole && !converted) return;  // keep GPU ownership if a partial readback cannot be staged
+    if (!read_back_pixels(s, whole ? guest : converted.get())) return;
+    surface_readback::copy_owned(guest, whole ? guest : converted.get(), s.addr, owned, vtx_invalidate);
+    memory_fills.forget(s.addr, s.bytes());
+    DCFlushRange(guest, s.bytes());
+    s.gpu_newer = false;
+    s.written.clear();
 }
 }  // namespace
 
-// Of the targets a read covers, the one the GPU wrote last holds what the memory would: Luigi's Mansion 2 draws its bottom screen (240x320) and
-// each part of its top screen (256x416, 128x416) at 18000000. Not read back where the game has written over it since the GPU drew it (texture
-// copies, transfers through memory, fills): memory holds the newer picture there.
+// Read every target contributing bytes, keeping newer aliases and later guest writes intact. A target is converted in full so a partial
+// request also materializes its other owned bytes before gpu_newer is cleared.
 void metal_guest_read(u32 paddr, u32 size) {
-    Surface *last = nullptr;
-    for (auto &s : surfaces)
-        if (!s->depth && s->gpu_newer && s->addr < paddr + size && paddr < s->addr + s->bytes() && (!last || s->drawn > last->drawn)) last = s.get();
-    if (!last) return;
-    const u32 lo = std::max(paddr, last->addr), hi = std::min(paddr + size, last->addr + last->bytes());  // the read, of this surface's bytes
-    if (last->guest_newer && last->written_lo <= lo && hi <= last->written_hi) return;
-    used(*last);
-    write_back(*last);
+    surface_readback::read(surfaces, paddr, size, [](Surface &s, const surface_readback::Spans &owned) {
+        used(s);
+        write_back(s, owned);
+    });
 }
 void metal_guest_prewrite(u32, u32) {}
 
@@ -3182,7 +3179,7 @@ bool gx2_memory_fill(u32 start, u32 end, u32 value, u32 control) {
     }
     if (memory_fills.holds(f, pptr(start))) {  // nothing to write, and a texture made from those bytes is current; surfaces there are older than memory, as metal_guest_written would mark them
         for (auto &s : surfaces)
-            if (s->addr < end && start < s->addr + s->bytes()) guest_wrote(*s, start, end - start);
+            if (s->addr < end && start < s->addr + s->bytes()) surface_readback::guest_wrote(*s, start, end - start);
         return true;
     }
     if (any) mark_textures(start, end - start, true);
@@ -3408,12 +3405,14 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
 // races where it began with 21, each holding its GPU memory (fast memory filled, and later targets went to slow memory), and every walk of the
 // list took longer: games slowed the longer they were played. One unused for kForgetAfter presents goes, what the GPU drew there that memory
 // lacks written back first, so nothing the game may still read is lost. One a present, as a write back waits for the GPU.
+bool transfer_source(const Surface &s);
+
 void forget_unused() {
     constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
     for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
         Surface &s = **it;
-        if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth) continue;
-        if (!s.depth && s.gpu_newer && !s.guest_newer) write_back(s);
+        if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth || transfer_source(s)) continue;
+        if (!surface_readback::retire(s, surfaces, write_back)) continue;
         if (void *image = s.image()) {
             if (!s.mem1) free(image);
             else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(image);
@@ -3743,6 +3742,15 @@ struct LastTransfer {
     Surface *src = nullptr;
     u32 in_paddr = 0, out_paddr = 0, in_dims = 0, out_dims = 0, flags = 0, out_size = 0;
 } last_transfer[3];
+
+namespace {
+bool transfer_source(const Surface &s) {
+    // These three delayed copies still need their source image if the CPU reads the output.
+    for (const LastTransfer &t : last_transfer)
+        if (t.src == &s) return true;
+    return false;
+}
+}  // namespace
 
 // A transfer between two surfaces the game draws at screen size stays on the GPU, at their higher resolution. Paper Mario draws its 3D at
 // double width, scales it down into a buffer, and copies that into the target it draws the 2D on. Through guest memory that would be a
@@ -4288,10 +4296,15 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
 
 void gx2_cpu_will_read(u32 paddr, u32 size) {
     for (const LastTransfer &t : last_transfer) {
-        if (!t.src || !(t.out_paddr < paddr + size && paddr < t.out_paddr + t.out_size)) continue;
-        t.src->gpu_newer = true;
-        write_back(*t.src);
-        const u8 *src = pptr(t.in_paddr);
+        if (!t.src || !surface_readback::overlaps(surface_readback::bounds(t.out_paddr, t.out_size), surface_readback::bounds(paddr, size))) continue;
+        // This is the transfer's source picture, not necessarily the newest view of its old guest address.
+        if (t.in_paddr < t.src->addr) continue;
+        const u64 offset = (u64)t.in_paddr - t.src->addr;
+        const u64 source_bytes = (u64)(t.in_dims & 0xffff) * (t.out_dims >> 16) * pixel_bytes((t.flags >> 8) & 7);
+        if (offset + source_bytes > t.src->bytes()) continue;
+        std::unique_ptr<u8, decltype(&free)> snapshot((u8 *)malloc(t.src->bytes()), &free);
+        if (!snapshot || !read_back_pixels(*t.src, snapshot.get())) continue;
+        const u8 *src = snapshot.get() + offset;
         u8 *dst = pptr(t.out_paddr);
         if (src && dst) {
             memory_fills.forget(t.out_paddr, t.out_size);
@@ -4316,7 +4329,7 @@ void gx2_finish_list() {
     for (Surface *s : read_targets) {
         s->in_list = false;
         if (s->was_sampled) continue;
-        write_back(*s);
+        write_back(*s, surface_readback::owned(*s, surfaces));
         mark_textures(s->addr, s->bytes(), true);  // other textures in that memory are whatever it holds now
     }
     read_targets.clear();
@@ -4570,7 +4583,7 @@ static void next_tv_layout(int dir) {
     wiiu::settings_due = true;
 }
 static void next_pad_layout(int dir) {
-    pad_layout = g_settings.pad_layout = (pad_layout + dir + screens::kPadLayouts) % screens::kPadLayouts;
+    pad_layout = g_settings.pad_layout = screens::next_pad_layout(pad_layout, dir);
     wiiu::settings_due = true;
 }
 
@@ -4667,8 +4680,8 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     static const char *const k_languages[12] = {"Japanese", "English", "French",  "German",     "Italian", "Spanish",
                                                 "Chinese",  "Korean",  "Dutch",   "Portuguese", "Russian", "Chinese (Taiwan)"};
     static const char *const k_tv_layouts[screens::kTvLayouts] = {"Top Screen",      "Side by Side",  "Stacked",           "Big Top + Small",
-                                                                  "Bottom Screen",   "Big Bottom + Small", "Top Screen (16:9)"};
-    static const char *const k_pad_layouts[screens::kPadLayouts] = {"Bottom Screen", "Top Screen", "Stacked", "Side by Side"};
+                                                                  "Bottom Screen",   "Big Bottom + Small", "Top Screen (16:9 stretch)"};
+    static const char *const k_pad_layouts[screens::kPadLayouts] = {"Bottom Screen", "Top Screen", "Stacked", "Side by Side", "Top Screen (16:9 stretch)"};
     const int count = menu_items(), quit = count - 1;
     char speed[16], vol[16], res[16], cap[16];
     snprintf(speed, sizeof speed, "%d%%", menu_speed);
@@ -4776,7 +4789,7 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     // what a change waits for, beside the bar
     const char *hint = nullptr;
     if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "The game changes language when it next starts.";  // a game takes its language as it starts
-    if (menu_item == 5 && pad_layout == 1) hint = "Touch is off while the GamePad shows the top screen.";
+    if (menu_item == 5 && (pad_layout == 1 || pad_layout == 4)) hint = "Touch is off in top-only layouts.";
     if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "The resolution changes when the game next starts.";  // targets keep their size
     if (hint) {
         const float hx = wide_bar + at(16), hy = bmid - note * k / 2;
