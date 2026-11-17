@@ -1,5 +1,6 @@
 """Synthetic title IDs and fake NAND folders: rejected packs must not touch existing tickets."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -112,6 +113,25 @@ class TicketSafety(unittest.TestCase):
                     ship_card.copy(str(source), str(root/'nand'))
             self.assertEqual(ticket.read_bytes(), b'keep this ticket')
             self.assertEqual(list(destination.iterdir()), [ticket])
+
+    def test_hardlinked_output_preserves_ticket_identity(self):
+        with tempfile.TemporaryDirectory(prefix='3dii-ticket-') as directory:
+            root = Path(directory)
+            ticket = root/'original.tik'
+            ticket.write_bytes(b'keep this synthetic ticket and its metadata')
+            output = root/'wup'
+            output.mkdir()
+            os.link(ticket, output/'title.tik')
+            before = ticket.stat()
+            with self.assertRaises(ValueError):
+                with pipeline.staged_output(str(output)):
+                    self.fail('a shared ticket must be rejected before staging or cleanup')
+            after = ticket.stat()
+            self.assertEqual(ticket.read_bytes(), b'keep this synthetic ticket and its metadata')
+            self.assertEqual((after.st_ino, after.st_nlink, after.st_mtime_ns),
+                             (before.st_ino, before.st_nlink, before.st_mtime_ns))
+            self.assertTrue(os.path.samefile(ticket, output/'title.tik'))
+            self.assertEqual([p.name for p in output.iterdir()], ['title.tik'])
 
     def test_resolved_alias(self):
         with tempfile.TemporaryDirectory(prefix='3dii-ticket-') as directory:

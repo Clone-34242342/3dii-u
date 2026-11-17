@@ -32,5 +32,5 @@ def check_output(path, source=None, replace=False):
             raise ValueError('The existing WUP output must be an ordinary folder.')
         for entry in original.iterdir():
             known = entry.name in ('title.tik', 'title.tmd', 'title.cert') or re.fullmatch(r'[0-9A-Fa-f]{8}\.(app|h3)', entry.name)
-            if reparse(entry) or not entry.is_file() or not known:
-                raise ValueError('Refusing to replace a folder containing files other than a WUP.')
+            if reparse(entry) or not entry.is_file() or entry.lstat().st_nlink != 1 or not known:
+                raise ValueError('Refusing to replace a folder containing unknown files or shared file links.')
