@@ -149,6 +149,7 @@ def gsx():
 def main():
     py = sys.executable
     checks = {
+        'shader compiler recipe': [[py, ROOT + '/tools/test_cafeglsl_recipe.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
         'vertex arrays': vertex_arrays(),
