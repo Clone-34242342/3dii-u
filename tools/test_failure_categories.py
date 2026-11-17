@@ -12,6 +12,7 @@ def test_categories():
         # 1. missing code
         ("restart: code the translation missed (1): [lazy] no code at 00100100 (lr=00100050)", "missing code"),
         ("blank_save: no recompiled code at 0x00100200; added to missing_functions.txt", "missing code"),
+        ("restart: 2 fallback function(s) executed; needs recompile in functions.txt", "missing code"),
 
         # 2. unsupported instruction
         ("restart: unsupported instruction (1): unsupported opcode 0xe12fff32 at 00100140", "unsupported instruction"),

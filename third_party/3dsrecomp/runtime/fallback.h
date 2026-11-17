@@ -69,6 +69,7 @@ inline void execute(CPU *c, u32 entry_pc) {
     u8 *M = g_mem;
     const u32 stop_pc = c->r[14];
     u32 steps = 0;
+    LOG("[fallback] executed missed function at %08x (lr=%08x)\n", entry_pc, stop_pc);
 
     while (steps++ < kMaxSteps) {
         if (c->pc == stop_pc || c->pc == kMagicCallReturn) {

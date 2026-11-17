@@ -15,6 +15,7 @@ u8 *g_mem = nullptr;
 std::string g_save_base = ".";
 volatile u32 rt_preempt_flag = 0;
 void watch_report() {}
+void rt_log(const char *, ...) {}
 namespace kernel { Thread *current_thread() { return nullptr; } }
 extern "C" void rt_preempt(CPU *) { assert(false && "unexpected preemption"); }
 [[noreturn]] void rt_fatal(const char *fmt, ...) {

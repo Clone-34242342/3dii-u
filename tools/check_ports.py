@@ -103,7 +103,7 @@ def categorize_fault(fault: str) -> str:
     m = fault.lower()
     if "cemu can't decode vertex data" in m or 'cemu stopped:' in m:
         return 'cemu validation'
-    if '[lazy] no code' in m or 'code the translation missed' in m or 'no recompiled code at' in m:
+    if '[lazy] no code' in m or 'code the translation missed' in m or 'no recompiled code at' in m or 'fallback function(s) executed' in m:
         return 'missing code'
     if 'unsupported instruction' in m or 'unsupported opcode' in m or 'undefined instruction' in m:
         return 'unsupported instruction'
@@ -434,6 +434,9 @@ def judge(t, seconds, flags, measured=False):
             n = len(re.findall(pat, text, re.IGNORECASE))
             if n:
                 faults.append(f'{name}: {what} ({n}): ' + next(l for l in text.split('\n') if re.search(pat, l, re.IGNORECASE))[:120])
+        fallbacks = len(re.findall(r'\[fallback\] executed missed function', text))
+        if fallbacks:
+            faults.append(f'{name}: {fallbacks} fallback function(s) executed; needs recompile in functions.txt')
         if 'every file call goes straight' not in text:
             faults.append(f'{name}: files not direct: ' + ' / '.join(l[:90] for l in text.split('\n') if '[fs] ' in l)[:200])
         # A vertex shader the pack lacks is compiled by the console, and its draws are the CPU's until it's there: a fault only if it never came
