@@ -82,6 +82,30 @@ int main() {
     const u16 thumb_branch[] = {0x280a, 0xd101, 0x3003, 0x4770, 0x3005, 0x4770};
     memcpy(g_mem + 0x100180, thumb_branch, sizeof thumb_branch);
 
+    // 4. ARM Load/Store test at 0x1001a0:
+    // str r0, [r1, #4]     (0xe5810004)
+    // ldr r2, [r1, #4]     (0xe5912004)
+    // strb r0, [r1, #8]    (0xe5c10008)
+    // ldrb r3, [r1, #8]    (0xe5d13008)
+    // strh r0, [r1, #10]   (0xe1c100ba)
+    // ldrh r4, [r1, #10]   (0xe1d140ba)
+    // bx lr                (0xe12fff1e)
+    const u32 arm_mem[] = {0xe5810004, 0xe5912004, 0xe5c10008, 0xe5d13008, 0xe1c100ba, 0xe1d140ba, 0xe12fff1e};
+    memcpy(g_mem + 0x1001a0, arm_mem, sizeof arm_mem);
+
+    // 5. Thumb Load/Store & Literal Pool test at 0x1001c0:
+    // str r0, [r1, #4]     (0x6048)
+    // ldr r2, [r1, #4]     (0x684a)
+    // strb r0, [r1, #8]    (0x7208)
+    // ldrb r3, [r1, #8]    (0x7a0b)
+    // strh r0, [r1, #10]   (0x8148)
+    // ldrh r4, [r1, #10]   (0x894c)
+    // ldr r5, [pc, #0]     (0x4d00) -> loads literal at 0x1001d0
+    // bx lr                (0x4770)
+    // .word 0xCAFEBABE     (literal at 0x1001d0)
+    const u16 thumb_mem[] = {0x6048, 0x684a, 0x7208, 0x7a0b, 0x8148, 0x894c, 0x4d00, 0x4770, 0xbabe, 0xcafe};
+    memcpy(g_mem + 0x1001c0, thumb_mem, sizeof thumb_mem);
+
     CPU c{};
     for (int i = 0; i < 16; i++) c.r[i] = 0x1000 + i;
     c.r[13] = 0x180000;
@@ -131,6 +155,40 @@ int main() {
         c.pc = 0x100181;
         fallback::execute(&c, 0x100181);
         assert(c.r[0] == 14); // 9 + 5 = 14
+        assert(c.pc == 0xFFFF0004u);
+    }
+
+    // Test ARM Load/Store
+    {
+        c.r[0] = 0x12345678;
+        c.r[1] = 0x190000; // scratch buffer in valid memory
+        c.r[2] = 0;
+        c.r[3] = 0;
+        c.r[4] = 0;
+        c.r[14] = 0xFFFF0004u;
+        c.pc = 0x1001a0;
+        fallback::execute(&c, 0x1001a0);
+        assert(c.r[2] == 0x12345678); // loaded 32-bit word
+        assert(c.r[3] == 0x78);       // loaded 8-bit byte
+        assert(c.r[4] == 0x5678);     // loaded 16-bit halfword
+        assert(c.pc == 0xFFFF0004u);
+    }
+
+    // Test Thumb Load/Store & Literal Pool
+    {
+        c.r[0] = 0x87654321;
+        c.r[1] = 0x190000;
+        c.r[2] = 0;
+        c.r[3] = 0;
+        c.r[4] = 0;
+        c.r[5] = 0;
+        c.r[14] = 0xFFFF0004u;
+        c.pc = 0x1001c1;
+        fallback::execute(&c, 0x1001c1);
+        assert(c.r[2] == 0x87654321); // loaded 32-bit word
+        assert(c.r[3] == 0x21);       // loaded 8-bit byte
+        assert(c.r[4] == 0x4321);     // loaded 16-bit halfword
+        assert(c.r[5] == 0xCAFEBABE); // loaded literal from pool
         assert(c.pc == 0xFFFF0004u);
     }
 

@@ -166,6 +166,45 @@ inline void execute(CPU *c, u32 entry_pc) {
                 continue;
             }
 
+            // Halfword and Signed Data Transfer (LDRH, STRH, LDRSB, LDRSH)
+            if ((op & 0x0E000090u) == 0x00000090u) {
+                const bool p = (op & 0x01000000u) != 0;
+                const bool u = (op & 0x00800000u) != 0;
+                const bool imm = (op & 0x00400000u) != 0;
+                const bool w = (op & 0x00200000u) != 0;
+                const bool l = (op & 0x00100000u) != 0;
+                const bool s = (op & 0x00000040u) != 0;
+                const bool h = (op & 0x00000020u) != 0;
+                const u32 rn = (op >> 16) & 0xFu;
+                const u32 rd = (op >> 12) & 0xFu;
+                const u32 offset = imm ? (((op >> 4) & 0xF0u) | (op & 0x0Fu)) : c->r[op & 0xFu];
+
+                const u32 base = (rn == 15) ? (at + 8) : c->r[rn];
+                const u32 addr = p ? (u ? (base + offset) : (base - offset)) : base;
+                const u32 new_base = u ? (base + offset) : (base - offset);
+
+                if (!s && h) {
+                    if (l) c->r[rd] = RD16(addr);
+                    else WR16(addr, c->r[rd]);
+                } else if (s && !h && l) {
+                    c->r[rd] = (s32)(s8)RD8(addr);
+                } else if (s && h && l) {
+                    c->r[rd] = (s32)(s16)RD16(addr);
+                }
+
+                if (!p || w) {
+                    if (!l || rn != rd) c->r[rn] = new_base;
+                }
+
+                if (l && rd == 15) {
+                    c->pc = c->r[15];
+                    if (c->pc == stop_pc || c->pc == kMagicCallReturn) return;
+                } else {
+                    c->pc = next_pc;
+                }
+                continue;
+            }
+
             // Data processing (MOV, ADD, SUB, RSB, CMP, CMN, TST, AND, ORR, EOR, BIC)
             if ((op & 0x0C000000u) == 0x00000000u) {
                 const bool imm = (op & 0x02000000u) != 0;
@@ -216,6 +255,57 @@ inline void execute(CPU *c, u32 entry_pc) {
                     }
                 }
                 c->pc = next_pc;
+                continue;
+            }
+
+            // Single Data Transfer (LDR, STR, LDRB, STRB)
+            if ((op & 0x0C000000u) == 0x04000000u) {
+                const bool imm = (op & 0x02000000u) == 0;
+                const bool p = (op & 0x01000000u) != 0;
+                const bool u = (op & 0x00800000u) != 0;
+                const bool b = (op & 0x00400000u) != 0;
+                const bool w = (op & 0x00200000u) != 0;
+                const bool l = (op & 0x00100000u) != 0;
+                const u32 rn = (op >> 16) & 0xFu;
+                const u32 rd = (op >> 12) & 0xFu;
+                u32 offset = 0;
+
+                if (imm) {
+                    offset = op & 0xFFFu;
+                } else {
+                    const u32 rm = op & 0xFu;
+                    const u32 shift_type = (op >> 5) & 3u;
+                    const u32 shift_imm = (op >> 7) & 0x1Fu;
+                    offset = c->r[rm];
+                    if (shift_imm) {
+                        if (shift_type == 0) offset = offset << shift_imm;
+                        else if (shift_type == 1) offset = offset >> shift_imm;
+                        else if (shift_type == 2) offset = (s32)offset >> shift_imm;
+                        else if (shift_type == 3) offset = ror32_val(offset, shift_imm);
+                    }
+                }
+
+                const u32 base = (rn == 15) ? (at + 8) : c->r[rn];
+                const u32 addr = p ? (u ? (base + offset) : (base - offset)) : base;
+                const u32 new_base = u ? (base + offset) : (base - offset);
+
+                if (l) {
+                    c->r[rd] = b ? RD8(addr) : RD32(addr);
+                } else {
+                    if (b) WR8(addr, c->r[rd]);
+                    else WR32(addr, c->r[rd]);
+                }
+
+                if (!p || w) {
+                    if (!l || rn != rd) c->r[rn] = new_base;
+                }
+
+                if (l && rd == 15) {
+                    c->pc = c->r[15];
+                    if (c->pc == stop_pc || c->pc == kMagicCallReturn) return;
+                } else {
+                    c->pc = next_pc;
+                }
                 continue;
             }
 
@@ -407,6 +497,107 @@ inline void execute(CPU *c, u32 entry_pc) {
                 if (offset & 0x0400) offset |= 0xFFFFF800;
                 offset = (offset << 1) + 4;
                 c->pc = (at + offset) | 1u;
+                continue;
+            }
+
+            // LDR Rd, [PC, #imm8*4] (Literal Pool)
+            if ((op & 0xF800u) == 0x4800u) {
+                const u32 rd = (op >> 8) & 7u;
+                const u32 addr = ((at + 4) & ~2u) + (op & 0xFFu) * 4;
+                c->r[rd] = RD32(addr);
+                c->pc = next_pc;
+                continue;
+            }
+
+            // STR / LDR Rd, [Rn, #imm5*4]
+            if ((op & 0xF800u) == 0x6000u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu) * 4;
+                WR32(addr, c->r[rd]);
+                c->pc = next_pc;
+                continue;
+            }
+            if ((op & 0xF800u) == 0x6800u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu) * 4;
+                c->r[rd] = RD32(addr);
+                c->pc = next_pc;
+                continue;
+            }
+
+            // STRB / LDRB Rd, [Rn, #imm5]
+            if ((op & 0xF800u) == 0x7000u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu);
+                WR8(addr, c->r[rd]);
+                c->pc = next_pc;
+                continue;
+            }
+            if ((op & 0xF800u) == 0x7800u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu);
+                c->r[rd] = RD8(addr);
+                c->pc = next_pc;
+                continue;
+            }
+
+            // STRH / LDRH Rd, [Rn, #imm5*2]
+            if ((op & 0xF800u) == 0x8000u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu) * 2;
+                WR16(addr, c->r[rd]);
+                c->pc = next_pc;
+                continue;
+            }
+            if ((op & 0xF800u) == 0x8800u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 addr = c->r[rn] + ((op >> 6) & 0x1Fu) * 2;
+                c->r[rd] = RD16(addr);
+                c->pc = next_pc;
+                continue;
+            }
+
+            // STR / LDR Rd, [SP, #imm8*4]
+            if ((op & 0xF800u) == 0x9000u) {
+                const u32 rd = (op >> 8) & 7u;
+                const u32 addr = c->r[13] + (op & 0xFFu) * 4;
+                WR32(addr, c->r[rd]);
+                c->pc = next_pc;
+                continue;
+            }
+            if ((op & 0xF800u) == 0x9800u) {
+                const u32 rd = (op >> 8) & 7u;
+                const u32 addr = c->r[13] + (op & 0xFFu) * 4;
+                c->r[rd] = RD32(addr);
+                c->pc = next_pc;
+                continue;
+            }
+
+            // Register-offset Load/Store (LDR, STR, LDRH, STRH, LDRB, STRB, LDRSB, LDRSH)
+            if ((op & 0xF200u) == 0x5000u) {
+                const u32 rd = op & 7u;
+                const u32 rn = (op >> 3) & 7u;
+                const u32 rm = (op >> 6) & 7u;
+                const u32 addr = c->r[rn] + c->r[rm];
+                const u32 subop = (op >> 9) & 7u;
+
+                switch (subop) {
+                    case 0: WR32(addr, c->r[rd]); break;             // STR
+                    case 1: WR16(addr, c->r[rd]); break;             // STRH
+                    case 2: WR8(addr, c->r[rd]); break;              // STRB
+                    case 3: c->r[rd] = (s32)(s8)RD8(addr); break;    // LDRSB
+                    case 4: c->r[rd] = RD32(addr); break;            // LDR
+                    case 5: c->r[rd] = RD16(addr); break;            // LDRH
+                    case 6: c->r[rd] = RD8(addr); break;             // LDRB
+                    case 7: c->r[rd] = (s32)(s16)RD16(addr); break;  // LDRSH
+                }
+                c->pc = next_pc;
                 continue;
             }
 
