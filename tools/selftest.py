@@ -176,6 +176,7 @@ def main():
         'boot sound': [[py, ROOT + '/tools/test_boot_sound.py']],
         'game art': [[py, ROOT + '/builder/test_covers.py'], [py, ROOT + '/builder/test_title_art.py']],
         'game detection': [[py, ROOT + '/tools/win/test_detect.py']],
+        'first game trial': [[py, ROOT + '/tools/test_trial_tools.py']],
         'shader logs': [[py, ROOT + '/builder/test_shaderlogs.py'], [py, ROOT + '/tools/test_dvlb_to_log.py']],
         'user files': [[py, ROOT + '/builder/test_user_files.py']],
         '3DS saves in a build': [[py, ROOT + '/builder/test_saves.py'], *save_from_content()],

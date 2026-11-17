@@ -870,8 +870,11 @@ def trial(g, args):
     if glob.glob(run_dir + '/shots/top*.ppm'):
         os.makedirs(g.dir + '/shots', exist_ok=True)
         sheet = f'{g.dir}/shots/sheet{"_" + args.run if args.run else ""}.png'
-        run([sys.executable, ROOT + '/tools/contact_sheet.py', 'shots', sheet, '8'], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print('pictures:', sheet)
+        r = run([sys.executable, ROOT + '/tools/trial_sheet.py', 'shots', sheet, '8'], cwd=run_dir, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors='replace')
+        if r.returncode:
+            print('no contact sheet:', r.stderr.strip()[-300:])
+        else:
+            print('pictures:', sheet)
     return code
 
 
