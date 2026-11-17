@@ -81,8 +81,46 @@ def mii_maker_db():
 # by playing, loaded in place of the one it enters. NSMB2's files: <world>-14 is a world's tower, -16 its castle, -12 its ghost house.
 SCENES = {'nsmb2_tower': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-14.sarc'}),
           'nsmb2_castle': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-16.sarc'})}
-CRASH =r'FATAL|no recompiled code at|\[crash\]'  # the game's log on a crash of its own
+CRASH = r'FATAL(?!: no recompiled code at)|\[crash\]'  # the game's log on a crash of its own
 SHADER_READY = r'\[glsl\] (?:compiler (?:[^\r\n]+ up|thread ready)|(?:vertex|pixel) [0-9a-f]{16} restored from native cache)'
+
+FAILURE_CATEGORIES = (
+    'missing code',
+    'unsupported instruction',
+    'missing service command',
+    'shader fallback',
+    'save failure',
+    'no useful frames',
+    'cemu validation',
+    'crash',
+    'other',
+)
+
+
+def categorize_fault(fault: str) -> str:
+    """Classifies a failure into distinct, rankable categories across games.
+    Explicitly tags Cemu emulator artifacts to keep them separate from real Wii U behavior."""
+    m = fault.lower()
+    if "cemu can't decode vertex data" in m or 'cemu stopped:' in m:
+        return 'cemu validation'
+    if '[lazy] no code' in m or 'code the translation missed' in m or 'no recompiled code at' in m:
+        return 'missing code'
+    if 'unsupported instruction' in m or 'unsupported opcode' in m or 'undefined instruction' in m:
+        return 'unsupported instruction'
+    if 'unimplemented service command' in m or 'unimplemented command' in m or '[srv] unhandled' in m or 'unknown service' in m:
+        return 'missing service command'
+    if ('vertex shaders the pack lacks' in m or
+            'console compiler' in m or
+            '[glsl]' in m or
+            'fragment misses' in m):
+        return 'shader fallback'
+    if 'save flush failed' in m or 'formatted the save again' in m or 'saved in common storage' in m:
+        return 'save failure'
+    if 'nothing drawn' in m or 'no pictures of the' in m or 'insufficient visual coverage' in m:
+        return 'no useful frames'
+    if 'crash' in m or 'fatal' in m or 'pagefault' in m or 'panic' in m:
+        return 'crash'
+    return 'other'
 
 
 @dataclass
@@ -387,10 +425,15 @@ def judge(t, seconds, flags, measured=False):
         for k, v in t.env.items():
             if f'[test] {k} is {v}' not in text or (k == 'RECOMP_ROMFS_SWAP' and '[fs] romfs swap' not in text):
                 faults.append(f'{name}: {k} did not take: this is not the scene')
-        for pat, what in ((CRASH, 'crash'), (r'\[lazy\] no code', 'code the translation missed')):
-            n = len(re.findall(pat, text))
+        for pat, what in (
+            (r'\[lazy\] no code|no recompiled code at', 'code the translation missed'),
+            (r'unsupported (?:opcode|instruction)|undefined instruction', 'unsupported instruction'),
+            (r'\[\w+\] unimplemented command 0x[0-9a-fA-F]+ \(failing\)', 'unimplemented service command'),
+            (CRASH, 'crash'),
+        ):
+            n = len(re.findall(pat, text, re.IGNORECASE))
             if n:
-                faults.append(f'{name}: {what} ({n}): ' + next(l for l in text.split('\n') if re.search(pat, l))[:120])
+                faults.append(f'{name}: {what} ({n}): ' + next(l for l in text.split('\n') if re.search(pat, l, re.IGNORECASE))[:120])
         if 'every file call goes straight' not in text:
             faults.append(f'{name}: files not direct: ' + ' / '.join(l[:90] for l in text.split('\n') if '[fs] ' in l)[:200])
         # A vertex shader the pack lacks is compiled by the console, and its draws are the CPU's until it's there: a fault only if it never came
@@ -483,6 +526,7 @@ def main():
     built = args.no_build or args.bless
     bad = 0
     ports_built = set()
+    game_gaps = {}
     for game in games:
         started = time.time()
         if game in SCENES and not args.measure:
@@ -529,7 +573,19 @@ def main():
         bad += bool(faults)
         print(f'{"FAIL" if faults else "ok  "} {game} ({int(time.time() - started)} s): ' + '; '.join(notes), flush=True)
         for f in faults:
-            print('     ' + f, flush=True)
+            cat = categorize_fault(f)
+            game_gaps.setdefault(cat, set()).add(game)
+            print(f'     [{cat}] {f}', flush=True)
+    if bad:
+        print('\n--- Cold-Build Runtime Gaps by Category ---' if COLD else '\n--- Runtime Gaps by Category ---', flush=True)
+        ranked = sorted(
+            [(cat, games_in_cat) for cat, games_in_cat in game_gaps.items() if games_in_cat],
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+        for cat, games_in_cat in ranked:
+            note = ' (Cemu emulation artifact; not console hardware behavior)' if cat == 'cemu validation' else ''
+            print(f'  {cat:24s}: {len(games_in_cat)} title(s){note} -> {", ".join(sorted(games_in_cat))}', flush=True)
     sys.exit(1 if bad else 0)
 
 
