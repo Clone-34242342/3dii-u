@@ -205,7 +205,8 @@ unsigned mii_serial = 0;
 }  // namespace
 
 static void mii_select_run(u32 id, const std::vector<u8> &cfg) {
-    const auto &miis = console_miis(nullptr);
+    int personal = -1;
+    const auto &miis = console_miis(&personal);
     if (!mii_select_shown() || miis.empty() || cfg.size() < 0x94) {
         LOG("[apt] Mii selector: returning the player's Mii\n");
         const auto mii = player_mii();
@@ -228,7 +229,9 @@ static void mii_select_run(u32 id, const std::vector<u8> &cfg) {
         r.names.push_back(utf8(name));
     }
     const u32 first = cfg[0x90] | cfg[0x91] << 8 | cfg[0x92] << 16 | (u32)cfg[0x93] << 24;
-    r.initial = first < miis.size() ? (int)first : 0;
+    std::vector<int> places;
+    for (const u32 i : rows) places.push_back(mii_maker_place(i));
+    r.initial = mii_select::initial_row(places, first, personal < 0 ? -1 : mii_maker_place(personal));
     r.can_cancel = cfg[0] != 0;
     LOG("[apt] Mii selector: waiting for the player (%zu Miis, \"%s\")\n", miis.size(), r.title.c_str());
     mii_wait_id = id;

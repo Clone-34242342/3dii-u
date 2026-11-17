@@ -43,6 +43,7 @@
 #include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
+#include "motion_input.h"
 #include "service.h"
 #include "services/services.h"
 #include "settings.h"
@@ -352,11 +353,8 @@ static int hid_thread(int, void *) {
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
             pad_x = st.leftStick.x;
             pad_y = st.leftStick.y;
-            // The GamePad's sensors in the 3DS's frame: y comes out of the screen and z towards the player. 512 is 1g; 14.375 is a degree a second, and the GamePad's 1.0 is a turn a second.
-            auto to_s16 = [](float v) { return (s16)std::clamp(v, -32767.0f, 32767.0f); };
-            const VPADVec3D &ac = st.accelerometer.acc;
-            const s16 accel[3] = {to_s16(ac.x * 512), to_s16(ac.z * 512), to_s16(-ac.y * 512)};
-            const s16 gyro[3] = {to_s16(st.gyro.x * 5175), to_s16(st.gyro.z * 5175), to_s16(-st.gyro.y * 5175)};
+            s16 accel[3], gyro[3];
+            wiiu::motion_input(st.accelerometer.acc, st.gyro, accel, gyro);
             kernel::hid_motion(accel, gyro);
             touch = false;
             bool down = false;
@@ -975,7 +973,7 @@ int main(int argc, char **argv) {
     }
     // Test aid: a Mii's store data (0x60 bytes) in a file named "test_mii.bin" in the data folder is taken as the current account's,
     // for Cemu, whose own account Mii is a placeholder
-    if (FILE *f = fopen((wiiu::data_dir() + "/test_mii.bin").c_str(), "rb")) {
+    if (FILE *f = wiiu::debug_flag("cemu") ? fopen((wiiu::data_dir() + "/test_mii.bin").c_str(), "rb") : nullptr) {
         std::array<u8, 0x60> m;
         if (fread(m.data(), 1, 0x60, f) == 0x60) {
             kernel::g_host_my_mii = (int)kernel::g_host_miis.size();
@@ -986,7 +984,7 @@ int main(int argc, char **argv) {
     }
     // The rest of the console's Miis, after the accounts': Mii Maker's own database, in its save, whichever region's Mii Maker the console
     // has (Japan's, America's, Europe's). The same test aid first: a "test_mii_maker.bin" in the data folder is read as that database.
-    if (FILE *f = fopen((wiiu::data_dir() + "/test_mii_maker.bin").c_str(), "rb")) {
+    if (FILE *f = wiiu::debug_flag("cemu") ? fopen((wiiu::data_dir() + "/test_mii_maker.bin").c_str(), "rb") : nullptr) {
         read_mii_maker(f);
         fclose(f);
     }

@@ -53,11 +53,14 @@ int main() {
             if (!shown[which]) continue;
             const Rect &a = r[which], &o = own[which];
             CHECK(inside(a, dw, dh), "GamePad layout %d screen %d at %u,%u %ux%u", layout, which, a.x, a.y, a.w, a.h);
-            CHECK(shaped(a, which), "GamePad layout %d screen %d is %ux%u", layout, which, a.w, a.h);
+            if (layout == 4)
+                CHECK(!a.x && !a.y && a.w == dw && a.h == dh, "GamePad 16:9 does not fill the display: %u,%u %ux%u", a.x, a.y, a.w, a.h);
+            else
+                CHECK(shaped(a, which), "GamePad layout %d screen %d is %ux%u", layout, which, a.w, a.h);
             CHECK(inside(o, dw, dh) && o.x <= a.x && o.y <= a.y && a.x + a.w <= o.x + o.w && a.y + a.h <= o.y + o.h, "GamePad layout %d screen %d outside its part %u,%u %ux%u",
                   layout, which, o.x, o.y, o.w, o.h);
         }
-        CHECK(shown[0] == (layout != 0) && shown[1] == (layout != 1), "GamePad layout %d shows top %d bottom %d", layout, shown[0], shown[1]);
+        CHECK(shown[0] == (layout != 0) && shown[1] == (layout != 1 && layout != 4), "GamePad layout %d shows top %d bottom %d", layout, shown[0], shown[1]);
         if (shown[0] && shown[1]) {
             CHECK(!overlap(r[0], r[1]), "GamePad layout %d: the screens overlap", layout);
             CHECK(!overlap(own[0], own[1]), "GamePad layout %d: one screen paints over the other's part", layout);
@@ -96,6 +99,20 @@ int main() {
         CHECK(layout == 0, "the TV line (step %d) ends at %d", dir, layout);
     }
     CHECK(screens::next_tv_layout(9, 1) == screens::kTvOrder[0], "an unknown layout steps to %d", screens::next_tv_layout(9, 1));
+
+    for (int dir : {1, -1}) {
+        bool seen[screens::kPadLayouts] = {};
+        int layout = 0;
+        for (int i = 0; i < screens::kPadLayouts; i++) {
+            CHECK(layout >= 0 && layout < screens::kPadLayouts && !seen[layout], "the GamePad line (step %d) comes to %d twice", dir, layout);
+            if (layout >= 0 && layout < screens::kPadLayouts) seen[layout] = true;
+            layout = screens::next_pad_layout(layout, dir);
+        }
+        CHECK(layout == 0, "the GamePad line (step %d) ends at %d", dir, layout);
+    }
+    CHECK(screens::next_pad_layout(1, 1) == 4 && screens::next_pad_layout(4, -1) == 1,
+          "the GamePad 16:9 choice must follow the top screen without renumbering saved layouts");
+    CHECK(screens::next_pad_layout(9, 1) == screens::kPadOrder[0], "an unknown GamePad layout steps to %d", screens::next_pad_layout(9, 1));
 
     if (failures) {
         printf("%d checks failed\n", failures);

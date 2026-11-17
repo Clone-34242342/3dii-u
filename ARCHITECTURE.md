@@ -134,7 +134,7 @@ The rest of the backend, in the order of the file's sections:
 - draws shaded on the CPU
 - reading the GPU's work back to guest memory
 - presenting: the top screen is drawn at 1200x720 (800x480 at the menu's 480p) and each screen is scaled to where the TV's and the GamePad's layouts put it (`screen_layouts.h`)
-- the options menu, with its own small font
+- the options menu, with its own small font; TV Display and GamePad Display each offer `Top Screen (16:9 stretch)`, which fills that display without changing the game's camera or field of view. Layout choices are saved in `settings.ini`; GamePad touch input is disabled when only the top screen is shown.
 - the software keyboard
 
 ## The Wii U frontend: `port/wiiu/`
