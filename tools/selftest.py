@@ -167,9 +167,17 @@ def camera():
     return commands
 
 
+def save_backups():
+    exe = build3ds.WORK + '/selftest/test_save_backup.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-static', ROOT + '/tools/test_save_backup.cpp', '-lpthread', '-o', exe],
+            [exe], [sys.executable, ROOT + '/tools/test_backup_menu.py']]
+
+
 def main():
     py = sys.executable
     checks = {
+        'save backups': save_backups(),
         'shader compiler recipe': [[py, ROOT + '/tools/test_cafeglsl_recipe.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],

@@ -32,4 +32,8 @@ inline bool writable_path(const char *name) {
 inline bool readonly_mode(const char *mode) {
     return mode && (std::string_view(mode) == "r" || std::string_view(mode) == "rb");
 }
+// Checkpoint's parent may need creating on a new card; this grants no file writes there.
+inline bool mkdir_path(const char *path) {
+    return path && (std::string_view(path) == "/vol/external01/3ds" || writable_path(path));
+}
 }  // namespace wiiu

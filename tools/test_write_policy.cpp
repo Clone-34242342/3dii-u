@@ -18,4 +18,13 @@ int main() {
     assert(wiiu::readonly_mode("r") && wiiu::readonly_mode("rb"));
     for (const char *mode : {"", "w", "a", "r+", "rb+", "r+b", "wb", "ab", "unknown"}) assert(!wiiu::readonly_mode(mode));
     assert(!wiiu::readonly_mode(nullptr));
+    assert(wiiu::mkdir_path("/vol/external01/3ds"));
+    assert(!wiiu::writable_path("/vol/external01/3ds"));
+    assert(wiiu::mkdir_path("/vol/external01/3ds/Checkpoint"));
+    assert(!wiiu::mkdir_path(nullptr));
+    for (const char *path : {"/vol/external01/3ds/", "/vol/external01/3ds/other", "/vol/external01/3ds/file",
+             "/vol/external01/3ds/../ticket", "/vol/external01/3ds-other", "/vol/storage_slc/rights/ticket"}) {
+        assert(!wiiu::mkdir_path(path));
+        assert(!wiiu::writable_path(path));
+    }
 }

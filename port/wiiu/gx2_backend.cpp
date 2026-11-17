@@ -54,6 +54,7 @@
 #include "screen_layouts.h"
 #include "surface_readback.h"
 #include "settings.h"
+#include "save_backup.h"
 #include "shader_compile.h"
 #include "shadergen.h"
 #include "mii_select.h"
@@ -4562,10 +4563,11 @@ void gfx_vblank() { vblank_pending = true; }
 // ---- options menu state; the input thread changes it, the GPU thread draws it
 // A game that's held to a frame rate (cap_game) has a line to let it run free, between the volume and quitting: its cutscenes are timed for
 // that rate, the rest of it may look better without (the user, 2026-11-14)
-static int menu_items() { return cap_game ? 10 : 9; }
+static int menu_items() { return cap_game ? 12 : 11; }
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
+static std::atomic<bool> menu_restore_confirm;
 
 // The game's language from its next start, as cfg.cpp will pick it (services/languages.h). settings.ini keeps a choice; the card thread
 // writes it (frontend_wiiu.cpp), as this one, the input thread, would wait out any save being written.
@@ -4605,18 +4607,26 @@ bool menu_wants_quit() { return menu_quit; }
 void menu_quit_now() { menu_quit = true; }
 
 void menu_input(u32 pressed, u32 held) {
+    if (save_backup::requests.view().busy) return;  // keep the menu up until storage releases the snapshot
     // ZL and ZR together, as the Virtual Console's menu opens, or a click of the left stick: it opens, and closes again
     constexpr u32 kTriggers = VPAD_BUTTON_ZL | VPAD_BUTTON_ZR;
     const bool toggle = (pressed & VPAD_BUTTON_STICK_L) || ((held & kTriggers) == kTriggers && (pressed & kTriggers));
     if (!menu_is_open) {
         if (menu_allowed && toggle) {
             menu_item = 0;
+            menu_restore_confirm = false;
             menu_is_open = true;
         }
         return;
     }
-    if (toggle || (pressed & VPAD_BUTTON_B)) menu_is_open = false;
+    if (pressed & VPAD_BUTTON_B) {
+        if (menu_restore_confirm) { menu_restore_confirm = false; return; }
+        menu_is_open = false;
+        return;
+    }
+    if (toggle) { menu_restore_confirm = false; menu_is_open = false; return; }
     const int count = menu_items();
+    if (pressed & (VPAD_BUTTON_UP | VPAD_BUTTON_DOWN | VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT)) menu_restore_confirm = false;
     if (pressed & VPAD_BUTTON_UP) menu_item = (menu_item + count - 1) % count;
     if (pressed & VPAD_BUTTON_DOWN) menu_item = (menu_item + 1) % count;
     const int dir = (pressed & VPAD_BUTTON_RIGHT) ? 1 : (pressed & VPAD_BUTTON_LEFT) ? -1 : 0;
@@ -4636,9 +4646,16 @@ void menu_input(u32 pressed, u32 held) {
         g_settings.show_fps = !g_settings.show_fps;
         wiiu::settings_due = true;
     }
-    if (count == 10 && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) cap_fps = cap_fps ? 0 : cap_game;
+    if (cap_game && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) cap_fps = cap_fps ? 0 : cap_game;
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
+        if (menu_item == count - 3) save_backup::requests.request(save_backup::Action::Export);
+        if (menu_item == count - 2) {
+            if (menu_restore_confirm) {
+                save_backup::requests.request(save_backup::Action::StageRestore);
+                menu_restore_confirm = false;
+            } else menu_restore_confirm = true;
+        }
         if (menu_item == count - 1) menu_quit = true;
     }
 }
@@ -4693,9 +4710,11 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     snprintf(res, sizeof res, "%dp", g_settings.resolution);
     if (cap_fps) snprintf(cap, sizeof cap, "%u fps", (unsigned)cap_fps);
     else snprintf(cap, sizeof cap, "Off");
-    const char *labels[10] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit", ""};
-    const char *values[10] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
-                              k_pad_layouts[pad_layout % screens::kPadLayouts], res, g_settings.show_fps ? "On" : "Off", cap, ""};
+    const char *labels[12] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit"};
+    const char *values[12] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
+                              k_pad_layouts[pad_layout % screens::kPadLayouts], res, g_settings.show_fps ? "On" : "Off", cap};
+    labels[count - 3] = "Back up Save to SD Card";
+    labels[count - 2] = menu_restore_confirm ? "Confirm Restore Next Start (A)" : "Restore Newest Backup Next Start";
     labels[quit] = "Return to Wii U Menu";
     values[quit] = "";
 
@@ -4724,6 +4743,18 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     const float title_x = std::floor((W - text_w(title, 30)) / 2);
     text(title, title_x + at(2), at(11) + at(2), 30, 0.04f, 0.07f, 0.16f);
     text(title, title_x, at(11), 30, 1, 1, 1);
+    std::string status = save_backup::requests.view().message;
+    if (menu_restore_confirm) status = "The newest SD backup will replace this save next start. A confirms; B cancels.";
+    if (!status.empty()) {
+        const bool shorten = text_w(status.c_str(), 11) > W - at(80);
+        while (!status.empty() && text_w((status + (shorten ? "..." : "")).c_str(), 11) > W - at(80)) {
+            size_t end = status.size() - 1;
+            while (end && ((unsigned char)status[end] & 0xc0) == 0x80) --end;
+            status.resize(end);
+        }
+        if (shorten) status += "...";
+        text(status.c_str(), (W - text_w(status.c_str(), 11)) / 2, at(43), 11, 1, 1, 1);
+    }
     // the dark frame and its tiles
     paint(0.47f, 0.58f, 0.84f);
     draw_round_rect(w, h, at(24), at(68), W - at(24), H - at(56), at(16));
@@ -4733,7 +4764,7 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     const float x0 = at(40), x1 = W - at(40), side = at(16), bar = at(9), bar_gap = at(3), arrow_size = at(11);
     for (int i = 0; i < count; i++) {
         const float y0 = at(first + i * (tile + gap)), y1 = at(first + i * (tile + gap) + tile), mid = (y0 + y1) / 2;
-        const bool chosen = i == menu_item, adjustable = i != 0 && i != quit;
+        const bool chosen = i == menu_item, adjustable = i != 0 && i < count - 3;
         if (chosen) {
             paint(0.18f, 0.76f, 1.0f);
             draw_round_rect(w, h, x0 - at(4), y0 - at(4), x1 + at(4), y1 + at(4), at(11));

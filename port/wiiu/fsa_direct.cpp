@@ -11,6 +11,7 @@
 
 #include "rt.h"
 #include "wiiu.h"
+#include "write_policy.h"
 
 extern "C" {
 FSError __real_FSAOpenFileEx(FSAClientHandle, const char *, const char *, FSMode, FSOpenFileFlags, uint32_t, FSAFileHandle *);
@@ -179,6 +180,10 @@ inline bool direct(FSAClientHandle c) {
 
 extern "C" {
 FSError __wrap_FSAOpenFileEx(FSAClientHandle c, const char *path, const char *mode, FSMode create, FSOpenFileFlags flags, uint32_t prealloc, FSAFileHandle *out) {
+    if ((!wiiu::readonly_mode(mode) || flags != FS_OPEN_FLAG_NONE || prealloc) && !wiiu::writable_path(path)) {
+        *out = (FSAFileHandle)-1;
+        return FS_ERROR_PERMISSION_ERROR;
+    }
     return direct(c) ? d_open(c, path, mode, create, flags, prealloc, out) : __real_FSAOpenFileEx(c, path, mode, create, flags, prealloc, out);
 }
 FSError __wrap_FSACloseFile(FSAClientHandle c, FSAFileHandle file) { return direct(c) ? d_close(c, file) : __real_FSACloseFile(c, file); }
@@ -206,6 +211,7 @@ FSError __wrap_FSATruncateFile(FSAClientHandle c, FSAFileHandle file) {
     return ask(c, FSA_COMMAND_TRUNCATE_FILE, s);
 }
 FSError __wrap_FSARemove(FSAClientHandle c, const char *path) {
+    if (!wiiu::writable_path(path)) return FS_ERROR_PERMISSION_ERROR;
     if (!direct(c)) return __real_FSARemove(c, path);
     alignas(64) FSAShimBuffer s;
     memset(&s, 0, sizeof s);
@@ -213,6 +219,7 @@ FSError __wrap_FSARemove(FSAClientHandle c, const char *path) {
     return ask(c, FSA_COMMAND_REMOVE, s);
 }
 FSError __wrap_FSAMakeDir(FSAClientHandle c, const char *path, FSMode mode) {
+    if (!wiiu::mkdir_path(path)) return FS_ERROR_PERMISSION_ERROR;
     if (!direct(c)) return __real_FSAMakeDir(c, path, mode);
     alignas(64) FSAShimBuffer s;
     memset(&s, 0, sizeof s);
@@ -221,6 +228,7 @@ FSError __wrap_FSAMakeDir(FSAClientHandle c, const char *path, FSMode mode) {
     return ask(c, FSA_COMMAND_MAKE_DIR, s);
 }
 FSError __wrap_FSARename(FSAClientHandle c, const char *from, const char *to) {
+    if (!wiiu::writable_path(from) || !wiiu::writable_path(to)) return FS_ERROR_PERMISSION_ERROR;
     if (!direct(c)) return __real_FSARename(c, from, to);
     alignas(64) FSAShimBuffer s;
     memset(&s, 0, sizeof s);

@@ -47,6 +47,7 @@
 #include "service.h"
 #include "services/services.h"
 #include "settings.h"
+#include "save_backup.h"
 #include "wiiu.h"
 
 static const char *const CONTENT_DIR = "fs:/vol/content";
@@ -637,6 +638,7 @@ static int watchdog_thread(int, void *) {
 }
 
 volatile bool wiiu::settings_due;
+wiiu::save_backup::Requests wiiu::save_backup::requests;
 
 // The log of a measuring build played on a console: on the SD card, sd:/3dii-u/<title id>/log.txt, for the PC to read, kept up to date every
 // 10 s (card_thread) so a freeze leaves what led up to it. In storage of its own in a test run the PC drives (live.txt), or with no card to write.
@@ -658,6 +660,13 @@ static std::string log_path() {
 static int card_thread(int, void *) {
     for (u32 pass = 1;; pass++) {
         OSSleepTicks(OSMillisecondsToTicks(200));
+        const auto backup = wiiu::save_backup::requests.take();
+        if (backup != wiiu::save_backup::Action::None) {
+            std::string message;
+            const bool ok = backup == wiiu::save_backup::Action::Export ? wiiu::save_backup::export_to_card(message) : wiiu::save_backup::stage_restore(message);
+            LOG("[save backup] %s: %s\n", ok ? "done" : "not completed", message.c_str());
+            wiiu::save_backup::requests.complete(message);
+        }
         if (want_hang_dump) {
             const u32 seconds = want_hang_dump - 1;
             want_hang_dump = 0;
@@ -916,8 +925,18 @@ int main(int argc, char **argv) {
     load_game(CONTENT_DIR);
     stage("game loaded");
     std::filesystem::create_directories(kernel::save_root(), no_save);
-    if (!wiiu::test_run())  // services/fs.cpp's folder for the game's save (archive_dir)
-        wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
+    if (!wiiu::test_run()) {  // before services/guest file handles, including cached save files
+        std::string message;
+        const auto restored = wiiu::save_backup::take_staged_restore(message);
+        if (!message.empty()) {
+            LOG("[save backup] %s\n", message.c_str());
+            wiiu::save_backup::requests.complete(message);
+        }
+        if (restored == wiiu::save_backup::Restore::Unsafe) report_stuck(message.c_str());
+        // A pending explicit restore keeps the current save. A successful one marks save_imported.
+        if (restored == wiiu::save_backup::Restore::None)
+            wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
+    }
     struct stat no_menu;
     if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
     rt_log_open(log_path());
