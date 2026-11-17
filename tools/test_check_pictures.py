@@ -3,6 +3,8 @@
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
+from unittest import mock
 
 from PySide6.QtGui import QColor, QImage
 
@@ -67,6 +69,43 @@ def main():
                     img.setPixelColor(31, 47, QColor('white'))
                 img.save(f'{visible.data}/shots/cemu/{screen}_{n:02d}.png')
         assert not c.pictures(visible, 'blank_save', minimum_pairs=2)[0]
+    # A restart can quit after 35s while the interpreter has a 150s allowance.
+    # Keep its 50s/6 cadence, rather than capturing just once at 150s/6.
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(c, 'CEMU', d + '/cemu'):
+        t = c.Target('cadence', 'ff', d + '/out', d + '/game')
+        os.makedirs(t.out + '/title/code')
+        open(t.out + '/title/code/game.rpx', 'wb').close()
+        os.makedirs(c.CEMU + '/portable', exist_ok=True)
+        open(c.CEMU + '/portable/log.txt', 'w').close()
+        calls = []
+
+        def runner(*argv):
+            seconds = int(argv[argv.index('-Seconds') + 1])
+            shots = int(argv[argv.index('-Shots') + 1])
+            interp = '-Interpreter' in argv
+            calls.append((seconds, shots, interp))
+            log = t.common + '/log.txt'
+            if len(calls) > 1 and not interp:
+                open(log, 'w').close()
+                return SimpleNamespace(stdout='exited by itself')
+            with open(log, 'w') as f:
+                f.write('[fs] every file call goes straight\n[glsl] compiler thread ready\n[quit] sound system shut down\n')
+            count = int((35 if interp else seconds) / (seconds / shots))
+            folder = t.data + '/shots/cemu'
+            os.makedirs(folder, exist_ok=True)
+            img = QImage(128, 72, QImage.Format_RGB888)
+            img.fill(QColor('green'))
+            for i in range(count):
+                for screen in ('tv', 'pad'):
+                    img.save(f'{folder}/{screen}_{i:02d}.png')
+            return SimpleNamespace(stdout='closed')
+
+        with mock.patch.object(c, 'run', side_effect=runner):
+            faults, notes = c.judge(t, 200, [])
+        assert calls[0] == (200, c.SHOTS, False)
+        assert calls[-1] == (150, c.SHOTS * 3, True), calls
+        assert not any('insufficient visual coverage' in f for f in faults), (faults, notes)
+        assert len(os.listdir(c.kept(t, 'check_shots') + '/restart')) >= 4
     print('ok')
 
 

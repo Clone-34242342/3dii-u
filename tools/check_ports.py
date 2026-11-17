@@ -220,8 +220,8 @@ def build_from_dump(name, src, otp):
 SHOTS = 6  # pictures of each screen a leg (--shots): more of them follow a transition step by step
 
 
-def cemu(t, seconds, interp):
-    ps = ['powershell', '-NoProfile', '-File', ROOT + '/tools/win/cemu_run.ps1', '-Rpx', t.rpx, '-Low', t.low, '-Seconds', str(seconds), '-Shots', str(SHOTS), '-Out', t.data + '/shots/cemu']
+def cemu(t, seconds, interp, shots=None):
+    ps = ['powershell', '-NoProfile', '-File', ROOT + '/tools/win/cemu_run.ps1', '-Rpx', t.rpx, '-Low', t.low, '-Seconds', str(seconds), '-Shots', str(SHOTS if shots is None else shots), '-Out', t.data + '/shots/cemu']
     if interp:
         ps.append('-Interpreter')
     return run(*ps).stdout
@@ -399,14 +399,15 @@ def judge(t, seconds, flags, measured=False):
         saved_before = bool(save_files(t))
         # Cemu's interpreter, taken after its recompiler failed, runs a game at a third of its speed or less (Luigi's Mansion 2): a leg in it gets
         # longer, and the restart's quit, at its route's end, still comes before the time is up
+        # Scale captures too: the extra allowance must not delay them past an early guest quit.
         slow = lambda: (3 if closing else 2) if interp and not t.interp else 1  # noqa: E731
-        said = cemu(t, secs * slow(), interp)
+        said = cemu(t, secs * slow(), interp, shots=SHOTS * slow())
         text = read_log()
         if 'exited by itself' in said and not text.strip():
             # Cemu died before the game wrote a line: one of its own caches for the title, left damaged by the run before, which can happen even
             # when that run closed as asked (NSMB2's restart, 2026-11-11). cemu_run.ps1 has dropped them, so the same again starts clean.
             notes.append(f'{name}: Cemu died as it started; run again on fresh caches')
-            said = cemu(t, secs * slow(), interp)
+            said = cemu(t, secs * slow(), interp, shots=SHOTS * slow())
             text = read_log()
         elif not text.strip() and not glob.glob(t.data + '/shots/cemu/tv_*.png'):
             # Or it stayed up and never started the game: no line on the game's log and not one picture (A Link Between Worlds' restart,
@@ -414,7 +415,7 @@ def judge(t, seconds, flags, measured=False):
             notes.append(f'{name}: Cemu never started the game; run again on fresh caches')
             for f in glob.glob(f'{CEMU}/portable/shaderCache/transferable/00050000{t.low}_*'):
                 os.remove(f)
-            said = cemu(t, secs * slow(), interp)
+            said = cemu(t, secs * slow(), interp, shots=SHOTS * slow())
             text = read_log()
         crashed = bool(re.search(CRASH, text))
         if not interp and (crashed or 'exited by itself' in said):
@@ -424,7 +425,7 @@ def judge(t, seconds, flags, measured=False):
             notes.append(f"{name}: " + ("the game crashed in Cemu's recompiler" if crashed else "Cemu's recompiler died with nothing on the game's log")
                          + '; run with its interpreter')
             interp = True
-            said = cemu(t, secs * slow(), interp)
+            said = cemu(t, secs * slow(), interp, shots=SHOTS * slow())
             text = read_log()
         if 'exited by itself' in said:
             faults.append(f'{name}: Cemu stopped: ' + said.strip()[-120:])
