@@ -1,5 +1,6 @@
 // Small services: ptm, ndm, ac, frd, boss, cecd, news, ir, mic, cam, y2r, ldr:ro, soc, ssl, http, ...
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <ctime>
 #include <vector>
@@ -500,26 +501,176 @@ struct Mic : Service {
     }
 };
 
+// The host's second stick and ZL/ZR (input thread): the Circle Pad Pro's C-stick and triggers, as a New 3DS gives its own to a game
+namespace {
+std::atomic<int> extra_x, extra_y;  // -0x7FF..0x7FF
+std::atomic<u32> extra_buttons;     // 1 ZL, 2 ZR, 4 R
+std::atomic<bool> extra_connected;
+}  // namespace
+void hid_extra_pad(float x, float y, bool zl, bool zr, bool r) {
+    extra_x = (int)(std::clamp(x, -1.0f, 1.0f) * 0x7FF);
+    extra_y = (int)(std::clamp(y, -1.0f, 1.0f) * 0x7FF);
+    extra_buttons = (zl ? 1u : 0u) | (zr ? 2u : 0u) | (r ? 4u : 0u);
+}
+bool extra_pad_connected() { return extra_connected; }
+
+// The infrared port with a Circle Pad Pro on it, as a New 3DS has one: its system answers a game that looks for a Circle Pad Pro with its
+// own C-stick, ZL and ZR. Majora's Mask 3D asks for one before each file and can't be got past without it. The game's shared memory holds
+// the status (0x8 connection status, 0xA role, 0xC connected, 0xD network id, 0xE initialized), then the receive buffer: its state at 0x10
+// (first packet, next packet, packets, bytes), a list of packets at 0x20 (offset, size), and the bytes after it, a ring. The device's
+// replies go there as packets: 0xA5, the network id, the size, the payload and a CRC-8.
 struct Ir : Service {
     using Service::Service;
     std::shared_ptr<Event> conn = make_event(ONESHOT, "ir conn");
     std::shared_ptr<Event> recv = make_event(ONESHOT, "ir recv");
     std::shared_ptr<Event> send = make_event(ONESHOT, "ir send");
+    std::shared_ptr<SharedMem> mem;
+    u32 packets_max = 0, data_max = 0;  // the receive buffer's room
+    bool connected = false;
+    u32 period_ms = 0, generation = 0;  // the pad's reports, every period_ms while connected
+
+    void status(u8 connection) {
+        if (!mem) return;
+        connected = connection == 2;
+        extra_connected = connected;
+        w8(mem->backing + 0x8, connection);
+        w8(mem->backing + 0xA, connected ? 2 : 0);
+        w8(mem->backing + 0xC, connected ? 1 : 0);
+        conn->signal();
+    }
+    static u8 crc8(const std::vector<u8> &p) {
+        u8 c = 0;
+        for (u8 b : p) {
+            c ^= b;
+            for (int i = 0; i < 8; i++) c = (c & 0x80) ? (u8)((c << 1) ^ 0x07) : (u8)(c << 1);
+        }
+        return c;
+    }
+    void put(const std::vector<u8> &payload) {  // one reply into the receive buffer
+        if (!mem || !packets_max || payload.size() >= 0x4000) return;
+        const u32 b = mem->backing, info = b + 0x10, list = b + 0x20, data = list + packets_max * 8;
+        std::vector<u8> p = {0xA5, r8(b + 0xD)};
+        if (payload.size() < 0x40) {
+            p.push_back((u8)payload.size());
+        } else {
+            p.push_back((u8)(0x40 | (payload.size() >> 8)));
+            p.push_back((u8)payload.size());
+        }
+        p.insert(p.end(), payload.begin(), payload.end());
+        p.push_back(crc8(p));
+        const u32 first = r32(info), next = r32(info + 4), count = r32(info + 8), used = r32(info + 12);
+        if (count >= packets_max || used + p.size() > data_max) return;  // the game hasn't taken the last ones: this report is dropped
+        const u32 at = count ? (r32(list + first * 8) + used) % data_max : 0;
+        for (size_t i = 0; i < p.size(); i++) w8(data + (at + i) % data_max, p[i]);
+        w32(list + next * 8, at);
+        w32(list + next * 8 + 4, (u32)p.size());
+        w32(info + 4, (next + 1) % packets_max);
+        w32(info + 8, count + 1);
+        w32(info + 12, used + (u32)p.size());
+        recv->signal();
+    }
+    void release(u32 n) {
+        if (!mem || !packets_max) return;
+        const u32 info = mem->backing + 0x10, list = mem->backing + 0x20;
+        u32 first = r32(info), count = r32(info + 8), used = r32(info + 12);
+        for (; n && count; n--, count--) {
+            used -= std::min(used, r32(list + first * 8 + 4));
+            first = (first + 1) % packets_max;
+        }
+        w32(info, first);
+        w32(info + 8, count);
+        w32(info + 12, count ? used : 0);
+    }
+    void report() {  // the C-stick (12 bits each, 0x800 the middle), a full battery, and ZL, ZR and R, set when not held
+        const u32 x = (u32)(0x800 + extra_x), y = (u32)(0x800 + extra_y), held = extra_buttons;
+        const u32 stick = 0x10 | (x & 0xFFF) << 8 | (y & 0xFFF) << 20;
+        put({(u8)stick, (u8)(stick >> 8), (u8)(stick >> 16), (u8)(stick >> 24),
+             (u8)(0x1F | (held & 1 ? 0 : 0x20) | (held & 2 ? 0 : 0x40) | (held & 4 ? 0 : 0x80)), 0});
+    }
+    void poll(u32 g) {  // (lock held)
+        if (g != generation || !connected || !period_ms) return;
+        report();
+        add_timeout(now_ns() + period_ms * 1000000ull, [this, g] { poll(g); });
+    }
+    void request(const u8 *d, u32 size) {  // what the game sends the device
+        if (!connected || !size) return;
+        if (d[0] == 1 && size >= 2) {  // the reports' period in ms
+            if (d[1] != period_ms) LOG("[ir] Circle Pad Pro: the game reads it every %u ms\n", d[1]);
+            period_ms = d[1];
+            const u32 g = ++generation;
+            if (period_ms) add_timeout(now_ns() + period_ms * 1000000ull, [this, g] { poll(g); });
+        } else if (d[0] == 2 && size >= 6) {  // calibration: offset and size, in 16s, of the device's 64 bytes
+            static const u8 calibration[0x40] = {
+                0x00, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0xF5,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65};
+            const u32 off = d[2] | d[3] << 8, n = d[4] | d[5] << 8;
+            if (off % 16 || n % 16 || off + n > sizeof calibration) return;
+            std::vector<u8> r = {0x11, d[2], d[3], d[4], d[5]};
+            r.insert(r.end(), calibration + off, calibration + off + n);
+            put(r);
+        }
+    }
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
+        case 0x0018: {  // InitializeIrNopShared(shared size, receive size, receive count, send size, send count, baud rate, shared memory)
+            mem = get<SharedMem>(ipc[8]);
+            packets_max = ipc[3];
+            data_max = ipc[2] > packets_max * 8 ? ipc[2] - packets_max * 8 : 0;
+            if (mem) {
+                for (u32 i = 0; i < 0x20; i++) w8(mem->backing + i, 0);
+                w8(mem->backing + 0xE, 1);
+            }
+            ipc.ok();
+            break;
+        }
+        case 0x0006:  // RequireConnection(device): the Circle Pad Pro (1) answers at once
+            VLOG("[ir] RequireConnection %u\n", ipc[1] & 0xFF);
+            if ((ipc[1] & 0xFF) == 1) status(2);
+            ipc.ok();
+            break;
+        case 0x0009:  // Disconnect
+            generation++;
+            status(0);
+            ipc.ok();
+            break;
+        case 0x0002:  // FinalizeIrNop
+            generation++;
+            if (connected) status(0);
+            if (mem) w8(mem->backing + 0xE, 0);
+            mem = nullptr;
+            extra_connected = false;
+            ipc.ok();
+            break;
+        case 0x000D:    // SendIrNop(size, static buffer)
+        case 0x000E: {  // SendIrNopLarge(size, mapped buffer)
+            const u32 size = ipc[1];
+            std::vector<u8> d(size);
+            for (u32 i = 0; i < size; i++) d[i] = r8(ipc[3] + i);
+            request(d.data(), size);
+            send->signal();
+            ipc.ok();
+            break;
+        }
+        case 0x0019:  // ReleaseReceivedData(count)
+            release(ipc[1]);
+            ipc.ok();
+            break;
+        case 0x000A:  // GetReceiveEvent
+            ipc.ok(1, 2);
+            ipc.handles(2, {recv});
+            break;
+        case 0x000B:  // GetSendEvent
+            ipc.ok(1, 2);
+            ipc.handles(2, {send});
+            break;
         case 0x000C:  // GetConnectionStatusEvent
             ipc.ok(1, 2);
             ipc.handles(2, {conn});
             break;
-        case 0x000D:  // GetReceiveEvent
-            ipc.ok(1, 2);
-            ipc.handles(2, {recv});
-            break;
-        case 0x000E:  // GetSendEvent
-            ipc.ok(1, 2);
-            ipc.handles(2, {send});
-            break;
         default:
+            VLOG("[ir] command %04x\n", ipc.cmd());
             ipc.ok();
         }
     }

@@ -7,7 +7,8 @@
     {"name": "Rhythm Heaven Megamix", "status": "Cemu", "note": "60 fps. No console report yet."},
     {"name": "Phoenix Wright: Ace Attorney Trilogy", "status": "Cemu", "note": "54 fps, from this build on: its script threads switch stacks, and it now builds the way that needs."},
     {"name": "Kid Icarus: Uprising", "status": "Cemu", "note": "30 fps; its cutscene videos play slowly. No console report yet."},
-    {"name": "Miitopia", "status": "Cemu", "note": "30 fps. Needs your 3DS system files (the Mii data), which the builder now finds or asks for. From this build, 331 more shaders are built in ahead (18 fps became 30 in Cemu)."}
+    {"name": "Miitopia", "status": "Cemu", "note": "30 fps. Needs your 3DS system files (the Mii data), which the builder now finds or asks for. From this build, 331 more shaders are built in ahead (18 fps became 30 in Cemu)."},
+    {"name": "The Legend of Zelda: Majora's Mask 3D", "status": "Cemu", "note": "30 fps in the game, about 20 in its intro. From this build it gets past its Circle Pad Pro screen: the right stick is the C-stick, and ZL and ZR are its own, as on a New 3DS. No console report yet."}
   ],
   "000400000008C300": {"slug": "tomodachi", "title_id": "0005000010334467", "name": "Tomodachi Life", "product": "WUP-N-TMDF", "folder": "Tomodachi_Life",
                        "status": "Plays", "note": "About 30 fps, as on a 3DS. Saves on the console."},
@@ -44,5 +45,8 @@
                        "status": "Plays", "note": "Plays on a Wii U: 30 fps in Cemu, and no texture problems on a console."},
   "0004000000033600": {"slug": "g_aqep", "title_id": "000500003D000336", "name": "The Legend of Zelda Ocarina of Time 3D", "product": "WUP-N-AQEP",
                        "folder": "The_Legend_of_Zelda_Ocarina_of_Time_3D", "mixed": true,
-                       "status": "Untested", "note": "The European version: built the same way as the American one, which plays on a Wii U. Plays in Cemu, not yet tried on a console."}
+                       "status": "Untested", "note": "The European version: built the same way as the American one, which plays on a Wii U. Plays in Cemu, not yet tried on a console."},
+  "0004000000125500": {"slug": "g_ajre", "title_id": "000500003D001255", "name": "The Legend of Zelda Majora's Mask 3D", "product": "WUP-N-AJRE",
+                       "folder": "The_Legend_of_Zelda_Majora_s_Mask_3D", "mixed": true,
+                       "status": "Untested", "note": "30 fps in Cemu in the game, about 20 in its intro. The right stick is the C-stick, and ZL and ZR are its own, as on a New 3DS. Not yet tried on a console."}
 }
