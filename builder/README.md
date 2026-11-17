@@ -39,6 +39,7 @@ Saves live in the game's own save storage on the console, like any installed gam
 - Mario & Luigi: Bowser's Inside Story + Bowser Jr.'s Journey
 - Professor Layton and the Azran Legacy
 - Professor Layton and the Miracle Mask
+- The Legend of Zelda: Ocarina of Time 3D (American version, contributor-reported console play; outstanding audio and graphics reports remain under investigation)
 
 Any other game builds as **untested**. It gets a title ID of its own (`000500003Dxxxxxx`, kept clear of real Wii U titles), and code finders run on it, but nobody has played it yet: it may not start, or it may stop partway.
 

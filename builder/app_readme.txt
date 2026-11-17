@@ -46,7 +46,9 @@ WHICH GAMES WORK
 - "Plays on Wii U": tested on a real Wii U, and it plays; some things may still be rough:
   Tomodachi Life, Paper Mario: Sticker Star, Mario & Luigi: Dream Team, Mario & Luigi: Paper Jam,
   Mario & Luigi: Superstar Saga + Bowser's Minions, Mario & Luigi: Bowser's Inside Story + Bowser Jr.'s Journey,
-  Professor Layton and the Azran Legacy, and Professor Layton and the Miracle Mask.
+  Professor Layton and the Azran Legacy, Professor Layton and the Miracle Mask,
+  and The Legend of Zelda: Ocarina of Time 3D (American version, contributor-reported console play;
+  audio and graphics reports remain under investigation).
   Either badge shows when your dump is the same edition that was tested. They were tested without updates.
 - "Runs in Cemu" (the Games page): built with this builder and played in the Cemu emulator, not yet on a real Wii U:
   Mario Kart 7, The Legend of Zelda: A Link Between Worlds, Metroid: Samus Returns, Kirby: Triple Deluxe, Rhythm Heaven Megamix,
