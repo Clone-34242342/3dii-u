@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "gpu/pica.h"
+#include "depth_viewport.h"
 #include "audio_iface.h"
 #include "gpu_iface.h"
 #include "services/services.h"
@@ -1950,7 +1951,10 @@ void send_state(const DrawState &ds, Surface &c, bool has_depth, bool stencil) {
     // At 4.5 times the 3DS's size every other 3DS pixel edge lands on the centre of a TV pixel, where two quads meeting at that edge can both leave the pixel to the other: the
     // console drew Dream Team's text boxes with a thin line where their pieces meet, and Cemu's GPU never did. A quarter of a pixel moves every edge off the centres.
     const float nudge = Sx != floorf(Sx) || Sy != floorf(Sy) ? 0.25f : 0.0f;
-    GX2SetViewport(ds.vp_x * Sx + nudge, ds.vp_y * Sy + c.row0 + nudge, 2 * ds.vp_hw * Sx, 2 * ds.vp_hh * Sy, 0.0f, 1.0f);
+    GX2ViewportReg viewport;
+    GX2InitViewportReg(&viewport, ds.vp_x * Sx + nudge, ds.vp_y * Sy + c.row0 + nudge, 2 * ds.vp_hw * Sx, 2 * ds.vp_hh * Sy, 0.0f, 1.0f);
+    depth_viewport::pica_range(viewport);
+    GX2SetViewportReg(&viewport);
     if (ds.scissor_mode == 3) {
         const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, c.w), x2 = std::clamp<s32>(ds.sc_x2, 0, c.w);
         const s32 y1 = std::clamp<s32>(ds.sc_y1, 0, c.h), y2 = std::clamp<s32>(ds.sc_y2, 0, c.h);

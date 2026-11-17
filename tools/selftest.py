@@ -36,6 +36,12 @@ def screen_layouts():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_screen_layouts.cpp', '-o', exe], [exe]]
 
 
+def depth_viewport():
+    exe = build3ds.WORK + '/selftest/test_depth_viewport.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_depth_viewport.cpp', '-o', exe], [exe]]
+
+
 def surface_readback():
     """GPU readback preserves newer CPU writes and overlapping surfaces."""
     exe = build3ds.WORK + '/selftest/test_surface_readback.exe'
@@ -146,6 +152,7 @@ def main():
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
+        'depth viewport': depth_viewport(),
         'surface readback': surface_readback(),
         'Mii selection': mii_selection(),
         'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py']],
