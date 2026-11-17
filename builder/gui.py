@@ -243,6 +243,30 @@ def theme():
     return {'font': body, 'display': display, 'mono': 'Cascadia Mono' if 'Cascadia Mono' in families else 'Consolas', 'light': light, 'dark': dark}
 
 
+def build_compat_list(compat):
+    """Unified cross-platform compatibility records for Wii U and Cemu."""
+    rows = []
+    cemu_by_name = {g['name'].lower(): g for g in compat.get('_cemu', [])}
+    for k, g in compat.items():
+        if k.startswith('_'): continue
+        name = g.get('name', '')
+        w_status = g.get('status', 'Untested')
+        w_note = g.get('note', '')
+        c_match = cemu_by_name.pop(name.lower(), None)
+        c_status = 'Plays' if c_match else ('Plays' if w_status in ('Complete', 'Plays') else 'Untested')
+        c_note = c_match.get('note', '') if c_match else ''
+        rows.append(dict(name=name, wiiu_status=w_status, wiiu_note=w_note,
+                         cemu_status=c_status, cemu_note=c_note, status=w_status,
+                         note=w_note or c_note, slug=g.get('slug', ''),
+                         title_id=g.get('title_id', ''), product=g.get('product', '')))
+    for g in cemu_by_name.values():
+        rows.append(dict(name=g['name'], wiiu_status='Untested', wiiu_note='Not yet tested on a console.',
+                         cemu_status='Plays', cemu_note=g.get('note', ''), status='Cemu',
+                         note=g.get('note', ''), slug='', title_id='', product=''))
+    rows.sort(key=lambda r: r['name'])
+    return rows
+
+
 # ---- what the window shows, and what its buttons do
 class App(QObject):
     changed = Signal()
@@ -275,7 +299,7 @@ class App(QObject):
     stages, stage, failed, progress, detail = _p('QVariantList', 'stages'), _p(int, 'stage'), _p(bool, 'failed'), _p(float, 'progress'), _p(str, 'detail')
     log = _p(str, 'log', logChanged)
     resultText, where, dialog = _p(str, 'resultText'), _p(str, 'where'), _p('QVariant', 'dialog')
-    games, others, version, rootOk = _p('QVariantList', 'games'), _p('QVariantList', 'others'), _p(str, 'version'), _p(bool, 'rootOk')
+    games, others, compatList, version, rootOk = _p('QVariantList', 'games'), _p('QVariantList', 'others'), _p('QVariantList', 'compatList'), _p(str, 'version'), _p(bool, 'rootOk')
     faq, themeMode, dark = _p('QVariantList', 'faq'), _p(str, 'themeMode'), _p(bool, 'dark')
     updateState, updateTitle, updateNotes, updateProgress = _p(str, 'updateState'), _p(str, 'updateTitle'), _p(str, 'updateNotes'), _p(int, 'updateProgress')
     updateMessage, releaseTag, updateSetAside = _p(str, 'updateMessage'), _p(str, 'releaseTag'), _p(bool, 'updateSetAside')
@@ -310,6 +334,7 @@ class App(QObject):
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
                        games=[dict(name=g['name'], status=g['status'], note=g['note']) for k, g in compat.items() if not k.startswith('_')],
                        others=compat.get('_cemu', []),  # shown only: they build as untested games, by their own code
+                       compatList=build_compat_list(compat),
                        faq=faq, themeMode=theme_mode if theme_mode in ('system', 'light', 'dark') else 'system', dark=False,
                        updateState='', updateTitle='', updateNotes='', updateProgress=0, updateMessage='', releaseTag=updater.own_tag(),
                        updateSetAside=False, buildText='', buildCustom=False)

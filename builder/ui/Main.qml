@@ -330,6 +330,34 @@ ApplicationWindow {
         }
     }
 
+    // a badge showing platform support (Wii U or Cemu) and verified compatibility status
+    component PlatformBadge: Rectangle {
+        id: pb
+        property string platform: "Wii U"
+        property string status: "Plays"
+        property string tone: "grey"
+        width: 136; height: 32; radius: 6
+        color: Qt.rgba(0, 0, 0, 0.22)
+        border.color: pb.tone === "cyan" ? pal.lightCyan : pb.tone === "green" ? pal.lightGreen : pal.railActive
+        border.width: 1
+        Row {
+            anchors.centerIn: parent
+            spacing: 6
+            Rectangle {
+                width: 8; height: 8; radius: 4
+                anchors.verticalCenter: parent.verticalCenter
+                color: pb.tone === "cyan" ? pal.lightCyan : pb.tone === "green" ? pal.lightGreen : pal.lightGrey
+            }
+            Label {
+                text: pb.platform + ": " + pb.status
+                font.pixelSize: 13
+                font.weight: Font.Medium
+                color: pb.tone === "cyan" ? pal.cyanText : pal.label
+                anchors.verticalCenter: parent.verticalCenter
+            }
+        }
+    }
+
     // a rail key-cap seen from above: a white face on grey sides, and its darker lower side showing under it
     component KeyCap: Item {
         id: kc
@@ -828,6 +856,8 @@ ApplicationWindow {
         Flickable {
             id: gamesPage
             Item { id: gamesStart }
+            property string viewMode: "library"
+            property string platformFilter: "all"
             x: 190; y: 100; width: 1090; height: 620
             visible: win.page === "games"
             contentHeight: gamesCol.height + 40
@@ -837,9 +867,29 @@ ApplicationWindow {
             Column {
                 id: gamesCol
                 x: 20; y: 12
-                spacing: 34
+                spacing: 24
+                Row {
+                    spacing: 12
+                    Pill {
+                        text: "Your Library"
+                        accessibleName: "Show your library"
+                        tone: gamesPage.viewMode === "library" ? "cyan" : "grey"
+                        fontSize: 17
+                        implicitHeight: 38
+                        onClicked: gamesPage.viewMode = "library"
+                    }
+                    Pill {
+                        text: "Compatibility List"
+                        accessibleName: "Show compatibility list"
+                        tone: gamesPage.viewMode === "compat" ? "cyan" : "grey"
+                        fontSize: 17
+                        implicitHeight: 38
+                        onClicked: gamesPage.viewMode = "compat"
+                    }
+                }
                 Card {
                     width: 1030
+                    visible: gamesPage.viewMode === "library"
                     title: "Your games"
                     subtitle: app.library.length ? "The games you picked before. Tap one to open it on the Build page." : "None yet: games you pick on the Build page come back here."
                     Flow {
@@ -888,11 +938,11 @@ ApplicationWindow {
                     }
                 }
                 Repeater {
-                    model: [
+                    model: gamesPage.viewMode === "library" ? [
                         { title: "Complete", sub: "Confirmed finished on a real Wii U.", list: app.games.filter(g => g.status === "Complete"), light: "cyan" },
                         { title: "Plays", sub: "Tested on a real Wii U.", list: app.games.filter(g => g.status === "Plays"), light: "grey" },
                         { title: "Runs in Cemu", sub: "Built with this builder and played in the Cemu emulator, not yet on a real Wii U.", list: app.others, light: "grey" }
-                    ]
+                    ] : []
                     Card {
                         id: tier
                         readonly property string tierLight: modelData.light
@@ -904,6 +954,91 @@ ApplicationWindow {
                         Repeater {
                             model: modelData.list
                             NoteRow { label: modelData.name; sub: modelData.note; light: tier.tierLight }
+                        }
+                    }
+                }
+                Card {
+                    width: 1030
+                    visible: gamesPage.viewMode === "compat"
+                    title: "Compatibility List"
+                    subtitle: "Tested compatibility on real Wii U hardware and Cemu. Ratings reflect console results."
+                    Row {
+                        x: 24
+                        spacing: 10
+                        bottomPadding: 8
+                        Pill {
+                            text: "All Platforms"
+                            accessibleName: "Show all platforms"
+                            tone: gamesPage.platformFilter === "all" ? "cyan" : "grey"
+                            fontSize: 15
+                            implicitHeight: 32
+                            onClicked: gamesPage.platformFilter = "all"
+                        }
+                        Pill {
+                            text: "Wii U Verified"
+                            accessibleName: "Show Wii U verified games"
+                            tone: gamesPage.platformFilter === "wiiu" ? "cyan" : "grey"
+                            fontSize: 15
+                            implicitHeight: 32
+                            onClicked: gamesPage.platformFilter = "wiiu"
+                        }
+                        Pill {
+                            text: "Cemu Verified"
+                            accessibleName: "Show Cemu verified games"
+                            tone: gamesPage.platformFilter === "cemu" ? "cyan" : "grey"
+                            fontSize: 15
+                            implicitHeight: 32
+                            onClicked: gamesPage.platformFilter = "cemu"
+                        }
+                    }
+                    Repeater {
+                        model: (app.compatList || []).filter(g => {
+                            if (gamesPage.platformFilter === "wiiu") return g.wiiu_status === "Complete" || g.wiiu_status === "Plays";
+                            if (gamesPage.platformFilter === "cemu") return g.cemu_status === "Plays" || g.status === "Cemu";
+                            return true;
+                        })
+                        Item {
+                            id: cRow
+                            width: 1030
+                            height: Math.max(54, colDetails.implicitHeight + 14)
+                            Light {
+                                x: 26; y: 14
+                                tone: modelData.wiiu_status === "Complete" ? "cyan" : (modelData.wiiu_status === "Plays" || modelData.cemu_status === "Plays") ? "green" : "grey"
+                            }
+                            Column {
+                                id: colDetails
+                                x: 64; y: 4
+                                width: 1030 - 64 - 310
+                                Label {
+                                    width: parent.width
+                                    text: modelData.name
+                                    color: pal.label
+                                    font.pixelSize: 18
+                                    wrapMode: Text.WordWrap
+                                }
+                                Label {
+                                    width: parent.width
+                                    text: modelData.note
+                                    color: pal.subLabel
+                                    font.pixelSize: 15
+                                    wrapMode: Text.WordWrap
+                                    visible: text.length > 0
+                                }
+                            }
+                            Row {
+                                x: 1030 - 300; y: 10
+                                spacing: 8
+                                PlatformBadge {
+                                    platform: "Wii U"
+                                    status: modelData.wiiu_status
+                                    tone: modelData.wiiu_status === "Complete" ? "cyan" : modelData.wiiu_status === "Plays" ? "green" : "grey"
+                                }
+                                PlatformBadge {
+                                    platform: "Cemu"
+                                    status: modelData.cemu_status
+                                    tone: modelData.cemu_status === "Plays" ? "cyan" : "grey"
+                                }
+                            }
                         }
                     }
                 }
