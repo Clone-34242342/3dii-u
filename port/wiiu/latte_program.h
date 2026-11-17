@@ -32,6 +32,16 @@ inline void set_word(uint8_t *p, uint32_t i, uint32_t v) {
     for (uint32_t b = 0; b < 4; b++) p[4 * i + b] = (uint8_t)(v >> (8 * b));
 }
 
+// CafeGLSL can report success with only a masked color EXPORT_DONE: no
+// calculation, fetch, kill or color output. A real eight-byte export is valid.
+inline bool hollow_pixel_program(const void *program, uint32_t bytes) {
+    if (!program || bytes != 8) return false;
+    const auto *p = static_cast<const uint8_t *>(program);
+    const uint32_t w0 = word(p, 0), w1 = word(p, 1);
+    return ((w1 >> 23) & 127) == 40 && (w1 & (1u << 21)) &&
+           ((w0 >> 13) & 3) == 0 && (w1 & 0xfff) == 0xfff;
+}
+
 constexpr uint32_t kThrowaway = 123, kLiteral = 253;
 
 // One pass over a program: its control flow list from the start, and each clause the list names. Returns whether it is laid out as a program is

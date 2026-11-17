@@ -11,6 +11,7 @@ struct CompileDone {
     GX2VertexShader *vs_shader;
     GX2PixelShader *ps_shader;
     u32 inputs;
+    bool from_gfd = false;  // restored headers/programs use malloc; CafeGLSL owns fresh compiles
 };
 void shader_compile_init();                                                     // (GPU thread, after the shipped set) starts the compiler thread and queues the cache
 bool shader_compile_on();                                                       // whether it did: on unless a "noglslcompile" file is in the data folder
