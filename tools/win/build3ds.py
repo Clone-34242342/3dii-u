@@ -367,6 +367,7 @@ def link_setup():
     other. With wut's script they land in .text with their callees at the far end of it, and ld --relax then places branch stubs in the
     fall-through path. Keeping them, and crtbegin's and crtend's code, together at the start of .text means no far branch is needed there."""
     d = WORK + '/rpx'
+    check_cache_dir(d)
     os.makedirs(d, exist_ok=True)
     s = open(WUT + '/share/wut.ld').read()
     init, fini = '      KEEP (*(SORT_NONE(.init)))\n', '      KEEP (*(SORT_NONE(.fini)))\n'
@@ -389,14 +390,21 @@ def obj_name(src):
     return '_project_' + os.path.relpath(src, ROOT).replace('\\', '/').replace('/', '_') + '.o'
 
 
+def runtime_sources(host=False):
+    skip = {'frontend.cpp', 'main.cpp', 'host_sdl.cpp', 'watch.cpp'}
+    if not host:
+        skip.add('profile.cpp')
+    folders = [RT, RT + '/services', RT + '/gpu', RT + '/audio']
+    folders += [PORT + '/pc', PORT + '/pc/win'] if host else [PORT + '/wiiu']
+    return [s.replace('\\', '/') for folder in folders for s in sorted(glob.glob(folder + '/*.cpp')) if os.path.basename(s) not in skip]
+
+
 def build_runtime(g, args):
     """the runtime every game links: one build of it serves them all"""
     obj_dir = f'{WORK}/rt_measure' if MEASURE else f'{WORK}/rt_std'
+    check_cache_dir(obj_dir)
     os.makedirs(obj_dir, exist_ok=True)
-    skip = {'frontend.cpp', 'main.cpp', 'host_sdl.cpp', 'watch.cpp', 'profile.cpp'}  # shadergen.cpp runs on the console too, for shader_compile.cpp
-    sources = []
-    for pat in (RT + '/*.cpp', RT + '/services/*.cpp', RT + '/gpu/*.cpp', RT + '/audio/*.cpp', PORT + '/wiiu/*.cpp'):
-        sources += [s.replace('\\', '/') for s in sorted(glob.glob(pat)) if os.path.basename(s) not in skip]
+    sources = runtime_sources()
     items = []
     extra = shlex.split(args.extra_flags or '')
     only = set((args.only or '').replace(' ', '').split(',')) - {''}
@@ -429,6 +437,7 @@ def game_flags(g, opt=None):
 
 def build_game_code(g, args):
     obj_dir = f'{WORK}/ppc_{g.name}'
+    check_cache_dir(obj_dir)
     os.makedirs(obj_dir, exist_ok=True)
     flags = game_flags(g, args.opt)
     # Debugging: THREEDII_OS_ONLY=lo-hi builds the files lo to hi-1 (in name order) at -Os and the rest at -O2, to find which a game's -Os trouble is in
@@ -470,10 +479,7 @@ def build_game_code(g, args):
             os.replace(tmp, made)
         items.append(('gs_native', made, f'{obj_dir}/gs_native.o', flags))
     # a new generation can come in fewer files: the old ones' objects would be linked too, defining their functions twice
-    wanted = {n for n, *_ in items}
-    for o in glob.glob(obj_dir + '/*.o*'):
-        if os.path.basename(o).split('.')[0] not in wanted:
-            os.remove(o)
+    prune_generated_objects(obj_dir, items)
     compile_all(items, args.jobs, 'game code', False)
     return obj_dir
 
@@ -489,6 +495,7 @@ def build_code(g, args):
 
 
 def link_game(g, rt, code, link_flags=None):
+    check_cache_dir(WORK + '/link')
     os.makedirs(WORK + '/link', exist_ok=True)
     os.makedirs(g.out, exist_ok=True)
     def rel(p):  # the standalone builder can have its work folder on another drive than its tools: then there's no relative path
@@ -503,12 +510,15 @@ def link_game(g, rt, code, link_flags=None):
     if r.returncode:
         sys.exit('aac_ffmpeg did not compile')
     aac = [rel(o), rel(a + '/lib/libavcodec.a'), rel(a + '/lib/libavutil.a')]
-    objects = sorted(glob.glob(rt + '/*.o'))
+    objects = [f'{rt}/{obj_name(s)}' for s in runtime_sources()]
     rsp = f'{WORK}/link/{g.name}.rsp'
     # the runtime goes first, so that its calls into the C library stay near
     open(rsp, 'w', newline='\n').write('\n'.join(rel(o) for o in objects))
     code_rsp = f'{WORK}/link/{g.name}_code.rsp'
-    open(code_rsp, 'w', newline='\n').write('\n'.join(rel(o) for o in sorted(glob.glob(code + '/*.o'))))
+    code_objects = [f'{code}/{os.path.basename(c)[:-2]}.o' for c in sorted(glob.glob(g.gen_dir + '/*.c'))]
+    if os.path.isfile(code + '/gs_native.c') and os.path.isfile(code + '/gs_native.o'):
+        code_objects.append(code + '/gs_native.o')
+    open(code_rsp, 'w', newline='\n').write('\n'.join(rel(o) for o in code_objects))
     elf = f'link/{g.name}.elf'
     if os.path.exists(f'{WORK}/{elf}'):
         os.remove(f'{WORK}/{elf}')
@@ -550,6 +560,7 @@ def link_game(g, rt, code, link_flags=None):
 # ---------------------------------------------------------------- shaders
 def build_shadergen(args):
     """The generator, for this PC, from the same sources as the other OS's build. It writes the GLSL and the index; compile_shaders does the rest."""
+    check_cache_dir(WORK + '/shadergen')
     if os.environ.get('THREEDII_SHADERGEN'):  # the standalone builder ships it built, as it has no host compiler
         os.makedirs(WORK + '/shadergen', exist_ok=True)  # build_shaders keeps a file there
         return os.environ['THREEDII_SHADERGEN']
@@ -751,19 +762,55 @@ def build_shaders(g, args):
 # ---------------------------------------------------------------- the PC trial: the game on this PC, headless, with the software renderer. It finds code static analysis missed and logs the shaders used.
 def host_runtime(args):
     obj_dir = WORK + '/pc_rt'
+    check_cache_dir(obj_dir)
     os.makedirs(obj_dir, exist_ok=True)
     flags = HOST_CXX + ['-std=c++20', '-O1', '-g', '-w', '-DRECOMP_VS_LOG', '-DRECOMP_MEASURE', '-D_FILE_OFFSET_BITS=64', f'-I{PORT}/pc/win', f'-I{PORT}/wiiu', f'-I{PORT}/pc', f'-I{RT}', f'-I{RT}/audio', f'-I{RT}/gpu',
                         f'-I{RT}/services', '-include', f'{PORT}/pc/shim.h', '-DRECOMP_GAME="tomodachi"', f'-DRECOMP_SOURCE_DIR="{ROOT}/third_party/3dsrecomp"'] + shlex.split(args.extra_flags or '')
-    skip = {'frontend.cpp', 'main.cpp', 'host_sdl.cpp', 'watch.cpp'}
-    sources = []
-    for pat in (RT + '/*.cpp', RT + '/services/*.cpp', RT + '/gpu/*.cpp', RT + '/audio/*.cpp', PORT + '/pc/*.cpp', PORT + '/pc/win/*.cpp'):
-        sources += [s.replace('\\', '/') for s in sorted(glob.glob(pat)) if os.path.basename(s) not in skip]
+    sources = runtime_sources(host=True)
     compile_all([(os.path.basename(s), s, f'{obj_dir}/{obj_name(s)}', flags) for s in sources], args.jobs, 'PC runtime', args.force)
     return obj_dir
 
 
 def host_game_flags(gen_dir):
     return [LLVM + 'clang.exe', '--target=x86_64-w64-mingw32', '--sysroot=' + MINGW, '-O1', '-w', '-ffp-contract=off', '-fno-strict-aliasing', '-std=gnu11', f'-I{RT}', f'-I{gen_dir}']
+
+
+def check_cache_dir(directory):
+    """Generated caches cannot traverse aliases or overwrite files shared with another location."""
+    root = os.path.normcase(os.path.realpath(WORK))
+    target = os.path.normcase(os.path.realpath(directory))
+    if os.path.commonpath((root, target)) != root:
+        raise ValueError('The generated cache must stay inside its work folder.')
+    path = os.path.abspath(directory)
+    while True:
+        if os.path.lexists(path):
+            info = os.lstat(path)
+            if os.path.islink(path) or getattr(info, 'st_file_attributes', 0) & 0x400:
+                raise ValueError('The generated cache must not traverse reparse paths.')
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    if os.path.isdir(directory):
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                info = os.lstat(entry.path)  # DirEntry.stat reports no link count on Windows.
+                if entry.is_symlink() or getattr(info, 'st_file_attributes', 0) & 0x400 or (entry.is_file(follow_symlinks=False) and info.st_nlink > 1):
+                    raise ValueError('The generated cache must not contain shared or reparse files.')
+
+
+def prune_generated_objects(obj_dir, items):
+    """A smaller generation must not link obsolete chunks; leave unrelated files alone."""
+    check_cache_dir(obj_dir)
+    wanted = {n for n, *_ in items}
+    removed = False
+    for path in glob.glob(obj_dir + '/*.o*'):
+        name = os.path.basename(path)
+        match = re.fullmatch(r'(code_[0-9]+|table|gs_native)\.o(?:\.d)?', name)
+        if match and match[1] not in wanted:
+            os.remove(path)
+            removed = True
+    return removed
 
 
 def host_build(g, args):
@@ -775,6 +822,7 @@ def host_build(g, args):
         do_gen(g, args, gen_dir, abi)
     rt = host_runtime(args)
     obj_dir = f'{WORK}/pc_{g.name}_{os.path.basename(gen_dir)}'
+    check_cache_dir(obj_dir)
     os.makedirs(obj_dir, exist_ok=True)
     flags = host_game_flags(gen_dir)
     items = []
@@ -783,13 +831,20 @@ def host_build(g, args):
         n = os.path.basename(c)[:-2]
         items.append((n, c, f'{obj_dir}/{n}.o', flags))
     # clang 23's optimiser never finishes on the odd generated file (Miracle Mask's code_040: over 15 minutes at -O1, 2 s at -O0), and this build is only the reference
+    pruned = prune_generated_objects(obj_dir, items)
     compile_all(items, args.jobs, 'game code for the PC', timeout=240, fallback=['-O0'])
     exe = f'{obj_dir}/{g.name}.exe'
-    objs = sorted(glob.glob(rt + '/*.o')) + sorted(glob.glob(obj_dir + '/*.o'))
-    if not os.path.exists(exe) or any(os.path.getmtime(o) > os.path.getmtime(exe) for o in objs):
+    objs = [f'{rt}/{obj_name(s)}' for s in runtime_sources(host=True)] + [item[2] for item in items]
+    rsp = f'{obj_dir}/link.rsp'
+    link_inputs = '\n'.join('"' + o.replace('\\', '/') + '"' for o in objs)
+    previous = None
+    if os.path.exists(rsp):
+        with open(rsp) as old:
+            previous = old.read()
+    if pruned or previous != link_inputs or not os.path.exists(exe) or any(os.path.getmtime(o) > os.path.getmtime(exe) for o in objs):
         t0 = time.time()
-        rsp = f'{obj_dir}/link.rsp'
-        open(rsp, 'w', newline='\n').write('\n'.join('"' + o.replace('\\', '/') + '"' for o in objs))
+        pending_rsp = f'{obj_dir}/link.pending.rsp'
+        open(pending_rsp, 'w', newline='\n').write(link_inputs)
         # code compiled on the spot links back to the game and the runtime's helpers, through an import library. A .def, not --export-all-symbols: a program can only export 65535 names.
         names = run([LLVM + 'llvm-nm.exe', '-g', *glob.glob(obj_dir + '/table.o')], capture_output=True, text=True).stdout
         defined = set(re.findall(r'^[0-9a-f]+ [A-TV-Z] (\S+)$', names, re.M))
@@ -798,11 +853,12 @@ def host_build(g, args):
         if len(funcs) > 60000:  # over a program's 65535 exports (Animal Crossing's 98577): code compiled on the spot then can't call the game's
             funcs = []
         open(f'{obj_dir}/exports.def', 'w', newline='\n').write('EXPORTS\n' + '\n'.join(sorted(set(funcs) | set(helpers) | (defined & {'guest_entries', 'guest_entry_count'}))) + '\n')
-        r = run(HOST_CXX + ['-static', f'@{rsp}', f'{obj_dir}/exports.def', '-lpthread', '-lwinmm', '-lgdi32', f'-Wl,--out-implib,{obj_dir}/game.dll.a', '-o', exe],
+        r = run(HOST_CXX + ['-static', f'@{pending_rsp}', f'{obj_dir}/exports.def', '-lpthread', '-lwinmm', '-lgdi32', f'-Wl,--out-implib,{obj_dir}/game.dll.a', '-o', exe],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
         if r.returncode:
             found = sorted({x for x in r.stdout.splitlines() if 'undefined symbol' in x or 'error' in x})
             sys.exit('the PC build did not link:\n' + '\n'.join(x[:170] for x in found[:40]))
+        os.replace(pending_rsp, rsp)
         print(f'linked in {time.time() - t0:.0f} s: {os.path.getsize(exe) >> 20} MB')
     return exe, gen_dir, obj_dir
 

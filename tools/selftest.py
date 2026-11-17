@@ -149,6 +149,8 @@ def gsx():
 def main():
     py = sys.executable
     checks = {
+        'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
+        'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
