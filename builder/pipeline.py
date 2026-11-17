@@ -131,11 +131,11 @@ def tool(name):
 
 
 def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
-               boot_sound=None):
+               boot_sound=None, screen_art=None):
     """the title every game gets (tools/make_game_title.py), then the update's and DLC's files beside the game's"""
     tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
                                        info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel,
-                                       pad_art, boot_sound)
+                                       pad_art, boot_sound, screen_art)
     content = os.path.join(out, 'title', 'content')
     for f in os.listdir(game_dir):
         if f.startswith(('update_', 'dlc_')):
@@ -223,7 +223,8 @@ def main():
     ap.add_argument('--no-menu', action='store_true', help='no options menu in the game: clicking the left stick does nothing (content/no_menu)')
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
-    ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games, where the Virtual Console's screens find the year a game came out")
+    ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games and libretro's of title screens, where the Virtual Console's screens "
+                                  "find the year a game came out and its title screen")
     ap.add_argument('--mixed', action='store_true', help='trial: fast code with only the video decoder in safe mode (build3ds.Game.mixed)')
     ap.add_argument('--cold', action='store_true', help="for the checks: build it as a game nobody has built before, with none of this PC's lists of "
                                                         'its code and shaders (tools/check_ports.py --cold)')
@@ -430,12 +431,13 @@ def main():
             shutil.copyfile(gsl, os.path.join(learned, 'dvlb.gsl'))
 
     PROGRESS.stage('Making the title')
-    released, case_scan = '', False
-    if a.art and a.art_style == 'console' and a.tdb:
-        import covers  # only here: the one download a build may make, and only with the Virtual Console's screens chosen
+    released, case_scan, title_shot = '', False, None
+    if a.art_style == 'console' and a.tdb:
+        import covers  # only here: the downloads a build may make, and only with the Virtual Console's screens chosen
         released = covers.released(game.product, a.tdb)
-        case_scan = covers.is_case_scan(a.art, a.tdb)  # the folder is the covers' own
-    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound)
+        case_scan = bool(a.art) and covers.is_case_scan(a.art, a.tdb)  # the folder is the covers' own
+        title_shot = covers.title_screen(game.product, [game.name] + covers.other_names(game.product, a.tdb), a.tdb)
+    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound, title_shot)
     if a.save:
         import saves
         try:

@@ -52,6 +52,20 @@ with tempfile.TemporaryDirectory() as tmp:
     assert near(tv[10][10], (247, 247, 247), 12), tv[10][10]          # the background above it
     assert near(tv[700][400], (214, 214, 214), 16), tv[700][400]      # and below
     assert near(pad[248][163], BLUE), pad[248][163]                    # the GamePad's is the TV's, smaller
+    assert sum(tv[78][844]) < sum(tv[78][400]) - 30, (tv[78][844], tv[78][400])  # the console behind it on the right, its lid's face
+
+    # a title screen as libretro keeps it, both screens one above the other (top_screen): the top one alone fills the frame, 344x206
+    stacked = os.path.join(tmp, 'stacked.png')
+    picture = QImage(512, 614, QImage.Format_RGB888)
+    picture.fill(QColor(*BLUE))
+    paint = QPainter(picture)
+    paint.fillRect(0, 307, 512, 307, QColor(*GREEN))
+    paint.end()
+    assert picture.save(stacked)
+    tv = title.console_screens(stacked, icon, top_screen=True)['bootTvTex.tga']
+    for y in (372 - 98, 372, 372 + 98):
+        assert near(tv[y][244], BLUE), (y, tv[y][244])
+    assert near(tv[372 - 110][244], WHITE, 12) and near(tv[372 + 110][244], WHITE, 12), 'the frame is not the top screen\'s shape'
 
     # a GameTDB case scan (768x680, case_scan): its white strip down the right is left out, the whole height stays (the green foot, where a
     # logo can sit), and it shows whole in its frame, 344 across and as tall as its shape asks
