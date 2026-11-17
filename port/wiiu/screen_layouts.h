@@ -10,12 +10,13 @@ struct Rect {
     uint32_t x, y, w, h;
 };
 
-// The TV's layouts as settings.ini numbers them: builds already given out hold 0-3, so the two added later come after them, and the menu
+// The TV's layouts as settings.ini numbers them: builds already given out hold 0-3, so those added later come after them, and the menu
 // steps through them in its own order (kTvOrder): either screen alone, then both.
 // 0 the top screen alone, 1 side by side, 2 the top above the bottom, 3 the top large and the bottom at half its scale beside its lower half,
-// 4 the bottom screen alone, 5 the bottom large and the top at half its scale beside its upper half
-constexpr int kTvLayouts = 6;
-constexpr int kTvOrder[kTvLayouts] = {0, 4, 1, 2, 3, 5};
+// 4 the bottom screen alone, 5 the bottom large and the top at half its scale beside its upper half, 6 the top screen stretched to fill the
+// TV, 16:9 (players asked, 2026-11-16)
+constexpr int kTvLayouts = 7;
+constexpr int kTvOrder[kTvLayouts] = {0, 6, 4, 1, 2, 3, 5};
 inline int next_tv_layout(int layout, int dir) {
     int at = 0;
     while (at < kTvLayouts - 1 && kTvOrder[at] != layout) at++;
@@ -46,6 +47,10 @@ inline bool tv_rect(int layout, int which, uint32_t tw, uint32_t th, Rect &r) {
                        : Rect{x0 + (uint32_t)(400 * k), y + (uint32_t)(120 * k), (uint32_t)(160 * k), (uint32_t)(120 * k)};
         return true;
     }
+    case 6:  // the top screen alone, filling the TV
+        if (which) return false;
+        r = Rect{0, 0, tw, th};
+        return true;
     case 4:  // the bottom screen alone, as tall as the TV
         if (!which) return false;
         r = Rect{(tw - th * 4 / 3) / 2, 0, th * 4 / 3, th};

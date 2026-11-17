@@ -4666,8 +4666,8 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     // the lines: what each is, and what it's set to (nothing for the two that act)
     static const char *const k_languages[12] = {"Japanese", "English", "French",  "German",     "Italian", "Spanish",
                                                 "Chinese",  "Korean",  "Dutch",   "Portuguese", "Russian", "Chinese (Taiwan)"};
-    static const char *const k_tv_layouts[screens::kTvLayouts] = {"Top Screen",      "Side by Side",  "Stacked",
-                                                                  "Big Top + Small", "Bottom Screen", "Big Bottom + Small"};
+    static const char *const k_tv_layouts[screens::kTvLayouts] = {"Top Screen",      "Side by Side",  "Stacked",           "Big Top + Small",
+                                                                  "Bottom Screen",   "Big Bottom + Small", "Top Screen (16:9)"};
     static const char *const k_pad_layouts[screens::kPadLayouts] = {"Bottom Screen", "Top Screen", "Stacked", "Side by Side"};
     const int count = menu_items(), quit = count - 1;
     char speed[16], vol[16], res[16], cap[16];

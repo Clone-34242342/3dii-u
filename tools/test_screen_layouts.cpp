@@ -34,10 +34,13 @@ int main() {
                 shown[which] = screens::tv_rect(layout, which, tv[0], tv[1], r[which]);
                 if (shown[which]) {
                     CHECK(inside(r[which], tv[0], tv[1]), "TV %ux%u layout %d screen %d at %u,%u %ux%u", tv[0], tv[1], layout, which, r[which].x, r[which].y, r[which].w, r[which].h);
-                    CHECK(shaped(r[which], which), "TV %ux%u layout %d screen %d is %ux%u", tv[0], tv[1], layout, which, r[which].w, r[which].h);
+                    if (layout == 6)  // the top screen stretched: the whole TV
+                        CHECK(!r[which].x && !r[which].y && r[which].w == tv[0] && r[which].h == tv[1], "TV %ux%u layout 6 is %ux%u", tv[0], tv[1], r[which].w, r[which].h);
+                    else
+                        CHECK(shaped(r[which], which), "TV %ux%u layout %d screen %d is %ux%u", tv[0], tv[1], layout, which, r[which].w, r[which].h);
                 }
             }
-            CHECK(shown[0] == (layout != 4) && shown[1] == (layout != 0), "TV layout %d shows top %d bottom %d", layout, shown[0], shown[1]);
+            CHECK(shown[0] == (layout != 4) && shown[1] == (layout != 0 && layout != 6), "TV layout %d shows top %d bottom %d", layout, shown[0], shown[1]);
             if (shown[0] && shown[1]) CHECK(!overlap(r[0], r[1]), "TV %ux%u layout %d: the screens overlap", tv[0], tv[1], layout);
         }
 
