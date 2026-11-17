@@ -82,6 +82,7 @@ def mii_maker_db():
 SCENES = {'nsmb2_tower': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-14.sarc'}),
           'nsmb2_castle': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-16.sarc'})}
 CRASH = r'FATAL(?!: no recompiled code at)|\[crash\]'  # the game's log on a crash of its own
+UNSUPPORTED = r'unsupported (?:(?:ARM|Thumb) )?(?:opcode|instruction)|undefined instruction'
 SHADER_READY = r'\[glsl\] (?:compiler (?:[^\r\n]+ up|thread ready)|(?:vertex|pixel) [0-9a-f]{16} restored from native cache)'
 
 FAILURE_CATEGORIES = (
@@ -101,11 +102,13 @@ def categorize_fault(fault: str) -> str:
     """Classifies a failure into distinct, rankable categories across games.
     Explicitly tags Cemu emulator artifacts to keep them separate from real Wii U behavior."""
     m = fault.lower()
-    if "cemu can't decode vertex data" in m or 'cemu stopped:' in m:
+    if "cemu can't decode vertex data" in m:
         return 'cemu validation'
+    if 'cemu stopped:' in m:
+        return 'crash'
     if '[lazy] no code' in m or 'code the translation missed' in m or 'no recompiled code at' in m or 'fallback function(s) executed' in m:
         return 'missing code'
-    if 'unsupported instruction' in m or 'unsupported opcode' in m or 'undefined instruction' in m:
+    if re.search(UNSUPPORTED, m, re.IGNORECASE):
         return 'unsupported instruction'
     if 'unimplemented service command' in m or 'unimplemented command' in m or '[srv] unhandled' in m or 'unknown service' in m:
         return 'missing service command'
@@ -436,7 +439,7 @@ def judge(t, seconds, flags, measured=False):
                 faults.append(f'{name}: {k} did not take: this is not the scene')
         for pat, what in (
             (r'\[lazy\] no code|no recompiled code at', 'code the translation missed'),
-            (r'unsupported (?:opcode|instruction)|undefined instruction', 'unsupported instruction'),
+            (UNSUPPORTED, 'unsupported instruction'),
             (r'\[\w+\] unimplemented command 0x[0-9a-fA-F]+ \(failing\)', 'unimplemented service command'),
             (CRASH, 'crash'),
         ):

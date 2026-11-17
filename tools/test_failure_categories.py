@@ -17,6 +17,8 @@ def test_categories():
         # 2. unsupported instruction
         ("restart: unsupported instruction (1): unsupported opcode 0xe12fff32 at 00100140", "unsupported instruction"),
         ("blank_save: undefined instruction at 0x00100144", "unsupported instruction"),
+        ("FATAL: fallback interpreter unsupported ARM opcode 0xe0000291 at 0x00100100", "unsupported instruction"),
+        ("FATAL: fallback interpreter unsupported Thumb opcode 0xdead at 0x00100140", "unsupported instruction"),
 
         # 3. missing service command
         ("restart: unimplemented service command (1): [fs] unimplemented command 0x08010002 (failing)", "missing service command"),
@@ -39,15 +41,18 @@ def test_categories():
 
         # Cemu validation (emulation artifacts, not console behavior)
         ("restart: Cemu can't decode vertex data this game drew with, so these aren't a console's pictures: Unsupported fmt ...", "cemu validation"),
-        ("restart: Cemu stopped: process exited with code 1", "cemu validation"),
 
         # Crash
+        ("restart: Cemu stopped: process exited with code 1", "crash"),  # an exit alone does not establish an emulator artifact
         ("restart: crash (1): FATAL: unhandled exception", "crash"),
     ]
 
     for fault_msg, expected_cat in cases:
         actual_cat = cp.categorize_fault(fault_msg)
         assert actual_cat == expected_cat, f"Expected {expected_cat} for '{fault_msg}', got {actual_cat}"
+    for opcode in ('ARM', 'Thumb'):
+        message = f'FATAL: fallback interpreter unsupported {opcode} opcode 0xdead at 0x00100140'
+        assert cp.re.search(cp.UNSUPPORTED, message, cp.re.IGNORECASE), 'The log scanner must use the same pattern as categorization'
 
     print("test_failure_categories: ok")
 
