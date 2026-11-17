@@ -1036,12 +1036,16 @@ struct FsUser : Service {
             ipc.set(5, info.duplicate);
             break;
         }
+        case 0x0830:    // legacy CreateExtSaveData(media, save id u64, icon size, directories, files, [icon])
+        case 0x0835:    // legacy DeleteExtSaveData(media, save id low)
         case 0x0851:    // CreateExtSaveData(info: media type, save id u64, unknown; directories, files, size limit u64, icon size, [icon])
         case 0x0852: {  // DeleteExtSaveData(info)
+            const bool legacy_create = ipc.cmd() == 0x0830;
+            const bool deleting = ipc.cmd() == 0x0835 || ipc.cmd() == 0x0852;
             char b[64];
-            snprintf(b, sizeof b, "/extdata/%08x%08x", ipc[3], ipc[2]);
+            snprintf(b, sizeof b, "/extdata/%08x%08x", ipc.cmd() == 0x0835 ? 0u : ipc[3], ipc[2]);
             const std::string d = save_root() + b;
-            if (ipc.cmd() == 0x0852) {  // what a game does before it makes its extra data anew ("initialize")
+            if (deleting) {  // what a game does before it makes its extra data anew ("initialize")
                 std::error_code ec;
                 SAVE_SETTLE(d, true);
                 fsys::remove_all(d, ec);
@@ -1050,10 +1054,14 @@ struct FsUser : Service {
                 // The counts are asked back (GetFormatInfo), with no size, as for a save: answered with a save's defaults, Pokemon Ultra Sun
                 // called its extra data corrupted at every start after the first (2026-11-13).
                 fsys::create_directories(d);
-                keep_format_info(d, {0, ipc[5], ipc[6], 0});
+                keep_format_info(d, {legacy_create ? ~0u : 0u, ipc[5], ipc[6], 0});
             }
             save_changed(d);
-            ipc.ok();
+            ipc.ok(1, legacy_create ? 2 : 0);
+            if (legacy_create) {
+                ipc.set(2, ipc[7]);
+                ipc.set(3, ipc[8]);
+            }
             break;
         }
         case 0x0812:  // GetFreeBytes
