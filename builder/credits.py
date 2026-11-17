@@ -2,7 +2,7 @@
 licence texts are THIRD_PARTY_LICENSES.md, which the app ships beside itself (make_app.py) and the repository keeps at
 its root; keep the two lists in step."""
 
-APP, VERSION = '3Dii U Builder', '1.0.2'
+APP, VERSION = '3Dii U Builder', '1.0.3'
 LICENCE = 'EUPL-1.2'
 SOURCE = 'https://github.com/J-Glitch2502/3dii-u'
 DESIGN = 'syntcity'  # the Builder's UI and art design

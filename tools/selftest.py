@@ -36,11 +36,47 @@ def screen_layouts():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_screen_layouts.cpp', '-o', exe], [exe]]
 
 
+def surface_readback():
+    """GPU readback preserves newer CPU writes and overlapping surfaces."""
+    exe = build3ds.WORK + '/selftest/test_surface_readback.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_surface_readback.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def shader_native_cache():
+    exe = build3ds.WORK + '/selftest/test_shader_native_cache.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_shader_native_cache.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def mii_selection():
+    exe = build3ds.WORK + '/selftest/test_mii_selection.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}', '-static', ROOT + '/tools/test_mii_selection.cpp', '-lpthread', '-o', exe], [exe]]
+
+
 def memory_fills():
     """port/wiiu/memory_fills.h against made-up fills and writes of a made-up memory, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_memory_fills.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_memory_fills.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def motion_input():
+    """GamePad motion axes and units against the 3DS HID contract, built for this PC"""
+    exe = build3ds.WORK + '/selftest/test_motion_input.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_motion_input.cpp', '-o', exe], [exe]]
+
+
+def audio_dsp():
+    """The DSP tests with a headless sink, including late/duplicate submission ownership."""
+    exe = build3ds.WORK + '/selftest/test_audio_dsp.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    sources = [build3ds.RT + '/audio/' + n + '.cpp' for n in ('dsp_core', 'source', 'mixer', 'codec', 'interp')]
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                                 '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/third_party/3dsrecomp/tools/audio_test/audio_test.cpp',
+                                 ROOT + '/tools/test_audio_host.cpp', build3ds.PORT + '/pc/win/win_compat.cpp', *sources, '-lwinmm', '-lpthread', '-o', exe], [exe]]
 
 
 def ro_tree():
@@ -110,7 +146,12 @@ def main():
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
+        'surface readback': surface_readback(),
+        'Mii selection': mii_selection(),
+        'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py']],
         'memory fills': memory_fills(),
+        'motion input': motion_input(),
+        'audio DSP': audio_dsp(),
         'module exports': ro_tree(),
         'game languages': languages(),
         'compiled programs': latte_program(),
@@ -122,6 +163,7 @@ def main():
         'picture check': [[py, ROOT + '/tools/test_check_pictures.py']],
         'missed code': [[py, ROOT + '/tools/test_learn_missed.py']],
         'switch through a helper': [[py, ROOT + '/tools/test_recomp_switch.py']],
+        'dispatcher transitions': [[py, ROOT + '/tools/test_transition_contract.py']],
         'build markers': [[py, ROOT + '/tools/test_mark_built.py']],
         'WUP packer': [[py, ROOT + '/tools/test_pack_wup.py']],
         'boot sound': [[py, ROOT + '/tools/test_boot_sound.py']],
@@ -131,10 +173,11 @@ def main():
         'user files': [[py, ROOT + '/builder/test_user_files.py']],
         '3DS saves in a build': [[py, ROOT + '/builder/test_saves.py'], *save_from_content()],
         'system archives': [[py, ROOT + '/builder/test_system_archives.py']],
-        'builder app': [[py, ROOT + '/builder/test_app.py']],
+        'builder app': [[py, ROOT + '/builder/test_app.py'], [py, ROOT + '/builder/test_pipeline_outputs.py']],
         'builder window': [[py, ROOT + '/builder/test_window.py']],
         'builder updater': [[py, ROOT + '/builder/test_updater.py']],
         'DLC reader': [[py, ROOT + '/builder/selftest.py']],
+        'Download Play content': [[py, ROOT + '/builder/test_dlp_content.py']],
     }
     failed = []
     for name, commands in checks.items():

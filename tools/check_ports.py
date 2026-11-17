@@ -82,6 +82,7 @@ def mii_maker_db():
 SCENES = {'nsmb2_tower': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-14.sarc'}),
           'nsmb2_castle': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-16.sarc'})}
 CRASH =r'FATAL|no recompiled code at|\[crash\]'  # the game's log on a crash of its own
+SHADER_READY = r'\[glsl\] (?:compiler (?:[^\r\n]+ up|thread ready)|(?:vertex|pixel) [0-9a-f]{16} restored from native cache)'
 
 
 @dataclass
@@ -246,14 +247,18 @@ def strangers(mine, theirs):
     return sum(1 for m in mine if all(unlike(m, g) > UNLIKE for g in theirs))
 
 
-def pictures(t, leg):
+def pictures(t, leg, minimum_pairs=1):
     """Keeps the leg's screenshots, of both screens, and says what's wrong with them against the good runs: (fault or None, note or None)"""
     mine, good = f'{kept(t, "check_shots")}/{leg}', f'{t.data}/good_shots/{t.like or t.name}/{leg}'
     shutil.rmtree(mine, ignore_errors=True)
     os.makedirs(mine)
     for f in glob.glob(t.data + '/shots/cemu/*.png'):  # tv_NN.png and pad_NN.png (cemu_run.ps1)
         shutil.move(f, mine)
-    count = {s: len(glob.glob(f'{mine}/{s}_*.png')) for s in ('tv', 'pad')}
+    captures = {s: {os.path.basename(p).split('_', 1)[1] for p in glob.glob(f'{mine}/{s}_*.png')} for s in ('tv', 'pad')}
+    count = {s: len(names) for s, names in captures.items()}
+    pairs = len(captures['tv'] & captures['pad'])
+    if minimum_pairs > 1 and pairs < minimum_pairs:
+        return f'{leg}: insufficient visual coverage: {pairs} TV/GamePad capture pairs; at least {minimum_pairs} needed to compare rendering', None
     for screen, name in (('tv', 'TV'), ('pad', 'GamePad')):
         if not count[screen]:
             return f'{leg}: no pictures of the {name}', None
@@ -414,7 +419,7 @@ def judge(t, seconds, flags, measured=False):
             faults.append(f"{name}: {miis[-1]} of the console's {MIIS} Miis reached the game's Mii Maker")
         made = re.findall(r'\[glsl\] (?:pixel|vertex) [0-9a-f]+ compiled in (\d+) ms', text)
         bad = re.findall(r'\[glsl\] (?:pixel|vertex) [0-9a-f]+ failed', text)
-        if 'compiler' not in text or '[glsl] off' in text:
+        if not re.search(SHADER_READY, text) or '[glsl] off' in text:
             faults.append(f'{name}: the console compiler is not running')
         if bad:
             faults.append(f'{name}: the console compiler failed {len(bad)} times')
@@ -429,7 +434,7 @@ def judge(t, seconds, flags, measured=False):
             notes.append(f'{name}: {s[len(s) // 2]:.0f} fps (low {s[0]:.0f}), {ps[-1] if ps else 0} fragment misses, {sum(map(int, cpu))} draws shaded by the CPU, {len(flushes)} flushes')
         elif measured:
             faults.append(f'{name}: nothing drawn')
-        fault, note = pictures(t, name.replace(' ', '_'))
+        fault, note = pictures(t, name.replace(' ', '_'), minimum_pairs=2 if SHOTS > 1 else 1)
         if fault:
             faults.append(fault)
         if note:
