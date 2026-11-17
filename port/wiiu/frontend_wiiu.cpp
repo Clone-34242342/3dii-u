@@ -187,6 +187,7 @@ static volatile int home_release_ms = -1;
 // This runs on the GPU thread's core with a higher priority than WHB's own callback, which frees the screens' memory and waits for the GPU from a thread that can stop the GPU thread
 // anywhere, even in the middle of a command. On a console both used to run while the game kept drawing, and the GPU thread was still at it when GX2 went away a second later.
 static uint32_t on_release(void *) {
+    wiiu::camera_pause(true);
     const OSTime t0 = OSGetSystemTime();
     foreground_back = false;
     kernel::gx_hold = true;
@@ -201,6 +202,7 @@ static uint32_t on_release(void *) {
 }
 
 static uint32_t on_acquire(void *) {
+    wiiu::camera_pause(false);
     foreground_back = true;
     return 0;
 }
@@ -827,6 +829,7 @@ void frontend_run() {
     for (int i = 0; i < 1000 && !audio_parked; i++) OSSleepTicks(OSMillisecondsToTicks(2));
     LOG("[quit] audio thread %s after %d ms\n", audio_parked ? "stopped" : "still running", (int)OSTicksToMilliseconds(OSGetSystemTime() - audio_asked));
     audio::shutdown();
+    wiiu::camera_shutdown();
     LOG("[quit] sound system shut down\n");
     wiiu::fs_begin(0xC001);
     rt_log_sync();  // the lines since the card thread's last look, these [quit] ones among them: they never reached the file before

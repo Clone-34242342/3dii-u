@@ -28,6 +28,8 @@ void save_from_content(const std::string &packed, const std::string &save, const
 extern volatile bool settings_due;  // the options menu changed settings.ini's values: the card thread writes the file
 // (input thread) the right stick is held in: the microphone hears blowing
 void mic_blow(bool on);
+void camera_pause(bool on);
+void camera_shutdown();
 // a line in trace.txt, which survives a forced power-off, and the last one is on the screen if the game freezes: for first uses of what Cemu can't test
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // takes turns with every other file operation once the game runs; a frozen game reports what's been going on for how long

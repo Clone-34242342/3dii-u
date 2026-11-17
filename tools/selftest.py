@@ -146,12 +146,34 @@ def gsx():
                                  '-lpthread', '-o', exe], [exe]]
 
 
+def camera():
+    """Real camera IPC with a made-up sensor, padded NV12 conversion, and native buffer ownership."""
+    commands = []
+    for name, sources in (
+        ('camera', [ROOT + '/tools/test_camera.cpp', build3ds.RT + '/services/cam.cpp', build3ds.RT + '/services/y2r.cpp']),
+        ('camera_queue', [ROOT + '/tools/test_camera_queue.cpp']),
+    ):
+        exe = build3ds.WORK + '/selftest/test_' + name + '.exe'
+        os.makedirs(os.path.dirname(exe), exist_ok=True)
+        commands += [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}', f'-I{build3ds.PORT}/wiiu', '-static',
+                                        *sources, '-lpthread', '-o', exe], [exe]]
+    exe = build3ds.WORK + '/selftest/test_camera_memory.exe'
+    commands += [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                                    '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_camera_memory.cpp', '-lpthread', '-o', exe], [exe]]
+    exe = build3ds.WORK + '/selftest/test_camera_backend.exe'
+    commands += [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', f'-I{ROOT}/tools/camera_mock', f'-I{build3ds.WUT}/include',
+                                    f'-I{build3ds.PORT}/wiiu', f'-I{build3ds.RT}', f'-I{build3ds.RT}/services',
+                                    ROOT + '/tools/test_camera_backend.cpp', '-lpthread', '-o', exe], [exe]]
+    return commands
+
+
 def main():
     py = sys.executable
     checks = {
         'shader compiler recipe': [[py, ROOT + '/tools/test_cafeglsl_recipe.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
+        'camera': camera(),
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
