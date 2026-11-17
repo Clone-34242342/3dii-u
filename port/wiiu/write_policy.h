@@ -17,6 +17,8 @@ inline bool writable_path(const char *name) {
     }
     constexpr std::string_view sd = "/vol/external01/3dii-u";
     if (path == sd || (path.size() > sd.size() && path.substr(0, sd.size()) == sd && path[sd.size()] == '/')) return true;
+    constexpr std::string_view checkpoint = "/vol/external01/3ds/Checkpoint";
+    if (path == checkpoint || (path.size() > checkpoint.size() && path.substr(0, checkpoint.size()) == checkpoint && path[checkpoint.size()] == '/')) return true;
     constexpr std::string_view save = "/vol/save/";
     if (path.substr(0, save.size()) != save) return false;
     const auto rest = path.substr(save.size());

@@ -4,7 +4,8 @@
 int main() {
     for (const char *path : {"/vol/save/common", "/vol/save/common/log.txt", "/vol/save/80000001/game/main",
              "/vol/save/800000aF/game/extdata/00000042/", "/vol/external01/3dii-u",
-             "/vol/external01/3dii-u/000500003d008630/start.txt"}) assert(wiiu::writable_path(path));
+             "/vol/external01/3dii-u/000500003d008630/start.txt",
+             "/vol/external01/3ds/Checkpoint/saves/0x00863 Animal Crossing  New Leaf/20261117-074500/main"}) assert(wiiu::writable_path(path));
     for (const char *path : {"", "/", "/vol/save", "/vol/save/", "/vol/save/other/main", "/vol/save/8000000g/main",
              "/vol/storage_slc/rights/ticket/apps/00050000/10101f00.tik", "/vol/storage_mlc01/usr/title/game",
              "/vol/storage_mlc01/usr/save/00050010/1004a100/user/common/db/FFL_ODB.dat", "/vol/content/romfs.bin",
