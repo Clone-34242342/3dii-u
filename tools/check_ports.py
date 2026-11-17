@@ -276,6 +276,13 @@ def small(path):
     return b''.join(bytes(img.constScanLine(y))[:64 * 3] for y in range(36))
 
 
+def black(path):
+    """Test full-size RGB pixels: shrinking can round a visible detail to black."""
+    from PySide6.QtGui import QImage
+    img = QImage(path).convertToFormat(QImage.Format_RGB888)
+    return not img.isNull() and not any(any(bytes(img.constScanLine(y))[:img.width() * 3]) for y in range(img.height()))
+
+
 def unlike(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
@@ -300,10 +307,12 @@ def pictures(t, leg, minimum_pairs=1):
     for screen, name in (('tv', 'TV'), ('pad', 'GamePad')):
         if not count[screen]:
             return f'{leg}: no pictures of the {name}', None
-    runs = glob.glob(good + '/*/')
-    if not runs:
-        return None, f'{leg}: no good pictures to compare with yet'
     try:
+        if pairs >= 2 and all(black(f'{mine}/tv_{n}') and black(f'{mine}/pad_{n}') for n in captures['tv'] & captures['pad']):
+            return f'{leg}: nothing drawn: every captured TV/GamePad pair is entirely black', None
+        runs = glob.glob(good + '/*/')
+        if not runs:
+            return None, f'{leg}: no good pictures to compare with yet'
         shrunk = {s: [x for x in map(small, sorted(glob.glob(f'{mine}/{s}_*.png'))) if x] for s in count}
 
         def apart(run):  # the most pictures of one screen that this run or that good one has and the other hasn't

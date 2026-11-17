@@ -102,6 +102,7 @@ try:
                                       'gui': types.SimpleNamespace(VERSION='1.0')}), \
             mock.patch.dict(os.environ, {'PATH': 'unrelated-tools', 'WINDIR': os.environ.get('WINDIR', 'C:/Windows')}), \
             mock.patch.object(make_app, 'make_icon'), mock.patch.object(make_app, 'version_resource'), \
+            mock.patch.object(make_app, 'unconfirmed', return_value=[]), \
             mock.patch.object(make_app.os, 'makedirs'):
         try:
             make_app.main()

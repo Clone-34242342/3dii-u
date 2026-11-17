@@ -49,6 +49,24 @@ def main():
         for name in os.listdir(kept):
             os.rename(kept + '/' + name, incoming + '/' + name.replace('pad_01', 'pad_02'))
         assert 'insufficient visual coverage' in c.pictures(coverage, 'blank_save', minimum_pairs=2)[0]
+        blank = c.Target('blank', '0', d, d.replace('\\', '/') + '/blank')
+        fault, note = leg(blank, ['black', 'black'], minimum_pairs=2)
+        assert 'nothing drawn' in fault and not note, (fault, note)
+        # A bad saved reference cannot make an entirely black run pass.
+        c.bless(blank)
+        assert 'nothing drawn' in leg(blank, ['black', 'black'], minimum_pairs=2)[0]
+        assert not leg(blank, ['black'])[0]  # a single intentional capture is inconclusive
+        visible = c.Target('visible', '0', d, d.replace('\\', '/') + '/visible')
+        assert not leg(visible, ['black', 'green'], minimum_pairs=2)[0]  # a normal fade
+        # One black screen and fine detail on the other are both valid output.
+        for screen in ('tv', 'pad'):
+            for n in (0, 1):
+                img = QImage(1280, 720, QImage.Format_RGB888)
+                img.fill(QColor('black'))
+                if screen == 'pad':
+                    img.setPixelColor(31, 47, QColor('white'))
+                img.save(f'{visible.data}/shots/cemu/{screen}_{n:02d}.png')
+        assert not c.pictures(visible, 'blank_save', minimum_pairs=2)[0]
     print('ok')
 
 
