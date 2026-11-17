@@ -35,11 +35,32 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # loaded by path (pipeline.py), so its own folder isn't on the path
 import objcache  # noqa: E402
 
+
+def short_sdk_root(path):
+    """GCC expands its own header paths through bin/../lib/...; use an existing shorter Windows name when available."""
+    if os.name == 'nt':
+        try:
+            short = ctypes.windll.kernel32.GetShortPathNameW
+            short.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            short.restype = ctypes.c_uint32
+            size = short(path, None, 0)
+            if size:
+                buf = ctypes.create_unicode_buffer(size)
+                used = short(path, buf, size)
+                if 0 < used < size:
+                    candidate = buf.value.replace('\\', '/')
+                    if len(candidate) < len(path) and os.path.samefile(path, candidate):
+                        return candidate
+        except (AttributeError, OSError, ValueError):
+            pass
+    return path
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))).replace('\\', '/')
 WORK = ROOT + '/build_win'
 RT = ROOT + '/third_party/3dsrecomp/runtime'
 PORT = ROOT + '/port'
-DKP = os.environ.get('THREEDII_DEVKITPRO') or 'C:/devkitPro/opt/devkitpro'  # the standalone builder brings its own copy
+DKP = short_sdk_root(os.environ.get('THREEDII_DEVKITPRO') or 'C:/devkitPro/opt/devkitpro')  # the standalone builder brings its own copy
 BIN = DKP + '/devkitPPC/bin/powerpc-eabi-'
 WUT = DKP + '/wut'
 LLVM = 'C:/Program Files/LLVM/bin/'

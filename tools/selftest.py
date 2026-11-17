@@ -179,6 +179,7 @@ def main():
     checks = {
         'save backups': save_backups(),
         'shader compiler recipe': [[py, ROOT + '/tools/test_cafeglsl_recipe.py']],
+        'SDK paths': [[py, ROOT + '/tools/test_sdk_path.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
         'camera': camera(),
