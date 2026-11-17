@@ -49,24 +49,49 @@ def short_path(engine, work):
 def fresh_cache(engine, work):
     """The work folder keeps the compiled runtime for the next game, and build3ds recompiles a file only when its source is newer than its
     object. A newer app's sources can be older than objects an earlier app compiled there, so with another engine the cache starts over."""
-    mark = os.path.join(work, 'engine_stamp.txt')
     try:
         with open(os.path.join(engine, 'stamp.txt')) as f:  # make_app.py writes one into each engine
             stamp = f.read()
     except FileNotFoundError:  # older/source engines without a stamp keep their existing behavior
         return
+    # This runs before pipeline's output checks, including when changing the selected build folder.
+    sys.path.insert(0, os.path.join(find_root(), 'tools', 'win'))
+    from objcache import _checked
+    work, _ = _checked(work, directory=True)
+    mark, _ = _checked(work / 'engine_stamp.txt')
+    cache, existing = _checked(work / 'build_win_builder', directory=True)
     if os.path.isfile(mark):
         with open(mark) as f:
             if f.read() == stamp:
                 return
     import shutil
-    cache = os.path.join(work, 'build_win_builder')
+    import tempfile
+    # Check the entire old tree before deletion: a nested alias must not escape this cache.
+    pending = [cache] if existing is not None else []
+    while pending:
+        folder = pending.pop()
+        _checked(folder, directory=True)
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                directory = entry.is_dir(follow_symlinks=False)
+                _checked(entry.path, directory=directory)
+                if directory:
+                    pending.append(entry.path)
+    _checked(cache, directory=True)
     shutil.rmtree(cache, ignore_errors=True)
-    if os.path.exists(cache):
+    if os.path.lexists(cache):
         raise OSError(f'Old compiled files are still in {cache}. Close other Builder windows and try again.')
+    _checked(work, directory=True)
     os.makedirs(work, exist_ok=True)
-    with open(mark, 'w') as f:
-        f.write(stamp)
+    fd, temporary = tempfile.mkstemp(prefix='engine_stamp.', suffix='.tmp', dir=work)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(stamp)
+        _checked(mark)
+        os.replace(temporary, mark)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
 
 
 def chosen_build():
@@ -120,7 +145,7 @@ def hand_over():
 hand_over()
 try:
     use_engine(find_root())
-except OSError as e:
+except (OSError, ValueError) as e:
     why = f'The compiled cache could not be refreshed.\n\n{e}'
     if FROZEN and os.name == 'nt' and len(sys.argv) == 1:
         import ctypes
