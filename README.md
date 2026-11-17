@@ -67,6 +67,10 @@ Clone-34242342 contributed code.
 [#42](https://github.com/J-Glitch2502/3dii-u/pull/42) and the Circle Pad Pro/New 3DS input foundation in
 [#44](https://github.com/J-Glitch2502/3dii-u/pull/44). Integration corrections and validation are tracked separately.
 
+[Walegy](https://github.com/Walegy) contributed the Virtual Console-style icon design in
+[#45](https://github.com/J-Glitch2502/3dii-u/issues/45). The builder applies its shared frame to each game's own SMDH icon;
+a custom Wii U Menu icon still takes precedence.
+
 ## Working on it
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) explains how a dump becomes a WUP, and what each part of the code does.

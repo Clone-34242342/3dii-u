@@ -95,18 +95,23 @@ WHAT STAYS ON YOUR PC
 - Your dumps are never changed. Your keys are only read.
 - The games you build are made from your dumps and your keys: don't share them.
 
-- When you pick a game, the builder downloads its cover art from GameTDB (art.gametdb.com) for the game's start-up screens and Wii U Menu icon.
+- When you pick a game, the builder downloads its cover art from GameTDB (art.gametdb.com) for the game's start-up screens.
+  The default Wii U Menu icon uses that game's own icon with a Virtual Console-style frame. A custom menu icon replaces it as supplied.
   It sends only the four letters of the game's product code. The "Art" pill on the game's tile lets you choose your own picture for the start-up screens, another for the Wii U Menu icon, or remove them to use the game's icon.
   Its "GamePad bezel" line takes a picture the GamePad shows beside the screens, a bezel or overlay, in place of black: any picture, scaled to fill
   the GamePad (854x480), its edges cut where its shape differs. "GamePad start screen" gives the GamePad a start-up picture of its own,
   shown as it is (the TV's otherwise), and "This game's sound" a start-up sound for that game alone, in place of the one for all games.
 - With a SteamGridDB key (Help page, "Art and sound"; the key is free, on steamgriddb.com under Preferences, API) each game gets a banner for
-  its start-up screens and an icon for the Wii U Menu from SteamGridDB instead. The builder sends the game's name (and its names in other
+  its start-up screens from SteamGridDB instead. Its menu icon still uses the game's own framed icon unless you choose a custom one. The builder sends the game's name (and its names in other
   regions, if SteamGridDB doesn't know this one) and your key there, and nothing else; the key stays in the builder's settings on this PC.
 - A start-up sound is yours to add (Help page, "Art and sound"): choose a WAV file and every game you build plays it while it starts.
 - The builder asks GitHub for the list of its releases, and downloads one from there only when you press "Update".
 
 UI and art design by syntcity.
+Virtual Console-style icon design by Walegy: https://github.com/J-Glitch2502/3dii-u/issues/45
+Ocarina of Time 3D build-mode support and the Circle Pad Pro/New 3DS input foundation by creeper88-boy:
+https://github.com/J-Glitch2502/3dii-u/pull/42
+https://github.com/J-Glitch2502/3dii-u/pull/44
 
 The builder comes with no game, no game data and no keys. This is a beta, with no warranty.
 Third-party notices.txt lists the open-source software it carries.

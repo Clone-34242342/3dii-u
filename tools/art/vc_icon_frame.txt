@@ -1,0 +1,17 @@
+Virtual Console-style menu icon frame
+
+Design reference and contributor: Walegy, https://github.com/J-Glitch2502/3dii-u/issues/45
+The shared frame was drawn procedurally for this project; no pixels from the example game pictures are included.
+Each game's image comes from that user's SMDH at build time. vc_console_3ds.png is separate startup-screen artwork.
+
+vc_icon_frame.png is a 512x512 RGBA overlay: black/104-alpha bands at y=0..98 and y=406..511, transparent elsewhere.
+Labels were rendered once using Windows Arial (arial.ttf) and Arial Bold Italic (arialbi.ttf), with Pillow, then stored as bitmap pixels.
+No font file or individual-glyph atlas is bundled. The Builder composites the PNG with its existing Qt dependency and needs neither these fonts nor Pillow.
+Microsoft's font FAQ permits bitmap words/phrases in applications without embedding the font files:
+https://learn.microsoft.com/en-us/typography/fonts/font-faq
+
+The label rectangles, in pixels, are NINTENDO=(34,24,274,51), 3=(279,24,339,76), DS=(346,24,474,76),
+and Virtual Console=(18,437,494,479). The first three use Arial; the footer uses Arial Bold Italic.
+Each text mask was rendered at size 100, cropped to its glyph bounds and resized to its rectangle with Lanczos.
+Header text is RGB(226,229,229), the 3 is RGB(204,27,37), and the footer is white.
+The frame's design does not imply Nintendo affiliation or endorsement.

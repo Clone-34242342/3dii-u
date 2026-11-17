@@ -39,6 +39,16 @@ with tempfile.TemporaryDirectory() as tmp:
     assert title.smdh_names(icon) == ('Some Game Name', 'Maker'), title.smdh_names(icon)
     assert title.smdh_names(japanese) == ('ゲーム', 'P-ja'), title.smdh_names(japanese)
 
+    # The common bands leave the game's own image visible, in the right orientation, for any SMDH.
+    quadrants = [[((255, 0, 0) if x < 24 else (0, 255, 0)) if y < 24 else
+                  ((0, 0, 255) if x < 24 else (255, 255, 0)) for x in range(48)] for y in range(48)]
+    framed = title.vc_icon_pixels(quadrants)
+    assert (len(framed), len(framed[0])) == (128, 128)
+    assert [framed[y][x] for x, y in ((16, 40), (112, 40), (16, 88), (112, 88))] == [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+    assert 0 < framed[2][2][0] < 255 and 0 < framed[126][126][0] < 255, 'both bands must darken the game art'
+    assert any(min(pixel) > 220 for row in framed[109:120] for pixel in row), 'the footer label is missing'
+
     # a picture of any other size fills its frame whole: 344 wide, as tall as its shape asks within 200-300, centred in the band
     cover = os.path.join(tmp, 'cover.png')
     picture = QImage(300, 400, QImage.Format_RGB888)
@@ -137,7 +147,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for d in (os.path.join(game, 'exefs'), shaders, archives):
         os.makedirs(d, exist_ok=True)
     every, own = struct.pack('>II', 2, 0) + b'EVRY' * 4, struct.pack('>II', 2, 0) + b'OWN!' * 4  # a boot sound's head, then samples
-    for f, body in (('game/exheader.bin', b''), ('game/code.bin', b''), ('game/romfs.bin', b''), ('game/exefs/icon.bin', bytes(0x36C0)),
+    for f, body in (('game/exheader.bin', b''), ('game/code.bin', b''), ('game/romfs.bin', b''), ('game/exefs/icon.bin', smdh('Some Game', 'Maker')),
                     ('g.rpx', b'rpx'), ('shaders/shaders.gsh', b''), ('shaders/shaders.idx', b''), ('boot_sound.btsnd', every),
                     ('own.btsnd', own), ('bad.btsnd', b'not a sound')):
         with open(os.path.join(tmp, f), 'wb') as fh:
@@ -155,10 +165,10 @@ with tempfile.TemporaryDirectory() as tmp:
         pictures[name] = os.path.join(tmp, name + '.png')
         assert img.save(pictures[name])
 
-    def made(style, pad_art=None, boot_sound=None):
+    def made(style, pad_art=None, boot_sound=None, icon_art=None):
         out = os.path.join(tmp, 'title')
         title.make_title(out, game, os.path.join(tmp, 'g.rpx'), shaders, '0005000010334455', 'A game', 'WUP-N-ABCD', archives,
-                         pictures['red'], None, style, pad_art=pad_art, boot_sound=boot_sound)
+                         pictures['red'], icon_art, style, pad_art=pad_art, boot_sound=boot_sound)
         middle = {}
         for tga, w, h in (('bootTvTex.tga', 1280, 720), ('bootDrcTex.tga', 854, 480)):
             data = open(os.path.join(out, 'meta', tga), 'rb').read()
@@ -166,8 +176,23 @@ with tempfile.TemporaryDirectory() as tmp:
             middle[tga] = tuple(data[at + 2:at - 1:-1])
         return middle, open(os.path.join(out, 'meta', 'bootSound.btsnd'), 'rb').read()
 
+    def menu_pixel(x, y):
+        data = open(os.path.join(tmp, 'title', 'meta', 'iconTex.tga'), 'rb').read()
+        assert struct.unpack_from('<HHBB', data, 12) == (128, 128, 32, 8)
+        assert len(data) == 18 + 128 * 128 * 4 + len(title.TGA_FOOTER) and data.endswith(title.TGA_FOOTER)
+        at = 18 + ((127 - y) * 128 + x) * 4
+        b, g, r, a = data[at:at + 4]
+        assert a == 255
+        return r, g, b
+
     middle, sound = made('picture')
     assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, (middle, sound)
+    assert menu_pixel(64, 64) == (0, 255, 0), 'bootscreen art must not replace the default SMDH icon'
+    assert 0 < menu_pixel(2, 2)[1] < 255, 'the default menu icon has no VC band'
+    made('picture', icon_art=pictures['red'])
+    assert menu_pixel(64, 64) == (255, 0, 0) and menu_pixel(2, 2) == (0, 0, 0), 'a custom icon was framed or replaced'
+    made('picture', icon_art=os.path.join(tmp, 'bad.png'))
+    assert menu_pixel(64, 64) == (0, 255, 0) and 0 < menu_pixel(2, 2)[1] < 255, 'invalid custom art must fall back to the framed SMDH'
     middle, sound = made('picture', pictures['green'], os.path.join(tmp, 'own.btsnd'))
     assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == own, (middle, sound)
     middle, sound = made('console', pictures['green'], os.path.join(tmp, 'gone.btsnd'))

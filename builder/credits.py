@@ -36,6 +36,7 @@ NOT_AFFILIATED = ('3Dii U is not affiliated with, endorsed by or sponsored by Ni
 def text():
     """the credits as plain text, for the command line"""
     lines = [f'{APP} {VERSION}, free and open-source under the {LICENCE}: {SOURCE}', f'UI and art design: {DESIGN}',
+             'Virtual Console-style icon design: Walegy (https://github.com/J-Glitch2502/3dii-u/issues/45)',
              f'Code contributions: {CONTRIBUTORS}', '', 'Built on:']
     lines += [f'  {what}: {who} ({lic}), {url}' for what, who, lic, url in UPSTREAM]
     lines += ['', 'Full notices and licence texts: THIRD_PARTY_LICENSES.md, beside the app and in the source.', '', NOT_AFFILIATED]
@@ -45,7 +46,7 @@ def text():
 def about(tag=''):
     """the credits for the About dialog, short enough to fit it: the projects by name; --credits and the file have the rest"""
     return (f'Version {VERSION}' + (f' ({tag})' if tag else '') + f'. Free and open-source under the {LICENCE}: {SOURCE}\n\n'
-            f'UI and art design by {DESIGN}. Code contributions by {CONTRIBUTORS}.\n\n'
+            f'UI and art design by {DESIGN}. Virtual Console-style icon design by Walegy (issue #45). Code contributions by {CONTRIBUTORS}.\n\n'
             'Built on 3dsrecomp by Nathan Soufflet (nathsou), devkitPro\'s devkitPPC and wut, CafeGLSL by Exzap, FFmpeg, '
             'makerom by 3DSGuy, applestash and Jakcron, pyctr by Ian Burgwin, PyCryptodome, cryptography, Qt and PySide6, '
             'Python, PyInstaller, and woomïnstaller by shinyquagsire23.\n\n'

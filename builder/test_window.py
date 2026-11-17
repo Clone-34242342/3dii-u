@@ -339,14 +339,13 @@ try:
     for st in ('downloading', 'unpacking', 'ready', 'restarting', 'failed'):
         state.set(updateState=st, updateProgress=37)
         settle(f'the update card, {st}')
-    # a picked game's art, with covers.py's two places faked: SteamGridDB's banner and icon where there's a key, GameTDB's cover for what it
-    # lacks and where there's none, and a key it turns down said so
-    made = {n: os.path.join(base, 'covers', n) for n in ('sgdb_1_banner.png', 'sgdb_1_icon.png', 'AAAE.jpg')}
+    # Downloaded art supplies startup screens; neither a SteamGridDB icon nor a fallback cover replaces the default menu icon.
+    made = {n: os.path.join(base, 'covers', n) for n in ('sgdb_0000000000000001_banner.png', 'sgdb_0000000000000001_icon.png', 'AAAE.jpg')}
     os.makedirs(os.path.join(base, 'covers'))
     for path in made.values():
         img.save(path)
     banner, square, cover = made.values()
-    picked = type('Game', (), dict(title_id=1, product='CTR-P-AAAE'))()
+    picked = type('Game', (), dict(title_id=1, product='CTR-P-AAAE', icon=[[(0, 255, 0)] * 48 for _ in range(48)]))()
     gui.covers.cover = lambda product, folder: cover
 
     def pick(found, key='a key'):
@@ -360,14 +359,38 @@ try:
         state.fetch_cover(picked, 'A game')
         return state.art, state.icon_art, state.artText
 
-    assert pick(dict(banner=banner, icon=square)) == (banner, square, gui.FROM_SGDB) and state.iconText == gui.FROM_SGDB
-    assert pick(dict(banner=banner, icon=None)) == (banner, cover, gui.FROM_SGDB) and state.iconText == gui.FROM_TDB
-    assert pick(dict(banner=None, icon=square)) == (cover, square, gui.FROM_TDB) and state.iconText == gui.FROM_SGDB
+    assert pick(dict(banner=banner, icon=square)) == (banner, None, gui.FROM_SGDB) and state.iconText == gui.NO_ICON_ART
+    assert pick(dict(banner=banner, icon=None)) == (banner, None, gui.FROM_SGDB) and state.iconText == gui.NO_ICON_ART
+    assert pick(dict(banner=None, icon=square)) == (cover, None, gui.FROM_TDB) and state.iconText == gui.NO_ICON_ART
     assert pick(dict(banner=None, icon=None)) == (cover, None, gui.FROM_TDB) and state.iconText == gui.NO_ICON_ART
+    preview = QImage.fromData(gui.base64.b64decode(state.iconArtUrl.split(',', 1)[1]))
+    assert (preview.width(), preview.height()) == (128, 128) and state.tileUrl == state.iconArtUrl
+    assert preview.pixelColor(64, 64).getRgb() == (0, 255, 0, 255) and 0 < preview.pixelColor(2, 2).green() < 255, 'the preview lost the default VC frame'
     assert pick(dict(banner=banner, icon=square), key='') == (cover, None, gui.FROM_TDB), 'SteamGridDB asked without a key'
     assert pick(None) == (cover, None, gui.FROM_TDB) and 'SteamGridDB' in state.dialog['title']
     state.answer(True)
     assert pick(None) == (cover, None, gui.FROM_TDB) and not state.dialog, 'a key turned down is said once, not for every game'
+
+    # Legacy migration recognizes only this game's exact downloader filenames in its managed directory, without deleting them.
+    gamekey = f'{picked.title_id:016x}'
+    for cached in (square, cover):
+        state.st.setdefault('icon_art', {})[gamekey] = cached
+        state.set_art(banner, state.stored_icon(picked), remember=False)
+        assert state.icon_art is None and state.iconText == gui.NO_ICON_ART
+        assert state.st['icon_art'][gamekey] == cached and os.path.isfile(cached)
+    for custom in (art, os.path.join(base, os.path.basename(square)), os.path.join(base, 'covers', 'my_icon.png'),
+                   os.path.join(base, 'covers', 'sgdb_0000000000000002_icon.png')):
+        state.st['icon_art'][gamekey] = custom
+        assert state.stored_icon(picked) == custom, 'a custom or uncertain path was treated as a downloaded icon'
+    # An explicit choice of even a cached picture gets provenance and survives reopening, fetching, and a new banner.
+    gui.QFileDialog.getOpenFileName = lambda *a, **k: (square, '')
+    state.chooseIcon()
+    assert state.stored_icon(picked) == square and json.load(open(settings))['icon_picked'][gamekey] == square
+    state.set_art(None, state.stored_icon(picked), remember=False)
+    state.cover_ready(gamekey, banner, '')
+    assert state.icon_art == square and state.iconText == gui.CUSTOM
+    state.removeIcon()
+    assert gamekey not in state.st['icon_picked'] and state.icon_art is None
 
     # a new key fetches the open game's art again, unless the player chose its picture or removed it on purpose
     asked_again = threading.Event()
@@ -391,7 +414,7 @@ try:
     assert state.st['sgdb_key'] == '' and not state.artKeySet
     state.fetch_cover = fetch_cover
 
-    # An icon picture of its own. Each line says what its own picture is; choosing the art keeps an icon the player picked, not a fetched one;
+    # An icon picture of its own. Each line says what its own picture is; choosing startup art keeps the selected icon;
     # removing the icon keeps the art; an icon picked with no art leaves the game's art to be fetched, and fetched art keeps that icon.
     title = f'{picked.title_id:016x}'
     chosen = iter([art, cover, own_icon, art])
@@ -404,14 +427,14 @@ try:
     assert state.art == cover and state.icon_art == art and (state.artText, state.iconText) == (gui.FROM_TDB, gui.CUSTOM)
     state.removeIcon()
     assert state.icon_art is None and state.art == cover and not state.hasIconArt and state.iconText == gui.NO_ICON_ART
-    state.set_art(banner, square)  # SteamGridDB's banner and icon: art the player chooses now replaces both
+    state.set_art(banner, square)  # a complete chosen icon is independent of the startup banner
     state.chooseIcon()  # own_icon
     state.set_art(None, own_icon)  # and with no art, what's fetched for it comes in beside that icon
     state.cover_ready(title, banner, square)
     assert (state.art, state.icon_art) == (banner, own_icon), 'fetched art took the place of the icon the player picked'
     state.set_art(banner, square)
     state.chooseArt()  # art
-    assert (state.art, state.icon_art) == (art, None) and state.artText == gui.CUSTOM, "a fetched icon stayed beside the player's art"
+    assert (state.art, state.icon_art) == (art, square) and state.artText == gui.CUSTOM, "startup art replaced the selected icon"
     # the default art again: the player's pictures forgotten for the game, its art looked up again; offered after a removal too
     asked_again.clear()
     state.fetch_cover = lambda *a: asked_again.set()
@@ -419,7 +442,7 @@ try:
     state.findArt()
     assert asked_again.wait(5) and (state.art, state.icon_art) == (None, None) and title not in state.st['art'] and not state.artOwn
     state.cover_ready(title, banner, square)
-    assert (state.art, state.icon_art) == (banner, square) and not state.artOwn, 'the fetched art was offered as the default again'
+    assert (state.art, state.icon_art) == (banner, None) and not state.artOwn, 'fetched art replaced the default VC icon'
     state.removeArt()
     assert state.artOwn, 'art removed on purpose had no way back'
     state.fetch_cover = fetch_cover

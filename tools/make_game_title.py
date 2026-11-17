@@ -43,6 +43,22 @@ def icon_pixels(smdh_path):
     return icon
 
 
+def vc_icon_pixels(icon):
+    """Each game's SMDH under Walegy's VC-inspired bands (issue #45); no game art is bundled."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QPainter
+    data = bytes(channel for row in icon for pixel in row for channel in pixel)
+    canvas = QImage(data, 48, 48, 48 * 3, QImage.Format_RGB888).scaled(128, 128, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    frame = QImage(os.path.join(os.path.dirname(__file__), 'art', 'vc_icon_frame.png'))
+    if frame.isNull():
+        raise ValueError('The shared Virtual Console icon frame is missing or unreadable')
+    painter = QPainter(canvas)
+    painter.drawImage(0, 0, frame.scaled(128, 128, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+    painter.end()
+    stride, data = canvas.bytesPerLine(), bytes(canvas.constBits())
+    return [[tuple(data[y * stride + 3 * x:y * stride + 3 * x + 3]) for x in range(128)] for y in range(128)]
+
+
 def write_tga(path, icon, w, h, bpp, scale, background):
     """the icon scaled up and centred on a plain background, in the TGA forms and sizes the Wii U Menu expects"""
     x0, y0 = (w - 48 * scale) // 2, (h - 48 * scale) // 2
@@ -235,8 +251,8 @@ def bezel_pixels(path):
 def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False,
                pad_bezel=None, pad_art=None, boot_sound=None, screen_art=None):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
-    art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
-    picture for the icon alone (a square one, where art is a wide banner). style: 'picture' shows art as it is on the start-up screens,
+    art: a picture for the start-up screens. The Wii U Menu icon uses the game's SMDH with Virtual Console bands unless icon_art supplies
+    a complete custom icon (shown as supplied, without bands). style: 'picture' shows art as it is on the start-up screens,
     'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan.
     pad_art: a picture of its own for the GamePad's start-up screen, shown as it is. boot_sound: the game's own start-up sound (a .btsnd,
     tools/make_boot_sound.py), in place of the one this PC has for every game. screen_art: the game's title screen (covers.title_screen), the
@@ -260,14 +276,14 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
         icon_bin = os.path.join(game, 'icon.bin')
     icon = icon_pixels(icon_bin)
     meta_dir = os.path.join(title, 'meta')
-    write_tga(os.path.join(meta_dir, 'iconTex.tga'), icon, 128, 128, 32, 2, BACKGROUND)
+    write_art_tga(os.path.join(meta_dir, 'iconTex.tga'), vc_icon_pixels(icon), 32)
     write_tga(os.path.join(meta_dir, 'bootLogoTex.tga'), icon, 170, 42, 32, 0, (0, 0, 0))
     write_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), icon, 854, 480, 24, 6, BACKGROUND)
     write_tga(os.path.join(meta_dir, 'bootTvTex.tga'), icon, 1280, 720, 24, 10, BACKGROUND)
     band = screen_art or art  # the Virtual Console's picture: the title screen, else the art
     screens = console_screens(band, os.path.join(game, 'exefs', 'icon.bin'), released, case_scan and not screen_art,
                               top_screen=bool(screen_art)) if style == 'console' and band else None
-    for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art or art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
+    for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
         rows = screens[tga] if screens and tga in screens else art_pixels(picture, w, h, (0, 0, 0)) if picture else None
         if rows:
             write_art_tga(os.path.join(meta_dir, tga), rows, bpp)
