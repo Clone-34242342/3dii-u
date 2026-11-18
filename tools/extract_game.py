@@ -9,6 +9,9 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'builder'))
+import dumps
+
 MEDIA_UNIT = 0x200
 
 
@@ -47,13 +50,12 @@ def main():
     f = open(game, 'rb')
     head = f.read(0x200)
     assert head[0x100:0x104] == b'NCSD', 'not a .3ds image'
-    offset = struct.unpack('<I', head[0x120:0x124])[0] * MEDIA_UNIT
+    offset, partition_size = (v * MEDIA_UNIT for v in struct.unpack('<II', head[0x120:0x128]))
     f.seek(offset)
     n = f.read(0x200)
     assert n[0x100:0x104] == b'NCCH'
-    exheader_hash, exefs_hash, romfs_hash = n[0x160:0x180], n[0x1C0:0x1E0], n[0x1E0:0x200]
+    exheader_hash, exefs_hash = n[0x160:0x180], n[0x1C0:0x1E0]
     exefs_off, exefs_size, exefs_hashed = struct.unpack('<III', n[0x1A0:0x1AC])
-    romfs_off, romfs_size, romfs_hashed = struct.unpack('<III', n[0x1B0:0x1BC])
     os.makedirs(out_dir, exist_ok=True)
 
     f.seek(offset + 0x200)
@@ -97,27 +99,10 @@ def main():
         with open(os.path.join(out_dir, 'icon.bin'), 'wb') as o:
             o.write(files['icon'])
 
-    # RomFS: the header's hash covers its first region (the IVFC header and the master hashes). Only level 3, the file system itself, is
-    # written: what the runtime, the recompiler's CRO reader and builder/dumps.py all take. The whole IVFC image stopped the recompiler
-    # (cro.py) before a first trial could run.
-    start = offset + romfs_off * MEDIA_UNIT
-    f.seek(start)
-    assert hashlib.sha256(f.read(romfs_hashed * MEDIA_UNIT)).digest() == romfs_hash, 'RomFS hash'
-    f.seek(start)
-    ivfc = f.read(0x60)
-    assert ivfc[:4] == b'IVFC', 'RomFS without an IVFC header'
-    master = struct.unpack('<I', ivfc[8:12])[0]
-    l3_size = struct.unpack('<Q', ivfc[0x44:0x4C])[0]
-    l3_block = 1 << struct.unpack('<I', ivfc[0x4C:0x50])[0]
-    f.seek(start + ((0x60 + master + l3_block - 1) & ~(l3_block - 1)))
-    written = 0
-    with open(os.path.join(out_dir, 'romfs.bin'), 'wb') as o:
-        while written < l3_size:
-            block = f.read(min(1 << 22, l3_size - written))
-            assert block, 'RomFS ended early'
-            o.write(block)
-            written += len(block)
-    print(f'romfs: level 3, {written} bytes, header hash verified')
+    # Share the builder's bounds checks and atomic replacement, including when old outputs are hardlinked.
+    program = dumps.FileSlice(f, offset, partition_size)
+    if dumps.copy_romfs(program, n, os.path.join(out_dir, 'romfs.bin')):
+        print('romfs: level 3, header hash verified')
 
     info = {
         'program_id': n[0x118:0x120][::-1].hex().upper(),

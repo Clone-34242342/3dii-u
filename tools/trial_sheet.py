@@ -22,6 +22,8 @@ def ppm(path):
 
 nums = sorted(int(n[3:-4]) for n in os.listdir(shots) if n.startswith('top') and n.endswith('.ppm') and n[3:-4].isdigit())
 nums = [n for n in nums if first <= n <= last]
+if not nums:
+    sys.exit('No trial pictures in the requested range')
 cw, ch = 200, 240
 rows = (len(nums) + cols - 1) // cols
 W, H = cols * (cw + 4), rows * (ch + 4)
