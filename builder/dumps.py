@@ -229,24 +229,40 @@ def copy_romfs(p, nh, out_path, progress=None):
     off, size, hashed = u32(nh, 0x1B0) * MU, u32(nh, 0x1B4) * MU, u32(nh, 0x1B8) * MU
     if not size:
         return False
+    available = min(p.size, os.fstat(p.f.fileno()).st_size - p.off)
+    declared = u32(nh, 0x104) * MU
+    if not MU <= declared <= available or off < MU or off + size > declared or not 0 < hashed <= size:
+        raise DumpError('The RomFS section lies outside its NCCH.')
     if hashlib.sha256(p.pread(off, hashed)).digest() != nh[0x1E0:0x200]:
         raise DumpError('The RomFS fails its hash: a bad decryption or a damaged dump.')
     ivfc = p.pread(off, 0x60)
-    if ivfc[:4] != b'IVFC':
+    if len(ivfc) != 0x60 or ivfc[:4] != b'IVFC':
         raise DumpError('The RomFS has no IVFC header.')
-    block = 1 << u32(ivfc, 0x4C)
+    block_bits = u32(ivfc, 0x4C)
+    if block_bits > 31:
+        raise DumpError('The RomFS block size is invalid.')
+    block = 1 << block_bits
     l3_size = struct.unpack_from('<Q', ivfc, 0x44)[0]
     l3_off = off + ((0x60 + u32(ivfc, 8) + block - 1) & ~(block - 1))
+    if l3_off > off + size or l3_size > off + size - l3_off:
+        raise DumpError('The RomFS level 3 image lies outside its section.')
     tmp = out_path + '.part'
-    with open(tmp, 'wb') as o:
-        done = 0
-        while done < l3_size:
-            n = min(8 << 20, l3_size - done)
-            o.write(p.pread(l3_off + done, n))
-            done += n
-            if progress:
-                progress(done, l3_size)
-    os.replace(tmp, out_path)
+    try:
+        with open(tmp, 'wb') as o:
+            done = 0
+            while done < l3_size:
+                n = min(8 << 20, l3_size - done)
+                data = p.pread(l3_off + done, n)
+                if len(data) != n:
+                    raise DumpError('The RomFS ended before its declared size.')
+                o.write(data)
+                done += n
+                if progress:
+                    progress(done, l3_size)
+        os.replace(tmp, out_path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
     return True
 
 

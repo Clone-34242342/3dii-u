@@ -108,6 +108,7 @@ def main():
     py = sys.executable
     checks = {
         'compiler policy': [[py, ROOT + '/builder/test_compiler_policy.py']],
+        'trial tools': [[py, ROOT + '/tools/test_trial_tools.py']],
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
