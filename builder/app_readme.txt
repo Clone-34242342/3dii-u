@@ -51,7 +51,10 @@ WHICH GAMES WORK
   Either badge shows when your dump is the same edition that was tested. They were tested without updates.
 - "Runs in Cemu" (the Games page): built with this builder and played in the Cemu emulator, not yet on a real Wii U:
   Mario Kart 7, The Legend of Zelda: A Link Between Worlds, Metroid: Samus Returns, Kirby: Triple Deluxe, Rhythm Heaven Megamix,
-  Phoenix Wright: Ace Attorney Trilogy, Animal Crossing: New Leaf, Kid Icarus: Uprising, Super Mario 3D Land and Miitopia.
+  Phoenix Wright: Ace Attorney Trilogy, Animal Crossing: New Leaf, Kid Icarus: Uprising, Super Mario 3D Land, Miitopia
+  and The Legend of Zelda: Majora's Mask 3D.
+- The right stick is a New 3DS's C-stick, and ZL and ZR are its own, for games that support the Circle Pad Pro: a New 3DS answers
+  them as one, and so does the Wii U. Majora's Mask 3D needs it to get past its Circle Pad Pro screen.
 - "Untested": every other game, and any game with a mod. It may play, it may not start, or it may stop partway.
   Reports on these games help the most.
 

@@ -225,7 +225,7 @@ static int gpu_thread(int, void *) {
 }
 
 // A Wii U Pro Controller's buttons, as the GamePad's are mapped (map_buttons)
-static u32 map_pro(u32 h) {
+static u32 map_pro(u32 h, bool z_too) {
     u32 b = 0;
     if (h & WPAD_PRO_BUTTON_A) b |= 1u << 0;
     if (h & WPAD_PRO_BUTTON_B) b |= 1u << 1;
@@ -235,8 +235,8 @@ static u32 map_pro(u32 h) {
     if (h & WPAD_PRO_BUTTON_LEFT) b |= 1u << 5;
     if (h & WPAD_PRO_BUTTON_UP) b |= 1u << 6;
     if (h & WPAD_PRO_BUTTON_DOWN) b |= 1u << 7;
-    if (h & (WPAD_PRO_BUTTON_R | WPAD_PRO_BUTTON_ZR)) b |= 1u << 8;
-    if (h & (WPAD_PRO_BUTTON_L | WPAD_PRO_BUTTON_ZL)) b |= 1u << 9;
+    if (h & (WPAD_PRO_BUTTON_R | (z_too ? WPAD_PRO_BUTTON_ZR : 0))) b |= 1u << 8;
+    if (h & (WPAD_PRO_BUTTON_L | (z_too ? WPAD_PRO_BUTTON_ZL : 0))) b |= 1u << 9;
     if (h & WPAD_PRO_BUTTON_X) b |= 1u << 10;
     if (h & WPAD_PRO_BUTTON_Y) b |= 1u << 11;
     return b;
@@ -255,8 +255,9 @@ static u32 pro_as_gamepad(u32 t) {
     return v;
 }
 
-// 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y
-static u32 map_buttons(u32 h) {
+// 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y. ZL and ZR are L and R as well (z_too), but for a game
+// that reads the Circle Pad Pro a New 3DS answers with: they are its own ZL and ZR then (kernel::hid_extra_pad).
+static u32 map_buttons(u32 h, bool z_too) {
     u32 b = 0;
     if (h & VPAD_BUTTON_A) b |= 1u << 0;
     if (h & VPAD_BUTTON_B) b |= 1u << 1;
@@ -266,8 +267,8 @@ static u32 map_buttons(u32 h) {
     if (h & VPAD_BUTTON_LEFT) b |= 1u << 5;
     if (h & VPAD_BUTTON_UP) b |= 1u << 6;
     if (h & VPAD_BUTTON_DOWN) b |= 1u << 7;
-    if (h & (VPAD_BUTTON_R | VPAD_BUTTON_ZR)) b |= 1u << 8;
-    if (h & (VPAD_BUTTON_L | VPAD_BUTTON_ZL)) b |= 1u << 9;
+    if (h & (VPAD_BUTTON_R | (z_too ? VPAD_BUTTON_ZR : 0))) b |= 1u << 8;
+    if (h & (VPAD_BUTTON_L | (z_too ? VPAD_BUTTON_ZL : 0))) b |= 1u << 9;
     if (h & VPAD_BUTTON_X) b |= 1u << 10;
     if (h & VPAD_BUTTON_Y) b |= 1u << 11;
     return b;
@@ -294,22 +295,26 @@ static int hid_thread(int, void *) {
     bool touch_was = false, leaving = false;
     VPADStatus st{};
     VPADTouchData cal{};
-    u32 buttons = 0, pad_buttons = 0, pro_hold[4] = {};
+    u32 buttons = 0, pad_held = 0, pro_hold[4] = {};
     float pad_x = 0, pad_y = 0, pro_x[4] = {}, pro_y[4] = {};
+    float pad_rx = 0, pad_ry = 0, pro_rx[4] = {}, pro_ry[4] = {};  // the right sticks: the C-stick
     s16 cx = 0, cy = 0;
     bool touch = false;
     u16 tx = 0, ty = 0;
     for (;;) {
         u32 presses = 0;  // the GamePad's way, from either, for the options menu
+        const bool z_too = !kernel::extra_pad_connected();
         VPADReadError err = VPAD_READ_SUCCESS;
         VPADRead(VPAD_CHAN_0, &st, 1, &err);
         if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
-            pad_buttons = 0;
-            pad_x = pad_y = 0;
+            pad_held = 0;
+            pad_x = pad_y = pad_rx = pad_ry = 0;
             touch = false;
         }
         if (err == VPAD_READ_SUCCESS) {
-            pad_buttons = map_buttons(st.hold);
+            pad_held = st.hold;
+            pad_rx = st.rightStick.x;
+            pad_ry = st.rightStick.y;
             presses |= st.trigger;
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
             pad_x = st.leftStick.x;
@@ -333,7 +338,7 @@ static int hid_thread(int, void *) {
             wiiu::keyboard_input(st.trigger, down && !touch_was, px, py);
             touch_was = down;
         }
-        buttons = pad_buttons;
+        buttons = map_buttons(pad_held, z_too);
         float sx = pad_x, sy = pad_y;
         for (int ch = 0; ch < 4; ch++) {
             KPADStatus ks{};
@@ -343,16 +348,29 @@ static int hid_thread(int, void *) {
                 pro_hold[ch] = ks.pro.hold;
                 pro_x[ch] = ks.pro.leftStick.x;
                 pro_y[ch] = ks.pro.leftStick.y;
+                pro_rx[ch] = ks.pro.rightStick.x;
+                pro_ry[ch] = ks.pro.rightStick.y;
                 presses |= pro_as_gamepad(ks.pro.trigger);
             } else if (read || kerr == KPAD_ERROR_INVALID_CONTROLLER) {  // another kind of controller there, or none
                 pro_hold[ch] = 0;
-                pro_x[ch] = pro_y[ch] = 0;
+                pro_x[ch] = pro_y[ch] = pro_rx[ch] = pro_ry[ch] = 0;
             }
-            buttons |= map_pro(pro_hold[ch]);
+            buttons |= map_pro(pro_hold[ch], z_too);
             if (std::fabs(pro_x[ch]) + std::fabs(pro_y[ch]) > std::fabs(sx) + std::fabs(sy)) {
                 sx = pro_x[ch];
                 sy = pro_y[ch];
             }
+        }
+        float rx = pad_rx, ry = pad_ry;
+        bool zl = pad_held & VPAD_BUTTON_ZL, zr = pad_held & VPAD_BUTTON_ZR, r = pad_held & VPAD_BUTTON_R;
+        for (int ch = 0; ch < 4; ch++) {
+            if (std::fabs(pro_rx[ch]) + std::fabs(pro_ry[ch]) > std::fabs(rx) + std::fabs(ry)) {
+                rx = pro_rx[ch];
+                ry = pro_ry[ch];
+            }
+            zl |= (pro_hold[ch] & WPAD_PRO_BUTTON_ZL) != 0;
+            zr |= (pro_hold[ch] & WPAD_PRO_BUTTON_ZR) != 0;
+            r |= (pro_hold[ch] & WPAD_PRO_BUTTON_R) != 0;
         }
         cx = (s16)(sx * 156.0f);
         cy = (s16)(sy * 156.0f);
@@ -380,6 +398,8 @@ static int hid_thread(int, void *) {
             }
         }
         wiiu::input_override(buttons, touch, tx, ty);
+        if (wiiu::menu_open()) kernel::hid_extra_pad(0, 0, false, false, false);
+        else kernel::hid_extra_pad(rx, ry, zl, zr, r);
         kernel::hid_update(buttons, cx, cy, touch, tx, ty);
         if (kMeasure) {
             all_samples = all_samples + 1;

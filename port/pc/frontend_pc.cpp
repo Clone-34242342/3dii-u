@@ -82,8 +82,9 @@ static void hid_thread() {
     for (;;) {
         next += period;
         std::this_thread::sleep_until(next);
-        // RECOMP_AUTOPLAY: presses A now and then and taps around the bottom screen, to walk through the game unattended
-        static const bool autoplay = getenv("RECOMP_AUTOPLAY");
+        // RECOMP_AUTOPLAY: presses A now and then and taps around the bottom screen, to walk through the game unattended. 0 is off, as
+        // build3ds.py trial --autoplay 0 sets it: scripted taps were lost among its own.
+        static const bool autoplay = getenv("RECOMP_AUTOPLAY") && atoi(getenv("RECOMP_AUTOPLAY")) != 0;
         static u32 tick;
         u32 buttons = 0;
         bool touch = false;
