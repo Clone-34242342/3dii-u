@@ -309,7 +309,8 @@ class Game:
     def mixed(self):
         """Trial (--mixed): a game whose only reason for safe mode is the video decoder gets the fast code everywhere else, and the safe
         way for the decoder's address range alone. The decoder is about 2% of such a game's code. Not the default until it has run on a
-        console: Mario Kart 7, the Laytons and Paper Jam build this way."""
+        console: Mario Kart 7, the Laytons and Paper Jam build this way. A game that has gets "mixed" in builder/compat.json, and the builder
+        builds it so (Ocarina of Time 3D: its safe-mode build fogged everything brown in Cemu)."""
         if self.mode == 'safe' and self.decoder_range and not coroutine_switches(self.dir):
             self.gen, self.mode, self.opt, self.safe_ranges = 'gen_mixed', 'abi', [], [self.decoder_range]
             self.gen_dir = f'{self.dir}/{self.gen}'
