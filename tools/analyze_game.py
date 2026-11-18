@@ -43,13 +43,15 @@ for w in words:
         kinds['data processing'] += 1
 print('shape of the code, if it were all ARM:', dict(kinds.most_common()))
 
-# ---- RomFS: IVFC container, then level 3 holds the file system
+# ---- RomFS: level 3 holds the file system. Extracted games keep level 3 alone (tools/extract_game.py, builder/dumps.py); an older
+# extraction may still be the whole IVFC container, with level 3 inside it.
 r = open(os.path.join(d, 'romfs.bin'), 'rb')
 head = r.read(0x60)
-assert head[:4] == b'IVFC', 'expected an IVFC container'
-master = struct.unpack('<I', head[8:12])[0]
-l3_block = struct.unpack('<I', head[0x4C:0x50])[0]  # log2 of level 3's block size
-level3 = (0x60 + master + (1 << l3_block) - 1) & ~((1 << l3_block) - 1)
+level3 = 0
+if head[:4] == b'IVFC':
+    master = struct.unpack('<I', head[8:12])[0]
+    l3_block = struct.unpack('<I', head[0x4C:0x50])[0]  # log2 of level 3's block size
+    level3 = (0x60 + master + (1 << l3_block) - 1) & ~((1 << l3_block) - 1)
 r.seek(level3)
 h = struct.unpack('<10I', r.read(40))
 dir_meta_off, dir_meta_size, file_meta_off, file_meta_size, data_off = h[3], h[4], h[7], h[8], h[9]

@@ -107,6 +107,7 @@ def gsx():
 def main():
     py = sys.executable
     checks = {
+        'trial tools': [[py, ROOT + '/tools/test_trial_tools.py']],
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
