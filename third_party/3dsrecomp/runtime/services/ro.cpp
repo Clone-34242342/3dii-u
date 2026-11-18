@@ -26,6 +26,7 @@ void set_game_cros(const GuestCro *cros, u32 count) {
 extern "C" {
 extern const GuestCro guest_cros[];
 extern const u32 guest_cro_count;  // ro_none.cpp if the game has none
+extern const u32 guest_has_static_module;
 }
 #endif
 
@@ -515,6 +516,11 @@ struct Ro : Service {
 
 void register_ro() { register_service(std::make_shared<Ro>("ldr:ro")); }
 
-bool ro_has_modules() { return guest_cro_count != 0; }
+bool ro_has_modules() {
+#ifndef RECOMP_MODULES
+    if (guest_has_static_module) return true;
+#endif
+    return guest_cro_count != 0;
+}
 
 }  // namespace kernel
