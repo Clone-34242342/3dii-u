@@ -14,6 +14,7 @@ with addresses of module symbols (static.crs imports).
 """
 import os
 import struct
+import zlib
 
 # the Wii U's flat guest block ends at 0x20000000, so its builds choose a slot range inside it
 CRO_BASE = int(os.environ.get('RECOMP_CRO_BASE', '0x40000000'), 16)
@@ -218,14 +219,30 @@ def load(gamedir):
     path = os.path.join(gamedir, 'romfs.bin')
     if not os.path.exists(path):
         return None
-    want = lambda n: n.endswith('.cro') or n.endswith('.crs')
-    files = romfs_files(path, want)
+    def read_modules(romfs):
+        files = romfs_files(romfs, lambda name: name.endswith(('.cro', '.crs', '.cro.p')))
+        modules = {}
+        for name, data in files.items():
+            if name.endswith('.cro.p'):
+                if len(data) < 16 or data[:4] != b'NDCF':
+                    raise ValueError(f'{name}: expected an NDCF-compressed CRO')
+                size, packed = struct.unpack_from('<II', data, 8)
+                if packed > len(data) - 16:
+                    raise ValueError(f'{name}: truncated NDCF payload')
+                stream = zlib.decompressobj()
+                data = stream.decompress(data[16:16 + packed], size + 1)
+                if len(data) != size or not stream.eof or stream.unused_data or data[0x80:0x84] != b'CRO0':
+                    raise ValueError(f'{name}: invalid NDCF CRO payload')
+                name = name[:-2]
+            modules[name] = data
+        return modules
+
+    files = read_modules(path)
     # An update's RomFS, which the game reads first: its modules replace the base's. Bowser's Inside Story's v2.2 ships only a new static.crs, the
     # table of where the updated code's functions are; read from the base, every module call into the updated code missed (2026-11-08).
     update = os.path.join(gamedir, 'update_romfs.bin')
     if os.path.exists(update):
-        files.update(romfs_files(update, want))
+        files.update(read_modules(update))
     if not any(p.endswith('.crs') for p in files):
         return None
-    s = CroSet(files)
-    return s if s.mods else None
+    return CroSet(files)
