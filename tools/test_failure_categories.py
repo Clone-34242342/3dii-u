@@ -28,6 +28,7 @@ def test_categories():
         ("restart: 2 vertex shaders the pack lacks and the console did not compile", "shader fallback"),
         ("restart: the console compiler failed 3 times", "shader fallback"),
         ("blank_save: the console compiler is not running", "shader fallback"),
+        ("restart: shader fallback: 4 CPU draw batches, 0 geometry shader fallbacks", "shader fallback"),
 
         # 5. save failure
         ("restart: save flush failed", "save failure"),
@@ -38,6 +39,7 @@ def test_categories():
         ("restart: nothing drawn", "no useful frames"),
         ("blank_save: no pictures of the GamePad", "no useful frames"),
         ("blank_save: insufficient visual coverage: 0 TV/GamePad capture pairs; at least 2 needed to compare rendering", "no useful frames"),
+        ("blank_save: unreadable TV picture", "no useful frames"),
 
         # Cemu validation (emulation artifacts, not console behavior)
         ("restart: Cemu can't decode vertex data this game drew with, so these aren't a console's pictures: Unsupported fmt ...", "cemu validation"),
@@ -53,6 +55,11 @@ def test_categories():
     for opcode in ('ARM', 'Thumb'):
         message = f'FATAL: fallback interpreter unsupported {opcode} opcode 0xdead at 0x00100140'
         assert cp.re.search(cp.UNSUPPORTED, message, cp.re.IGNORECASE), 'The log scanner must use the same pattern as categorization'
+    assert not cp.shader_faults('[gx2] 60 fps, 0 on CPU, 0 fragment misses\n')
+    assert len(cp.shader_faults('[gx2] 30 fps, 3 on CPU, 5 fragment misses\n[gx2] 60 fps, 0 on CPU, 5 fragment misses\n')) == 2
+    assert '5 fragment misses' in cp.shader_faults('0 on CPU, 5 fragment misses\n0 on CPU, 5 fragment misses')[0]
+    assert cp.shader_faults(''), 'Missing metrics cannot imply zero fallbacks'
+    assert cp.shader_faults("2 geometry shaders' draws the pack lacked a shader for, drawn by the CPU")
 
     print("test_failure_categories: ok")
 

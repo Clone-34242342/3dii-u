@@ -48,6 +48,8 @@ std::string account_dir;
 
 std::mutex cache_m;
 std::map<std::string, std::shared_ptr<wiiu::SaveFile>> cache;
+struct DirectUsers { u32 users = 0; bool shared = false; };
+std::map<std::string, DirectUsers> direct_users;  // keep a path direct until every uncached file session closes
 u64 cached_bytes;
 constexpr u64 CACHE_FILE_MAX = 16 << 20, CACHE_MAX = 48 << 20;  // bigger files go to storage as the game writes them
 
@@ -94,8 +96,12 @@ bool write_out(const std::shared_ptr<wiiu::SaveFile> &f) {
     if (ok) {
         if (n) ok = wiiu::save_write(fd, copy, n, 0) == (long)n;
         struct stat st;
-        if (ok && !fstat(fd, &st) && (u64)st.st_size > n) wiiu::save_resize(fd, n);
-        close(fd);
+        if (ok) {
+            ok = !fstat(fd, &st);
+            if (ok && (u64)st.st_size > n) wiiu::save_resize(fd, n);
+            if (ok) ok = !fstat(fd, &st) && (u64)st.st_size == n;
+        }
+        if (close(fd)) ok = false;
     }
     free(copy);
     LOG("[save] wrote %s, %u bytes, %s, %u ms\n", f->path.c_str(), n, ok ? "done" : "FAILED", (u32)OSTicksToMilliseconds(OSGetSystemTime() - t));
@@ -318,6 +324,9 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
             it->second->users++;
             return it->second;
         }
+        // Reserve before loading: another open must not cache a path with a live direct session.
+        auto &direct = direct_users[path];
+        if (++direct.users != 1) { direct.shared = true; return nullptr; }
     }
     struct stat st;
     if (fstat(fd, &st) || (u64)st.st_size > CACHE_FILE_MAX) return nullptr;
@@ -332,20 +341,19 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
         if (!ok) return nullptr;
     }
     std::lock_guard<std::mutex> lk(cache_m);
-    auto it = cache.find(path);  // another thread's open may have got there first
-    if (it != cache.end()) {
-        it->second->users++;
-        return it->second;
-    }
-    for (auto e = cache.begin(); e != cache.end() && cached_bytes + f->data.size() > CACHE_MAX;)
+    const auto &direct = direct_users.at(path);
+    if (direct.users != 1 || direct.shared) return nullptr;
+    for (auto e = cache.begin(); e != cache.end() && cached_bytes + f->data.capacity() > CACHE_MAX;)
         if (!e->second->users && !e->second->dirty) {
-            cached_bytes -= e->second->data.size();
+            cached_bytes -= e->second->data.capacity();
             e = cache.erase(e);
         } else {
             ++e;
         }
+    if (cached_bytes + f->data.capacity() > CACHE_MAX) return nullptr;
+    direct_users.erase(path);
     f->users = 1;
-    cached_bytes += f->data.size();
+    cached_bytes += f->data.capacity();
     cache[path] = f;
     return f;
 }
@@ -353,6 +361,12 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
 void save_file_close(SaveFile &f) {
     std::lock_guard<std::mutex> lk(cache_m);
     if (f.users) f.users--;
+}
+
+void save_file_close_direct(const std::string &path) {
+    std::lock_guard<std::mutex> lk(cache_m);
+    auto it = direct_users.find(path);
+    if (it != direct_users.end() && !--it->second.users) direct_users.erase(it);
 }
 
 long save_file_read(SaveFile &f, void *to, u32 len, u64 at) {
@@ -368,8 +382,9 @@ long save_file_write(SaveFile &f, const void *from, u32 len, u64 at) {
     if (!len) return 0;
     std::lock_guard<std::mutex> lk(cache_m);
     if (at + len > f.data.size()) {
-        cached_bytes += at + len - f.data.size();
+        const size_t old_capacity = f.data.capacity();
         f.data.resize((size_t)(at + len));
+        cached_bytes = cached_bytes - old_capacity + f.data.capacity();
     }
     memcpy(f.data.data() + at, from, len);
     f.dirty = true;
@@ -383,31 +398,49 @@ u64 save_file_size(SaveFile &f) {
 
 void save_file_resize(SaveFile &f, u64 size) {
     std::lock_guard<std::mutex> lk(cache_m);
-    cached_bytes = cached_bytes - f.data.size() + size;
+    const size_t old_capacity = f.data.capacity();
     f.data.resize((size_t)size);
+    cached_bytes = cached_bytes - old_capacity + f.data.capacity();
     f.dirty = true;
 }
 
 // Before the game deletes, renames or lists anything under prefix, storage has to hold what it wrote there. forget: it's going away or moving, so memory lets go too.
-void save_settle(const std::string &prefix, bool forget) {
+bool save_settle(const std::string &prefix, bool forget) {
     fs_begin(0xC009);
     std::vector<std::shared_ptr<SaveFile>> hit;
+    bool ok = true;
     {
         std::lock_guard<std::mutex> lk(cache_m);
+        if (forget)
+            for (const auto &e : direct_users)
+                if (under(e.first, prefix)) ok = false;
         for (auto &e : cache)
-            if (under(e.first, prefix) && e.second->dirty) hit.push_back(e.second);
-    }
-    for (auto &f : hit) write_out(f);
-    if (forget) {
-        std::lock_guard<std::mutex> lk(cache_m);
-        for (auto e = cache.begin(); e != cache.end();)
-            if (under(e->first, prefix)) {
-                cached_bytes -= e->second->data.size();
-                e = cache.erase(e);
-            } else {
-                ++e;
+            if (under(e.first, prefix)) {
+                // shortcut: live handles prevent moving/deleting; rebind ownership if a title needs live-handle rename.
+                if (forget && e.second->users) ok = false;
+                if (e.second->dirty) hit.push_back(e.second);
             }
     }
+    if (!ok) { fs_end(); return false; }
+    for (auto &f : hit) if (!write_out(f)) ok = false;
+    if (ok) {
+        std::lock_guard<std::mutex> lk(cache_m);
+        // A write that arrived during the snapshot must stay cached for the next attempt.
+        if (forget)
+            for (const auto &e : direct_users)
+                if (under(e.first, prefix)) ok = false;
+        for (auto &e : cache)
+            if (under(e.first, prefix) && (e.second->dirty || (forget && e.second->users))) ok = false;
+        if (forget && ok)
+            for (auto e = cache.begin(); e != cache.end();)
+                if (under(e->first, prefix)) {
+                    cached_bytes -= e->second->data.capacity();
+                    e = cache.erase(e);
+                } else {
+                    ++e;
+                }
+    }
     fs_end();
+    return ok;
 }
 }  // namespace wiiu

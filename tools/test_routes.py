@@ -44,6 +44,13 @@ USUM_BATTLE = ['WAIT 900'] + A(45, 90) + ['B 6', 'WAIT 60'] * 6 + ['CLEFT+B 240'
 MK7_RACE = ['WAIT 600'] + A(30, 120) + ['A 600', 'WAIT 10'] * 40
 
 ROUTES = {
+    # The generic center touch selects Rename; file 1's Begin button is lower down.
+    'zelda_albw': ['WAIT 600', 'A 6', 'WAIT 600', 'A 6', 'WAIT 300', 'T@160/60 10', 'WAIT 300', 'T@160/174 10', 'WAIT 600']
+                  + A(60, 60) + ['CDOWN 240', 'WAIT 1800', 'CLEFT 240', 'WAIT 3000'],
+    # Confirm extra-data setup, swipe through help, then decline SpotPass and reach the models.
+    'pokedex_3d': ['WAIT 600', 'T@160/180 10', 'WAIT 600']
+                  + ['DRAG 280/120 40/120 30', 'WAIT 240'] * 12
+                  + ['T@160/200 10', 'WAIT 600', 'T@214/180 10', 'WAIT 300', 'T@160/180 10', 'WAIT 300', 'WAIT 30000'],
     'mario_kart_7': MK7_RACE,
     # the same, held on through the cup: each race ends four to five minutes in with the kart against walls, and the third is Cheep Cheep
     # Lagoon, whose water is where a console loses the most frames (the user, 2026-11-14). A course can't be swapped in for the first: the game

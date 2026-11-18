@@ -48,6 +48,12 @@ with tempfile.TemporaryDirectory() as tmp:
         (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
     assert 0 < framed[2][2][0] < 255 and 0 < framed[126][126][0] < 255, 'both bands must darken the game art'
     assert any(min(pixel) > 220 for row in framed[109:120] for pixel in row), 'the footer label is missing'
+    assert any(min(pixel) > 200 for row in framed[6:13] for pixel in row[9:68]), 'the NINTENDO label is missing'
+    # The game's 48 pixels become 128 more sharply than Qt's smooth scaling took them (its steepest step on this edge was 48), and
+    # nothing rings past the edge: every pixel stays between the two greys
+    edge = [pixel[0] for pixel in title.sharp_icon([[(64,) * 3 if x < 24 else (192,) * 3 for x in range(48)] for _ in range(48)])[64]]
+    assert max(abs(b - a) for a, b in zip(edge, edge[1:])) >= 56, edge[56:72]
+    assert edge[:60] == [64] * 60 and edge[68:] == [192] * 60, f'the edge rings: {edge[56:72]}'
 
     # a picture of any other size fills its frame whole: 344 wide, as tall as its shape asks within 200-300, centred in the band
     cover = os.path.join(tmp, 'cover.png')

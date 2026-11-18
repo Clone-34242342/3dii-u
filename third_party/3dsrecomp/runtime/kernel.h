@@ -208,6 +208,7 @@ std::string kstats_report(u64 frames);
 void *guest_host_thread(u32 i);  // (Wii U, for hang reports) the OSThread behind slot i of 64, or null
 void dump_memory(const char *prefix);  // RECOMP_MEMDUMP
 bool guest_readable(u32 addr, u32 size);
+bool guest_readable_locked(u32 addr, u32 size);  // same check, with the kernel lock already held by an HLE service
 bool guest_writable(u32 addr, u32 size);  // (lock held) entire range is mapped writable, without address overflow
 bool guest_busy();  // a guest thread is running (not all waiting)  // mapped and readable (host-side reads of game state)
 

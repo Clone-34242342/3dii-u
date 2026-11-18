@@ -223,6 +223,15 @@ def normal(s):
             if typ in (1, 2, 4):
                 coord = ws = wt = 0
         tex.append(need | null << 1 | typ << 2 | coord << 6 | ws << 8 | wt << 11 | sho << 14)
+    if len(s['tev']) > 1:
+        first, nxt = s['tev'][:2]
+        n = lambda op: 3 if op in (4, 8, 9) else 2 if op in (1, 2, 3, 5, 6, 7) else 1
+        na = 0 if nxt['cop'] == 7 or nxt['aop'] in (6, 7) else n(nxt['aop'])
+        external = not any(t['urgb'] or t['ua'] for t in s['tev'])
+        external &= not any(x in (13, 15) for x in nxt['csrc'][:n(nxt['cop'])] + nxt['asrc'][:na])
+        if external and first['cop'] != 7 and first['aop'] not in (6, 7):
+            first = dict(first, cop=0, aop=0, cmul=1, amul=1)
+            s = dict(s, tev=[first, *s['tev'][1:]])
     tev = []
     for t in s['tev']:
         t = dict(t, csrc=list(t['csrc']), asrc=list(t['asrc']), cmod=list(t['cmod']), amod=list(t['amod']))
@@ -244,7 +253,12 @@ def normal(s):
         fogat &= ~2
     s = dict(s, tex=tex, tev=tev, fogat=fogat, blend=3 << 24, mask=0)
     if s['light']:
+        if not s['lcfg'] & (1 << 15):  # disabled shadows: map, invert, primary, secondary, alpha and each light's bit go unread
+            s['lcfg'] &= ~(3 << 12 | 15 << 16)
+            s['lights'] = [w & ~(1 << 9) for w in s['lights']]
         s['lsel'] = [w if w & 1 else 0 for w in s['lsel']]
+        if not any(lt & (1 << 8) for lt in s['lights'][:s['lcfg'] & 15]):
+            s['lsel'][2] &= ~(7 << 2)
     return s
 
 

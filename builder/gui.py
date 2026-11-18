@@ -3,6 +3,7 @@
 Questions come up inside the window one at a time: a choice that asks several things is a generator that yields each question and is sent the
 answer (App.run_flow), and messages wait their turn in the same queue."""
 import base64
+import functools
 import json
 import os
 import queue
@@ -165,22 +166,69 @@ def nands_below(top, depth):
     return found
 
 
+DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+CARD_BUSES = (7, 12, 13)  # STORAGE_BUS_TYPE: BusTypeUsb, BusTypeSd, BusTypeMmc
+
+
+@functools.cache
+def kernel32():
+    """kernel32 with the types card_reader_disk needs, in its own copy: ctypes.windll's stays as other code expects it"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32')
+    k32.CreateFileW.restype = wintypes.HANDLE  # so a failure comes back as INVALID_HANDLE_VALUE, not a truncated int
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+def card_reader_disk(k32, root):
+    """A FAT or FAT32 disk on a USB, SD or MMC bus: many card readers call the card in them a fixed disk. A Wii U card is FAT32, as an
+    internal disk never is."""
+    import ctypes
+    from ctypes import wintypes
+    name = ctypes.create_unicode_buffer(16)
+    if not k32.GetVolumeInformationW(root, None, 0, None, None, None, name, 16) or name.value not in ('FAT32', 'FAT'):
+        return False
+    disk = k32.CreateFileW(f'\\\\.\\{root[:2]}', 0, 3, None, 3, 0, None)  # no access asked for: what a disk is needs no rights
+    if disk in (None, ctypes.c_void_p(-1).value):  # INVALID_HANDLE_VALUE
+        return False
+    try:
+        query = (ctypes.c_uint32 * 3)()  # STORAGE_PROPERTY_QUERY: StorageDeviceProperty, PropertyStandardQuery
+        descriptor, got = ctypes.create_string_buffer(64), wintypes.DWORD()
+        if not k32.DeviceIoControl(disk, IOCTL_STORAGE_QUERY_PROPERTY, query, 12, descriptor, 64, ctypes.byref(got), None) or got.value < 32:
+            return False
+        return int.from_bytes(descriptor.raw[28:32], 'little') in CARD_BUSES  # STORAGE_DEVICE_DESCRIPTOR.BusType
+    finally:
+        k32.CloseHandle(disk)
+
+
+def wiiu_card(path):
+    return os.path.isdir(os.path.join(path, 'wiiu'))
+
+
 def sd_cards():
-    """removable drives, the ones already set up for a Wii U first"""
+    """(path, removable) for removable drives and card readers' disks: the ones already set up for a Wii U first, then removable ones"""
     found = []
     if WIN:
-        import ctypes
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        k32 = kernel32()
+        mask = k32.GetLogicalDrives()
         for i in range(26):
             root = f'{chr(65 + i)}:\\'
-            if mask >> i & 1 and ctypes.windll.kernel32.GetDriveTypeW(root) == 2:  # DRIVE_REMOVABLE
-                found.append(root)
+            if not mask >> i & 1:
+                continue
+            kind = k32.GetDriveTypeW(root)
+            if kind == DRIVE_REMOVABLE or (kind == DRIVE_FIXED and card_reader_disk(k32, root)):
+                found.append((root, kind == DRIVE_REMOVABLE))
     else:
         user = os.environ.get('USER', '')
         for base in (f'/media/{user}', f'/run/media/{user}'):
             if os.path.isdir(base):
-                found += [os.path.join(base, d) for d in sorted(os.listdir(base))]
-    return sorted(found, key=lambda d: not os.path.isdir(os.path.join(d, 'wiiu')))
+                found += [(os.path.join(base, d), True) for d in sorted(os.listdir(base))]
+    return sorted(found, key=lambda card: (not wiiu_card(card[0]), not card[1]))
 
 
 def describe(d):
@@ -283,6 +331,7 @@ class App(QObject):
     keyRefused = Signal()  # SteamGridDB turned the key down: from fetch_cover's thread
     updateEvent = Signal(str, object)  # what, value: from the updater's worker threads, the value passed as it is
     logChanged = Signal()
+    destWanted = Signal()  # build() has nowhere to put the game: the window brings its choice into view
 
     def _p(kind, name, notify=changed):
         return Property(kind, lambda self: self._s[name], notify=notify)
@@ -1040,9 +1089,11 @@ class App(QObject):
 
     def refresh_cards(self):
         cards = sd_cards()
-        if self.st.get('card') not in cards:
-            self.st['card'] = cards[0] if cards else ''
-        self.set(cards=[dict(path=c, label=f'{c}    {"set up for a Wii U" if os.path.isdir(os.path.join(c, "wiiu")) else "removable drive"}') for c in cards])
+        if self.st.get('card') not in [path for path, _ in cards]:
+            # chosen without asking only where it can't be some other disk: removable, or set up for a Wii U, never a USB hard drive
+            self.st['card'] = next((path for path, removable in cards if removable or wiiu_card(path)), '')
+        self.set(cards=[dict(path=path, label=f'{path}    {"set up for a Wii U" if wiiu_card(path) else "removable drive" if removable else "card reader"}')
+                        for path, removable in cards])
 
     def refresh_files(self):
         keys, otp = self.st['keys'], self.st.get('otp', '')
@@ -1212,6 +1263,7 @@ class App(QObject):
             return
         dest = self.st.get('card', '') if self._s['target'] == 'card' else self.st.get('folder', '')
         if not dest or not os.path.isdir(dest):
+            self.destWanted.emit()
             self.tell('Where should it go?', 'Choose an SD card or a folder for the game.', 'warn')
             return
         self.find_system(True)

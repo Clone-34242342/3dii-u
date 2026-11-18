@@ -133,8 +133,8 @@ static inline u32 smlaxy_add(u32 p, u32 acc, u32 *q) {
     return (u32)r;
 }
 static inline u32 ssat(u32 v, int bits, u32 *q) {
+    if (bits == 32) return v;  // before the limits: at 32 they overflow s32
     s32 x = (s32)v, hi = (1 << (bits - 1)) - 1, lo = -(1 << (bits - 1));
-    if (bits == 32) return v;
     if (x > hi) { *q = 1; return (u32)hi; }
     if (x < lo) { *q = 1; return (u32)lo; }
     return v;

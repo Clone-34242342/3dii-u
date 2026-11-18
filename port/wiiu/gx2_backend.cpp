@@ -274,6 +274,22 @@ struct PsEntry {
 };
 constexpr u32 COMPILED_HERE = 0x7ffffffe;  // a VsEntry or PsEntry index: the console compiled it, nothing to load from the shipped set
 constexpr u32 MISSED = ~0u;                // the set lacks it: the fallback draws, or the CPU does, until the console has compiled it
+// GPU-thread owned, monotonic for this session: queued draws finish before a larger VS partition is published.
+uint32_t vertex_registers = shader_budget::kDefaultVertex;
+bool state_lost = true;  // the GPU's state no longer matches what was last set
+void shader_mode() {
+    GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_BLOCK, vertex_registers, 64, 0, 0, shader_budget::pixel(vertex_registers), 192);
+}
+void require_vs_registers(uint32_t required) {
+    const uint32_t next = shader_budget::vertex(vertex_registers, required);
+    if (!next) FATAL("vertex shader needs %u ordinary registers (supported 1..%u)\n", required, shader_budget::kOrdinary);
+    if (next == vertex_registers) return;
+    GX2DrawDone();
+    vertex_registers = next;
+    shader_mode();
+    state_lost = true;
+    LOG("[gx2] shader registers: VS %u, PS %u\n", vertex_registers, shader_budget::pixel(vertex_registers));
+}
 std::unordered_map<u64, VsEntry> vs_table;
 std::unordered_map<u64, PsEntry> ps_table;
 GX2VertexShader *vs_passthrough, *vs_blit;
@@ -330,14 +346,16 @@ std::vector<GfdShader> gfd_vs, gfd_ps;
 std::vector<u8> gfd_file_head, gfd_end;  // the file's header and its end block
 FILE *gfd_file;
 
-static void gfd_scan(const u8 *d, u32 n) {
+static void gfd_scan(const u8 *d, u32 n, const u8 *idx, u32 idx_size) {
     constexpr u32 VS_HEAD = 3, VS_PROG = 5, PS_HEAD = 6, PS_PROG = 7, END = 1;
     auto be32 = [&](u32 at) { return (u32)d[at] << 24 | (u32)d[at + 1] << 16 | (u32)d[at + 2] << 8 | d[at + 3]; };
     if (n < 32 || memcmp(d, "Gfx2", 4)) FATAL("shaders.gsh is not a GFD file\n");
     const u32 first = be32(4);
+    if (first < 32 || first > n) FATAL("shaders.gsh has an invalid file header\n");
     gfd_file_head.assign(d, d + first);
     for (u32 at = first; at + 32 <= n && !memcmp(d + at, "BLK{", 4);) {
         const u32 head = be32(at + 4), kind = be32(at + 16), size = be32(at + 20), len = head + size;
+        if (head < 32 || head > n - at || size > n - at - head) FATAL("shaders.gsh has an invalid block at %u\n", at);
         if (kind == VS_HEAD) gfd_vs.push_back({at, len, 0, 0});
         else if (kind == VS_PROG && !gfd_vs.empty()) gfd_vs.back().prog_at = at, gfd_vs.back().prog_len = len;
         else if (kind == PS_HEAD) gfd_ps.push_back({at, len, 0, 0});
@@ -345,6 +363,34 @@ static void gfd_scan(const u8 *d, u32 n) {
         else if (kind == END) gfd_end.assign(d + at, d + at + len);
         at += len;
     }
+    if (gfd_vs.empty()) FATAL("shaders.gsh contains no vertex programs\n");
+    if (!idx || idx_size < 32) FATAL("shaders.idx is missing\n");
+    auto index_word = [&](u32 at) { return (u32)idx[at] << 24 | (u32)idx[at + 1] << 16 | (u32)idx[at + 2] << 8 | idx[at + 3]; };
+    if (index_word(0) != kShaderIndexMagic || index_word(4) != kShaderIndexVersion) FATAL("shaders.idx is the wrong version\n");
+    const u32 pixels = index_word(8), vertices = index_word(12), entries = (idx_size - 32) / 16;
+    if (pixels > entries || vertices > entries - pixels) FATAL("shaders.idx is truncated\n");
+    u32 most_vs = shader_budget::kDefaultVertex;
+    std::vector<bool> used_vs(gfd_vs.size()), used_ps(gfd_ps.size());
+    auto use = [&](bool vertex, u32 index) {
+        const auto &shaders = vertex ? gfd_vs : gfd_ps;
+        auto &used = vertex ? used_vs : used_ps;
+        if (index >= shaders.size()) FATAL("shaders.idx references missing %s program %u\n", vertex ? "vertex" : "pixel", index);
+        if (used[index]) return;
+        used[index] = true;
+        const auto &s = shaders[index];
+        const u32 h = be32(s.head_at + 4), p = s.prog_len ? be32(s.prog_at + 4) : 0;
+        if (s.head_len - h < 4 || !s.prog_len) FATAL("shaders.gsh has an incomplete shader %u\n", index);
+        const u32 declared = be32(s.head_at + h) & 255;
+        u32 required;
+        if (!program_registers(d + s.prog_at + p, s.prog_len - p, declared, required) || required != declared)
+            FATAL("shaders.gsh %s program %u has invalid layout/register references (declared %u, maximum %u)\n", vertex ? "vertex" : "pixel", index, declared, shader_budget::kOrdinary);
+        if (vertex) most_vs = std::max(most_vs, required);
+    };
+    // Invalid GSX bodies remain in GSH after Builder removes their IDX entries; only reachable programs need a partition.
+    use(true, index_word(16)); use(true, index_word(20));
+    use(false, index_word(24)); use(false, index_word(28)); use(false, index_word(28) + 1);
+    for (u32 i = 0; i < pixels + vertices; i++) use(i >= pixels, index_word(32 + 16 * i + 8));
+    require_vs_registers(most_vs);
 }
 
 // one shader's blocks as a GFD file of their own, its blocks numbered as the first of their kind
@@ -389,7 +435,7 @@ void load_shader_tables() {
     {
         std::vector<u8> file = read_whole("fs:/vol/content/shaders.gsh", 0);
         if (file.empty()) FATAL("shaders.gsh is missing\n");
-        gfd_scan(file.data(), (u32)file.size());
+        gfd_scan(file.data(), (u32)file.size(), idx.data(), (u32)idx.size());
     }  // and the memory goes back
     gfd_file = fopen("fs:/vol/content/shaders.gsh", "rb");
     if (!gfd_file) FATAL("shaders.gsh is missing\n");
@@ -466,7 +512,7 @@ GX2PixelShader *find_ps(const DrawState &ds) {
     GX2PixelShader *r = fallback;
     if (it != ps_table.end()) {
         if (!it->second.shader) {
-        if (glsl_force && ds.need_shade && shader_compile_on()) shader_compile_request(false, h, gen_fs_glsl(ds), 0);
+        if (glsl_force && (ds.need_shade || ds.wbuffer || ds.scissor_mode == 1) && shader_compile_on()) shader_compile_request(false, h, gen_fs_glsl(ds), 0);
         it->second.shader = load_ps(it->second.index);
         const GX2PixelShader *q = it->second.shader;
         static int shown;
@@ -485,7 +531,7 @@ GX2PixelShader *find_ps(const DrawState &ds) {
         miss_put("FS  ", 4);
         miss_put(&n, 4);
         miss_put(k.data(), k.size());
-        if (ds.need_shade && shader_compile_on()) shader_compile_request(false, h, gen_fs_glsl(ds), 0);  // the console compiles it meanwhile: gfx_pump installs it
+        if ((ds.need_shade || ds.wbuffer || ds.scissor_mode == 1) && shader_compile_on()) shader_compile_request(false, h, gen_fs_glsl(ds), 0);  // the console compiles it meanwhile: gfx_pump installs it
     }
     seen[quick] = r;
     last = r;
@@ -539,6 +585,7 @@ void install_compiled() {
                 shader_compile_discard(d);
                 continue;
             }
+            require_vs_registers(d.vs_shader->regs.sq_pgm_resources_vs & 255);
             if (const auto shipped = vs_set_aside.find(d.key); shipped != vs_set_aside.end())  // "glslvsforce": the two side by side
                 log_vs_tables("shipped", d.key, load_vs(shipped->second));
             VsEntry &v = vs_table[d.key];
@@ -550,8 +597,9 @@ void install_compiled() {
                 const u32 words = unburst(made, v.shader->size / 4, nullptr);
                 if (u8 *const longer = words ? (u8 *)memalign(GX2_SHADER_PROGRAM_ALIGNMENT, words * 4) : nullptr) {
                     unburst(made, v.shader->size / 4, longer);
-                    v.shader->program = longer;  // (the compiler's block stays its own: nothing frees an installed shader)
+                    v.shader->program = longer;
                     v.shader->size = words * 4;
+                    if (d.from_gfd) free((void *)made);  // CafeGLSL owns its block; a restored program is a separate allocation
                 }
             }
             GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, v.shader->program, v.shader->size);
@@ -659,7 +707,7 @@ std::vector<Surface *> read_targets;  // those the list being run has drawn to, 
 GX2ContextState *ctx;
 GX2DepthBuffer scratch_depth;
 bool frame_started;
-bool state_lost = true;  // the GPU's state no longer matches what was last set
+
 bool state_sent_valid;   // set_state's record of what it last sent still holds (StateSent)
 
 #ifdef GX2_JUNK  // test builds: fresh host memory filled with noise, as a console's is, so that Cemu shows what starts uninitialized. 1 surfaces, 2 textures, 4 the ring
@@ -741,7 +789,7 @@ bool share_depth_block(GX2Surface &f) {
 
 // The top screen is drawn at 1200x720, three times the 3DS's, and the blit scales it up to the TV, as most Wii U games' pictures are (the user's choice, 2026-11-06). Under half the
 // pixels of 1800x1080, targets small enough for nearly all to fit in fast memory, and a whole-number scale, so 3DS pixel edges never land on TV pixel centres.
-// The options menu's RESOLUTION line can make it 800x480, twice the 3DS's, for a GPU with less to do (settings.ini, from the next start).
+// The options menu's RESOLUTION line also offers 240, 440 and 480 rows, for a GPU with less to do (settings.ini, from the next start).
 // "top1080" (a file in the data folder, or a test run's flag) draws at 1800x1080 again, to compare.
 u32 top_rows = 720;
 int start_resolution = 720;  // settings.ini's resolution as this start took it: the menu says when a change waits for the next
@@ -835,10 +883,16 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
         f.use = GX2_SURFACE_USE_DEPTH_BUFFER;
         f.tileMode = GX2_TILE_MODE_DEFAULT;
         s->db.viewNumSlices = 1;
-        s->db.depthClear = 1.0f;
+        // A depth buffer starts as its guest memory, as on a 3DS: a game that never fills its depth (Pokédex 3D clears only by drawing)
+        // finds what VRAM held there, zeros from boot, not the GPU's usual 1.0 or a console's fresh memory. One that fills first overwrites it.
+        const u8 *g = pptr(addr);
+        const u32 v = g ? (u32)g[0] | (u32)g[1] << 8 | (u32)g[2] << 16 | (u32)g[3] << 24 : 0;
+        s->db.depthClear = fmt == 0 ? (v & 0xffff) / 65535.0f : (v & 0xffffff) / 16777215.0f;
+        s->db.stencilClear = fmt == 3 ? (u8)(v >> 24) : 0;
+        s->clear_pending = true;  // take_depth_block, at the first draw that uses it
         GX2CalcSurfaceSizeAndAlignment(&f);
         GX2InitDepthBufferRegs(&s->db);
-        if (screen && mem1_relief && share_depth_block(f)) s->mem1 = s->shared_depth = s->clear_pending = true;
+        if (screen && mem1_relief && share_depth_block(f)) s->mem1 = s->shared_depth = true;
         else f.image = alloc_surface_mem(f.imageSize, f.alignment, s->mem1, screen);
     } else {
         memset(&s->cb, 0, sizeof s->cb);
@@ -936,19 +990,19 @@ volatile bool vtx_drop_all;
 // A draw's vertex data was copied (and integers made floats) at every draw, the whole span its indices reach: Luigi's Mansion: Dark Moon's draws reach 1300
 // to 4100 vertices, 36 to 115 KB, 20 to 50 MB a frame, about 43 ms of each frame on a console. What a draw read stays converted, until the game says it
 // may have written there: every way a game can make its writes seen by the GPU (GSP's cache calls, GX's, the kernel's, and the GPU's own copies) comes
-// through metal_guest_written, in order with the commands, as the texture cache relies on too. In case a game writes without saying, an entry is checked
-// against what's in memory now and then (kVtxRecheck flips).
+// through metal_guest_written, in order with the commands, as the texture cache relies on too. Ordinary CPU stores need not say so: check an entry's
+// bytes at its first use in each command list. Repeated draws in that list reuse the check; changed bytes get a new copy, leaving queued draws' copies intact.
 struct VtxEntry {
     u32 addr = 0, bytes = 0;  // the source, in guest memory
     void *buf = nullptr;
     u32 size = 0;
     u64 hash = 0;
-    u32 used = 0, checked = 0;  // flips
+    u32 used = 0, checked = 0;  // flips, command lists
 };
 std::unordered_map<u64, VtxEntry> vtx_cache;
 std::vector<std::pair<void *, u32>> vtx_retired;  // buffers the GPU may still read, and the flip from which they can go
 u64 vtx_cache_size, st_vtx_hits, st_vtx_misses;
-constexpr u32 kVtxRecheck = 60;
+u32 vtx_list;
 constexpr u64 kVtxCacheMax = 48u << 20;
 
 void vtx_retire(VtxEntry &e) {
@@ -1003,8 +1057,8 @@ const void *vtx_cached(u32 addr, const u8 *src, u32 src_stride, u32 count, u32 k
     auto it = vtx_cache.find(key);
     if (it != vtx_cache.end()) {
         VtxEntry &e = it->second;
-        if (e.addr == addr && e.size == size && e.buf && (now - e.checked < kVtxRecheck || hash_bytes(src, bytes) == e.hash)) {
-            if (now - e.checked >= kVtxRecheck) e.checked = now;
+        if (e.addr == addr && e.size == size && e.buf && (e.checked == vtx_list || hash_bytes(src, bytes) == e.hash)) {
+            e.checked = vtx_list;
             e.used = now;
             if (kMeasure) st_vtx_hits++;
             return e.buf;
@@ -1028,7 +1082,8 @@ const void *vtx_cached(u32 addr, const u8 *src, u32 src_stride, u32 count, u32 k
     e.buf = buf;
     e.size = size;
     e.hash = hash_bytes(src, bytes);
-    e.used = e.checked = now;
+    e.used = now;
+    e.checked = vtx_list;
     vtx_cache_size += size;
     return buf;
 }
@@ -1125,7 +1180,7 @@ MemoryFills memory_fills;
 
 void restore_context() {
     GX2SetContextState(ctx);
-    GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
+    shader_mode();
     state_lost = true;
     cur_color = cur_depth = nullptr;
 }
@@ -1145,6 +1200,7 @@ void apply_fill(Surface &s, const Fill &f) {
             return;
         }
         GX2ClearDepthStencilEx(&s.db, d, st, GX2_CLEAR_FLAGS_BOTH);
+        s.clear_pending = false;  // filled: nothing left of its start-up clear
     } else {
         const u32 v = f.value;
         float r, g, b, a = 1;
@@ -1924,12 +1980,12 @@ void bind_targets(const RTConfig &rt, const DrawState *ds = nullptr) {
     gt_mark(GT_DRAW, c->addr);
 }
 
-// A draw is about to use the depth buffer just bound. If it's in the shared block, it needs its pending clear now. If it has neither that nor the block's contents, the game
-// came back to it without clearing it and these two can't share: this frame's depth is lost, and from now on it has memory of its own.
+// A draw is about to use the depth buffer just bound. If it's in the shared block, or new and never filled, it needs its pending clear now. If a shared one has neither
+// that nor the block's contents, the game came back to it without clearing it and these two can't share: this frame's depth is lost, and from now on it has memory of its own.
 void take_depth_block(const RTConfig &rt) {
     Surface &d = *cur_depth;
-    if (!d.shared_depth) return;
-    if (depth_owner != &d && !d.clear_pending) {
+    if (!d.shared_depth && !d.clear_pending) return;
+    if (d.shared_depth && depth_owner != &d && !d.clear_pending) {
         LOG("[gx2] depth %08x %ux%u came back with no clear: giving it its own memory\n", d.addr, d.w, d.h);
         GX2Surface &f = d.db.surface;
         f.image = alloc_surface_mem(f.imageSize, f.alignment, d.mem1, false);
@@ -2382,7 +2438,7 @@ void decode_textures_first(const DrawState &ds) {
 
 void begin_draw_common(const DrawState &ds, GX2PixelShader *ps) {
     if (state_lost) {
-        GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
+        shader_mode();
         state_lost = false;
         state_sent_valid = false;
     }
@@ -2544,12 +2600,20 @@ bool gx2_draw(const Gx2Draw &d) {
         // The console compiles the shader itself, as it does pixel shaders (install_compiled puts it in the table), and this draw and the
         // next ones go the CPU way meanwhile. A build's dump scan misses programs a game keeps outside shader binaries: 63 of
         // the 64 vertex shaders runs met and builds lacked (2026-11-10).
-        if (glsl_vs && shader_compile_on()) {
+        const bool compiler_on = shader_compile_on();
+        if (glsl_vs && compiler_on) {
             u32 bools = 0, inputs = 0;
             for (u32 i = 0; i < 16; i++)
                 if (g.vs.b[i]) bools |= 1u << i;
+            shader_glsl_fail_line = 0;
+            shader_glsl_fail_at = 0;
             std::string glsl = gen_vs_glsl(d.prog, d.entry, bools, g.vs.i, d.slot_src, &inputs);
             if (!glsl.empty()) shader_compile_request(true, key, std::move(glsl), inputs);
+            else LOG("[gx2] vertex %016llx entry %u not requested: empty GLSL, shader.cpp line %d instruction %u\n",
+                     (unsigned long long)key, d.entry, shader_glsl_fail_line, shader_glsl_fail_at);
+        } else {
+            LOG("[gx2] vertex %016llx entry %u not requested: glsl_vs=%u compiler_on=%u\n",
+                (unsigned long long)key, d.entry, (u32)glsl_vs, (u32)compiler_on);
         }
         return false;
     }
@@ -2716,7 +2780,8 @@ bool gx2_draw(const Gx2Draw &d) {
         const bool constant = !at || at->is_default || at->elems == 0 || at->stride == 0;
         if (constant) {
             static const float k_zero[4] = {0, 0, 0, 0}, k_unit[4] = {0, 0, 0, 1};
-            const float *v = !at ? k_zero : at->is_default ? g.default_attr[a].v : k_unit;
+            const float *v = !at ? (memcmp(g.default_attr[r].v, k_zero, 16) ? g.default_attr[r].v : k_unit)
+                                 : at->is_default ? g.default_attr[a].v : k_unit;
             float *c = (float *)ring_alloc(64, 64);
             memcpy(c, v, 16);
             DCFlushRange(c, 16);
@@ -3223,7 +3288,7 @@ void draw_screen(const Screen &s, u32 x, u32 y, u32 w, u32 h) {
 }
 
 void begin_blit() {
-    GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
+    shader_mode();
     GX2SetVertexShader(vs_blit);
     GX2SetPixelShader(ps_blit);
     GX2SetFetchShader(blit_fetch);
@@ -3306,12 +3371,15 @@ std::vector<u8> surface_ppm(GX2Surface &src, u32 step) {
     st.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     st.aa = GX2_AA_MODE1X;
     st.use = GX2_SURFACE_USE_TEXTURE;
-    st.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    // In Cemu a copy to a LINEAR_ALIGNED surface lands some draws later (its read-back is scheduled), so a render target came back black
+    // or stale; LINEAR_SPECIAL finishes at once once the queue is drained, as write_back does
+    st.tileMode = in_cemu ? GX2_TILE_MODE_LINEAR_SPECIAL : GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&st);
     st.image = memalign(st.alignment, st.imageSize);
     if (!st.image) return out;
     memset(st.image, 0, st.imageSize);
     DCFlushRange(st.image, st.imageSize);
+    if (in_cemu) draw_done();
     GX2CopySurface(&src, 0, 0, &st, 0, 0);
     GX2DrawDone();
     DCInvalidateRange(st.image, st.imageSize);
@@ -3416,9 +3484,10 @@ void forget_unused() {
     constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
     for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
         Surface &s = **it;
-        if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth || transfer_source(s)) continue;
+        if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || &s == depth_owner || transfer_source(s)) continue;
         if (!surface_readback::retire(s, surfaces, write_back)) continue;
-        if (void *image = s.image()) {
+        // Shared depth descriptors borrow depth_block; retiring one must not free it.
+        if (void *image = s.shared_depth ? nullptr : s.image()) {
             if (!s.mem1) free(image);
             else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(image);
         }
@@ -4300,7 +4369,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
 }
 
 void gx2_cpu_will_read(u32 paddr, u32 size) {
-    for (const LastTransfer &t : last_transfer) {
+    for (LastTransfer &t : last_transfer) {
         if (!t.src || !surface_readback::overlaps(surface_readback::bounds(t.out_paddr, t.out_size), surface_readback::bounds(paddr, size))) continue;
         // This is the transfer's source picture, not necessarily the newest view of its old guest address.
         if (t.in_paddr < t.src->addr) continue;
@@ -4315,6 +4384,7 @@ void gx2_cpu_will_read(u32 paddr, u32 size) {
             memory_fills.forget(t.out_paddr, t.out_size);
             transfer_convert(src, dst, t.in_dims, t.out_dims, t.flags);
             DCFlushRange(dst, t.out_size);
+            t.src = nullptr;  // The whole copy is now in memory; replaying it would undo newer writes.
         }
     }
     metal_guest_read(paddr, size);
@@ -4339,6 +4409,7 @@ void gx2_finish_list() {
     }
     read_targets.clear();
     GX2Flush();
+    if (!++vtx_list) vtx_invalidate(0, ~0u);
 }
 
 bool get_display_image_for(u32, u32, u32, const u32 **, int *, int *) { return false; }
@@ -4452,7 +4523,7 @@ void gfx_thread_init() {
     ctx = (GX2ContextState *)memalign(GX2_CONTEXT_STATE_ALIGNMENT, sizeof(GX2ContextState));
     GX2SetupContextStateEx(ctx, TRUE);
     GX2SetContextState(ctx);
-    GX2SetShaderMode(GX2_SHADER_MODE_UNIFORM_BLOCK);
+    shader_mode();
     GX2SetRasterizerClipControlEx(TRUE, TRUE, TRUE);
     GX2SetSwapInterval(1);
     ring = (u8 *)memalign(0x1000, RING_SIZE);
@@ -4513,7 +4584,7 @@ void gfx_thread_init() {
     if (in_cemu) gxt_cpu_attr |= 1;
     tv_layout = std::clamp(g_settings.tv_layout, 0, screens::kTvLayouts - 1);
     pad_layout = std::clamp(g_settings.pad_layout, 0, screens::kPadLayouts - 1);
-    top_rows = start_resolution = g_settings.resolution == 480 ? 480 : 720;  // "top1080" below can still change top_rows
+    top_rows = start_resolution = g_settings.resolution == 240 || g_settings.resolution == 440 || g_settings.resolution == 480 ? g_settings.resolution : 720;  // "top1080" below can still change top_rows
     if (wiiu::debug_flag("dynres")) dyn_test = true;
     if (wiiu::debug_flag("nocap")) cap_fps = 0;
     if (cap_fps) LOG("[gx2] this game is held to %u frames a second\n", cap_fps);
@@ -4594,8 +4665,11 @@ static void next_pad_layout(int dir) {
 }
 
 // the rows the top screen is drawn at (top_rows), from the next start: the targets already made keep their size
-static void next_resolution() {
-    g_settings.resolution = g_settings.resolution == 480 ? 720 : 480;
+static void next_resolution(int dir) {
+    const int choices[] = {240, 440, 480, 720};
+    const int *it = std::find(choices, choices + 4, g_settings.resolution);
+    const int index = it == choices + 4 ? 3 : it - choices;
+    g_settings.resolution = choices[(index + (dir > 0 ? 1 : 3)) % 4];
     wiiu::settings_due = true;
 }
 
@@ -4641,7 +4715,7 @@ void menu_input(u32 pressed, u32 held) {
     if (menu_item == 3 && dir) next_language(dir);
     if (menu_item == 4 && dir) next_tv_layout(dir);
     if (menu_item == 5 && dir) next_pad_layout(dir);
-    if (menu_item == 6 && dir) next_resolution();
+    if (menu_item == 6 && dir) next_resolution(dir);
     if (menu_item == 7 && (dir || (pressed & VPAD_BUTTON_A))) {  // the frame rate counter (draw_fps), kept in settings.ini
         g_settings.show_fps = !g_settings.show_fps;
         wiiu::settings_due = true;

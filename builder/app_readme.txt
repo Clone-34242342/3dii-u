@@ -53,6 +53,8 @@ WHICH GAMES WORK
 - "Runs in Cemu" (the Games page): built with this builder and played in the Cemu emulator, not yet on a real Wii U:
   Mario Kart 7, The Legend of Zelda: A Link Between Worlds, Metroid: Samus Returns, Kirby: Triple Deluxe, Rhythm Heaven Megamix,
   Phoenix Wright: Ace Attorney Trilogy, Animal Crossing: New Leaf, Kid Icarus: Uprising, Super Mario 3D Land and Miitopia.
+- The right stick and ZL/ZR provide Circle Pad Pro input when a game connects to that accessory. Otherwise ZL/ZR also act as L/R.
+  The PR #44 contributor reports Majora's Mask 3D play in Cemu; that game remains Untested here, with no console report.
 - "Untested": every other game, and any game with a mod. It may play, it may not start, or it may stop partway.
   Reports on these games help the most.
 

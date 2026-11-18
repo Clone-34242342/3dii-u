@@ -510,6 +510,107 @@ static void byte_arguments() {
     assert(call(0x13, {0xaabbcc00}) == 0);
 }
 
+static void y2r_coefficients() {
+    const auto camera = service;
+    kernel::register_y2r();
+    assert(call(0x2b) == 0);
+    auto done = event_call(0xf, {});
+    // Wire words are independent fixtures, including the signed offsets' two's-complement halves.
+    constexpr std::array<std::array<u32, 4>, 4> standard = {{
+        {0x01660100, 0x005800b6, 0xe99101c5, 0xe3a510ee},
+        {0x01930100, 0x002f0077, 0xe6cd01db, 0xe2af0a7c},
+        {0x0198012a, 0x006400d0, 0xe4220204, 0xdd6510f2},
+        {0x01ca012a, 0x00360088, 0xe0fc021c, 0xdbdf099c},
+    }};
+    constexpr std::array<u32, 4> zero{}, custom{0x8000ffff, 0x7fff0001, 0xabcd1234, 0x0000fedc};
+    auto query = [&](u32 command, u32 index, const std::array<u32, 4> &expected, u32 result = 0) {
+        constexpr u32 sentinel = 0xa55a3cc3;
+        w32(0xfc, sentinel);
+        w32(0x200, sentinel);
+        for (u32 i = 0; i < 64; i++) w32(0x100 + 4 * i, sentinel);
+        w32(0x100, command << 16 | (command == 0x21 ? 0x40 : 0));
+        if (command == 0x21) w32(0x104, index);
+        kernel::IPC ipc(nullptr, 0x100, &ipc_lock);
+        service->handle(ipc);
+        assert(r32(0x100) == (command << 16 | (result ? 1u : 5u) << 6));
+        assert(r32(0x104) == result);
+        std::array<u32, 4> actual;
+        for (u32 i = 0; i < 4; i++) {
+            actual[i] = r32(0x108 + 4 * i);
+            assert(actual[i] == (result ? sentinel : expected[i]));
+        }
+        for (u32 i = 6; i < 64; i++) assert(r32(0x100 + 4 * i) == sentinel);
+        assert(r32(0xfc) == sentinel && r32(0x200) == sentinel);
+        return actual;
+    };
+    puts("Y2R coefficient getter IPC tests");
+    fflush(stdout);
+    query(0x21, 0, standard[0]);
+    query(0x1f, 0, zero);  // reading a standard did not replace DriverInitialize's zero coefficients
+    assert(!done->signaled);
+    assert(call(0x1e, {custom[0], custom[1], custom[2], custom[3]}) == 0);
+    for (u32 index = 0; index < standard.size(); index++) {
+        query(0x21, index, standard[index]);
+        query(0x1f, 0, custom);
+        assert(!done->signaled);
+    }
+    for (u32 index : {4u, 0x100u, 0x80000000u, 0xffffffffu}) {
+        query(0x21, index, zero, 0xe0e053ed);
+        query(0x1f, 0, custom);
+        assert(!done->signaled);
+    }
+    assert(call(0x2b) == 0);
+    query(0x1f, 0, zero);
+
+    constexpr u32 input = 0x210001, direct_output = 0x220001, restored_output = 0x230001;
+    constexpr std::array<u8, 32> samples = {
+        16, 128, 16, 128, 235, 128, 235, 128, 81, 90, 81, 240, 145, 54, 145, 34,
+        41, 240, 41, 110, 0, 0, 255, 255, 64, 200, 192, 20, 17, 129, 234, 127,
+    };
+    std::fill_n(memory.data() + input - 1, samples.size() + 2, 0xa5);
+    std::copy(samples.begin(), samples.end(), memory.begin() + input);
+    assert(call(1, {4}) == 0 && call(3, {3}) == 0);  // YUYV422 to RGB565, linear 8x2
+    assert(call(0x1a, {8}) == 0 && call(0x1c, {2}) == 0 && call(0x22, {0xa6}) == 0);
+    assert(call(0x13, {input, samples.size(), 0, 0}) == 0);
+    auto convert_frame = [&](u32 address) {
+        std::fill_n(memory.data() + address - 1, samples.size() + 2, 0xa5);
+        assert(call(0x18, {address, samples.size(), 0, 0}) == 0);
+        done->signaled = false;
+        assert(call(0x26) == 0 && done->signaled);
+        assert(memory[address - 1] == 0xa5 && memory[address + samples.size()] == 0xa5);
+        return std::vector<u8>(memory.begin() + address, memory.begin() + address + samples.size());
+    };
+    for (u32 index = 0; index < standard.size(); index++) {
+        assert(call(0x20, {index}) == 0);
+        query(0x1f, 0, standard[index]);
+        const auto direct = convert_frame(direct_output);
+        assert(call(0x1e, {custom[0], custom[1], custom[2], custom[3]}) == 0);
+        done->signaled = false;
+        const int before_writes = writes;
+        const auto returned = query(0x21, index, standard[index]);
+        query(0x1f, 0, custom);
+        assert(!done->signaled && writes == before_writes);
+        assert(call(0x1e, {returned[0], returned[1], returned[2], returned[3]}) == 0);
+        assert(convert_frame(restored_output) == direct);
+        if (index == 2) {
+            const std::array<u16, 5> colors = {0, 0xffff, 0xf800, 0x07e0, 0x001f};
+            for (u32 i = 0; i < colors.size(); i++) {
+                assert(direct[4 * i] == (colors[i] & 0xff));
+                assert(direct[4 * i + 1] == (colors[i] >> 8));
+            }
+        }
+        assert(call(2) == 0 && r32(0x108) == 4);
+        assert(call(4) == 0 && r32(0x108) == 3);
+        assert(call(0x1b) == 0 && r32(0x108) == 8);
+        assert(call(0x1d) == 0 && r32(0x108) == 2);
+        assert(call(0x23) == 0 && r32(0x108) == 0xa6);
+    }
+    assert(std::equal(samples.begin(), samples.end(), memory.begin() + input));
+    assert(memory[input - 1] == 0xa5 && memory[input + samples.size()] == 0xa5);
+    service = camera;
+    puts("Y2R getters: four standards, signed custom/zero words, guards, errors, state and real conversion parity passed");
+}
+
 int main(int argc, char **argv) {
     conversion_oracle();
     if (argc == 2 && strcmp(argv[1], "--benchmark") == 0) { benchmark(); return 0; }
@@ -519,5 +620,6 @@ int main(int argc, char **argv) {
     y2r_parity();
     query_replies();
     byte_arguments();
+    y2r_coefficients();
     puts("camera: padded NV12, crops/flips, RGB565LE/Y2R parity, actual IPC partial receive/cancel/rearm, busy masks and bounds passed");
 }

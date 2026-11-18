@@ -136,7 +136,7 @@ def bundle_engine(engine):
         if os.path.isdir(os.path.join(src, 'shader_logs')):
             made, missing = bundle_logs(src, dst)
             recipes, left = recipes + made, left + missing
-    print(f'shader logs: {recipes} vertex records as recipes, {left} left out, their programs in no file of the dump to find them by')
+    print(f'shader logs: {recipes} vertex records as recipes, {left} unresolved; source data absent or unmatched')
     # libstdc++'s policy-based data structures: nothing here uses them, and theirs are the deepest paths, past what Windows can copy in a deep folder.
     # binutils' bfd-plugins: nm and ld load each file there as a DLL, and its libdep.a (a static library) made Windows stop a build with a
     # "bad image" box on a tester's PC (issue 1); the builds use no plugin

@@ -99,7 +99,8 @@ renderer and SDL audio output. The Wii U and PC builds leave them out.
 The backend splits the work the way upstream's Metal renderer does. `runtime/gpu` decodes the PICA200's registers into
 a `DrawState`, and the backend turns each draw into GX2 state and a draw call.
 
-**Shaders are compiled ahead of time.** Nothing is compiled when the game first needs it, so there's no stutter.
+**Known shaders are compiled ahead of time.** New states can still require runtime compilation or CPU shading on their
+first encounter; successfully compiled native shaders are cached for later starts.
 
 - [`shadergen.cpp`](port/wiiu/shadergen.cpp) writes GLSL. A fragment shader covers one fragment-pipeline state: TEV
   combiners, fragment lighting, fog, alpha test. A vertex shader covers one PICA vertex program, or a vertex program
@@ -120,7 +121,7 @@ a `DrawState`, and the backend turns each draw into GX2 state and a draw call.
 
 **When a shader is missing,** a fragment state draws with a generic "uber" shader or a plain fallback, and is logged.
 A vertex program without a shader is shaded on the CPU, as is a geometry shader's draw (logged for the next build, or
-left there where its result could depend on an earlier run's state). The console can also compile missing pixel shaders itself, on a
+left there where its result could depend on an earlier run's state). The console can also compile missing vertex and pixel shaders itself, on a
 thread of its own, with CafeGLSL's Wii U library ([`shader_compile.cpp`](port/wiiu/shader_compile.cpp)). The GLSL of
 each miss is kept in the save folder, so the next start compiles it before it's needed. A file named `noglslcompile`
 in the data folder turns this off.
@@ -144,13 +145,38 @@ The rest of the backend, in the order of the file's sections:
 | `frontend_wiiu.cpp` | Start-up, threads and cores, VBlank, ProcUI and the HOME Menu, GamePad input, a watchdog that puts the start-up stage and thread addresses on screen if nothing is drawn |
 | `audio_wiiu.cpp` | Two looping AX voices that play what the DSP HLE mixes |
 | `save_storage.cpp` | Saves in the title's own save storage on the console, through `nn_save` |
+| `save_backup.cpp`, `save_backup.h` | Checkpoint exports and staged, recoverable restores of this title's savedata and paired extdata |
 | `fsa_direct.cpp`, `direct_read.cpp` | File calls that skip Aroma's ContentRedirection hooks (see the lessons below) |
 | `net_console.cpp` | The log, thread dumps and debug commands over TCP port 4405 |
 | `console_profile.cpp` | A sampling profiler for the real console: an empty `profile` file in the save folder turns it on |
 | `mic_wiiu.cpp` | The GamePad microphone for mic:u. Holding the right stick in counts as blowing |
+| `camera_wiiu.cpp`, `camera_queue.h` | Lazy GamePad camera capture through `camera.rpl`; completed NV12 surfaces stay out of the DMA queue until their snapshots have been copied |
 | `stubs.cpp`, `shim.h`, `TargetConditionals.h`, `mach/` | Stand-ins for the macOS calls the upstream runtime makes |
 
 Guest threads share core 1, which has the 2 MB L2 cache. GPU work runs on core 2, and input and audio on core 0.
+
+The camera service converts the GamePad's single lens into the requested 3DS sensor/context format, including crop,
+size, flip, frame cadence, YUYV and little-endian RGB565. Receives validate guest write permissions and signal completion
+only after a real frame is copied. Missing cameras return unavailable rather than manufactured frames. HOME callbacks
+defer reopening to the service thread, and shutdown releases the camera before freeing its buffers. The single lens
+cannot provide stereo depth. Calibration metadata is nominal, not a measurement of the GamePad lens. Requested exposure
+and white-balance state can be read back, while the host still uses automatic controls. Service, pixel conversion and SDK lifecycle
+tests run on the PC, but live capture, orientation, QR scanning and suspend/resume still need real Wii U verification.
+
+### Save backups and write boundaries
+
+The options menu queues Checkpoint backups to the storage thread. It pauses guest save writes while copying a
+snapshot to the SD card's `3ds/Checkpoint` folders. Restore requires a second confirmation and runs at the next
+start, before guest services or bundled save imports. Paired backups restore savedata and extdata together;
+external Checkpoint backups without pairing metadata restore savedata alone. The previous save remains in the
+title's `.checkpoint-restore/previous` folder so an interrupted replacement can recover. PC tests inject failures
+through export and restore; real SD power-loss behavior still needs console verification.
+
+The FSA bridge rejects writes outside this title's mounted save storage, `3dii-u` on the SD card and
+`3ds/Checkpoint` on the SD card. Creating the exact SD `3ds` parent is a mkdir-only exception. System NAND and
+ticket paths are outside that allowlist; read-only Mii access does not grant writes. The Builder also rejects
+reparse points and shared hardlinks at protected output/cache boundaries. These checks cover the project's file
+operations; they do not constrain independent installers, plugins or modified console software.
 
 ### The console's Miis
 

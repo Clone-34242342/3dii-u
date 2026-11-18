@@ -139,7 +139,8 @@ LiveCmd parse_live(const std::string &line) {
     return c;
 }
 
-void live_line(const std::string &line) {
+void live_line(std::string line) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();  // Windows line endings also reach the Wii U unchanged
     if (line == "DUMP") dump_threads();  // right away: the state of every thread in the log
     else if (line.rfind("POKE8 ", 0) == 0) {  // right away: "POKE8 <address> <value>" writes a byte of guest memory
         unsigned a = 0, v = 0;
@@ -239,6 +240,7 @@ void hid_motion(const s16 *accel, const s16 *gyro) {
 
 void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty) {
     live_input(buttons, cx, cy, touch, tx, ty);
+    hid_extra_pad_live(live.active ? live.cur.buttons : 0);
     Lock lk(kmutex);
     if (!hid.shm) return;
     u32 b = hid.shm->backing;

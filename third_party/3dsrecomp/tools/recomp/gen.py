@@ -490,6 +490,47 @@ class Analyzer:
         insts, ok = self.explore(key, limit=20000)
         return ok
 
+    def relative_callbacks(self):
+        """Adjacent self-relative callback fields in read-only records, after ordinary discovery fixed the function boundaries."""
+        img = self.img
+        pairs = []
+        for s in img.segments:
+            if s in img.texts or s.writable:
+                continue
+            for off in range(0, len(s.data) - 7, 4):
+                slot = s.addr + off
+                if slot & 3 or slot in img.volatile or slot + 4 in img.volatile:
+                    continue
+                words = struct.unpack_from('<2I', s.data, off)
+                pair = tuple((slot + 4 * k + w) & 0xFFFFFFFF for k, w in enumerate(words))
+                if all(img.in_text(f & ~1) and (f & 1 or not f & 3) for f in pair):
+                    pairs.append(pair)
+        targets = {f for pair in pairs for f in pair}
+        if not targets:
+            return set()
+        inside = set()
+        for f in self.funcs:
+            insts, _ = self.explore(f)
+            inside.update((a | (f & 1)) for a in insts if a != (f & ~1) and (a | (f & 1)) in targets)
+        valid = {}
+        for f in targets - inside:
+            if self.plausible_entry(f):
+                insts, ok = self.explore(f, limit=20000)
+                if ok and len(insts) <= 20000:  # a capped exploration is not a complete callback body
+                    # shortcut: unknown stack-using leaves need a proven entry; expand only with stack-flow validation.
+                    if f not in self.funcs and not self.saves_lr(f) and any(13 in i.regs() for i in insts.values()):
+                        continue
+                    valid[f] = insts
+        # Compare all records together: another pair can otherwise invent an entry inside a new callback.
+        for f, insts in valid.items():
+            inside.update((a | (f & 1)) for a in insts if a != (f & ~1) and (a | (f & 1)) in valid)
+        found = set()
+        for a, b in pairs:
+            if a not in valid or b not in valid or a in inside or b in inside:
+                continue
+            found.update((a, b))
+        return found
+
     def discover(self):
         img = self.img
         queue = [img.entry]
@@ -510,6 +551,7 @@ class Analyzer:
                     candidates.add(v)
         done = set()
         gap_done = False
+        relative_done = False
         gaps = set()
         lit_candidates = set()
         rounds = 0
@@ -589,6 +631,14 @@ class Analyzer:
                     else:
                         self.rejected.add(v)
                 self.log('gap filling: +%d functions' % len(queue))
+            if not queue and not relative_done:
+                relative_done = True
+                callbacks = self.relative_callbacks()
+                lit_candidates.update(callbacks)
+                for v in sorted(callbacks - self.funcs.keys()):
+                    self.funcs[v] = True
+                    queue.append(v)
+                self.log('self-relative callbacks: +%d functions' % len(queue))
             if not queue:
                 break
         # the functions code can reach through a pointer: their addresses appear as values (data, literal pools, adr,

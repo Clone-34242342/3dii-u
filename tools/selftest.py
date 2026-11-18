@@ -46,7 +46,7 @@ def surface_readback():
     """GPU readback preserves newer CPU writes and overlapping surfaces."""
     exe = build3ds.WORK + '/selftest/test_surface_readback.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
-    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_surface_readback.cpp', '-lpthread', '-o', exe], [exe]]
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_surface_readback.cpp', '-lpthread', '-o', exe], [exe], [sys.executable, ROOT + '/tools/test_surface_lifetime.py']]
 
 
 def shader_native_cache():
@@ -76,13 +76,8 @@ def motion_input():
 
 
 def audio_dsp():
-    """The DSP tests with a headless sink, including late/duplicate submission ownership."""
-    exe = build3ds.WORK + '/selftest/test_audio_dsp.exe'
-    os.makedirs(os.path.dirname(exe), exist_ok=True)
-    sources = [build3ds.RT + '/audio/' + n + '.cpp' for n in ('dsp_core', 'source', 'mixer', 'codec', 'interp')]
-    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
-                                 '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/third_party/3dsrecomp/tools/audio_test/audio_test.cpp',
-                                 ROOT + '/tools/test_audio_host.cpp', build3ds.PORT + '/pc/win/win_compat.cpp', *sources, '-lwinmm', '-lpthread', '-o', exe], [exe]]
+    """Production DSP coverage plus serialized Wii U queue/lifetime checks."""
+    return [[sys.executable, ROOT + '/tools/test_audio_stability.py']]
 
 
 def ro_tree():
@@ -135,6 +130,17 @@ def open_bools():
                                  '-lpthread', '-o', exe], [exe]]
 
 
+def fs_normal():
+    """The production fragment normalizer, plus both log converters' key parity."""
+    shadergen()
+    exe = build3ds.WORK + '/selftest/test_fs_normal.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    objs = [f'{build3ds.WORK}/shadergen/{n}.o' for n in ('shadergen.cpp', 'shaderkeys.cpp', 'shader.cpp', 'shadergen_stubs.cpp')]
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                                 f'-I{build3ds.RT}/gpu', '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_fs_normal.cpp', *objs,
+                                 '-lpthread', '-o', exe], [sys.executable, ROOT + '/tools/test_fs_normal.py', exe], [sys.executable, ROOT + '/tools/test_fragment_requests.py']]
+
+
 def gsx():
     """tools/test_gsx.cpp with the shader generator's own objects"""
     shadergen()
@@ -167,6 +173,45 @@ def camera():
     return commands
 
 
+def mapped_output():
+    exe = build3ds.WORK + '/selftest/test_mapped_output.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_mapped_output.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def replay_validation():
+    exe = build3ds.WORK + '/selftest/test_replay_validation.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-DNOMINMAX', '-ffunction-sections', '-fdata-sections',
+            '-Wl,--gc-sections', '-static', f'-I{build3ds.RT}', ROOT + '/tools/test_replay_validation.cpp',
+            '-lpthread', '-o', exe], [exe, build3ds.WORK + '/selftest/replay_validation_fixtures']]
+
+
+def unanswered():
+    exe = build3ds.WORK + '/selftest/test_unanswered.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_unanswered.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def uds_room():
+    exe = build3ds.WORK + '/selftest/test_uds_room.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_uds_room.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def ir_ipc():
+    exe = build3ds.WORK + '/selftest/test_ir.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_ir.cpp', '-lpthread', '-o', exe], [exe]]
+
+
+def ir_memory():
+    exe = build3ds.WORK + '/selftest/test_ir_memory.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                              '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_ir_memory.cpp', '-lpthread', '-o', exe], [exe]]
+
+
 def save_backups():
     exe = build3ds.WORK + '/selftest/test_save_backup.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
@@ -178,18 +223,34 @@ def main():
     py = sys.executable
     checks = {
         'save backups': save_backups(),
+        'save scheduling and cache': [[py, ROOT + '/tools/test_fs_save.py']],
         'shader compiler recipe': [[py, ROOT + '/tools/test_cafeglsl_recipe.py']],
+        'dependency setup': [[py, ROOT + '/tools/test_setup_deps.py']],
         'SDK paths': [[py, ROOT + '/tools/test_sdk_path.py']],
+        'IR IPC': ir_ipc(),
+        'IR memory': ir_memory(),
+        'IR input': [[py, ROOT + '/tools/test_ir_input.py']],
+        'PC autoplay': [[py, ROOT + '/tools/test_pc_autoplay.py']],
+        'mapped output': mapped_output(),
+        'unanswered service replies': unanswered(),
+        'module memory ownership': [[py, '-B', ROOT + '/tools/test_module_memory.py']],
+        'offline UDS IPC': uds_room(),
+        'relative callbacks': [[py, ROOT + '/tools/test_relative_callbacks.py']],
+        'multiply wrap': [[py, ROOT + '/tools/test_multiply_wrap.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
         'camera': camera(),
         'vertex arrays': vertex_arrays(),
+        'vertex cache': [[py, ROOT + '/tools/test_vertex_cache.py']],
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
         'depth viewport': depth_viewport(),
         'surface readback': surface_readback(),
         'Mii selection': mii_selection(),
-        'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py']],
+        'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py'],
+                                                       [py, ROOT + '/tools/test_shader_install.py']],
+        'shader learning': [[py, ROOT + '/tools/test_shader_learning.py']],
+        'shader budget': [[py, ROOT + '/tools/test_shader_budget.py']],
         'memory fills': memory_fills(),
         'motion input': motion_input(),
         'audio DSP': audio_dsp(),
@@ -202,7 +263,15 @@ def main():
         'command lists': [[py, ROOT + '/tools/test_shadergen_lists.py', shadergen()]],
         'program rules': [[py, ROOT + '/tools/gsh_rules.py', '--self-check']],
         'fragment variants': [[py, ROOT + '/tools/fs_variants.py', '--self-check']],
+        'fragment normalization': fs_normal(),
+        'overwritten TEV arithmetic': [[py, ROOT + '/tools/test_tev_prefix.py']],
         'picture check': [[py, ROOT + '/tools/test_check_pictures.py']],
+        'graphics replay comparison': [[py, ROOT + '/tools/test_gpu_pngdiff.py'],
+                                       [py, ROOT + '/tools/test_gpu_replay_check.py']],
+        'graphics replay rendering': [[py, ROOT + '/tools/test_gpu_render.py']],
+        'graphics replay validation': replay_validation(),
+        'deferred transfer readback': [[py, ROOT + '/tools/test_deferred_transfer.py']],
+        'Cemu capture deadline': [[py, ROOT + '/tools/test_cemu_capture.py']],
         'failure categories': [[py, ROOT + '/tools/test_failure_categories.py']],
         'missed code': [[py, ROOT + '/tools/test_learn_missed.py']],
         'switch through a helper': [[py, ROOT + '/tools/test_recomp_switch.py']],
@@ -223,13 +292,17 @@ def main():
         '3DS saves in a build': [[py, ROOT + '/builder/test_saves.py'], *save_from_content()],
         'system archives': [[py, ROOT + '/builder/test_system_archives.py']],
         'builder app': [[py, ROOT + '/builder/test_app.py'], [py, ROOT + '/builder/test_pipeline_outputs.py']],
-        'builder window': [[py, ROOT + '/builder/test_window.py']],
+        'builder window': [[py, ROOT + '/builder/test_window.py'], [py, ROOT + '/builder/test_cards.py']],
         'builder updater': [[py, ROOT + '/builder/test_updater.py']],
         'DLC reader': [[py, ROOT + '/builder/selftest.py']],
         'Download Play content': [[py, ROOT + '/builder/test_dlp_content.py']],
+        'CIA conversion': [[py, ROOT + '/builder/test_cia_conversion.py']],
     }
     failed = []
+    filter_args = [a.lower() for a in sys.argv[1:] if not a.startswith('-')]
     for name, commands in checks.items():
+        if filter_args and not any(f in name.lower() for f in filter_args):
+            continue
         for argv in commands:
             r = subprocess.run(argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
             if r.returncode:

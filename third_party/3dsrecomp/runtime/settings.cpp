@@ -75,7 +75,7 @@ void settings_load() {
     s.language = std::clamp(s.language, -1, 11);
     s.tv_layout = std::max(s.tv_layout, 0);  // (the frontend clamps these to its layouts)
     s.pad_layout = std::max(s.pad_layout, 0);
-    s.resolution = s.resolution == 480 ? 480 : 720;
+    s.resolution = s.resolution == 240 || s.resolution == 440 || s.resolution == 480 ? s.resolution : 720;
     // the GPU backend reads these once at startup; an environment variable given at launch wins
     setenv("GPU_MSAA", std::to_string(s.msaa).c_str(), 0);
     setenv("GPU_ANISO", std::to_string(s.aniso).c_str(), 0);

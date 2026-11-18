@@ -44,5 +44,8 @@
                        "status": "Plays", "note": "A contributor reports play on a Wii U with a mixed build (PR #42). Slow music, misplaced particles and title/file-select flickering reported in other builds remain under investigation."},
   "0004000000033600": {"slug": "g_aqep", "title_id": "000500003D000336", "name": "The Legend of Zelda Ocarina of Time 3D", "product": "WUP-N-AQEP",
                        "folder": "The_Legend_of_Zelda_Ocarina_of_Time_3D", "mixed": true,
-                       "status": "Untested", "note": "The European version: built with the American version's mixed policy. Cemu play reported in PR #42; not yet tried on a console."}
+                       "status": "Untested", "note": "The European version: built with the American version's mixed policy. Cemu play reported in PR #42; not yet tried on a console."},
+  "0004000000125500": {"slug": "g_ajre", "title_id": "000500003D001255", "name": "The Legend of Zelda Majora's Mask 3D", "product": "WUP-N-AJRE",
+                       "folder": "The_Legend_of_Zelda_Majora_s_Mask_3D", "mixed": true,
+                       "status": "Untested", "note": "The PR #44 contributor reports 30 fps in Cemu during play and about 20 in the intro. Not independently tested here; no console report. The right stick and ZL/ZR provide Circle Pad Pro input."}
 }

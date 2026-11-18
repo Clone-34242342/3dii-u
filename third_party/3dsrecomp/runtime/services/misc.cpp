@@ -1,7 +1,10 @@
 // Small services: ptm, ndm, ac, frd, boss, cecd, news, ir, mic, cam, y2r, ldr:ro, soc, ssl, http, ...
 #include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <vector>
 
 #include "../loader.h"
@@ -500,24 +503,268 @@ struct Mic : Service {
     }
 };
 
+// The host's second stick and ZL/ZR (input thread): the Circle Pad Pro's C-stick and triggers, as a New 3DS gives its own to a game
+namespace {
+std::atomic<int> extra_x, extra_y;  // -0x7FF..0x7FF
+std::atomic<u32> extra_buttons;     // 1 ZL, 2 ZR, 4 R
+std::atomic<u32> extra_live_buttons;  // latched separately so physical refreshes cannot erase scripted holds
+std::atomic<unsigned> extra_connections;
+}  // namespace
+void hid_extra_pad(float x, float y, bool zl, bool zr, bool r) {
+    extra_x = std::isfinite(x) ? (int)(std::clamp(x, -1.0f, 1.0f) * 0x7FF) : 0;
+    extra_y = std::isfinite(y) ? (int)(std::clamp(y, -1.0f, 1.0f) * 0x7FF) : 0;
+    extra_buttons = (zl ? 1u : 0u) | (zr ? 2u : 0u) | (r ? 4u : 0u);
+}
+bool extra_pad_connected() { return extra_connections != 0; }
+void hid_extra_pad_live(u32 buttons) {
+    extra_live_buttons = (buttons & (1u << 14) ? 1u : 0u) | (buttons & (1u << 15) ? 2u : 0u) |
+                         (buttons & (1u << 8) ? 4u : 0u);
+}
+
+// Circle Pad Pro over ir:USER: status at 0, receive info at 0x10, descriptors at 0x20, then packet data.
+// Keep queue accounting private: shared memory belongs to the guest and cannot supply trusted write offsets.
 struct Ir : Service {
     using Service::Service;
     std::shared_ptr<Event> conn = make_event(ONESHOT, "ir conn");
     std::shared_ptr<Event> recv = make_event(ONESHOT, "ir recv");
     std::shared_ptr<Event> send = make_event(ONESHOT, "ir send");
+    std::shared_ptr<SharedMem> mem;
+    u32 shared_size = 0, packets_max = 0, data_max = 0;
+    u32 first = 0, next = 0, used = 0, head = 0;
+    std::deque<u32> lengths;
+    bool connected = false;
+    u32 period_ms = 0, generation = 0;  // the pad's reports, every period_ms while connected
+
+    static constexpr u32 NOT_CONNECTED = 0xC8A10C0D;  // Status / InvalidState / IR / 13
+    static constexpr u32 NO_DATA = 0xC8810FEF;  // Status / NotFound / IR / NoData
+
+    ~Ir() override { connection(false); }
+    void connection(bool on) {
+        if (connected != on) {
+            if (on) ++extra_connections;
+            else --extra_connections;
+            connected = on;
+        }
+    }
+    bool mapped() const {
+        return mem && shared_size <= mem->size && guest_readable_locked(mem->backing, shared_size) &&
+               guest_writable(mem->backing, shared_size);
+    }
+    bool ring_valid() const {
+        if (!mapped()) return false;
+        const u32 info = mem->backing + 0x10, list = mem->backing + 0x20;
+        if (r32(info) != first || r32(info + 4) != next || r32(info + 8) != lengths.size() || r32(info + 12)) return false;
+        u32 index = first, offset = head;
+        for (u32 size : lengths) {
+            if (r32(list + index * 8) != offset || r32(list + index * 8 + 4) != size) return false;
+            index = (index + 1) % packets_max;
+            offset = ((u64)offset + size) % data_max;
+        }
+        return true;
+    }
+    void ring_info() {
+        const u32 info = mem->backing + 0x10;
+        w32(info, first); w32(info + 4, next); w32(info + 8, (u32)lengths.size()); w32(info + 12, 0);
+    }
+    void stop() {
+        ++generation;
+        period_ms = 0;
+        connection(false);
+    }
+    void status(u8 value, bool notify = true) {
+        connection(value == 2);
+        if (mapped()) {
+            w8(mem->backing + 0x9, value == 1 ? 2 : 0);
+            w8(mem->backing + 0x8, value);
+            w8(mem->backing + 0xA, connected ? 2 : 0);
+            w8(mem->backing + 0xC, connected ? 1 : 0);
+        }
+        if (notify && value != 1) conn->signal();
+    }
+    static u8 crc8(const std::vector<u8> &p) {
+        u8 c = 0;
+        for (u8 b : p) {
+            c ^= b;
+            for (int i = 0; i < 8; i++) c = (c & 0x80) ? (u8)((c << 1) ^ 0x07) : (u8)(c << 1);
+        }
+        return c;
+    }
+    void put(const std::vector<u8> &payload) {  // one reply into the receive buffer
+        if (!ring_valid() || payload.size() >= 0x4000) return;
+        const u32 b = mem->backing, list = b + 0x20, data = list + packets_max * 8;
+        std::vector<u8> p = {0xA5, r8(b + 0xD)};
+        if (payload.size() < 0x40) {
+            p.push_back((u8)payload.size());
+        } else {
+            p.push_back((u8)(0x40 | (payload.size() >> 8)));
+            p.push_back((u8)payload.size());
+        }
+        p.insert(p.end(), payload.begin(), payload.end());
+        p.push_back(crc8(p));
+        if (lengths.size() >= packets_max || p.size() > data_max - used) return;
+        const u32 at = lengths.empty() ? 0 : ((u64)head + used) % data_max;
+        for (size_t i = 0; i < p.size(); i++) w8(data + ((u64)at + i) % data_max, p[i]);
+        w32(list + next * 8, at);
+        w32(list + next * 8 + 4, (u32)p.size());
+        if (lengths.empty()) head = at;
+        lengths.push_back((u32)p.size());
+        next = (next + 1) % packets_max;
+        used += (u32)p.size();
+        ring_info();
+        recv->signal();
+    }
+    u32 release(u32 n) {
+        if (!mapped()) return RES_INVALID_ADDRESS;
+        if (!ring_valid()) return RES_INVALID_COMBINATION;
+        if (n > lengths.size()) return NO_DATA;
+        for (; n; --n) {
+            used -= lengths.front();
+            head = ((u64)head + lengths.front()) % data_max;
+            lengths.pop_front();
+            first = (first + 1) % packets_max;
+        }
+        ring_info();
+        return RES_OK;
+    }
+    void report() {  // the C-stick (12 bits each, 0x800 the middle), a full battery, and ZL, ZR and R, set when not held
+        const u32 x = (u32)(0x800 + extra_x), y = (u32)(0x800 + extra_y), held = extra_buttons | extra_live_buttons;
+        const u32 stick = 0x10 | (x & 0xFFF) << 8 | (y & 0xFFF) << 20;
+        put({(u8)stick, (u8)(stick >> 8), (u8)(stick >> 16), (u8)(stick >> 24),
+             (u8)(0x1F | (held & 1 ? 0 : 0x20) | (held & 2 ? 0 : 0x40) | (held & 4 ? 0 : 0x80)), 0});
+    }
+    void schedule() {
+        std::weak_ptr<Service> weak = weak_from_this();
+        const u32 g = generation;
+        add_timeout(now_ns() + period_ms * 1000000ull, [weak, g] {
+            if (auto service = weak.lock()) static_cast<Ir *>(service.get())->poll(g);
+        });
+    }
+    void poll(u32 g) {  // (kernel lock held)
+        if (g != generation || !connected || !period_ms || !mapped()) return;
+        report();
+        schedule();
+    }
+    u32 request(const u8 *d, u32 size) {
+        if (!size) return RES_INVALID_COMBINATION;
+        if (d[0] == 1 && size == 3) {  // the reports' period in ms
+            if (d[1] != period_ms) LOG("[ir] Circle Pad Pro: the game reads it every %u ms\n", d[1]);
+            period_ms = d[1];
+            ++generation;
+            if (period_ms) schedule();
+        } else if (d[0] == 2 && size == 6) {  // calibration: offset and size, in 16s, of the device's 64 bytes
+            static const u8 calibration[0x40] = {
+                0x00, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0xF5,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65,
+                0xFF, 0x00, 0x08, 0x80, 0x85, 0xEB, 0x11, 0x3F, 0x85, 0xEB, 0x11, 0x3F, 0xFF, 0xFF, 0xFF, 0x65};
+            const u32 off = d[2] | d[3] << 8, n = d[4] | d[5] << 8;
+            if (off % 16 || n % 16 || off + n > sizeof calibration) return RES_INVALID_COMBINATION;
+            std::vector<u8> r = {0x11, d[2], d[3], d[4], d[5]};
+            r.insert(r.end(), calibration + off, calibration + off + n);
+            put(r);
+        } else return RES_INVALID_COMBINATION;
+        return RES_OK;
+    }
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
+        case 0x0018: {  // InitializeIrNopShared(shared size, receive size, receive count, send size, send count, baud rate, shared memory)
+            if ((ipc[0] & 0xffff) != 0x182 || ipc[7] != 0) { ipc.result(RES_INVALID_COMBINATION); break; }
+            auto candidate = get<SharedMem>(ipc[8]);
+            if (!candidate) { ipc.result(RES_INVALID_HANDLE); break; }
+            if (!ipc[3] || (u64)ipc[3] * 8 >= ipc[2] || (u64)ipc[5] * 8 > ipc[4] ||
+                (u64)0x30 + ipc[2] + ipc[4] > ipc[1] || ipc[1] > candidate->size) {
+                ipc.result(RES_INVALID_COMBINATION); break;
+            }
+            if (!guest_readable_locked(candidate->backing, ipc[1]) || !guest_writable(candidate->backing, ipc[1])) {
+                ipc.result(RES_INVALID_ADDRESS); break;
+            }
+            stop();
+            mem = candidate;
+            shared_size = ipc[1]; packets_max = ipc[3]; data_max = ipc[2] - packets_max * 8;
+            first = next = used = head = 0;
+            lengths.clear();
+            conn->clear(); recv->clear(); send->clear();
+            for (u32 i = 0; i < 0x20; i++) w8(mem->backing + i, 0);
+            w8(mem->backing + 0xE, 1);
+            ipc.ok();
+            break;
+        }
+        case 0x0006:  // RequireConnection(device): the Circle Pad Pro (1) answers at once
+            if ((ipc[0] & 0xffff) != 0x40) { ipc.result(RES_INVALID_COMBINATION); break; }
+            if (!mapped()) { ipc.result(RES_INVALID_ADDRESS); break; }
+            if ((ipc[1] & 0xFF) != 1) stop();
+            status((ipc[1] & 0xFF) == 1 ? 2 : 1);
+            ipc.ok();
+            break;
+        case 0x0009:  // Disconnect
+            if (ipc[0] & 0xffff) { ipc.result(RES_INVALID_COMBINATION); break; }
+            status(0, connected);
+            stop();
+            ipc.ok();
+            break;
+        case 0x0002:  // FinalizeIrNop
+            if (ipc[0] & 0xffff) { ipc.result(RES_INVALID_COMBINATION); break; }
+            if (connected) status(0);
+            stop();
+            if (mapped()) w8(mem->backing + 0xE, 0);
+            mem = nullptr;
+            lengths.clear();
+            ipc.ok();
+            break;
+        case 0x000D:    // SendIrNop(size, static buffer)
+        case 0x000E: {  // SendIrNopLarge(size, mapped buffer)
+            const bool large = ipc.cmd() == 0xE;
+            const u32 size = ipc[1], desc = ipc[2], addr = ipc[3];
+            const u32 capacity = large ? desc >> 4 : desc >> 14;
+            const bool readable = large ? ((desc & 15) == 10 || (desc & 15) == 14) : (desc & 0x3fff) == 2;
+            u32 error = RES_OK;
+            if ((ipc[0] & 0xffff) != 0x42 || !readable || size > capacity || (size != 3 && size != 6))
+                error = RES_INVALID_COMBINATION;
+            else if (!connected) error = NOT_CONNECTED;
+            else if (!guest_readable_locked(addr, size) || !mapped()) error = RES_INVALID_ADDRESS;
+            else if (!ring_valid()) error = RES_INVALID_COMBINATION;
+            else {
+                u8 d[6];
+                for (u32 i = 0; i < size; i++) d[i] = r8(addr + i);
+                error = request(d, size);
+                if (!error) send->signal();
+            }
+            // Return a valid mapped descriptor even on device errors so the caller can finish its transfer.
+            const bool mapped_reply = large && readable && (ipc[0] & 0xffff) == 0x42;
+            ipc.result(error, 1, mapped_reply ? 2 : 0);
+            if (mapped_reply) { ipc.set(2, desc); ipc.set(3, addr); }
+            break;
+        }
+        case 0x0019:  // ReleaseReceivedData(count)
+            ipc.result((ipc[0] & 0xffff) == 0x40 ? release(ipc[1]) : RES_INVALID_COMBINATION);
+            break;
+        case 0x000A:  // GetReceiveEvent
+        case 0x000B:  // GetSendEvent
         case 0x000C:  // GetConnectionStatusEvent
+            if (ipc[0] & 0xffff) { ipc.result(RES_INVALID_COMBINATION); break; }
             ipc.ok(1, 2);
-            ipc.handles(2, {conn});
+            ipc.handles(2, {ipc.cmd() == 0xA ? recv : ipc.cmd() == 0xB ? send : conn});
             break;
-        case 0x000D:  // GetReceiveEvent
+        default:
+            VLOG("[ir] command %04x\n", ipc.cmd());
+            ipc.ok();
+        }
+    }
+};
+
+// ir:u is the raw infrared protocol, not the Circle Pad Pro service. Retain its idle event stub separately.
+struct Iru : Service {
+    using Service::Service;
+    std::shared_ptr<Event> conn = make_event(ONESHOT, "ir:u conn");
+    std::shared_ptr<Event> recv = make_event(ONESHOT, "ir:u recv");
+    std::shared_ptr<Event> send = make_event(ONESHOT, "ir:u send");
+    void handle(IPC &ipc) override {
+        switch (ipc.cmd()) {
+        case 0xC:  // retained legacy event stub
+        case 0xD:  // GetSendFinishedEvent
+        case 0xE:  // GetRecvFinishedEvent
             ipc.ok(1, 2);
-            ipc.handles(2, {recv});
-            break;
-        case 0x000E:  // GetSendEvent
-            ipc.ok(1, 2);
-            ipc.handles(2, {send});
+            ipc.handles(2, {ipc.cmd() == 0xD ? send : ipc.cmd() == 0xE ? recv : conn});
             break;
         default:
             ipc.ok();
@@ -525,27 +772,59 @@ struct Ir : Service {
     }
 };
 
-// Local wireless with nobody around: a game can look for other players and find none. New Super Mario Bros. 2's Co-op menu stops with a
-// fatal error if it doesn't get its status event.
+// Offline local wireless: games can obtain their status/bind events and scan, but there is no transport or peer.
+// Command IDs and reply layouts: Azahar nwm_uds.cpp / nwm_uds.h, commit11eceda5e0e682a1f44e396bf954a1b9137097ca.
 struct Uds : Service {
     using Service::Service;
     std::shared_ptr<Event> status = make_event(ONESHOT, "uds status");
+    // shortcut: one offline bind event; use per-bind events when a transport is added.
+    std::shared_ptr<Event> bind = make_event(ONESHOT, "uds bind");
+    // CTR Result fields: UDS module68; Status/InvalidState/NotAuthorized, and Permanent/NotSupported/NotImplemented.
+    static constexpr u32 NOT_CONNECTED = 0xC8A113EA;
+    static constexpr u32 UNSUPPORTED = 0xD8C113F4;
+
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
+        case 0x0001:  // Initialize (deprecated)
         case 0x001B:  // InitializeWithVersion
+            status->clear();
+            bind->clear();
             ipc.ok(1, 2);
             ipc.handles(2, {status});
             break;
-        case 0x000B:  // GetConnectionStatus
+        case 0x0004:  // BeginHostingNetwork (deprecated)
+        case 0x0009:  // ConnectToNetwork (deprecated)
+        case 0x001D:  // BeginHostingNetwork
+        case 0x001E:  // ConnectToNetwork
+            unimplemented(ipc, false);
+            ipc.result(UNSUPPORTED);  // Cannot create a working host/client without a transport.
+            break;
+        case 0x0005:  // EjectClient: only a host can eject, and node1 is never ejectable.
+            ipc.result((u16)ipc[1] == 1 ? 0xE10113EA : 0xE0A113EA);
+            break;
+        case 0x0006:  // EjectSpectators: no spectators exist.
+        case 0x0007:  // UpdateNetworkAttribute: no network exists to update.
+            ipc.ok();
+            break;
+        case 0x0008:  // DestroyNetwork: Status / InvalidState / UDS / WrongStatus490
+            ipc.result(0xC8A111EA);
+            break;
+        case 0x000A:  // DisconnectNetwork: remains offline, but notify status waiters.
+            ipc.ok();
+            status->signal();
+            break;
+        case 0x000B:  // GetConnectionStatus: result +0x30-byte ConnectionStatus, all zero except NotConnected3.
             ipc.ok(13);
-            ipc.set(2, 3);  // not connected
+            ipc.set(2, 3);
             for (int i = 3; i < 14; i++) ipc.set(i, 0);
             break;
-        case 0x000D:  // GetNodeInformation: no such node
-            ipc.result(0xC90113FA);
+        case 0x000D:  // GetNodeInformation: no peer node is known.
+            ipc.result(0xC90113FA);  // Status / WrongArgument / UDS / NotFound
             break;
-        case 0x000F: {  // RecvBeaconBroadcastData(size, ..., mapped buffer): no beacons. Header: size of the buffer, bytes used, entries
+        case 0x000F: {  // RecvBeaconBroadcastData: max buffer size, bytes used, entries (little endian).
             const u32 desc = ipc[19], buf = ipc[20];
+            const u32 error = ipc[1] < 12 ? RES_INVALID_COMBINATION : ipc.mapped_output_error(19, ipc[1]);
+            if (error) { ipc.result(error); break; }
             w32(buf, ipc[1]);
             w32(buf + 4, 12);
             w32(buf + 8, 0);
@@ -554,20 +833,44 @@ struct Uds : Service {
             ipc.set(3, buf);
             break;
         }
-        case 0x0012:  // Bind: an event for packets that never come (New Super Mario Bros. 2's Coin Rush)
+        case 0x0011:  // GetApplicationData: no network/application data; return an empty static buffer.
+            ipc.ok(2, 2);
+            ipc.set(2, 0);
+            ipc.static_desc(3, 0, 0);
+            break;
+        case 0x0012:  // Bind: a local packet event; packets never arrive while offline.
+            if (!ipc[1] || !(u8)ipc[3]) { ipc.result(0xE10113EA); break; }
+            if (ipc[2] < 0x5F4) { ipc.result(0xE10113E9); break; }
+            bind->clear();
             ipc.ok(1, 2);
             ipc.handles(2, {bind});
             break;
         case 0x0003:  // Shutdown
-        case 0x000A:  // DisconnectNetwork
-        case 0x0013:  // Unbind
+            status->clear();
+            bind->signal();  // Release a guest waiting for a packet, as Unbind does.
             ipc.ok();
             break;
+        case 0x0013:  // Unbind: result, bind ID, three reserved words.
+            if (!ipc[1]) { ipc.result(0xE10113EA); break; }
+            bind->signal();  // Release a guest waiting on the local binding being cancelled.
+            ipc.ok(5);
+            ipc.set(2, ipc[1]);
+            for (int i = 3; i < 6; i++) ipc.set(i, 0);
+            break;
+        case 0x0014:  // PullPacket
+        case 0x0017:  // SendTo
+            ipc.result(NOT_CONNECTED);
+            break;
+        case 0x001A:  // GetChannel: zero when NotConnected.
+            ipc.ok(2);
+            ipc.set(2, 0);
+            break;
         default:
-            unimplemented(ipc);
+            // Includes deprecated/modern DecryptBeaconData0xE/0x1F and SetApplicationData0x10.
+            unimplemented(ipc, false);
+            ipc.result(UNSUPPORTED);
         }
     }
-    std::shared_ptr<Event> bind = make_event(ONESHOT, "uds bind");
 };
 
 struct Generic : Service {
@@ -581,10 +884,12 @@ struct Ssl : Service {
     using Service::Service;
     void handle(IPC &ipc) override {
         if (ipc.cmd() != 0x0011) return unimplemented(ipc);
+        const u32 error = ipc.mapped_output_error(2, ipc[1]);
+        if (error) return ipc.result(error);
         // GenerateRandomData(size, [buffer]): the clock and the tick it's first asked at, stirred (splitmix64)
         static u64 state = (u64)time(nullptr) << 32 ^ system_tick();
         u64 z = 0;
-        for (u32 i = 0; i < std::min(ipc[1], ipc[2] >> 4); i++) {  // (no further than the buffer it names)
+        for (u32 i = 0; i < ipc[1]; i++) {
             if (i % 8 == 0) {
                 z = (state += 0x9E3779B97F4A7C15ull);
                 z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9ull;
@@ -745,7 +1050,7 @@ void register_misc() {
     register_service(std::make_shared<Boss>("boss:U"));
     register_service(std::make_shared<Mic>("mic:u"));
     register_service(std::make_shared<Ir>("ir:USER"));
-    register_service(std::make_shared<Ir>("ir:u"));
+    register_service(std::make_shared<Iru>("ir:u"));
     register_service(std::make_shared<Uds>("nwm::UDS"));
     register_service(std::make_shared<Am>("am:app"));  // was Generic: NSMB2's Coin Rush read its own request back as thousands of DLC tickets (2026-11-07)
     register_service(std::make_shared<DlpSrvr>("dlp:SRVR"));

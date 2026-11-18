@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "shadergen.h"
+#include "latte_program.h"
 
 using namespace gpu;
 namespace fsys = std::filesystem;
@@ -315,19 +316,48 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    // GX2SetShaderMode leaves 48 registers for vertex shaders and 200 for pixel shaders. A shader asking for more can't start on a real GPU, and Cemu doesn't mind.
+    // The runtime reserves this VS maximum once; both compiler stages have at most124 ordinary GPRs.
     {
-        const std::vector<u8> g = read_file(out + "/shaders.gsh");
+        std::vector<u8> g = read_file(out + "/shaders.gsh");
+        if (g.size() < 32 || memcmp(g.data(), "Gfx2", 4)) return 1;
         auto word = [&](size_t at) { return (u32)g[at] << 24 | g[at + 1] << 16 | g[at + 2] << 8 | g[at + 3]; };
-        u32 most_vs = 0, most_ps = 0;
-        for (size_t p = word(4); p + 32 <= g.size() && !memcmp(&g[p], "BLK{", 4);) {
+        u32 most_vs = 0, most_ps = 0, declared_vs = 0, declared_ps = 0, vertex_count = 0, pixel_count = 0;
+        bool have_vs_header = false, have_ps_header = false;
+        const u32 first = word(4);
+        if (first < 32 || first > g.size()) return 1;
+        for (size_t p = first; p + 32 <= g.size() && !memcmp(&g[p], "BLK{", 4);) {
             const u32 head = word(p + 4), type = word(p + 16), size = word(p + 20);
-            if (type == 3) most_vs = std::max(most_vs, word(p + head) & 255);
-            if (type == 6) most_ps = std::max(most_ps, word(p + head) & 255);
+            if (head < 32 || head > g.size() - p || size > g.size() - p - head) return 1;
+            if (type == 3 || type == 6) {
+                if (size < 4) return 1;
+                (type == 3 ? declared_vs : declared_ps) = word(p + head) & 255;
+                (type == 3 ? have_vs_header : have_ps_header) = true;
+            }
+            if (type == 5 || type == 7) {
+                const bool vertex = type == 5;
+                const u32 declared = vertex ? declared_vs : declared_ps;
+                const u32 index = vertex ? vertex_count++ : pixel_count++;
+                const auto &files = vertex ? vs_files : ps_files;
+                const char *file = index < files.size() ? files[index].c_str() : "shaders.gsh";
+                bool &have_header = vertex ? have_vs_header : have_ps_header;
+                if (!have_header) {
+                    printf("%s program %u (%s): missing matching shader header\n", vertex ? "vertex" : "pixel", index, file);
+                    return 1;
+                }
+                have_header = false;
+                u32 required;
+                if (!program_registers(g.data() + p + head, size, declared, required) || required != declared) {
+                    if (!declared) printf("%s program %u (%s): zero-register metadata references ordinary registers\n", vertex ? "vertex" : "pixel", index, file);
+                    printf("%s program %u (%s): invalid layout/metadata or ordinary registers exceed124 (declared %u)\n", vertex ? "vertex" : "pixel", index, file, declared);
+                    return 1;
+                }
+                (vertex ? most_vs : most_ps) = std::max(vertex ? most_vs : most_ps, required);
+            }
             p += head + size;
         }
-        printf("registers: vertex shaders use up to %u of 48, pixel shaders up to %u of 200\n", most_vs, most_ps);
-        if (!most_vs || most_vs > 48 || most_ps > 200) return 1;
+        if (!vertex_count) { printf("no vertex programs discovered (not register pressure)\n"); return 1; }
+        const u32 allocation = std::max(shader_budget::kDefaultVertex, most_vs);
+        printf("registers: vertex programs require up to %u/124, pixel up to %u/124; runtime partition VS %u, PS %u\n", most_vs, most_ps, allocation, shader_budget::pixel(allocation));
     }
     }
 

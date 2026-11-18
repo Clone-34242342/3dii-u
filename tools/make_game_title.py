@@ -2,6 +2,7 @@
 """Assembles a game's Wii U title folder (code, content, meta), for Cemu and the WUP packer. Game files are hard links, so they take no extra disk.
 tools/win/build3ds.py and builder/pipeline.py call make_title() for every game. By hand:
     make_game_title.py <title folder> <game folder> <rpx> <shaders folder> <title id> <name> <product code> [system archives folder]"""
+import math
 import os
 import re
 import shutil
@@ -43,12 +44,50 @@ def icon_pixels(smdh_path):
     return icon
 
 
+def resample_taps(src, dst, a=3):
+    """For each of dst pixels across: the src pixels it takes, with their Lanczos-a weights, and the two src pixels it lies between."""
+    taps = []
+    for o in range(dst):
+        c = (o + 0.5) * src / dst - 0.5
+        f = math.floor(c)
+        ws = [(i, 1.0 if c == i else a * math.sin(math.pi * (c - i)) * math.sin(math.pi * (c - i) / a) / (math.pi * (c - i)) ** 2)
+              for i in range(f - a + 1, f + a + 1)]
+        total = sum(w for _, w in ws)
+        taps.append(([(min(max(i, 0), src - 1), w / total) for i, w in ws], min(max(f, 0), src - 1), min(max(f + 1, 0), src - 1)))
+    return taps
+
+
+def sharp_icon(icon, size=128):
+    """The 48x48 icon at size x size, as sharp as its pixels allow: Lanczos-3, a light unsharp mask, and each pixel kept within the four it
+    lies between, so edges come out crisp without halos. Pure Python, as the Builder has no numpy or Pillow: a quarter of a second."""
+    tx, ty = resample_taps(len(icon[0]), size), resample_taps(len(icon), size)
+    across = [[[sum(row[i][ch] * k for i, k in taps) for ch in range(3)] for taps, _, _ in tx] for row in icon]
+    up = [[[sum(across[i][x][ch] * k for i, k in taps) for ch in range(3)] for x in range(size)] for taps, _, _ in ty]
+
+    def blur(line):  # [1 2 1] / 4 along a line, its ends repeated
+        n = len(line)
+        return [[(line[max(j - 1, 0)][ch] + 2 * line[j][ch] + line[min(j + 1, n - 1)][ch]) / 4 for ch in range(3)] for j in range(n)]
+    rows = [blur(line) for line in up]
+    soft = [blur([rows[y][x] for y in range(size)]) for x in range(size)]  # soft[x][y]
+    out = []
+    for y in range(size):
+        y0, y1 = ty[y][1], ty[y][2]
+        line = []
+        for x in range(size):
+            x0, x1 = tx[x][1], tx[x][2]
+            near = (icon[y0][x0], icon[y0][x1], icon[y1][x0], icon[y1][x1])
+            line.append(tuple(min(max(round(1.5 * up[y][x][ch] - 0.5 * soft[x][y][ch]), min(p[ch] for p in near)), max(p[ch] for p in near))
+                              for ch in range(3)))
+        out.append(line)
+    return out
+
+
 def vc_icon_pixels(icon):
     """Each game's SMDH under Walegy's VC-inspired bands (issue #45); no game art is bundled."""
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QImage, QPainter
-    data = bytes(channel for row in icon for pixel in row for channel in pixel)
-    canvas = QImage(data, 48, 48, 48 * 3, QImage.Format_RGB888).scaled(128, 128, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+    data = bytes(channel for row in sharp_icon(icon) for pixel in row for channel in pixel)
+    canvas = QImage(data, 128, 128, 128 * 3, QImage.Format_RGB888).copy()  # its own pixels: data goes when this returns
     frame = QImage(os.path.join(os.path.dirname(__file__), 'art', 'vc_icon_frame.png'))
     if frame.isNull():
         raise ValueError('The shared Virtual Console icon frame is missing or unreadable')

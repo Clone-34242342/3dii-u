@@ -578,19 +578,20 @@ def decode_media(i, w):
         p1 = '(s64)((s32)(s16)%s * (s32)(s16)%s)' % (R(i, rn_), m)
         p2 = '(s64)((s32)(s16)(%s >> 16) * (s32)(s16)(%s >> 16))' % (R(i, rn_), m)
         lo, hi = ra, rd_
-        i.code.append('{ s64 acc = (s64)(((u64)%s << 32) | %s); acc += %s %s %s; %s %s }' % (
+        # ARM accumulators wrap; signed host overflow would make these results undefined.
+        i.code.append('{ u64 acc = ((u64)%s << 32) | %s; acc += %s %s %s; %s %s }' % (
             R(i, hi), R(i, lo), p1, '-' if sub else '+', p2, W(i, lo, '(u32)acc'), W(i, hi, '(u32)((u64)acc >> 32)')))
         i.note = 'smlald'
         return
     if op1 == 0x75 and op2 in (0, 1, 6, 7):
-        rnd = '0x80000000ll' if op2 & 1 else '0'
-        prod = '(s64)(s32)%s * (s32)%s' % (R(i, rn_), R(i, rm_))
+        rnd = '0x80000000ull' if op2 & 1 else '0'
+        prod = '(u64)((s64)(s32)%s * (s32)%s)' % (R(i, rn_), R(i, rm_))
         if op2 >= 6:
-            e = '(u32)((((s64)%s << 32) - (%s) + %s) >> 32)' % (R(i, ra), prod, rnd)
+            e = '(u32)((((u64)%s << 32) - (%s) + %s) >> 32)' % (R(i, ra), prod, rnd)
         elif ra == 15:
             e = '(u32)(((%s) + %s) >> 32)' % (prod, rnd)
         else:
-            e = '(u32)((((s64)%s << 32) + (%s) + %s) >> 32)' % (R(i, ra), prod, rnd)
+            e = '(u32)((((u64)%s << 32) + (%s) + %s) >> 32)' % (R(i, ra), prod, rnd)
         i.code.append(W(i, rd_, e))
         i.note = 'smmul'
         return

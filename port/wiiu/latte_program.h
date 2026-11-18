@@ -6,7 +6,7 @@
 //     USE_CONST_FIELDS: the format of the data then comes from the buffer and not from the instruction, which says four floats. GX2 gives
 //     a uniform block's buffer no format. With the bit cleared the instruction is field for field what 0.2 writes.
 //   - An instruction with three operands always stores its result, and where only the next group reads it (through PV) 1.0 stores it in
-//     register 123. A vertex program has 48 registers and a pixel program 200 (GX2SetShaderMode). Here the store goes to the first register
+//     register 123. The default partition gives vertex programs 48 registers; larger programs reserve more before use. The store goes to the first register
 //     the program doesn't use, and the program says it uses one more.
 //   - Two instructions of a group may store to the same component of register 123: one in a vector unit and one in the scalar unit, each
 //     read by the next group through its own latch (PV, PS). A GPU keeps the two apart whatever becomes of the register. Cemu reads both
@@ -21,9 +21,10 @@
 #pragma once
 #include <cstdint>
 #include <cstring>
+#include "shader_budget.h"
 
 namespace gpu {
-constexpr uint32_t kVertexRegisters = 48, kPixelRegisters = 200;  // what GX2SetShaderMode gives each kind of program
+constexpr uint32_t kVertexRegisters = 48, kPixelRegisters = 200;  // default partition limits retained for the fitter regression fixtures
 
 namespace latte {
 // a program is 32-bit words, least significant byte first, whatever the CPU reading it
@@ -43,17 +44,27 @@ inline bool hollow_pixel_program(const void *program, uint32_t bytes) {
 }
 
 constexpr uint32_t kThrowaway = 123, kLiteral = 253;
+// The same unary opcodes as gsh_rules.py: their unused second selector is neither a GPR nor a literal read.
+inline bool one_operand(uint32_t op) {
+    return (op >= 16 && op <= 22) || op == 24 || op == 25 || op == 26 || op == 51 ||
+           (op >= 97 && op <= 111) || (op >= 119 && op <= 121);
+}
 
 // One pass over a program: its control flow list from the start, and each clause the list names. Returns whether it is laid out as a program is
 // (every clause inside it, every instruction group ended, the list ended by its END_OF_PROGRAM before the first clause begins). `top` gets
-// the highest register it reads or writes, the throwaway one aside, and `spares` how many registers the stores to that one need: one, or
+// the ordinary register count it reads or writes, the throwaway one aside, and `spares` how many registers the stores to that one need: one, or
 // two if two of a group store to the same component of it. With `to`, those stores go to register `to`, the second of such a pair to the
 // one after it, and uniform fetches lose their USE_CONST_FIELDS.
-inline bool walk(uint8_t *p, uint32_t words, uint32_t &top, uint32_t &spares, const uint32_t *to) {
+inline bool walk(uint8_t *p, uint32_t words, uint32_t &top, uint32_t &spares, const uint32_t *to, bool repair = true, bool *reads123 = nullptr) {
     top = spares = 0;
+    if (reads123) *reads123 = false;
     uint32_t first_clause = words / 2;  // in instructions (two words each), as the control flow list counts
+    uint32_t furthest_target = 0;
     auto reg = [&](uint32_t r) {
-        if (r < kThrowaway && r > top) top = r;
+        if (r < shader_budget::kOrdinary) {
+            if (r + 1 > top) top = r + 1;
+            if (r == kThrowaway && reads123) *reads123 = true;
+        }
     };
     for (uint32_t pc = 0; pc < first_clause; pc++) {
         const uint32_t w0 = word(p, 2 * pc), w1 = word(p, 2 * pc + 1);
@@ -68,21 +79,24 @@ inline bool walk(uint8_t *p, uint32_t words, uint32_t &top, uint32_t &spares, co
             while (i < end) {
                 const uint32_t a0 = word(p, 2 * i), a1 = word(p, 2 * i + 1);
                 const bool three = (a1 >> 15) & 7;
-                const uint32_t dst = (a1 >> 21) & 0x7F, sources = three ? 3 : 2;
+                const uint32_t dst = (a1 >> 21) & 0x7F, sources = three ? 3 : one_operand((a1 >> 7) & 0x7FF) ? 1 : 2;
                 for (uint32_t s = 0; s < sources; s++) {
                     const uint32_t sel = s == 0 ? a0 & 0x1FF : s == 1 ? (a0 >> 13) & 0x1FF : a1 & 0x1FF;
                     const uint32_t chan = s == 0 ? (a0 >> 10) & 3 : s == 1 ? (a0 >> 23) & 3 : (a1 >> 10) & 3;
+                    const bool relative = s == 0 ? a0 & (1u << 9) : s == 1 ? a0 & (1u << 22) : a1 & (1u << 9);
+                    if (sel < 128 && relative) return false;  // the computed register cannot be bounded by its base alone
                     if (sel == kLiteral && chan + 1 > literals) literals = chan + 1;
                     reg(sel);  // 124 to 127 are a clause's own, and 128 up constants: neither counts
                 }
                 if (three || (a1 & 0x10)) {  // it stores: two-operand instructions only with their write bit
-                    if (dst == kThrowaway) {
+                    if (a1 & (1u << 28)) return false;
+                    if (dst == kThrowaway && repair) {
                         const uint32_t component = 1u << ((a1 >> 29) & 3), again = (thrown & component) != 0;
                         thrown |= component;
                         if (spares < 1 + again) spares = 1 + again;
                         if (to) set_word(p, 2 * i + 1, (a1 & ~(0x7Fu << 21)) | ((*to + again) << 21));
                     }
-                    reg(dst);
+                    else reg(dst);
                 }
                 i++;
                 ended = a0 >> 31;
@@ -95,36 +109,57 @@ inline bool walk(uint8_t *p, uint32_t words, uint32_t &top, uint32_t &spares, co
             continue;
         }
         const uint32_t kind = (w1 >> 23) & 0x7F;
+        // Mesa r600_isa.c marks 4..17 as LOOP/BRANCH; their full WORD0 address is in CF instructions (r600_asm.c).
+        if (kind >= 4 && kind <= 17 && w0 > furthest_target) furthest_target = w0;
+        if (kind == 18 || kind == 20 || (kind == 19 && (w0 || (w1 & (63u << 13))))) return false;  // CALL/RET need a subroutine walk; canonical CALL_FS invokes the separate fetch shader
         if (kind == 39 || kind == 40) {  // exports: a register, and with a burst the ones after it
-            reg(((w0 >> 15) & 0x7F) + ((w1 >> 17) & 15));
-        } else if (kind >= 1 && kind <= 3) {  // fetches: four words each
+            const uint32_t last = ((w0 >> 15) & 0x7F) + ((w1 >> 17) & 15);
+            if (last > 127 || (w0 & (1u << 22))) return false;
+            if ((w1 & 7) < 4 || ((w1 >> 3) & 7) < 4 || ((w1 >> 6) & 7) < 4 || ((w1 >> 9) & 7) < 4) {
+                if (last >= shader_budget::kOrdinary) return false;  // clause temporaries never survive to an export
+                reg(last);
+            }
+        } else if ((kind >= 1 && kind <= 3) || (kind >= 27 && kind <= 29)) {  // fetches, including ACK: four words each
             const uint32_t count = (((w1 >> 10) & 7) | ((w1 >> 19) & 1) << 3) + 1;
-            if (w0 <= pc || w0 + 2 * count > words / 2) return false;
+            if (w0 <= pc || w0 > words / 2 || 2 * count > words / 2 - w0) return false;
             if (w0 < first_clause) first_clause = w0;
             for (uint32_t k = 0; k < count; k++) {
                 const uint32_t at = 2 * (w0 + 2 * k), f0 = word(p, at), f1 = word(p, at + 1);
-                if (f0 & 0x1F) continue;  // a texture sample, whose words are laid out differently
+                // TEX and ordinary VTX fetches share these GPR fields (Mesa r600_sq.h). Semantic/relative destinations need a different proof.
+                if ((f0 & 0x1F) == 1 || (f0 & (1u << 23)) || (f1 & (1u << 7))) return false;
+                if (((f0 >> 16) & 0x7F) >= shader_budget::kOrdinary || (f1 & 0x7F) >= shader_budget::kOrdinary) return false;
                 reg((f0 >> 16) & 0x7F);
                 reg(f1 & 0x7F);
-                if (to && ((f0 >> 8) & 0xFF) >= 0x80) set_word(p, at + 1, f1 & ~(1u << 21));  // a uniform block's buffer: 128 and up
+                if (to && !(f0 & 0x1F) && ((f0 >> 8) & 0xFF) >= 0x80) set_word(p, at + 1, f1 & ~(1u << 21));  // a uniform block's buffer: 128 and up
             }
-        }
-        if (w1 & (1u << 21)) return true;  // END_OF_PROGRAM
+        } else if (kind >= 30) return false;  // uninspected memory/export encodings cannot certify a register budget
+        if (w1 & (1u << 21)) return furthest_target <= pc;  // no branch may escape the prefix whose references were inspected
     }
     return false;
 }
 }  // namespace latte
 
-// `registers` is how many the program says it uses (the low byte of its sq_pgm_resources), and comes back higher by the one or two its
-// throwaway stores took. False, with the program as it was, if it isn't laid out as expected or hasn't those registers left under `limit`.
-inline bool fit_program(void *program, uint32_t bytes, uint32_t &registers, uint32_t limit) {
-    uint8_t *const p = (uint8_t *)program;
+// Inspect completely before changing words or metadata. Underdeclared ordinary counts are normalized; an ambiguous R123 read is refused.
+inline bool program_registers(const void *program, uint32_t bytes, uint32_t declared, uint32_t &required, uint32_t *spare_base = nullptr) {
+    if (!program || bytes < 8 || bytes % 8 || declared > shader_budget::kOrdinary) return false;
     uint32_t top, spares;
-    if (!latte::walk(p, bytes / 4, top, spares, nullptr)) return false;
-    const uint32_t spare = registers > top + 1 ? registers : top + 1;
-    if (spares && spare + spares > limit) return false;
-    latte::walk(p, bytes / 4, top, spares, &spare);
-    if (spares) registers = spare + spares;
+    bool reads123;
+    const bool repair = declared < shader_budget::kOrdinary;
+    if (!latte::walk((uint8_t *)program, bytes / 4, top, spares, nullptr, repair, &reads123) || (repair && reads123)) return false;
+    if (!declared && (top || spares)) return false;  // zero is valid for a constant-only pixel program, never missing metadata for real GPRs
+    const uint32_t base = declared > top ? declared : top;
+    required = base + spares;
+    if (required > shader_budget::kOrdinary) return false;
+    if (spare_base) *spare_base = base;
+    return true;
+}
+
+// False leaves both words and count unchanged, including programs needing no throwaway repair.
+inline bool fit_program(void *program, uint32_t bytes, uint32_t &registers, uint32_t limit) {
+    uint32_t required, spare, top, spares;
+    if (!program_registers(program, bytes, registers, required, &spare) || required > limit) return false;
+    latte::walk((uint8_t *)program, bytes / 4, top, spares, &spare, registers < shader_budget::kOrdinary);
+    registers = required;
     return true;
 }
 

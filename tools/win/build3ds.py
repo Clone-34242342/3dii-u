@@ -642,33 +642,42 @@ def merge_gfd(paths, out):
 
 
 def check_registers(path, droppable=frozenset()):
-    """GX2SetShaderMode leaves 48 registers for vertex shaders and 200 for pixel shaders. A shader asking for more can't start on a real GPU, and Cemu doesn't mind;
-    tools/gsh_rules.py says what else a real GPU holds a program to. droppable: vertex shaders (by number) whose draws the CPU can shade instead, a vertex
-    program and the geometry shader after it (gen_gsx_glsl): one of those a GPU can't take leaves shaders.idx, and the build goes on."""
+    """Validate ordinary GPRs; runtime reserves the pack's VS maximum from the shared248-register pool before drawing."""
     import importlib.util
     spec = importlib.util.spec_from_file_location('gsh_rules', ROOT + '/tools/gsh_rules.py')
     rules = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rules)
-    vs = ps = vi = 0
+    listed = os.path.join(os.path.dirname(path), 'glsl', 'list.txt')
+    names = open(listed).read().split() if os.path.isfile(listed) else []
+    source = {'vertex': [n for n in names if n.endswith('.vert')], 'pixel': [n for n in names if n.endswith('.frag')]}
+    counts, maxima = {'vertex': 0, 'pixel': 0}, {'vertex': 0, 'pixel': 0}
     broken, dropped = [], set()
-    for kind, registers, words in rules.programs(open(path, 'rb').read()):
-        bad = rules.check(words, registers)
-        if kind == 'vertex':
-            if (registers > 48 or bad) and vi in droppable:
-                dropped.add(vi)
-            else:
-                vs = max(vs, registers)
-                broken += [f'vertex program {vi}: {what}' for what in bad]
-            vi += 1
+    try:
+        programs = list(rules.programs(open(path, 'rb').read()))
+    except ValueError as error:
+        sys.exit(f'{path}: {error}')
+    for kind, registers, words in programs:
+        index = counts[kind]; counts[kind] += 1
+        filename = source[kind][index] if index < len(source[kind]) else path
+        label = f'{kind} program {index} ({filename}, declared {registers})'
+        bad = list(rules.check(words, registers))
+        if not registers and bad:
+            bad.insert(0, 'zero-register metadata')
+        elif registers > 124:
+            bad.insert(0, f'requires {registers} ordinary registers; supported maximum is124')
+        if kind == 'vertex' and bad and index in droppable:
+            dropped.add(index)
         else:
-            ps = max(ps, registers)
-            broken += [f'pixel program: {what}' for what in bad]
-    print(f'registers: vertex shaders use up to {vs} of 48, pixel shaders up to {ps} of 200')
-    if not vs or vs > 48 or ps > 200:
-        sys.exit('a shader needs more registers than the GPU gives it')
+            maxima[kind] = max(maxima[kind], registers)
+            broken += [f'{label}: {what}' for what in bad]
+    if not counts['vertex']:
+        sys.exit(f'{path}: no vertex programs discovered (not a register-pressure failure)')
     if broken:
-        sys.exit('shader programs a real GPU may not take (tools/gsh_rules.py):\n   ' + '\n   '.join(broken[:20]))
-    if dropped:  # shaders.idx (shadergen.h): its header, the fragment entries, then the vertex ones, 16 bytes each, big-endian
+        sys.exit('invalid shader programs (tools/gsh_rules.py):\n   ' + '\n   '.join(broken[:20]))
+    vs, ps = maxima['vertex'], maxima['pixel']
+    allocation = max(48, vs)
+    print(f'registers: vertex programs require up to {vs}/124, pixel up to {ps}/124; runtime partition VS {allocation}, PS {248-allocation}')
+    if dropped:
         idx = os.path.join(os.path.dirname(path), 'shaders.idx')
         d = bytearray(open(idx, 'rb').read())
         num_ps, num_vs = struct.unpack_from('>II', d, 8)
@@ -676,7 +685,7 @@ def check_registers(path, droppable=frozenset()):
         kept = [d[p:p + 16] for p in range(at, at + 16 * num_vs, 16) if struct.unpack_from('>I', d, p + 8)[0] not in dropped]
         struct.pack_into('>I', d, 12, len(kept))
         open(idx, 'wb').write(bytes(d[:at]) + b''.join(kept))
-        print(f'{len(dropped)} geometry shader draws left to the CPU: their shaders are more than a GPU takes')
+        print(f'{len(dropped)} geometry shader draws left to the CPU: their programs failed GPU validation')
 
 
 def compile_shaders(out, jobs):

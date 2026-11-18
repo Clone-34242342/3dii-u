@@ -60,7 +60,7 @@ inline bool shader_header(const uint8_t *p, size_t n, bool vs, uint32_t program_
     const uint32_t fixed = vs ? 0x134 : 0xe8, size_at = vs ? 0xd0 : 0xa4;
     if (n < fixed + 40 || n > 65536 || n % 4 || word(p + size_at) != program_size || word(p + size_at + 4) || word(p + size_at + 8) != 1) return false;
     const uint32_t regs = word(p) & 255;
-    if (!regs || regs > (vs ? 48u : 200u)) return false;
+    if (regs > gpu::shader_budget::kOrdinary) return false;
     if (vs ? (word(p + 12) > 10 || word(p + 64) > 32 || word(p + 0x110)) : word(p + 16) > 32) return false;
     const uint8_t *r = p + n - 40;
     const uint32_t patch_count = word(r + 32), patch_tag = word(r + 36), patch_at = patch_tag & 0xfffff;
@@ -102,7 +102,7 @@ inline bool shader_header(const uint8_t *p, size_t n, bool vs, uint32_t program_
 
 inline bool valid_gfd(const uint8_t *p, size_t n, bool vs) {
     if (n < 128 || n > kMaxFile - kHeader || word(p) != 0x47667832 || word(p + 4) != 32 || word(p + 8) != 7 || word(p + 12) != 1) return false;
-    const uint8_t *header = nullptr;
+    const uint8_t *header = nullptr, *program = nullptr;
     size_t header_size = 0;
     uint32_t program_size = 0;
     bool ended = false;
@@ -118,11 +118,14 @@ inline bool valid_gfd(const uint8_t *p, size_t n, bool vs) {
         } else if (kind == (vs ? 5u : 7u)) {
             if (!header || program_size || size < 8 || size % 8 || size > (1u << 20)) return false;
             if (!vs && gpu::latte::hollow_pixel_program(p + at, size)) return false;
-            program_size = size;
+            program = p + at; program_size = size;
         } else if (kind != 2) return false;  // optional alignment padding only
         at += size;
     }
-    return ended && header && program_size && shader_header(header, header_size, vs, program_size);
+    if (!ended || !header || !program_size || !shader_header(header, header_size, vs, program_size)) return false;
+    // Zero metadata is only valid when the production scanner proves no ordinary references or repairs.
+    uint32_t required;
+    return (word(header) & 255) || (gpu::program_registers(program, program_size, 0, required) && !required);
 }
 
 inline bool decode(const std::vector<uint8_t> &file, const Identity &id, const uint8_t *&gfd, size_t &size) {

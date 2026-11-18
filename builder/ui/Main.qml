@@ -684,11 +684,17 @@ ApplicationWindow {
             // the right column: the choices, or the build
             Flickable {
                 id: column
+                objectName: "buildColumn"  // test_window.py scrolls it
                 x: 660; y: 100; width: 610; height: 620
                 contentHeight: rightCol.height + 40
                 clip: true
                 boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: Thumb { }
+                // shown while there's more below: "Put it on" starts under the window's edge (#29)
+                ScrollBar.vertical: Thumb { policy: column.contentHeight > column.height ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded }
+                Connections {  // Build with nowhere to put the game: its choice comes into view under the message, rightCol's 12 above it
+                    target: app
+                    function onDestWanted() { column.contentY = Math.max(0, Math.min(destCard.y, column.contentHeight - column.height)) }
+                }
                 Column {
                     id: rightCol
                     x: 20; y: 12
@@ -786,6 +792,7 @@ ApplicationWindow {
                     }
 
                     Card {
+                        id: destCard
                         visible: app.view === "form"
                         enabled: !win.restarting
                         title: "Put it on"

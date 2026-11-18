@@ -38,11 +38,12 @@ void save_dirty();
 struct SaveFile;
 std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd);
 void save_file_close(SaveFile &f);
+void save_file_close_direct(const std::string &path);
 long save_file_read(SaveFile &f, void *to, u32 len, u64 at);
 long save_file_write(SaveFile &f, const void *from, u32 len, u64 at);
 u64 save_file_size(SaveFile &f);
 void save_file_resize(SaveFile &f, u64 size);
-void save_settle(const std::string &prefix, bool forget);
+bool save_settle(const std::string &prefix, bool forget);
 }
 using wiiu::save_write;
 using wiiu::save_resize;
@@ -59,7 +60,7 @@ struct FsIo {
 #else
 #define FS_NOTE(...)
 #define SAVE_DIRTY()
-#define SAVE_SETTLE(prefix, forget)
+#define SAVE_SETTLE(prefix, forget) true
 struct FsIo {
     explicit FsIo(u32) {}
 };
@@ -81,6 +82,7 @@ static const u32 ERR_FILE_EXISTS = fs_err(180, 1);
 static const u32 ERR_DIR_EXISTS = fs_err(185, 1);
 static const u32 ERR_ARCHIVE = fs_err(101, 4);
 static const u32 ERR_UNSUPPORTED = fs_err(760, 6, 28);
+static const u32 ERR_IO = fs_err(1007, 11);  // NoData, Internal: cached changes could not reach storage
 
 }  // namespace kernel
 extern std::string g_save_base;
@@ -441,6 +443,7 @@ struct FileSession : Service {
     std::string path;
 #ifdef __WIIU__
     std::shared_ptr<wiiu::SaveFile> held;  // a save file of the game's, in memory: no storage behind its reads and writes
+    bool direct_save = false;  // this session reserved an uncached save path
 #endif
     FileSession() : Service("fs file") {}
     ~FileSession() override {
@@ -456,6 +459,9 @@ struct FileSession : Service {
             close(fd);
             if (written) SAVE_DIRTY();  // a file's last changes may only go out as it closes
         }
+#ifdef __WIIU__
+        if (direct_save) wiiu::save_file_close_direct(path);
+#endif
     }
     u64 file_size() {
         if (romfs) return size;
@@ -518,10 +524,10 @@ struct FileSession : Service {
             u64 off = (u64)ipc[1] | ((u64)ipc[2] << 32);
             u32 len = ipc[3];
             u32 src = ipc[6];
-            ipc.lk->unlock();  // as for a read
+            s64 n;
+            run_blocked(*ipc.lk, [&] {
             FS_NOTE("save: writing %x bytes to %s", len, path.c_str());
             save_lock();
-            s64 n;
 #ifdef __WIIU__
             if (held) n = wiiu::save_file_write(*held, gptr(src), len, off);
             else
@@ -532,7 +538,7 @@ struct FileSession : Service {
             }
             save_unlock();
             FS_NOTE("save: written, %d", (int)n);
-            ipc.lk->lock();
+            });
             if (n < 0) n = 0;
             if (g_verbose) LOG("[fs] write %s off %llx len %x\n", path.c_str(), (unsigned long long)off, len);
             if (!romfs && n > 0) {
@@ -545,27 +551,34 @@ struct FileSession : Service {
             ipc.set(4, src);
             break;
         }
-        case 0x0804:  // GetSize
+        case 0x0804: {  // GetSize
+            u64 size;
+            run_blocked(*ipc.lk, [&] { size = file_size(); });
             ipc.ok(3);
-            ipc.set64(2, file_size());
+            ipc.set64(2, size);
             break;
-        case 0x0805:  // SetSize
+        }
+        case 0x0805: {  // SetSize
             if (!romfs) {
+                const u64 size = (u64)ipc[1] | ((u64)ipc[2] << 32);
+                run_blocked(*ipc.lk, [&] {
                 save_lock();
 #ifdef __WIIU__
-                if (held) wiiu::save_file_resize(*held, (u64)ipc[1] | ((u64)ipc[2] << 32));
+                if (held) wiiu::save_file_resize(*held, size);
                 else
 #endif
                 {
                     FsIo io(0x0805);
-                    save_resize(fd, (u64)ipc[1] | ((u64)ipc[2] << 32));
+                    save_resize(fd, size);
                 }
                 save_unlock();
+                });
                 written = true;
                 save_changed(path);
             }
             ipc.ok();
             break;
+        }
         case 0x0808:  // Close
         case 0x0809:  // Flush
         case 0x080A:  // SetPriority
@@ -847,9 +860,13 @@ struct FsUser : Service {
             VLOG("[fs] open %s\n", path.c_str());
 #ifdef __WIIU__
             // the game's own saves are held in memory from here on (save_storage.cpp)
-            if (!path.compare(0, g_save_base.size(), g_save_base) && (fs->held = wiiu::save_file_open(path, fs->fd))) {
-                close(fs->fd);
-                fs->fd = -1;
+            if (!path.compare(0, g_save_base.size(), g_save_base)) {
+                fs->held = wiiu::save_file_open(path, fs->fd);
+                fs->direct_save = !fs->held;
+                if (fs->held) {
+                    close(fs->fd);
+                    fs->fd = -1;
+                }
             }
 #endif
         }
@@ -860,6 +877,28 @@ struct FsUser : Service {
     }
 
     void handle(IPC &ipc) override {
+        if (ipc.cmd() == 0x080E) {  // CloseArchive only changes the kernel-owned handle table.
+            archives.erase((u64)ipc[1] | ((u64)ipc[2] << 32));
+            ipc.ok();
+            return;
+        }
+        if (ipc.cmd() == 0x0802) {  // OpenFile: snapshot archive state before storage can block.
+            Archive *a = arch(ipc[2], ipc[3]);
+            if (!a) { ipc.result(ERR_ARCHIVE); return; }
+            Archive archive = *a;
+            const LowPath path = read_path(ipc[4], ipc[5], ipc[9]);
+            const u32 flags = ipc[6];
+            ObjPtr file;
+            u32 result;
+            run_blocked(*ipc.lk, [&] {
+                FsIo io(0x3802);
+                result = open_file(&archive, path, flags, &file);
+                if (result) file.reset();
+            });
+            ipc.result(result, 1, 2);
+            ipc.handles(2, {file}, true);
+            return;
+        }
         FsIo io(0x3000 | ipc.cmd());
         switch (ipc.cmd()) {
         case 0x0801:  // Initialize
@@ -883,20 +922,6 @@ struct FsUser : Service {
             if (g_verbose) LOG("[fs] control archive action %u\n", ipc[3]);
             ipc.ok();
             break;
-        case 0x080E:  // CloseArchive
-            archives.erase((u64)ipc[1] | ((u64)ipc[2] << 32));
-            ipc.ok();
-            break;
-        case 0x0802: {  // OpenFile(transaction, archive u64, path type, size, flags, attrs, desc, ptr)
-            Archive *a = arch(ipc[2], ipc[3]);
-            if (!a) { ipc.result(ERR_ARCHIVE); break; }
-            LowPath p = read_path(ipc[4], ipc[5], ipc[9]);
-            ObjPtr f;
-            u32 r = open_file(a, p, ipc[6], &f);
-            ipc.result(r, 1, 2);
-            ipc.handles(2, {f}, true);
-            break;
-        }
         case 0x0803: {  // OpenFileDirectly
             LowPath ap = read_path(ipc[3], ipc[4], ipc[10]);
             LowPath fp = read_path(ipc[5], ipc[6], ipc[12]);
@@ -915,7 +940,7 @@ struct FsUser : Service {
             Archive *a = arch(ipc[2], ipc[3]);
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
-            SAVE_SETTLE(path, true);
+            if (!SAVE_SETTLE(path, true)) { ipc.result(ERR_IO); break; }
             ipc.result(fsys::remove(path) ? 0 : ERR_FILE_NOT_FOUND);
             save_changed(path);
             break;
@@ -926,8 +951,7 @@ struct FsUser : Service {
             if (!a || !b) { ipc.result(ERR_ARCHIVE); break; }
             std::string s = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[11]).str());
             std::string d = b->host + sanitize(read_path(ipc[8], ipc[9], ipc[13]).str());
-            SAVE_SETTLE(s, true);
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(s, true) || !SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_FILE_NOT_FOUND : 0);
@@ -939,7 +963,7 @@ struct FsUser : Service {
             Archive *a = arch(ipc[2], ipc[3]);
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
-            SAVE_SETTLE(path, true);
+            if (!SAVE_SETTLE(path, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             if (ipc.cmd() == 0x0807) fsys::remove_all(path, ec);
             else fsys::remove(path, ec);
@@ -981,8 +1005,7 @@ struct FsUser : Service {
             if (!a || !b) { ipc.result(ERR_ARCHIVE); break; }
             std::string s = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[11]).str());
             std::string d = b->host + sanitize(read_path(ipc[8], ipc[9], ipc[13]).str());
-            SAVE_SETTLE(s, true);
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(s, true) || !SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_PATH_NOT_FOUND : 0);
@@ -995,7 +1018,8 @@ struct FsUser : Service {
             if (a->id == 10) { ipc.result(ERR_UNSUPPORTED, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             std::string path = a->host + sanitize(read_path(ipc[3], ipc[4], ipc[6]).str());
             if (!fsys::is_directory(path)) { VLOG("[fs] OpenDirectory %s: not found\n", path.c_str()); ipc.result(ERR_PATH_NOT_FOUND, 1, 2); ipc.handles(2, {nullptr}, true); break; }
-            SAVE_SETTLE(path, false);  // the sizes it lists come from storage
+            // The sizes it lists come from storage, which must contain the cached changes.
+            if (!SAVE_SETTLE(path, false)) { ipc.result(ERR_IO, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             auto ds = std::make_shared<DirSession>();
             for (auto &e : fsys::directory_iterator(path)) ds->entries.push_back(e);
             VLOG("[fs] OpenDirectory %s: %zu entries\n", path.c_str(), ds->entries.size());
@@ -1012,7 +1036,7 @@ struct FsUser : Service {
             // size in 512-byte blocks, directories, files, two bucket counts, duplicate data: after the archive's path in FormatSaveData
             const int at = ipc.cmd() == 0x084C ? 4 : 1;
             FS_NOTE("save: formatting");
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             fsys::remove_all(d, ec);
             fsys::create_directories(d);
             keep_format_info(d, {ipc[at] * 512, ipc[at + 1], ipc[at + 2], ipc[at + 5] & 0xff});
@@ -1047,7 +1071,7 @@ struct FsUser : Service {
             const std::string d = save_root() + b;
             if (deleting) {  // what a game does before it makes its extra data anew ("initialize")
                 std::error_code ec;
-                SAVE_SETTLE(d, true);
+                if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
                 fsys::remove_all(d, ec);
                 fsys::remove(d + ".format", ec);
             } else {

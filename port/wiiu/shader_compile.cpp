@@ -132,7 +132,7 @@ bool native_load(const Job &j, CompileDone &d) {
     u32 registers = resources & 255;
     if ((j.vs && (d.vs_shader->size <= 16 || (inputs_read(j.glsl) && !d.vs_shader->attribVarCount))) ||
         !fit_program(j.vs ? d.vs_shader->program : d.ps_shader->program, j.vs ? d.vs_shader->size : d.ps_shader->size,
-                     registers, j.vs ? kVertexRegisters : kPixelRegisters)) {
+                     registers, shader_budget::kOrdinary)) {
         shader_compile_discard(d);
         return false;
     }
@@ -332,12 +332,16 @@ int compile_thread(int, void *) {
         // what this compiler writes that a real GPU may not take, put right before anything draws with the program (latte_program.h)
         u32 &resources = j.vs ? d.vs_shader->regs.sq_pgm_resources_vs : d.ps_shader->regs.sq_pgm_resources_ps;
         u32 registers = resources & 0xFF;
-        if (!fit_program(j.vs ? d.vs_shader->program : d.ps_shader->program, j.vs ? d.vs_shader->size : d.ps_shader->size, registers, j.vs ? kVertexRegisters : kPixelRegisters)) {
-            failed("its program isn't laid out as this GPU's are, or has no register to spare");
+        if (!fit_program(j.vs ? d.vs_shader->program : d.ps_shader->program, j.vs ? d.vs_shader->size : d.ps_shader->size, registers, shader_budget::kOrdinary)) {
+            char why[160];
+            snprintf(why, sizeof why, "invalid program/metadata or ordinary-register requirement exceeds %u (declared %u, %u bytes)",
+                     shader_budget::kOrdinary, resources & 255, j.vs ? d.vs_shader->size : d.ps_shader->size);
+            failed(why);
             shader_compile_discard(d);
             continue;
         }
         resources = (resources & ~0xFFu) | registers;
+        LOG("[glsl] %s %016llx requires %u ordinary registers\n", j.vs ? "vertex" : "pixel", (unsigned long long)j.key, registers);
         native_save(j, d);  // store the corrected program, before install_compiled's Cemu-only export expansion
         if (!j.cached) cache_append(j);
         OSLockMutex(&mutex);
@@ -396,17 +400,24 @@ void shader_compile_watch() {
 // asks for moves up to the front: after a start with a few hundred cached shaders a miss used to wait its turn behind all of them, its draws
 // going through the fallback for as many seconds.
 void shader_compile_request(bool vs, u64 key, std::string glsl, u32 inputs) {
+    static std::unordered_set<u64> reported_vs;  // at most one request diagnostic per vertex key, even if a caller repeats it
+    const char *disposition = "already known (no queued job)";
     OSLockMutex(&mutex);
-    if (known.insert(key).second) jobs.push_front(Job{vs, false, key, inputs, std::move(glsl)});
-    else
+    const bool report = vs && reported_vs.insert(key).second;
+    if (known.insert(key).second) {
+        jobs.push_front(Job{vs, false, key, inputs, std::move(glsl)});
+        disposition = "queued";
+    } else
         for (auto it = jobs.begin(); it != jobs.end(); ++it)
             if (it->key == key && it->vs == vs) {
                 Job j = std::move(*it);
                 jobs.erase(it);
                 jobs.push_front(std::move(j));
+                disposition = "promoted";
                 break;
             }
     OSUnlockMutex(&mutex);
+    if (report) LOG("[glsl] vertex %016llx request: %s\n", (unsigned long long)key, disposition);
 }
 
 void shader_compile_discard(CompileDone &d) {

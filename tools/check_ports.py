@@ -16,7 +16,9 @@ games/<folder>/good_shots/<game>/<leg>: a game fails when, against the nearest g
 the other (pictures()), and so also when it draws nothing where a good run drew. A game with no good run says so. --bless runs nothing: it keeps
 the last run's pictures as a good run, for once they've been looked at (tools/contact_sheet.py lays them out, a sheet per game).
 A game also fails on a crash, code the translation missed, a vertex shader that wasn't compiled, a failed save flush, a save that formats itself twice, a save in common storage
-instead of the player's, or files not going straight to the file system. Fragment misses and frame rates are reported, not judged: Cemu has no real GPU. Shaders a run missed go to shader_logs, for the next build. Exit code 0 if all passed.
+instead of the player's, or files not going straight to the file system. By default fragment misses and frame rates are reported, not judged.
+--strict requires --measure and approved reference pictures; CPU shader fallback, fragment misses and missing execution counters also fail.
+This validates the exercised route, never complete gameplay or console performance. Shaders a run missed go to shader_logs, for the next build. Exit code 0 if all passed.
 --cold checks what a tester gets from a game nobody has built before: sources.json's games built with none of this PC's lists of their code and
 shaders (pipeline.py --cold), run the same way and held to the usual builds' good pictures. The usual check passed for weeks while testers' games,
 of other regions and versions than this PC's, crashed on code only this PC's lists named (2026-11-12).
@@ -44,6 +46,7 @@ CEMU = ROOT + '/build_win/cemu'
 GAMES = {'sticker_star': '77', 'nsmb2': '78', 'dream_team': '79', 'paper_jam': '80', 'superstar_saga': '83', 'bowsers_inside': '84', 'layton_azran': '85', 'layton_mask': '86', 'tomodachi': '67'}
 OUT = {'layton_mask': 'build_layton/layton_mask', 'layton_azran': 'build_layton/layton_azran', 'tomodachi': 'build'}
 MEASURE = False  # --measure: the measuring kind of build, which build3ds.py and the builder's pipeline keep in folders of their own
+STRICT = False   # --strict: shader slow paths/misses block release validation too
 COLD = False     # --cold: built as a game nobody has built before, under <name>_cold
 SOURCES = ROOT + '/games/sources.json'
 # A console's account always has a Mii, and Cemu's is a placeholder the runtime turns down, so a run had the games find none: a state no
@@ -112,14 +115,16 @@ def categorize_fault(fault: str) -> str:
         return 'unsupported instruction'
     if 'unimplemented service command' in m or 'unimplemented command' in m or '[srv] unhandled' in m or 'unknown service' in m:
         return 'missing service command'
-    if ('vertex shaders the pack lacks' in m or
+    if ('vertex shaders the pack lacks' in m or 'shader fallback' in m or
             'console compiler' in m or
             '[glsl]' in m or
             'fragment misses' in m):
         return 'shader fallback'
     if 'save flush failed' in m or 'formatted the save again' in m or 'saved in common storage' in m:
         return 'save failure'
-    if 'nothing drawn' in m or 'no pictures of the' in m or 'insufficient visual coverage' in m:
+    if ('nothing drawn' in m or 'no pictures of the' in m or 'insufficient visual coverage' in m or
+            'unverified rendering' in m or
+            'unreadable' in m or 'pictures not compared' in m or 'invalid reference pictures' in m):
         return 'no useful frames'
     if 'crash' in m or 'fatal' in m or 'pagefault' in m or 'panic' in m:
         return 'crash'
@@ -259,6 +264,15 @@ def learn_missed(t):
     return len(new)
 
 
+def learn_shaders(t, misses):
+    """Keep this title's programs and shareable fragment states; cold checks never change learned inputs."""
+    if t.like:
+        return
+    os.makedirs(t.data + '/shader_logs', exist_ok=True)
+    out = f'{t.data}/shader_logs/cemu_{time.strftime("%m%d_%H%M%S")}.bin'
+    run(sys.executable, 'tools/misses_to_log.py', misses, out, out[:-4] + '_fs.bin')
+
+
 UNLIKE = 45  # mean difference per colour channel, of 255, between two pictures shrunk to 64x36: a frame of the same scene a moment apart
 #              comes to 2 to 35, the same scene with its background drawn as stripes to 50 to 80 (Superstar Saga, 2026-11-11)
 
@@ -311,22 +325,28 @@ def pictures(t, leg, minimum_pairs=1):
         if not count[screen]:
             return f'{leg}: no pictures of the {name}', None
     try:
+        shrunk = {s: list(map(small, sorted(glob.glob(f'{mine}/{s}_*.png')))) for s in count}
+        for screen in count:
+            if any(image is None for image in shrunk[screen]):
+                return f'{leg}: unreadable {"TV" if screen == "tv" else "GamePad"} picture', None
         if pairs >= 2 and all(black(f'{mine}/tv_{n}') and black(f'{mine}/pad_{n}') for n in captures['tv'] & captures['pad']):
             return f'{leg}: nothing drawn: every captured TV/GamePad pair is entirely black', None
         runs = glob.glob(good + '/*/')
         if not runs:
             return None, f'{leg}: no good pictures to compare with yet'
-        shrunk = {s: [x for x in map(small, sorted(glob.glob(f'{mine}/{s}_*.png'))) if x] for s in count}
-
         def apart(run):  # the most pictures of one screen that this run or that good one has and the other hasn't
             n = 0
             for s in count:
-                theirs = [x for x in map(small, glob.glob(f'{run}/{s}_*.png')) if x]
+                theirs = list(map(small, glob.glob(f'{run}/{s}_*.png')))
+                if not theirs or any(image is None for image in theirs):
+                    raise ValueError(f'invalid reference pictures: missing or unreadable {s} images in {run}')
                 n = max(n, strangers(shrunk[s], theirs), strangers(theirs, shrunk[s]))
             return n
         nearest = min(map(apart, runs))
     except ImportError:
-        return None, f'{leg}: pictures not compared (PySide6 is not installed)'
+        return f'{leg}: pictures not compared (PySide6 is not installed)', None
+    except ValueError as error:
+        return f'{leg}: {error}', None
     if nearest >= 2:
         return f'{leg}: {nearest} pictures of a screen are in this run or the nearest good run and not in the other (see {mine})', None
     return None, f'{leg}: pictures like a good run\'s'
@@ -363,6 +383,23 @@ def save_files(t):
         for n in names:
             got[os.path.relpath(os.path.join(d, n), base)] = hashlib.md5(open(os.path.join(d, n), 'rb').read()).hexdigest()[:8]
     return got
+
+
+def shader_faults(text):
+    """Strict release evidence: CPU fallback and missing shaders cannot count as a native pass."""
+    faults = []
+    cpu_counts = re.findall(r'(\d+) on CPU', text)
+    fragment_counts = re.findall(r'(\d+) fragment misses', text)
+    if not cpu_counts or not fragment_counts:
+        faults.append('shader fallback validation lacks complete execution counters')
+    cpu = sum(map(int, cpu_counts))
+    fragments = max(map(int, fragment_counts), default=0)
+    geometry = sum(map(int, re.findall(r'(\d+) geometry shaders.*drawn by the CPU', text)))
+    if cpu or geometry:
+        faults.append(f'shader fallback: {cpu} CPU draw batches, {geometry} geometry shader fallbacks')
+    if fragments:
+        faults.append(f'shader fallback: {fragments} fragment misses')
+    return faults
 
 
 def judge(t, seconds, flags, measured=False):
@@ -488,6 +525,8 @@ def judge(t, seconds, flags, measured=False):
         fps = [float(x) for x in re.findall(r'\[gx2\] ([0-9.]+) fps', text)]
         ps = re.findall(r'(\d+) fragment misses', text)
         cpu = re.findall(r'(\d+) on CPU', text)
+        if STRICT:
+            faults.extend(f'{name}: {fault}' for fault in shader_faults(text))
         if fps:
             s = sorted(fps)
             notes.append(f'{name}: {s[len(s) // 2]:.0f} fps (low {s[0]:.0f}), {ps[-1] if ps else 0} fragment misses, {sum(map(int, cpu))} draws shaded by the CPU, {len(flushes)} flushes')
@@ -498,14 +537,17 @@ def judge(t, seconds, flags, measured=False):
             faults.append(fault)
         if note:
             notes.append(note)
+            if STRICT and 'no good pictures to compare with' in note:
+                faults.append(f'{name}: unverified rendering: no approved reference pictures')
         misses = d + '/shader_misses.bin'
         if os.path.exists(misses) and os.path.getsize(misses):
+            shutil.copyfile(misses, f'{kept(t, "check_logs")}/{name.replace(" ", "_")}_shader_misses.bin')
             gsx = gsx_misses(misses)
             if gsx:
                 notes.append(f"{name}: {gsx} geometry shaders' draws the pack lacked a shader for, drawn by the CPU")
-            if not t.like:  # what a cold build missed stays out of the lists the usual builds are made from
-                os.makedirs(t.data + '/shader_logs', exist_ok=True)
-                run(sys.executable, 'tools/misses_to_log.py', misses, f'{t.data}/shader_logs/cemu_{time.strftime("%m%d_%H%M%S")}.bin')
+                if STRICT:
+                    faults.append(f'{name}: shader fallback: {gsx} geometry shader records need native compilation')
+            learn_shaders(t, misses)
             os.remove(misses)
     found = learn_missed(t)
     if found:
@@ -529,8 +571,13 @@ def main():
     p.add_argument('--measure', action='store_true', help="the measuring kind of build (build3ds.py's THREEDII_MEASURE): frame rates and costs on the log, and the scenes")
     p.add_argument('--shots', type=int, default=6, help='pictures of each screen a leg; more than the usual six are for looking at, and fail the comparison with a good run')
     p.add_argument('--cold', action='store_true', help="sources.json's games as a tester's first build of a game nobody has built: none of this PC's lists of its code and shaders")
+    p.add_argument('--strict', action='store_true', help='CPU shader fallback and fragment misses block release validation')
     args = p.parse_args()
+    if args.strict and not args.measure:
+        p.error('--strict requires --measure so fallback execution counters are available')
     SHOTS = args.shots
+    global STRICT
+    STRICT = args.strict
     global COLD
     COLD = args.cold
     if args.measure:

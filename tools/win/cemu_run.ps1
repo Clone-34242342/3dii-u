@@ -47,6 +47,7 @@ while (Get-Process CemuMario -ErrorAction SilentlyContinue) {
 }
 New-Item -ItemType Directory -Force -Path $sd, $Out | Out-Null
 if (Test-Path -LiteralPath "$sd\log.txt") { Remove-Item -LiteralPath "$sd\log.txt" -Force -Confirm:$false }
+$logFresh = -not (Test-Path -LiteralPath "$sd\log.txt")  # a failed removal must never make an old quit end this run
 # Cemu killed while it writes one of this title's shader caches leaves a half-written file, and the next start crashes in ntdll (heap corruption: Kirby,
 # NSMB2 and both Laytons on 2026-11-08/09; deleting the pipeline cache alone didn't stop it; NSMB2 again on 2026-11-11, from the precompiled one, on
 # every start with no shader cache). So a run ends by asking Cemu to close, which lets it finish writing, and any run that ends otherwise (a crash,
@@ -65,11 +66,19 @@ $p = Get-Process -Id ([W3]::Start($exe, $cmd, $cemuDir))
 function Post([uint32]$msg, [int]$key, [int64]$l) {  # a key message, to Cemu's own windows only
   foreach ($h in [W3]::Windows([uint32]$p.Id, $true)) { [W3]::PostMessage($h, $msg, [IntPtr]$key, [IntPtr]$l) | Out-Null }
 }
+function Guest-Exited {
+  if (-not $logFresh) { return $false }
+  try {
+    return [IO.File]::GetLastWriteTimeUtc("$sd\log.txt") -ge $p.StartTime.ToUniversalTime() -and
+      [IO.File]::ReadAllText("$sd\log.txt") -cmatch '(?m)^[ \t]*[0-9]+ \[quit\] sound system shut down\r?\n'
+  } catch { return $false }
+}
 function Shot([string]$name) {  # Cemu's screenshot (F12) of what its window shows, moved to $Out under that name once Cemu has written it
+  if (Guest-Exited) { return }
   Get-ChildItem -LiteralPath $shotDir -File -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Confirm:$false  # one that came late
   Post 0x100 0x7B 0x00580001
   Post 0x101 0x7B 0xC0580001
-  for ($i = 0; $i -lt 40; $i++) {
+  for ($i = 0; $i -lt 40 -and -not $p.HasExited -and -not (Guest-Exited) -and $captureClock.Elapsed.TotalSeconds -lt $captureBudget; $i++) {
     Start-Sleep -Milliseconds 100
     $f = Get-ChildItem -LiteralPath $shotDir -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($f) { try { Move-Item -LiteralPath $f.FullName -Destination "$Out\$name" -Force -ErrorAction Stop; return } catch { } }  # Cemu is still writing it
@@ -78,15 +87,22 @@ function Shot([string]$name) {  # Cemu's screenshot (F12) of what its window sho
 # Both screens, each time: Cemu's window shows the GamePad's picture while Tab is held. (With its separate GamePad window open Cemu saves
 # that picture too, but the one run tried that way crashed in Cemu at the start of NSMB2, 2026-11-11.)
 $per = [int]($Seconds / [Math]::Max($Shots, 1))
-$from = Get-Date
-for ($n = 0; $n -lt $Shots -and -not $p.HasExited; $n++) {
-  $wait = [int]($from.AddSeconds($per * ($n + 1)) - (Get-Date)).TotalMilliseconds
-  if ($wait -gt 0) { Start-Sleep -Milliseconds $wait }
+$captureBudget = [Math]::Max($Seconds, $per * $Shots) + 10  # enough for the final TV/Pad pair, even when neither screenshot arrives
+$captureClock = [Diagnostics.Stopwatch]::StartNew()
+for ($n = 0; $n -lt $Shots -and -not $p.HasExited -and $captureClock.Elapsed.TotalSeconds -lt $captureBudget; $n++) {
+  $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
+  while ($wait -gt 0 -and -not $p.HasExited -and -not (Guest-Exited)) {
+    Start-Sleep -Milliseconds ([Math]::Min($wait, 1000))
+    $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
+  }
+  if ($p.HasExited -or (Guest-Exited)) { break }
   Shot ("tv_{0:d2}.png" -f $n)
+  if ($p.HasExited -or (Guest-Exited) -or $captureClock.Elapsed.TotalSeconds -ge $captureBudget) { break }
   Post 0x100 0x09 0x000F0001
-  Start-Sleep -Milliseconds 400
-  Shot ("pad_{0:d2}.png" -f $n)
-  Post 0x101 0x09 0xC00F0001
+  try {
+    Start-Sleep -Milliseconds 400
+    Shot ("pad_{0:d2}.png" -f $n)
+  } finally { Post 0x101 0x09 0xC00F0001 }
 }
 Start-Sleep -Seconds 3
 if ($p.HasExited) {

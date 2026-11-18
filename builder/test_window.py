@@ -127,6 +127,26 @@ try:
         state.set(view=view, stages=stages, stage=1, failed=view == 'failed', building=view == 'building', resultText='x', log='a\nb')
         win.setProperty('showLog', view == 'failed')
         settle(f'view {view}')
+    # Build with nowhere to put the game (#29): "Put it on" starts under the window's edge, and comes into view, whole, under the message
+    column = win.findChild(QObject, 'buildColumn')
+    state.setTarget('card')
+    state.st['card'] = ''
+    settle('no card chosen')
+    card = next(i for i in items(QQuickWindow.contentItem(win)) if i.property('text') == 'Put it on').parentItem()
+    assert card.mapToItem(column, 0, 0).y() >= column.property('height'), '"Put it on" is in view already: this check shows nothing'
+    real_otp_ok, gui.otp_ok, state.game = gui.otp_ok, lambda path: True, object()
+    try:
+        state.build()
+        settle('Build with nowhere to put the game')
+    finally:
+        gui.otp_ok, state.game = real_otp_ok, None
+    assert state.dialog['title'] == 'Where should it go?', state.dialog
+    top = card.mapToItem(column, 0, 0).y()
+    assert 0 <= top and top + card.property('height') <= column.property('height'), f'"Put it on" is not all in view: {top}'
+    assert column.property('contentY') <= column.property('contentHeight') - column.property('height'), 'scrolled past the end'
+    state.answer(True)
+    column.setProperty('contentY', 0)
+    settle('the message closed')
     for yes in ('Yes', 'Sure'):  # two questions queued: the second starts on its own yes button too
         state.dialogs.append(dict(title='A question with a title long enough to wrap onto a second line', message='A message', yes=yes, no='No',
                                   tone='ask', flow=False))

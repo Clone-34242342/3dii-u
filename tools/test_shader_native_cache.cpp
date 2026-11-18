@@ -47,7 +47,76 @@ static Bytes fixture(bool vs) {
     return gfd;
 }
 
+// Header words are big endian; program words are little endian on both host and PPC.
+static Bytes register_fixture(bool vs, uint32_t declared, std::initializer_list<uint32_t> words) {
+    auto gfd = fixture(vs);
+    const size_t header = 64, size_at = vs ? 0xd0 : 0xa4;
+    const size_t block = header + nc::word(gfd.data() + 32 + 20), program = block + 32;
+    const uint32_t bytes = uint32_t(words.size() * 4);
+    gfd.erase(gfd.begin() + program, gfd.begin() + program + 24);
+    gfd.insert(gfd.begin() + program, bytes, 0);
+    nc::put(gfd.data() + header, declared);
+    nc::put(gfd.data() + header + size_at, bytes);
+    nc::put(gfd.data() + block + 20, bytes);
+    uint32_t i = 0;
+    for (uint32_t w : words) gpu::latte::set_word(gfd.data() + program, i++, w);
+    return gfd;
+}
+
+static bool expect_resource_contract(bool vs, uint32_t declared, const Bytes &gfd, bool expected) {
+    const nc::Identity id{2, 11, 22, 33, 44, vs, 0};
+    const uint8_t *payload = nullptr;
+    size_t size = 0;
+    auto file = nc::encode(gfd, id);
+    const bool admitted = !file.empty() && nc::decode(file, id, payload, size);
+    if (admitted != expected) {
+        fprintf(stderr, "%s declared %u: cache admission %d, expected %d\n", vs ? "VS" : "PS", declared, admitted, expected);
+    }
+    assert(nc::valid_gfd(gfd.data(), gfd.size(), vs) == admitted);
+    auto body = gfd;
+    const size_t block = 64 + nc::word(body.data() + 32 + 20), program = block + 32;
+    const uint32_t bytes = nc::word(body.data() + block + 20);
+    const auto unchanged = body;
+    uint32_t required = UINT32_MAX;
+    assert(gpu::program_registers(body.data() + program, bytes, declared, required) == expected);
+    assert(body == unchanged);  // proof must not repair or mutate the cached payload
+    required = declared;
+    assert(gpu::fit_program(body.data() + program, bytes, required, gpu::shader_budget::kOrdinary) == expected);
+    if (expected) {
+        assert(required == declared);
+        if (vs) assert(gpu::shader_budget::vertex(48, required) == (required > 48 ? required : 48));
+        if (admitted) assert(size == gfd.size() && !memcmp(payload, gfd.data(), size));
+    } else {
+        assert(body == unchanged && required == declared);
+    }
+    return admitted == expected;
+}
+
+static void resource_contracts() {
+    bool passed = true;
+    for (bool vs : {false, true}) {
+        for (uint32_t count : {48u, 49u, 54u, 124u, 125u, 150u, 200u}) {
+            const uint32_t export_word = (vs ? 0xc0002000u : 0xc0000000u) | ((count - 1) << 15);
+            const auto gfd = register_fixture(vs, count, {0, 0, 0, 0, export_word, 0x688u | (40u << 23) | (1u << 21)});
+            passed &= expect_resource_contract(vs, count, gfd, count <= gpu::shader_budget::kOrdinary);
+        }
+        // Three CF instructions keep the valid VS above native_load's <=16-byte hollow filter.
+        const auto zero = register_fixture(vs, 0, {0, 0, 0, 0, vs ? 0xc0002000u : 0xc0000000u, 0xb24u | (40u << 23) | (1u << 21)});
+        passed &= expect_resource_contract(vs, 0, zero, true);
+        const auto reads_r0 = register_fixture(vs, 0, {0, 0, 0, 0, vs ? 0xc0002000u : 0xc0000000u, 0x688u | (40u << 23) | (1u << 21)});
+        passed &= expect_resource_contract(vs, 0, reads_r0, false);
+        const auto no_eop = register_fixture(vs, 0, {0, 0, 0, 0, 0, 0});
+        passed &= expect_resource_contract(vs, 0, no_eop, false);
+        const auto escape = register_fixture(vs, 0, {2, 10u << 23, vs ? 0xc0002000u : 0xc0000000u, 0xb24u | (40u << 23) | (1u << 21)});
+        passed &= expect_resource_contract(vs, 0, escape, false);
+    }
+    const auto tiny_ps = register_fixture(false, 0, {0xc0000000u, 0x94200924u});
+    passed &= expect_resource_contract(false, 0, tiny_ps, true);
+    assert(passed);
+}
+
 int main(int argc, char **argv) {
+    resource_contracts();
     for (bool vs : {false, true}) {
         const auto gfd = fixture(vs);
         nc::Identity id{2, 0x1122334455667788ull, 0x2233445566778899ull, 7, 9, vs, 3};
@@ -142,5 +211,5 @@ int main(int argc, char **argv) {
         Bytes gfd((std::istreambuf_iterator<char>(in)), {});
         assert(nc::valid_gfd(gfd.data(), gfd.size(), argv[2][0] == 'v'));
     }
-    puts("native shader cache: envelope, GFD relocation bounds, truncation and disk budget passed");
+    puts("native shader cache: physical GPR/zero proof, envelope, GFD relocation bounds, truncation and disk budget passed");
 }

@@ -69,6 +69,23 @@ def main():
                     img.setPixelColor(31, 47, QColor('white'))
                 img.save(f'{visible.data}/shots/cemu/{screen}_{n:02d}.png')
         assert not c.pictures(visible, 'blank_save', minimum_pairs=2)[0]
+        corrupt = c.Target('corrupt', '0', d, d.replace('\\', '/') + '/corrupt')
+        incoming = corrupt.data + '/shots/cemu'
+        os.makedirs(incoming)
+        for screen in ('tv', 'pad'):
+            for n in (0, 1):
+                with open(f'{incoming}/{screen}_{n:02d}.png', 'wb') as f:
+                    f.write(b'not an image')
+        fault, note = c.pictures(corrupt, 'blank_save', minimum_pairs=2)
+        assert fault and 'unreadable' in fault and not note, (fault, note)
+        reference = c.Target('bad_reference', '0', d, d.replace('\\', '/') + '/bad_reference')
+        leg(reference, ['red', 'green'])
+        c.bless(reference)
+        import glob
+        with open(glob.glob(reference.data + '/good_shots/**/*.png', recursive=True)[0], 'wb') as f:
+            f.write(b'corrupt reference')
+        fault, note = leg(reference, ['red', 'green'])
+        assert fault and 'reference' in fault and 'unreadable' in fault and not note, (fault, note)
     # A restart can quit after 35s while the interpreter has a 150s allowance.
     # Keep its 50s/6 cadence, rather than capturing just once at 150s/6.
     with tempfile.TemporaryDirectory() as d, mock.patch.object(c, 'CEMU', d + '/cemu'):
@@ -106,6 +123,11 @@ def main():
         assert calls[-1] == (150, c.SHOTS * 3, True), calls
         assert not any('insufficient visual coverage' in f for f in faults), (faults, notes)
         assert len(os.listdir(c.kept(t, 'check_shots') + '/restart')) >= 4
+        calls.clear()
+        with mock.patch.object(c, 'run', side_effect=runner), mock.patch.object(c, 'STRICT', True):
+            faults, notes = c.judge(t, 200, [], measured=True)
+        assert any('unverified rendering' in fault for fault in faults), faults
+        assert any('lacks complete execution counters' in fault for fault in faults), faults
     print('ok')
 
 

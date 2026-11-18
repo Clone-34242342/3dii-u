@@ -213,6 +213,11 @@ struct Y2rService : Service {
             ipc.ok(2);
             ipc.set(2, v);
         };
+        auto coefficients = [&](const s16 *values) {
+            ipc.ok(5);
+            for (u32 i = 0; i < 4; i++)
+                ipc.set(2 + i, (u32)(u16)values[2 * i] | (u32)(u16)values[2 * i + 1] << 16);
+        };
         switch (ipc.cmd()) {
         case 0x0001: input_format = ipc[1] & 0xff; ipc.ok(); break;
         case 0x0002: get(input_format); break;
@@ -247,10 +252,15 @@ struct Y2rService : Service {
             for (u32 i = 0; i < 8; i++) co[i] = (s16)(ipc[1 + i / 2] >> (16 * (i & 1)));
             ipc.ok();
             break;
+        case 0x001F: coefficients(co); break;  // GetCoefficient
         case 0x0020:  // SetStandardCoefficient
             standard = std::min<u32>(ipc[1], 3);
             memcpy(co, kStandard[standard], sizeof co);
             ipc.ok();
+            break;
+        case 0x0021:  // GetStandardCoefficient
+            if (ipc[1] >= 4) ipc.result(0xE0E053ED);  // CAM InvalidEnumValue / InvalidArgument / Usage
+            else coefficients(kStandard[ipc[1]]);
             break;
         case 0x0022: alpha = ipc[1] & 0xffff; ipc.ok(); break;
         case 0x0023: get(alpha); break;
