@@ -104,9 +104,25 @@ def gsx():
                                  '-lpthread', '-o', exe], [exe]]
 
 
+
+def ir_ipc():
+    exe = build3ds.WORK + '/selftest/test_ir.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_ir.cpp', '-lpthread', '-o', exe], [exe]]
+
+def ir_memory():
+    exe = build3ds.WORK + '/selftest/test_ir_memory.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/pc/win', f'-I{build3ds.PORT}/pc', f'-I{build3ds.RT}',
+                              '-include', f'{build3ds.PORT}/pc/shim.h', '-static', ROOT + '/tools/test_ir_memory.cpp', '-lpthread', '-o', exe], [exe]]
+
 def main():
     py = sys.executable
     checks = {
+        'IR IPC': ir_ipc(),
+        'IR memory': ir_memory(),
+        'IR input': [[py, ROOT + '/tools/test_ir_input.py']],
+        'PC autoplay': [[py, ROOT + '/tools/test_pc_autoplay.py']],
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
