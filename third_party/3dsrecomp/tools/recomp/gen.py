@@ -1207,6 +1207,8 @@ class Emitter:
             f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
             cros = self.an.img.cros
             if cros:
+                f.write('\nconst u32 guest_has_static_module = 1;\n')
+            if cros and cros.mods:
                 # the slots the runtime's ldr:ro moves each CRO module's code to (tools/recomp/cro.py)
                 f.write('\nconst GuestCro guest_cros[] = {\n')
                 for m in cros.mods:
