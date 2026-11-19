@@ -73,30 +73,62 @@ bool load_sockets() {
 bool mapped(u32 a) { return OSIsAddressValid(a) || OSEffectiveToPhysical(a); }  // Cemu only answers the second
 bool valid(const void *p) { return p && mapped((u32)p); }
 
-// ---- every thread in the process, the system's and the plugins' too: what each waits for, who holds it, where it is and how much it has run
-void dump_thread(const OSThread *t) {
-    char wait[64] = "";
-    if (valid(t->mutex)) {
-        const OSThread *owner = t->mutex->owner;
-        snprintf(wait, sizeof wait, "mutex %08x held by %s", (u32)t->mutex, valid(owner) && valid(owner->name) ? owner->name : "?");
-    } else if (valid(t->queue)) {
-        const void *parent = t->queue->parent;
-        const u32 tag = valid(parent) ? *(const u32 *)parent : 0;
-        snprintf(wait, sizeof wait, "queue %08x tag %08x", (u32)t->queue, tag);
+// Read-only debugger snapshots. Scheduler-owned pointers can change during the
+// validity check itself: never validate one read then dereference a fresh read.
+bool valid_span(const void *p, u32 length) {
+    const u32 at = (u32)p;
+    if (!at || !length || length - 1 > UINT32_MAX - at) return false;
+    if (!mapped(at) || !mapped(at + length - 1)) return false;
+    for (u32 offset = 4096 - (at & 4095); offset < length; offset += 4096)
+        if (!mapped(at + offset)) return false;
+    return true;
+}
+bool copy_thread(const OSThread *live, OSThread &snapshot) {
+    if (!valid_span(live, sizeof snapshot)) return false;
+    memcpy(&snapshot, live, sizeof snapshot);
+    return snapshot.tag == OS_THREAD_TAG;
+}
+void copy_thread_name(const char *name, char (&out)[64]) {
+    strcpy(out, "(no name)");
+    if (!name || (u32)name > UINT32_MAX - 63) return;
+    for (unsigned i = 0; i < 63; ++i) {
+        if (!mapped((u32)name + i)) { out[i] = 0; return; }
+        const char c = name[i];
+        out[i] = c;
+        if (!c) return;
+    }
+    out[63] = 0;
+}
+// Snapshots are best effort, not a globally consistent scheduler freeze. Copy
+// the thread before inspecting fields, then cache every optional nested pointer.
+void dump_thread(const OSThread *live, const OSThread &t) {
+    char name[64], wait[80] = "";
+    copy_thread_name(t.name, name);
+    const OSMutex *const mutex = t.mutex;
+    const OSThreadQueue *const queue = t.queue;
+    if (valid_span(mutex, sizeof *mutex)) {
+        const OSThread *const owner = mutex->owner;
+        snprintf(wait, sizeof wait, "mutex %08x owner=%08x", (u32)mutex, (u32)owner);
+    } else if (valid_span(queue, sizeof *queue)) {
+        const void *const parent = queue->parent;
+        const u32 tag = valid_span(parent, sizeof(u32)) ? *(const u32 *)parent : 0;
+        snprintf(wait, sizeof wait, "queue %08x tag %08x", (u32)queue, tag);
     }
     char frames[220];
     int used = 0;
-    const u32 lo = (u32)t->stackEnd, hi = (u32)t->stackStart;
-    u32 sp = t->context.gpr[1];
-    for (int i = 0; i < 18 && sp >= lo && sp + 8 <= hi && !(sp & 3); i++) {
-        const u32 *frame = (const u32 *)sp;
+    const u32 lo = (u32)t.stackEnd, hi = (u32)t.stackStart;
+    u32 sp = t.context.gpr[1];
+    for (int i = 0; i < 18 && sp >= lo && hi >= 8 && sp <= hi - 8 && !(sp & 3); ++i) {
+        if (!valid_span((const void *)sp, 8)) break;
+        u32 frame[2];
+        memcpy(frame, (const void *)sp, sizeof frame);
         used += snprintf(frames + used, sizeof frames - used, " %08x", frame[1]);
         if (frame[0] <= sp) break;
         sp = frame[0];
     }
     frames[used] = 0;
-    LOG("[ps] %s id %u attr %x state %x prio %d/%d susp %d ran %u ms woke %u pc %08x lr %08x sp %08x [%s] |%s\n", valid(t->name) ? t->name : "(no name)", t->id, (u32)t->attr, (u32)t->state,
-        t->priority, t->basePriority, t->suspendCounter, (u32)(t->coreTimeConsumedNs / 1000000), (u32)t->wakeCount, t->context.srr0, t->context.lr, t->context.gpr[1], wait, frames);
+    LOG("[ps] thread=%08x %s id %u attr %x state %x prio %d/%d susp %d ran %u ms woke %u pc %08x lr %08x sp %08x spin=%u cancel=%x [%s] |%s\n", (u32)live, name, t.id, (u32)t.attr, (u32)t.state,
+        t.priority, t.basePriority, t.suspendCounter, (u32)(t.coreTimeConsumedNs / 1000000), (u32)t.wakeCount, t.context.srr0, t.context.lr, t.context.gpr[1], t.context.spinLockCount, (u32)t.cancelState, wait, frames);
 }
 
 // ---- file system tests from the PC, each on its own thread so a stuck one costs only itself
@@ -430,8 +462,19 @@ bool debug_flag(const char *name) {
 void log_threads() {
     log_status();
     OSThread *t = OSGetCurrentThread();
-    for (u32 n = 0; n < 256 && valid(t->activeLink.prev); n++) t = t->activeLink.prev;
-    for (u32 n = 0; n < 256 && valid(t); n++, t = t->activeLink.next) dump_thread(t);
+    OSThread snapshot;
+    for (u32 n = 0; n < 256; ++n) {
+        if (!copy_thread(t, snapshot)) break;
+        OSThread *const previous = snapshot.activeLink.prev;
+        if (!previous || !valid_span(previous, sizeof snapshot)) break;
+        t = previous;
+    }
+    for (u32 n = 0; n < 256; ++n) {
+        if (!copy_thread(t, snapshot)) break;
+        OSThread *const next = snapshot.activeLink.next;
+        dump_thread(t, snapshot);
+        t = next;
+    }
     LOG("[ps] end\n");
 }
 

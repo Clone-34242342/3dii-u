@@ -36,6 +36,13 @@ def screen_layouts():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_screen_layouts.cpp', '-o', exe], [exe]]
 
 
+def gfd_index():
+    """Shader file extents, missing programs, and truncated index tables."""
+    exe = build3ds.WORK + '/selftest/test_gfd_index.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', f'-I{build3ds.PORT}/wiiu', '-static', ROOT + '/tools/test_gfd_index.cpp', '-o', exe], [exe]]
+
+
 def memory_fills():
     """port/wiiu/memory_fills.h against made-up fills and writes of a made-up memory, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_memory_fills.exe'
@@ -125,10 +132,12 @@ def main():
         'PC autoplay': [[py, ROOT + '/tools/test_pc_autoplay.py']],
         'compiler policy': [[py, ROOT + '/builder/test_compiler_policy.py']],
         'trial tools': [[py, ROOT + '/tools/test_trial_tools.py']],
+        'homebrew dev publisher': [[py, ROOT + '/tools/test_ftp_homebrew_dev.py']],
         'vertex arrays': vertex_arrays(),
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
         'memory fills': memory_fills(),
+        'shader file validation': gfd_index(),
         'module exports': ro_tree(),
         'game languages': languages(),
         'compiled programs': latte_program(),

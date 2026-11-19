@@ -4,6 +4,7 @@
 // FSAReadFile would have made and sends it to IOS itself. The file is opened the ordinary way, once. A mod redirecting this title would hand back a handle IOS doesn't know.
 // So: three stretches of the file have to read the same as through the ordinary path before this is used at all, and any failure later goes back to that path for good.
 #include <coreinit/cache.h>
+#include <coreinit/debug.h>
 #include <coreinit/filesystem_fsa.h>
 #include <coreinit/ios.h>
 #include <malloc.h>
@@ -11,18 +12,22 @@
 
 #include <algorithm>
 #include <cstring>
+#include <mutex>
 
 #include "rt.h"
+#include "direct_source.h"
 #include "wiiu.h"
 
 namespace wiiu {
 namespace {
 constexpr u32 CHUNK = 1 << 20;  // IOS writes whole cache lines into it: the game's own buffers can start anywhere
-FSAClientHandle client;
-FSAFileHandle file;
+FSAClientHandle client = (FSAClientHandle)-1;
+FSAFileHandle file = (FSAFileHandle)-1;
 FSAShimBuffer *shim;
 u8 *chunk;
 bool on;
+u64 source_offset, source_size;
+std::mutex read_m;
 
 bool read_chunk(u32 n, u32 pos) {
     memset(&shim->request, 0, sizeof shim->request);
@@ -50,40 +55,79 @@ bool read_chunk(u32 n, u32 pos) {
 }  // namespace
 
 void direct_read_open(const char *path, int fd, u64 size) {
-    fsa_direct_report();  // the game data file is open by now, so the route has been settled
+    if (on) return;
+    fsa_direct_report();
+    // A WUHB's /vol/content is virtual. Its FSA handles are not IOS handles.
+    // The publisher records the byte range of this same romfs.bin in the existing
+    // bundle. Three comparisons against the mounted file must agree before use.
+    std::string physical = !strncmp(path, "fs:", 3) ? path + 3 : path;
+    source_offset = 0;
+    source_size = size;
+    u64 expected_backing = 0;
+    if (FILE *source = fopen("fs:/vol/content/direct-romfs-source.bin", "rb")) {
+        u8 descriptor[673];
+        const size_t n = fread(descriptor, 1, sizeof descriptor, source);
+        const bool read_ok = !ferror(source);
+        fclose(source);
+        direct_source::Source parsed;
+        if (!read_ok || !direct_source::parse(descriptor, n, parsed) || parsed.length != size) {
+            OSReport("[3dii-u fs] direct reads off: invalid bundle source descriptor\n");
+            return;
+        }
+        physical = parsed.path;
+        source_offset = parsed.offset;
+        expected_backing = parsed.backing_size;
+    }
+    if (!size || size > UINT32_MAX) return;
     shim = (FSAShimBuffer *)memalign(0x40, sizeof(FSAShimBuffer));
     chunk = (u8 *)memalign(0x40, CHUNK);
-    if (!shim || !chunk || size > 0xFFFFFFFFull) return;
+    auto cleanup = [&] {
+        if (file != (FSAFileHandle)-1 && client >= 0) FSACloseFile(client, file);
+        if (client >= 0) FSADelClient(client);
+        file = (FSAFileHandle)-1; client = (FSAClientHandle)-1;
+        free(shim); free(chunk); shim = nullptr; chunk = nullptr;
+    };
+    if (!shim || !chunk) { cleanup(); return; }
     memset(shim, 0, sizeof *shim);
     client = FSAAddClient(nullptr);
     if (client < 0) {
-        LOG("[fs] direct reads off: no FSA client, %d\n", (int)client);
-        return;
+        OSReport("[3dii-u fs] direct reads off: no FSA client, %d\n", (int)client);
+        cleanup(); return;
     }
-    const FSError opened = FSAOpenFileEx(client, !strncmp(path, "fs:", 3) ? path + 3 : path, "r", (FSMode)0x660, FS_OPEN_FLAG_NONE, 0, &file);
+    const FSError opened = FSAOpenFileEx(client, physical.c_str(), "r", (FSMode)0x660, FS_OPEN_FLAG_NONE, 0, &file);
     if (opened != FS_ERROR_OK) {
-        LOG("[fs] direct reads off: open failed, %d\n", (int)opened);
-        return;
+        file = (FSAFileHandle)-1;
+        OSReport("[3dii-u fs] direct reads off: open %s failed, %d\n", physical.c_str(), (int)opened);
+        cleanup(); return;
+    }
+    if (expected_backing) {
+        FSAStat st {};
+        if (FSAGetStatFile(client, file, &st) != FS_ERROR_OK || st.size != expected_backing) {
+            OSReport("[3dii-u fs] direct reads off: bundle size changed\n");
+            cleanup(); return;
+        }
     }
     static u8 want[4096];
     const u32 n = (u32)std::min<u64>(size, sizeof want);
-    const u32 at[3] = {0, (u32)(size / 2) & ~63u, (u32)(size - n)};
+    const u32 at[3] = {0, (u32)((size - n) / 2) & ~63u, (u32)(size - n)};
     for (u32 i = 0; i < 3; i++) {
-        if (pread(fd, want, n, (off_t)at[i]) != (ssize_t)n || !read_chunk(n, at[i]) || memcmp(want, chunk, n)) {
-            LOG("[fs] direct reads off: stretch %u at %08x didn't match\n", i, at[i]);
-            return;
+        if (pread(fd, want, n, (off_t)at[i]) != (ssize_t)n || !read_chunk(n, (u32)(source_offset + at[i])) || memcmp(want, chunk, n)) {
+            OSReport("[3dii-u fs] direct reads off: sample %u at %08x didn't match\n", i, at[i]);
+            cleanup(); return;
         }
     }
     on = true;
-    LOG("[fs] game data read directly, past Aroma's hook\n");
+    OSReport("[3dii-u fs] direct RomFS enabled: %s offset=%llu size=%llu, all 3 samples matched\n",
+             physical.c_str(), (unsigned long long)source_offset, (unsigned long long)source_size);
 }
 
 bool direct_read(void *dst, u32 len, u64 off) {
-    if (!on) return false;
+    std::lock_guard<std::mutex> lock(read_m);
+    if (!on || !direct_source::fits(source_size, off, len)) return false;
     for (u32 done = 0; done < len;) {
         const u32 n = std::min(len - done, CHUNK);
-        if (!read_chunk(n, (u32)off + done)) {
-            LOG("[fs] direct read of %u at %08x failed: back to the system's file calls\n", n, (u32)off + done);
+        if (!read_chunk(n, (u32)(source_offset + off + done))) {
+            OSReport("[3dii-u fs] direct read of %u at %08x failed: back to the system's file calls\n", n, (u32)off + done);
             on = false;
             return false;
         }

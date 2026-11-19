@@ -20,6 +20,7 @@ import argparse
 import ctypes
 import functools
 import glob
+import hashlib
 import json
 import os
 import re
@@ -280,7 +281,7 @@ DECODER_MARGIN = 64 << 10
 
 class Game:
     """How a game builds. Every game follows the same recipe: what differs comes from the game itself (its code, its program id) or from what
-    earlier runs of it learned (functions.txt, shader logs), never from which game it is."""
+    earlier runs of it learned (functions.txt, shader logs)."""
     def __init__(self, name, game_dir=None):
         self.name = name
         self.dir = (game_dir or f'{ROOT}/games/{name}').replace('\\', '/')
@@ -300,9 +301,28 @@ class Game:
         # goes through memory at calls: safe mode. gcc -O2 turns that C into code Cemu's recompiler runs wrong (a compare reused across a jump), so -O1.
         decoder = mobiclip_sites(self.dir)
         safe = len(decoder) >= 8 or coroutine_switches(self.dir) > 0
+        # These executables unwind to translated return sites. Mario Maker's
+        # setjmp and longjmp are in separate functions, so the proximity scan
+        # above does not identify the startup path.
+        safe_code_hashes = {
+            'g_acve': '496841ca1bdd506e82652392d34978f367a1f8a5407d589e6fbd5cc3ef16938c',
+            'g_ajhe': '5c107329883fbe0a2738ff0b200506fe8be6b2a236308f8fdff48c51cc6f8fd5',
+        }
+        if self.name in safe_code_hashes:
+            with open(self.dir + '/code.bin', 'rb') as code:
+                safe |= hashlib.sha256(code.read()).hexdigest() == safe_code_hashes[self.name]
         self.gen, self.mode, self.opt = ('gen_safe', 'safe', ['-O1']) if safe else ('gen_abi', 'abi', [])
         self.gen_dir = f'{self.dir}/{self.gen}'
         self.safe_ranges = []  # with mode 'abi': address ranges generated the safe way (mixed)
+        self.verified_entries = ()
+        # This ASRE base executable's sort routine splits around ARM calls that
+        # retain live registers across generated entry points.
+        if self.mode == 'abi' and self.name == 'g_asre':
+            with open(self.dir + '/code.bin', 'rb') as code:
+                if hashlib.sha256(code.read()).hexdigest() == '7c820d33c3b4aa8dddc479bc2fd48b92994f1701dad011470a31bb69acdbe7f5':
+                    self.safe_ranges = [(0x0013d500, 0x0013e800), (0x00278de4, 0x002791f0)]
+                    self.verified_entries = (0x0013df38, 0x0013e790, 0x00279134)
+                    self.opt = ['-O1']
         # the decoder's sites span 65 KB of each game that has it; the margin takes in the rest of its library
         self.decoder_range = (decoder[0] - DECODER_MARGIN, decoder[-1] + DECODER_MARGIN) if len(decoder) >= 8 else None
 
@@ -325,10 +345,11 @@ def functions_list(g):
     """The recompiler's --extra: the entries this game's runs found, and the 3dsrecomp project's runs of it if it has any.
     A merged list is written only when it changes, so its date says when the entries did."""
     lists = [p for p in (g.extra_functions, g.upstream_functions) if p and os.path.isfile(p) and os.path.getsize(p)]
-    if len(lists) == 1:
+    if len(lists) == 1 and not g.verified_entries:
         return lists[0]
     merged = f'{WORK}/functions_{g.name}.txt'
     text = ''.join(open(p, encoding='utf-8').read().strip() + '\n' for p in lists)
+    text += ''.join(f'0x{entry:08x}\n' for entry in g.verified_entries)
     if not os.path.isfile(merged) or open(merged, encoding='utf-8').read() != text:
         os.makedirs(WORK, exist_ok=True)
         with open(merged, 'w', encoding='utf-8', newline='\n') as f:
@@ -888,6 +909,7 @@ def pack(g, otp):
 
 
 def main():
+    global WORK
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('command', choices=['code', 'shaders', 'title', 'all', 'pack', 'gen', 'trial', 'lazy'])
     ap.add_argument('game')
@@ -913,12 +935,25 @@ def main():
     ap.add_argument('--only')
     ap.add_argument('--opt')
     ap.add_argument('--out', help='put the RPX, game.nm and shaders here instead, to keep a test build apart')
+    ap.add_argument('--prepared-game', help='code: reuse the extracted game directory from a Builder run with --keep')
+    ap.add_argument('--work-dir', help='code: reuse the Builder run’s build_win_builder directory')
     args = ap.parse_args()
-    if not os.path.isdir(f'{ROOT}/games/{args.game}'):
+    if (args.prepared_game or args.work_dir) and args.command != 'code':
+        ap.error('--prepared-game and --work-dir apply only to code')
+    if args.work_dir:
+        WORK = os.path.abspath(args.work_dir).replace('\\', '/')
+    prepared = os.path.abspath(args.prepared_game).replace('\\', '/') if args.prepared_game else None
+    if prepared and os.path.basename(prepared) != args.game:
+        ap.error('--prepared-game must match the game name')
+    if prepared and not all(os.path.isfile(prepared + '/' + name) for name in ('code.bin', 'exheader.bin', 'functions.txt')):
+        ap.error('--prepared-game needs code.bin, exheader.bin and functions.txt from a completed build')
+    if not prepared and not os.path.isdir(f'{ROOT}/games/{args.game}'):
         sys.exit(f'no games/{args.game}')
     if not os.path.exists(BIN + 'gcc.exe'):
         sys.exit('no toolchain: run tools/win/install_toolchain.sh once')
-    g = Game(args.game)
+    g = Game(args.game, prepared)
+    if prepared and re.search(r'_v\d+$', g.name):
+        g.upstream_functions = None  # the prepared update supplies its own entry list
     if args.mixed:
         g.mixed()
     if args.out:

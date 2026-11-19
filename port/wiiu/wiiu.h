@@ -36,11 +36,13 @@ void fs_end();
 void romfs_begin();  // the game's RomFS reads: they take turns only with each other, never with saves being written out or flushed
 void romfs_end();
 void fsa_direct_check_writes();
+void fsa_report_save_quota(const char *path);
 void fsa_direct_report();  // fsa_direct.cpp: which way file calls go, for the log
-bool fsa_direct_flush_quota(const char *path);
+bool fsa_direct_flush_quota(const char *path, int &result);
 // direct_read.cpp: the game's RomFS read past Aroma's hook on the file calls, once three stretches of it have matched the ordinary path. false: read it the ordinary way.
 void direct_read_open(const char *path, int fd, u64 size);
 bool direct_read(void *dst, u32 len, u64 off);
+void gfx_report_draw_trace();  // (card thread) sends a sampled frame to the console log
 void gfx_write_misses();  // (card thread) adds what the GPU thread has noted to shader_misses.bin
 void gfx_take_misses(std::vector<u8> &out);  // the same notes, for the PC
 int net_thread(int, void *);  // net_console.cpp: the PC's way in, over the network
