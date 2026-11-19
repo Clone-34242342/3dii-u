@@ -137,6 +137,7 @@ def main():
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
         'memory fills': memory_fills(),
+        'surface retirement': [[py, ROOT + '/tools/test_surface_retirement.py']],
         'shader file validation': gfd_index(),
         'module exports': ro_tree(),
         'game languages': languages(),

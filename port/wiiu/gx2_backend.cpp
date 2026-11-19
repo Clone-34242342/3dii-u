@@ -3539,14 +3539,16 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
 
 // Render targets a game made and stopped using (a course or a scene left behind) are freed. Kept for good, Mario Kart 7 had 88 after three
 // races where it began with 21, each holding its GPU memory (fast memory filled, and later targets went to slow memory), and every walk of the
-// list took longer: games slowed the longer they were played. One unused for kForgetAfter presents goes, what the GPU drew there that memory
-// lacks written back first, so nothing the game may still read is lost. One a present, as a write back waits for the GPU.
+// list took longer: games slowed the longer they were played. Only synchronized colour targets may be retired: an idle timeout does not
+// mean the game still owns their old guest addresses. Brain Age reuses a target's memory for a layout archive; writing its old pixels back
+// during eviction overwrote that archive. Keep unsynchronized colour targets until an explicit readback makes them safe to retire. This
+// retains their GPU contents for legitimate later reads without an unsolicited write into reused guest memory. Retire at most one a present.
 void forget_unused() {
     constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
     for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
         Surface &s = **it;
         if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth) continue;
-        if (!s.depth && s.gpu_newer && !s.guest_newer) write_back(s);
+        if (!s.depth && s.gpu_newer) continue;
         if (void *image = s.image()) {
             if (!s.mem1) free(image);
             else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(image);
