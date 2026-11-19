@@ -1,0 +1,84 @@
+# Wii U Session Recorder
+
+Open **Wii U Session Recorder** from the KDE application menu or run `python3 recorder.py --console YOUR_WII_U_IP` from this folder. Enable TCP logging in debug Aroma, then click **Connect**. You can connect before launching a game or rebooting the console. The recorder retries automatically while connected. Click **Disconnect** to stop listening. You can leave a recording running across a reconnect or stop it separately.
+
+**F8** starts or stops recording. **F9** marks a graphics glitch. Both shortcuts work while the window is unfocused in KDE on X11. The buttons work without global shortcuts. Run with `--no-hotkeys` to leave those keys available to other apps.
+
+Sessions default to `~/Wii U/Logs`; select a different location with `--output` or `WIIU_LOG_DIR`. Each session contains `console.log` for the raw Aroma stream and `events.jsonl` for start, stop, reconnect, and graphics markers. Markers have a PC timestamp and a byte offset into the log. Aroma can resend its retained startup log when reconnecting. A graphics marker records the moment you pressed the key. With the recorder build of ScreenshotWUPS active in debug Aroma and FTPiiU enabled, it requests the next available GamePad frame and saves a PNG in the same session folder. The PNG name includes the marker number and local time. The `graphics_glitch` event contains the marker timestamp, byte offset and PNG filename. The paired `graphics_screenshot` event reports success or failure and adds the PC completion time. A missing frame or FTP connection leaves the original marker intact. Closely spaced requests are processed in order and may capture later frames.
+
+The recorder uses FTPiiU to create a request under `sd:/wiiu/screenshots/recorder/` and fetch the finished PNG. The console writes a temporary file and renames it after encoding so the PC only downloads completed PNGs. A frozen game may stop producing new frames. Run with `--no-screenshots` to record markers and logs without requesting images.
+
+From another terminal, while the recorder is open:
+
+```bash
+python3 recorder.py --control status
+python3 recorder.py --control connect
+python3 recorder.py --control start
+python3 recorder.py --control mark --note "Mecha Marathon floor"
+python3 recorder.py --control stop
+python3 recorder.py --control disconnect
+```
+
+Python can call the same local, user-only Unix socket with `from recorder import control` and `control("status")`. Status returns the current or last session path. The recorder needs Python 3 and Tk. Global shortcuts also need python-xlib and X11.
+
+## Optional 3Dii U draw trace
+
+A trace-enabled 3Dii U RPX reads an empty `drawtrace` file in its `/vol/save/common` directory at startup. The runtime samples one frame per 30 presents and reports up to 32 distinct draw states through Aroma TCP logging. Start recording before launching the title. Press F9 when the glitch appears and keep recording for at least a second afterward. That retains a sample on either side of the marker when the game is still presenting.
+
+The trace identifies shaders by their vertex and fragment keys. `ps=7ffffffe` means a shader built at runtime. Values `ffffffff` through `fffffffc` identify the simple, generic, lit generic, and textured fallbacks, respectively. Other small numbers index the precompiled shader table. A zero vertex key indicates CPU vertex processing. The `flags` field includes W-buffer mode (bit 0), depth test (bit 1), depth write (bit 2), stencil (bit 3), alpha test (bit 4), blending (bit 5), early depth (bit 6), depth comparison (bits 8–15), and depth precision (bits 16 and up). `depth` logs the scale and offset as IEEE 754 hex words. A sample can omit draws if it hits the capacity limit.
+
+A diagnostic build can also load `extra-pixel-shaders.bin` from the same save directory. A `ps=40000000`–`400003ff` entry comes from that additional precompiled pack. Removing the file with the title closed restores the original shader selection on the next launch.
+
+## Shared Aroma and runtime capture
+
+Connect starts both Aroma's syslog receiver and the read-only game runtime client. Runtime shows "waiting for game" on the Wii U Menu or with builds that do not expose the opt-in TCP console. It reconnects automatically when the game starts. Disconnect stops both receivers.
+
+Record starts one session folder containing console.log, runtime.log, and events.jsonl. Stop closes both logs together. Reconnection events, runtime commands, and markers share ISO timestamps and byte offsets for both files. Existing GamePad screenshots remain attached to Mark Glitch/F9 and are stored as timestamped PNGs beside the logs. There are no periodic screenshots.
+
+The runtime client requests status and the mapped heap header about every three seconds while recording, and thread snapshots about every thirty seconds. A repeatedly observed nonzero owner causes an additional thread listing and bounded owner-memory snapshot. This is an observation for investigation, not an automatic deadlock diagnosis. When not recording it keeps the connection alive without requesting unsaved automatic snapshots. An attached runtime client prevents the existing game's watchdog from forcing its fatal screen; it cannot prevent a kernel failure.
+
+Python control uses the existing socket/API:
+
+```sh
+python3 recorder.py --control connect
+python3 recorder.py --control start
+python3 recorder.py --control runtime --note "ps"
+python3 recorder.py --control runtime --note "mem 80000000 80"
+python3 recorder.py --control mark --note "Graphics glitch here"
+python3 recorder.py --control stop
+python3 recorder.py --control disconnect
+```
+
+The integrated runtime client accepts only status, thread-list and bounded memory-read commands. It does not send input, renderer modifications, restart commands, filesystem probes or save-reset commands. The game must be rebuilt with the lightweight opt-in console support and have SD marker wiiu/3dii-u/debug/console-enable. Heavy RECOMP_MEASURE profiling is not required.
+
+Validation: real TCP integration tests cover both channels in one folder, markers with both offsets, start/stop and session rotation, runtime reconnect, persistent-owner snapshot requests, operation with an unavailable runtime channel, and disconnect after the Aroma receiver has stopped. A live Cemu test also captured native thread addresses/names and read the running build stamp through the integrated receiver.
+
+## Explicit renderer experiments
+
+The `runtime` action stays read-only. A separate `renderer` action accepts only `set cpuvs 0|1`, `set vtxcache 0|1`, `set cpuattr 0..15`, `set drawtrace 0|1`, and `set trace 0..256`. Each request is logged before the runtime sends it. These temporary live switches require a compatible 3Dii U runtime; they are for developer A/B tests, not an automatic graphics repair. Restore `cpuvs 0` and `vtxcache 1` after testing unless a deliberately chosen experiment requires otherwise.
+
+```sh
+python3 recorder.py --control renderer --note "set trace 64"
+python3 recorder.py --control renderer --note "set cpuvs 1"
+python3 recorder.py --control mark --note "CPU vertex path comparison"
+python3 recorder.py --control renderer --note "set cpuvs 0"
+```
+
+`cpuattr` selects CPU conversion of vertex attribute formats while leaving vertex shader execution on the GPU: bit 0 signed 8-bit, bit 1 unsigned 8-bit, bit 2 signed 16-bit, bit 3 float. The hardware default is zero; Cemu may enable its signed-byte workaround. Restore the starting value after each experiment. `drawtrace` enables sampled draw-state reports; `trace` is a bounded graphics-event budget and does not guarantee that a draw will be captured.
+
+## KDE launcher
+
+Create `~/.local/share/applications/wiiu-session-recorder.desktop` with the following content, replacing both absolute paths for your checkout and logs location:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Wii U Session Recorder
+Comment=Record Aroma and 3Dii U runtime logs together
+Exec=python3 /absolute/path/to/3dii-u/tools/wiiu_session_recorder/recorder.py --console WII_U_IP --output "/absolute/path/to/Wii U/Logs"
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Development;Utility;
+```
+
+KDE discovers the desktop entry through its application menu. On Wayland, use the buttons if global X11 shortcuts are unavailable.
