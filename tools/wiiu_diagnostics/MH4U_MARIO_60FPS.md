@@ -54,6 +54,27 @@ Validation and tooling:
 
 The first native-program update still had the linkage defect and showed no clear improvement. The corrected executable is an RPX-only update; ROMFS assets and the existing shader pack are retained. No full-speed gameplay claim is made yet. Short GPU-timestamp windows attributed about 13.2 ms to the main target and 11 ms to the present interval; these buckets can include submission gaps and presentation waits and must not be read as isolated shader execution times. A temporary lower-level resolution test produced no useful improvement and was restored. The user confirmed 480p was already selected. A subsequent RPX adds opt-in `cputime` counters for renderer stages and geometry work, disabled by default; it does not enable interrupt sampling or shader disassembly.
 
+## MH4U follow-up: combined GPU programs and logging-induced audio gaps
+
+The live CPU sample identified 8.40 ms/flip in CPU geometry processing in one gameplay interval, including 5.89 ms of vertex interpretation and 1.71 ms of geometry execution. Capture the missing `GSX` records, convert them with the existing shader generator, and compile the combined vertex/geometry programs. This produced eleven programs with a maximum of 17 vertex registers; nine new vertex keys were appended to the original pack. The complete merged pack stays within 37 vertex / 27 pixel registers. It adds **zero pixel keys**, preserves every original program block and key mapping, and totals 2,055,744 bytes including its index. `tools/linux/append_shader_pack.py` reproduces the append while validating program indices and the original prefix.
+
+On real hardware, startup reports 1,521 vertex keys rather than 1,512. A warmed interval recorded 51.8 FPS and CPU geometry time of 0.80 ms/flip, with approximately five residual geometry draws rather than hundreds. The captured town/dialogue frame remains visually intact and shows 52 FPS; a comparable earlier frame showed 33 FPS. These observations cover this scene, not every gameplay area. The user initially perceived a possible regression and then clarified that audio interruptions were their main indication of stutter.
+
+The audio log continued reporting recurring approximately 50 ms stalls. A twelve-second disconnect of both PC logging connections nearly eliminated the gap reports, without changing average rendering rate. A subsequent channel-isolation test used the same running game, no FTP transfers and no screenshots: runtime-only had one reported audio underrun in its twelve-second phase, while the separate Aroma-only phase had 21. This implicates high-volume Aroma streaming in this setup; it does not identify which module or transport operation causes the delay.
+
+The PC recorder now has a **Stream Aroma trace** checkbox and `--control aroma --note on|off`. Pausing it leaves the runtime debugger connected and records into the same session; Connect respects the selection and the preference survives restart. The status explicitly identifies a deliberate pause. Re-enabling it remains available for module/crash investigations; system trace output is not captured while paused.
+
+With Aroma streaming paused, two consecutive twenty-second gameplay windows recorded **zero audio underruns**, at 52.8 and 53.0 FPS. The user subsequently confirmed the audio improvement held much better. CPU/GPU timing switches were off, and no screenshot or FTP transfer ran during these measurements. The current hardware setup retains the nine-key GPU pack and lightweight runtime recording. Further frame-rate optimization remains open.
+
+Reproduction workflow (using the user's own captured shader data):
+
+1. Fetch `shader_misses.bin` from the game's save/log directory after reaching the affected scene. Keep game-derived records private.
+2. Use `tools/misses_to_log.py` to make shader-generator input; `GSX` records describe the paired stages and their runtime arguments.
+3. Run the native shader generator with the captured records and compile the resulting GLSL with the project's trusted CafeGLSL toolchain. The normal register/program validation remains required.
+4. Append the compiled pack with `python3 tools/linux/append_shader_pack.py ORIGINAL EXTRA NEW_OUTPUT`; retain the generated matching GSH/SHDX pair. Never replace a running title's pack.
+5. Publish the RPX and changed shader pair with `tools/ftp_homebrew_dev.py ... --content NEW_CONTENT --release UNIQUE_ID --no-readback` while at the Wii U Menu. Existing assets and saves stay in the base WUHB.
+6. Relaunch, discard the first cumulative `stats` interval, and measure warmed intervals. Enable `cputime` only for short diagnostic windows and turn it off afterward. Compare audio gaps with Aroma streaming on/off independently of screenshots, transfers and shader compilation.
+
 ## Super Mario 3D Land: upstream 60 FPS mod
 
 Credit: [AlonBorodAHub/mario-3d-land-60fps](https://github.com/AlonBorodAHub/mario-3d-land-60fps), tested commit `eab11f6cc03c9df6ba06cd56af1ac28e7cf64a09`. This is an experimental USA Rev 1 interpolation mod targeting 60 Hz render updates while retaining 30 Hz gameplay updates. This PR supplies adaptation tooling and recompiler support, **not the upstream patch payload, game code or assets**.

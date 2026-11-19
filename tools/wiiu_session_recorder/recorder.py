@@ -342,8 +342,17 @@ class AromaReceiver(threading.Thread):
             self.recorder.connection(False)
 
 
+def read_preferences(path):
+    try:
+        value = json.loads(path.read_text())
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError): return {}
+
+
 class Controller:
-    def __init__(self, recorder, console, aroma_tcp_port=TCP_PORT, aroma_udp_port=UDP_PORT, runtime_port=4405):
+    def __init__(self, recorder, console, aroma_tcp_port=TCP_PORT, aroma_udp_port=UDP_PORT, runtime_port=4405, aroma_enabled=True, preferences_path=None):
+        self.aroma_enabled = aroma_enabled
+        self.preferences_path = preferences_path
         self.aroma_tcp_port, self.aroma_udp_port, self.runtime_port = aroma_tcp_port, aroma_udp_port, runtime_port
         self.runtime_receiver = None
         self.recorder = recorder
@@ -355,8 +364,28 @@ class Controller:
         with self.lock:
             if action == "toggle_connection":
                 action = "disconnect" if (self.receiver and self.receiver.is_alive()) or (self.runtime_receiver and self.runtime_receiver.is_alive()) else "connect"
+            if action == "aroma":
+                if note not in ("on", "off"): raise ValueError('Use aroma on or off')
+                self.aroma_enabled = note == "on"
+                if not self.aroma_enabled and self.receiver:
+                    self.receiver.done.set()
+                    self.receiver.join(2)
+                    if self.receiver.is_alive(): raise RuntimeError('Aroma receiver is still shutting down')
+                    self.receiver = None
+                elif self.aroma_enabled and self.runtime_receiver and self.runtime_receiver.is_alive() and not self.receiver:
+                    self.receiver = AromaReceiver(self.recorder, self.console, self.aroma_tcp_port, self.aroma_udp_port)
+                    self.receiver.start()
+                if self.preferences_path:
+                    self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                    pending = self.preferences_path.with_suffix('.tmp')
+                    values = read_preferences(self.preferences_path)
+                    values['aroma_enabled'] = self.aroma_enabled
+                    pending.write_text(json.dumps(values) + '\n')
+                    pending.replace(self.preferences_path)
+                self.recorder.runtime_event('aroma_stream_mode', enabled=self.aroma_enabled)
+                action = "status"
             if action == "connect":
-                if not self.receiver or not self.receiver.is_alive():
+                if self.aroma_enabled and (not self.receiver or not self.receiver.is_alive()):
                     self.receiver = AromaReceiver(self.recorder, self.console, self.aroma_tcp_port, self.aroma_udp_port)
                     self.receiver.start()
                 if not self.runtime_receiver or not self.runtime_receiver.is_alive():
@@ -392,6 +421,7 @@ class Controller:
             result["receiver_error"] = self.receiver.error if self.receiver else None
             result["runtime_listening"] = bool(self.runtime_receiver and self.runtime_receiver.is_alive())
             result["runtime_error"] = self.runtime_receiver.error if self.runtime_receiver else None
+            result["aroma_enabled"] = self.aroma_enabled
             result["console"] = self.console
             return result
 
@@ -496,8 +526,8 @@ def gui(controller, hotkey_enabled):
 
     root = tk.Tk()
     root.title("Wii U Session Recorder")
-    root.geometry("740x300")
-    root.minsize(650, 280)
+    root.geometry("740x340")
+    root.minsize(650, 310)
     panel = ttk.Frame(root, padding=18)
     panel.pack(fill="both", expand=True)
     connection = tk.StringVar(value="Waiting for Aroma TCP logging")
@@ -530,6 +560,11 @@ def gui(controller, hotkey_enabled):
     mark = ttk.Button(buttons, text="Mark graphics glitch (F9)", command=lambda: act("mark"))
     record.pack(side="left", padx=(0, 10))
     mark.pack(side="left")
+    aroma_choice = tk.BooleanVar(value=controller.aroma_enabled)
+    def toggle_aroma():
+        try: controller.command('aroma', 'on' if aroma_choice.get() else 'off')
+        except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
+    ttk.Checkbutton(panel, text="Stream Aroma trace", variable=aroma_choice, command=toggle_aroma).pack(anchor="w")
     ttk.Label(panel, textvariable=message).pack(anchor="w")
     shot_note = tk.StringVar()
     ttk.Label(panel, textvariable=shot_note, wraplength=610).pack(anchor="w")
@@ -541,7 +576,8 @@ def gui(controller, hotkey_enabled):
             act(pending.get())
         state = controller.command("status")
         if state["listening"] or state["runtime_listening"]:
-            aroma = "connected" if state["connected"] else "waiting"
+            aroma_choice.set(state["aroma_enabled"])
+            aroma = "paused" if not state["aroma_enabled"] else "connected" if state["connected"] else "waiting"
             runtime = "connected" if state["runtime_connected"] else "waiting for game"
             connection.set(f"Aroma: {aroma}   ·   Runtime: {runtime}")
         else:
@@ -574,14 +610,18 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--no-hotkeys", action="store_true")
     parser.add_argument("--no-screenshots", action="store_true")
-    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer"))
+    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma"))
     parser.add_argument("--note", default="")
     args = parser.parse_args()
     if args.control:
         result = control(args.control, args.note)
         print(json.dumps(result))
         return int("error" in result)
-    controller = Controller(Recorder(args.output, None if args.no_screenshots else args.console), args.console)
+    preferences = Path(os.environ.get('XDG_CONFIG_HOME', Path.home()/'.config'))/'wiiu-session-recorder/settings.json'
+    enabled = read_preferences(preferences).get('aroma_enabled', True)
+    if not isinstance(enabled, bool): enabled = True
+    controller = Controller(Recorder(args.output, None if args.no_screenshots else args.console), args.console,
+                            aroma_enabled=enabled, preferences_path=preferences)
     with ControlServer(CONTROL, controller) as server:
         control_thread = threading.Thread(target=server.serve_forever, daemon=True)
         control_thread.start()

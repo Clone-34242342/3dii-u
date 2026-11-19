@@ -89,6 +89,29 @@ class DualChannelTests(unittest.TestCase):
         self.aroma = socket.create_connection(('127.0.0.1', port))
         wait_for(lambda: self.rec.connected and self.rec.runtime_connected)
 
+    def test_pause_aroma_preserves_runtime_and_recording(self):
+        self.connect()
+        folder = Path(self.controller.command('start')['session'])
+        preference = Path(self.tmp.name)/'preferences.json'
+        preference.write_text(json.dumps({'custom': 'keep'}))
+        self.controller.preferences_path = preference
+        state = self.controller.command('aroma', 'off')
+        self.assertFalse(state['aroma_enabled'])
+        self.assertFalse(state['listening'])
+        self.assertTrue(state['runtime_connected'])
+        self.assertTrue(state['recording'])
+        self.assertFalse(json.loads(preference.read_text())['aroma_enabled'])
+        self.assertEqual(json.loads(preference.read_text())['custom'], 'keep')
+        self.controller.command('runtime', 'stats')
+        wait_for(lambda: b'stats' in self.server.commands)
+        state = self.controller.command('connect')
+        self.assertFalse(state['listening'])
+        state = self.controller.command('aroma', 'on')
+        self.assertTrue(state['listening'])
+        self.assertTrue(state['runtime_connected'])
+        self.assertEqual(Path(state['session']), folder)
+        with self.assertRaises(ValueError): self.controller.command('aroma', 'invalid')
+
     def test_shared_buttons_and_session_rotation(self):
         self.connect()
         first = Path(self.controller.command('start')['session'])

@@ -86,3 +86,9 @@ KDE discovers the desktop entry through its application menu. On Wayland, use th
 GPU timestamps are opt-in with `renderer --note "set gputime 1"`; disable them after measurement. `toplevel 0` holds the original internal rendering size, `1` tests the lower level, and `2` restores automatic selection. To restore the original size after a diagnostic at 720p with automatic scaling disabled, send `toplevel 0`, allow a frame, then `toplevel 2`. These controls alter rendering resolution, not the console display mode.
 
 `cputime` enables opt-in renderer and CPU geometry timing counters in compatible release builds. It does not enable shader disassembly or an interrupt sampler. Leave it off outside short diagnostic windows; compare timing-enabled and disabled runs before claiming an FPS improvement.
+
+### Low-overhead playback recording
+
+The **Stream Aroma trace** checkbox pauses only the Aroma TCP stream, keeping the runtime debugger and recording active in the same session. Connect/Disconnect respects this setting, which is remembered for the next launch. Python control: `--control aroma --note off` or `--control aroma --note on`. The status reports `aroma_enabled` so a deliberate pause is distinguishable from a failed connection. Enable the stream when system/module trace evidence is needed.
+
+On one MH4U hardware session, a 12-second runtime-only test had one audio underrun while a separate 12-second Aroma-only window had 21. This implicates the high-volume system trace stream in that session; it does not identify an individual plugin or prove all gameplay slowdown has been fixed. Pausing the stream also means system trace messages are not captured during that interval; the game's buffered runtime log remains available.
