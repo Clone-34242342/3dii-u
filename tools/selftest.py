@@ -64,6 +64,13 @@ def languages():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}', '-static', ROOT + '/tools/test_languages.cpp', '-o', exe], [exe]]
 
 
+def cpu_parallel():
+    """ARM byte-lane operations against an independent scalar reference."""
+    exe = build3ds.WORK + '/selftest/test_cpu_parallel.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++17', '-O1', '-static', ROOT + '/tools/test_cpu_parallel.cpp', '-o', exe], [exe]]
+
+
 def latte_program():
     """port/wiiu/latte_program.h against small programs made up word by word, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_latte_program.exe'
@@ -142,6 +149,7 @@ def main():
         'shader file validation': gfd_index(),
         'module exports': ro_tree(),
         'game languages': languages(),
+        'CPU byte operations': cpu_parallel(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
         'geometry shaders': gsx(),

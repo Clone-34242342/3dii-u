@@ -3585,6 +3585,29 @@ void forget_unused() {
 
 void draw_fps();  // the frame rate counter (below, beside the text it draws)
 
+// One clock read per present, independent of the expensive draw timers. Average
+// FPS alone hides a movie alternating normal frames and 15 FPS stretches. These
+// disjoint gap buckets remain in the PC runtime log without taking screenshots.
+static void report_frame_pacing() {
+    static OSTime previous, start;
+    static u32 buckets[6], count, longest;
+    const OSTime now = OSGetSystemTime();
+    if (!previous) { previous = start = now; return; }
+    const u32 gap = (u32)OSTicksToMicroseconds(now - previous);
+    previous = now;
+    longest = std::max(longest, gap);
+    const u32 bucket = gap <= 20000 ? 0 : gap <= 35000 ? 1 : gap <= 50000 ? 2 : gap <= 67000 ? 3 : gap <= 100000 ? 4 : 5;
+    buckets[bucket]++;
+    count++;
+    if (now - start < OSSecondsToTicks(2)) return;
+    LOG("[pace] %u frames in %u ms; max gap %u us; gaps <=20/35/50/67/100/>100 ms: %u %u %u %u %u %u\n",
+        count, (u32)OSTicksToMilliseconds(now - start), longest,
+        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5]);
+    start = now;
+    count = longest = 0;
+    memset(buckets, 0, sizeof buckets);
+}
+
 void present() {
     const OSTime tp = prof_now();
     gt_mark(GT_PRESENT, 0);
@@ -3639,6 +3662,7 @@ void present() {
     dyn_res_update();
     vtx_cache_flip();
     prof_add(P_PRESENT, tp);
+    report_frame_pacing();
 }
 
 bool screen_fresh;
