@@ -13,6 +13,7 @@ class FakeFTP:
         self.here = '/'
         self.corrupt = False
         self.fail_activation = False
+        self.missing_reply = '550 missing'
     def voidcmd(self, cmd): pass
     def pwd(self): return self.here
     def cwd(self, path):
@@ -22,7 +23,7 @@ class FakeFTP:
         if path in self.dirs: raise error_perm('550 exists')
         self.dirs.add(path)
     def size(self, path):
-        if path not in self.files: raise error_perm('550 missing')
+        if path not in self.files: raise error_perm(self.missing_reply)
         return len(self.files[path])
     def storbinary(self, cmd, stream, **kw):
         self.files[cmd[5:]] = stream.read() + (b'bad' if self.corrupt else b'')
@@ -66,6 +67,16 @@ class PublishTests(unittest.TestCase):
     def test_immutable_release(self):
         self.publish()
         with self.assertRaises(error_perm):self.publish()
+    def test_first_title_ftpiiu_missing_marker(self):
+        del self.ftp.files[self.marker]
+        self.ftp.missing_reply='553 No such file or directory'
+        self.publish()
+        self.assertEqual(self.ftp.files[self.marker],b'new-1\n')
+    def test_other_553_errors_are_not_missing(self):
+        del self.ftp.files[self.marker]
+        self.ftp.missing_reply='553 File name not allowed'
+        with self.assertRaises(error_perm):self.publish()
+        self.assertNotIn(self.marker,self.ftp.files)
     def test_bad_paths(self):
         for p in ['wiiu/apps/../App.wuhb','wiiu/apps//App.wuhb','/wiiu/apps/App.wuhb','wiiu/apps/A\\B.wuhb']:
             with self.assertRaises(ValueError):dev.validate_bundle(p)

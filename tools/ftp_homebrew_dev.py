@@ -101,7 +101,9 @@ def publish(ftp, bundle, rpx, content, release):
         ftp.size(active)
         had_active = True
     except error_perm as error:
-        if not str(error).startswith('550'):
+        # FTPiiU uses 553 for a missing marker on a first-time title.
+        missing = str(error).startswith('550') or str(error).lower().startswith('553 no such file or directory')
+        if not missing:
             raise
     if had_active:
         ftp.rename(active, backup)
