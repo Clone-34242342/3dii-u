@@ -145,10 +145,10 @@ class DualChannelTests(unittest.TestCase):
         self.connect()
         self.controller.command('start')
         with self.assertRaises(ValueError): self.controller.command('runtime', 'set cpuvs 1')
-        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1']:
+        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1']:
             self.controller.command('renderer', command)
             wait_for(lambda: command.encode() in self.server.commands)
-        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'fw 1', 'relaunch', 'set uberall 1']:
+        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'fw 1', 'relaunch', 'set uberall 1']:
             with self.assertRaises(ValueError): self.controller.command('renderer', command)
 
     def test_discovers_split_mutex_banner_and_captures_owner(self):

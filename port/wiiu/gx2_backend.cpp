@@ -1583,8 +1583,8 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
     const u64 tkey = tex_key(addr, w, h, fmt, levels);
     if (auto hit = tex_index.find(tkey); hit != tex_index.end()) {
         Tex &e = *hit->second;
-        // Brain Age writes ink into its A4 canvas without a texture flush.
-        // Check the canvas on first use each flip, using the same path as stalecheck.
+        // Brain Age's A4 handwriting canvas changes without a flush. The generic
+        // periodic check can delay the first stroke; check this canvas every flip.
         const bool handwriting_canvas = g_game.program_id == 0x00040000000b3c00ULL
             && w == 512 && h == 256 && fmt == 11 && levels == 1;
         if ((stale_check || handwriting_canvas) && e.last_use != use_counter && !e.dirty && !e.maybe_dirty && !e.hash_stale
