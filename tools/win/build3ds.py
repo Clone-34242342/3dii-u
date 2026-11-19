@@ -507,6 +507,21 @@ def build_code(g, args):
     link_game(g, rt, code, getattr(args, 'link_flags', None))
 
 
+def validate_native_gs_symbols(symbols, required):
+    """A weak lookup must use the same C name as the optional generated table."""
+    names = {}
+    for line in symbols.splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            name, kind = fields[-1], fields[-2]
+            if 'gs_native_count' in name or 'gs_native_table' in name:
+                if name not in ('gs_native_count', 'gs_native_table'):
+                    raise ValueError('Native geometry shader table has namespace-mangled linkage: ' + name)
+                names[name] = kind
+    if required and any(names.get(name) not in ('R', 'D') for name in ('gs_native_count', 'gs_native_table')):
+        raise ValueError('Generated geometry shaders are missing from the linked executable')
+
+
 def link_game(g, rt, code, link_flags=None):
     os.makedirs(WORK + '/link', exist_ok=True)
     os.makedirs(g.out, exist_ok=True)
@@ -554,6 +569,8 @@ def link_game(g, rt, code, link_flags=None):
     out = g.rpx
     with open(g.nm, 'wb') as f:
         run([BIN + 'nm.exe', '-n', elf], cwd=WORK, stdout=f)
+    with open(g.nm, encoding='utf-8', errors='replace') as f:
+        validate_native_gs_symbols(f.read(), os.path.isfile(code + '/gs_native.o'))
     r = run(['elf2rpl.exe', elf, os.path.relpath(out, WORK).replace('\\', '/')], cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     if r.returncode:
         sys.exit('elf2rpl failed:\n' + r.stdout[-1000:])

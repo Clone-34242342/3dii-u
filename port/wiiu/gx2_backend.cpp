@@ -83,9 +83,9 @@ u32 prof[P_COUNT], st_syncs, st_luts, st_flushes, st_rehashes;
 // above, and a draw's steps one after another (lap). "nolaps" in the data folder leaves the steps out of a measuring build, to see
 // what reading the clock a dozen times a draw costs.
 bool prof_laps = true;
-inline OSTime prof_now() { return kMeasure ? OSGetSystemTime() : 0; }
+inline OSTime prof_now() { return cpu_timing_enabled() ? OSGetSystemTime() : 0; }
 inline void prof_add(int k, OSTime since) {
-    if (kMeasure) prof[k] += (u32)(OSGetSystemTime() - since);
+    if (since) prof[k] += (u32)(OSGetSystemTime() - since);
 }
 // ---- the GPU's own time, per pass: where the console's GPU spends a frame (the "[prof] GPU" line)
 // A pass is the draws into one target, a clear, a copy, or the present. Each starts with two stamps from the GPU's clock: the cycle its command processor
@@ -194,10 +194,10 @@ void gt_flip(u32 first_target) {
 
 OSTime prof_t;
 inline void lap_start() {
-    if (kMeasure && prof_laps) prof_t = OSGetSystemTime();
+    if (cpu_timing_enabled() && prof_laps) prof_t = OSGetSystemTime();
 }
 inline void lap(int k) {
-    if (!kMeasure || !prof_laps) return;
+    if (!cpu_timing_enabled() || !prof_laps) return;
     const OSTime n = OSGetSystemTime();
     prof[k] += (u32)(n - prof_t);
     prof_t = n;
@@ -229,7 +229,7 @@ void ring_next_segment() {
     const OSTime tw = OSGetSystemTime();
     if (ring_fence[ring_seg]) GX2WaitTimeStamp(ring_fence[ring_seg]);
     const u32 waited = (u32)(OSGetSystemTime() - tw);
-    if (kMeasure) prof[P_WAIT] += waited;
+    if (cpu_timing_enabled()) prof[P_WAIT] += waited;
     dyn_waited += waited;  // (this one the picture's size goes by: dyn_res_update)
     ring_off = RING_SIZE / 3 * ring_seg;
     ring_end = ring_off + RING_SIZE / 3;
@@ -1082,13 +1082,13 @@ const void *vtx_cached(u32 addr, const u8 *src, u32 src_stride, u32 count, u32 k
         if (e.addr == addr && e.size == size && e.buf && (now - e.checked < kVtxRecheck || hash_bytes(src, bytes) == e.hash)) {
             if (now - e.checked >= kVtxRecheck) e.checked = now;
             e.used = now;
-            if (kMeasure) st_vtx_hits++;
+            if (cpu_timing_enabled()) st_vtx_hits++;
             return e.buf;
         }
         vtx_retire(e);
         vtx_cache.erase(it);
     }
-    if (kMeasure) st_vtx_misses++;
+    if (cpu_timing_enabled()) st_vtx_misses++;
     void *buf = memalign(64, size + 64);
     if (!buf) {  // no room: this draw's own copy, as before
         void *w = ring_alloc(size + 64, 64);
@@ -1574,7 +1574,7 @@ void upload_texture(Tex &e, const u32 *rows = nullptr) {
         st_upload_bytes += e.bytes;
     }
     st_uploads++;
-    if (kMeasure) {
+    if (t0) {
         const u32 dt = (u32)(OSGetSystemTime() - t0);
         prof[P_TEXUP] += dt;
         st_upload_ms += OSTicksToMicroseconds((u64)dt) / 1000.0;
@@ -2873,7 +2873,7 @@ bool gx2_draw(const Gx2Draw &d) {
                 // In steps of a multiple of 4 bytes, which is all a real GPU takes (vertex_arrays.h). The copy is kept (vtx_cached) until the game says it
                 // wrote there: Luigi's Mansion: Dark Moon's draws reach 1300 to 4100 vertices, and copying each draw's arrays again took 20 to 50 MB a frame.
                 const u32 count = maxv - minv + 1, bytes = gpu_array_bytes(x, count), step = gpu_stride(x.stride);
-                if (kMeasure) {  // for the [prof] lines
+                if (cpu_timing_enabled()) {  // for the [prof] lines
                     st_attr_verts += count;
                     st_attr_bytes += bytes;
                     st_attr_streams++;
@@ -2911,7 +2911,7 @@ bool gx2_draw(const Gx2Draw &d) {
             // rather than depending on how each GPU path fetches little-endian integers. Only floats are read in place.
             const u32 stride = at->elems * 4;
             const u32 count = maxv - minv + 1;
-            if (kMeasure) {  // for the [prof] lines
+            if (cpu_timing_enabled()) {  // for the [prof] lines
                 st_attr_verts += count;
                 st_attr_bytes += (u64)count * at->stride;
                 st_attr_streams++;
@@ -2959,7 +2959,7 @@ bool gx2_draw(const Gx2Draw &d) {
         {
             // Copied, not read where it is: the game may rewrite it as soon as its list's interrupt comes, and a real GPU only gets to it later (see gx2_finish_list).
             const u32 elems = at->elems, stride = (elems == 1 ? 2 : elems) * 4, count = maxv - minv + 1, src_stride = at->stride;
-            if (kMeasure) {  // for the [prof] lines
+            if (cpu_timing_enabled()) {  // for the [prof] lines
                 st_attr_verts += count;
                 st_attr_bytes += (u64)count * src_stride;
                 st_attr_streams++;
@@ -5170,6 +5170,7 @@ bool gfx_set(const char *name, u32 v) {
     else if (!strcmp(name, "halfss")) half_ss = v;  // a target its transfer scales down is drawn at the smaller size (note_downscaled); from the next one made
     else if (!strcmp(name, "capfps")) cap_fps = v;  // the game's frames a second (frame_cap_wait); 0 for as fast as it goes
     else if (!strcmp(name, "gsshared")) g_gs_shared = v;  // geometry shader runs on two threads (vertex.cpp: gs_run_shared)
+    else if (!strcmp(name, "cputime") && v <= 1) g_cpu_timing.store(v != 0, std::memory_order_relaxed);
     else if (!strcmp(name, "gputime")) {  // the GPU's own time per pass (gt_mark), in the [prof] lines
         gt_on = v;
         live_gpu_timing.store(v != 0, std::memory_order_relaxed);

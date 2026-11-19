@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Append observed SHDC v2 shader states to a matched GSH/SHDX pair.
+"""Append observed SHDC v2/v4/v5 shader states to a matched GSH/SHDX pair.
 
 Requires the same trusted compiler/toolchain as the original pack. Output is a
 new directory; never mutate a pack used by a running title. No game data ships
@@ -14,8 +14,11 @@ from native_build import load_builder
 
 
 def records(data):
-    if len(data) < 8 or struct.unpack_from('>2I', data) != (0x53484443, 2):
-        raise ValueError('Expected SHDC revision 2')
+    if len(data) < 8:
+        raise ValueError('Truncated SHDC header')
+    magic, revision = struct.unpack_from('>2I', data)
+    if magic != 0x53484443 or revision not in (2, 4, 5):
+        raise ValueError('Expected SHDC revision 2, 4 or 5')
     at, result = 8, {}
     while at < len(data):
         if len(data) - at < 20: raise ValueError('Truncated cache record header')

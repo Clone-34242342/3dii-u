@@ -9,7 +9,7 @@ import time
 
 def checked_command(command, allow_renderer=False):
     command = command.strip()
-    if command in {'st', 'ps'}:
+    if command in {'st', 'ps', 'stats'}:
         return command
     match = re.fullmatch(r'mem ([0-9a-fA-F]{1,8}) ([0-9a-fA-F]{1,4})', command)
     if match:
@@ -17,12 +17,13 @@ def checked_command(command, allow_renderer=False):
         if 0 < size <= 4096 and address + size <= 0x100000000:
             return command
     if allow_renderer:
-        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh) [01]', command): return command
+        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime) [01]', command): return command
+        if re.fullmatch(r'set toplevel [012]', command): return command
         match = re.fullmatch(r'set cpuattr ([0-9]{1,2})', command)
         if match and int(match[1]) <= 15: return command
         match = re.fullmatch(r'set trace ([0-9]{1,3})', command)
         if match and int(match[1]) <= 256: return command
-    raise ValueError('Use st, ps, or bounded mem. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh 0|1, cpuattr 0..15 and trace 0..256 only.')
+    raise ValueError('Use st, ps, stats, or bounded mem. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh/gputime/cputime 0|1, toplevel 0..2, cpuattr 0..15 and trace 0..256 only.')
 
 
 class RuntimeReceiver(threading.Thread):

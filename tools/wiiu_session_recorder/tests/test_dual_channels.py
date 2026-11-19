@@ -141,14 +141,23 @@ class DualChannelTests(unittest.TestCase):
         self.assertTrue(any(e['event']=='runtime_disconnected' for e in events))
         self.assertGreaterEqual(sum(e['event']=='runtime_connected' for e in events), 1)
 
+    def test_read_only_performance_query(self):
+        self.connect()
+        self.controller.command('start')
+        self.controller.command('runtime', 'stats')
+        wait_for(lambda: b'stats' in self.server.commands)
+        for command in ['stats\nquit', 'stats extra', 'relaunch']:
+            with self.assertRaises(ValueError):
+                self.controller.command('runtime', command)
+
     def test_renderer_controls_require_explicit_action_and_are_bounded(self):
         self.connect()
         self.controller.command('start')
         with self.assertRaises(ValueError): self.controller.command('runtime', 'set cpuvs 1')
-        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1']:
+        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1', 'set gputime 0', 'set gputime 1', 'set cputime 1', 'set cputime 0', 'set toplevel 0', 'set toplevel 1', 'set toplevel 2']:
             self.controller.command('renderer', command)
             wait_for(lambda: command.encode() in self.server.commands)
-        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'fw 1', 'relaunch', 'set uberall 1']:
+        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'set gputime 2', 'set cputime 2', 'set toplevel 3', 'fw 1', 'relaunch', 'set uberall 1']:
             with self.assertRaises(ValueError): self.controller.command('renderer', command)
 
     def test_discovers_split_mutex_banner_and_captures_owner(self):

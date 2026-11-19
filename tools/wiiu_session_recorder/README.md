@@ -55,7 +55,7 @@ Validation: real TCP integration tests cover both channels in one folder, marker
 
 ## Explicit renderer experiments
 
-The `runtime` action stays read-only. A separate `renderer` action accepts only `set cpuvs 0|1`, `set vtxcache 0|1`, `set cpuattr 0..15`, `set drawtrace 0|1`, and `set trace 0..256`. Each request is logged before the runtime sends it. These temporary live switches require a compatible 3Dii U runtime; they are for developer A/B tests, not an automatic graphics repair. Restore `cpuvs 0` and `vtxcache 1` after testing unless a deliberately chosen experiment requires otherwise.
+The `runtime` action stays read-only, including the one-shot `stats` performance report. A separate `renderer` action accepts only `set cpuvs 0|1`, `set vtxcache 0|1`, `set cpuattr 0..15`, `set drawtrace 0|1`, and `set trace 0..256`, `set gputime 0|1`, `set cputime 0|1`, and `set toplevel 0..2`. Each request is logged before the runtime sends it. These temporary live switches require a compatible 3Dii U runtime; they are for developer A/B tests, not an automatic graphics repair. Restore `cpuvs 0` and `vtxcache 1` after testing unless a deliberately chosen experiment requires otherwise.
 
 ```sh
 python3 recorder.py --control renderer --note "set trace 64"
@@ -82,3 +82,7 @@ Categories=Development;Utility;
 ```
 
 KDE discovers the desktop entry through its application menu. On Wayland, use the buttons if global X11 shortcuts are unavailable.
+
+GPU timestamps are opt-in with `renderer --note "set gputime 1"`; disable them after measurement. `toplevel 0` holds the original internal rendering size, `1` tests the lower level, and `2` restores automatic selection. To restore the original size after a diagnostic at 720p with automatic scaling disabled, send `toplevel 0`, allow a frame, then `toplevel 2`. These controls alter rendering resolution, not the console display mode.
+
+`cputime` enables opt-in renderer and CPU geometry timing counters in compatible release builds. It does not enable shader disassembly or an interrupt sampler. Leave it off outside short diagnostic windows; compare timing-enabled and disabled runs before claiming an FPS improvement.

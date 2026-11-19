@@ -34,9 +34,25 @@ Validation:
 - `tools/test_y2r_coefficients.py` compiles the actual complete service with kernel stubs: standard-table queries, signed IPC packing, Set/Get round trips, invalid enums, neutral black/white conversion and batched DMA boundary/gap checks pass. The old service fails the new query test.
 - Differential native runs compared **640 combinations** of input/output formats, rotation, tiled/linear output and DMA units/gaps: all **2,621,440 output bytes** matched before/after batching.
 - A synthetic 512×240 RGB24 tiled conversion benchmark measured **1.433–1.487 ms/frame before** versus **0.755–0.803 ms/frame after**, approximately **1.8–1.9× faster on the host CPU**. These are not Wii U timings or an end-to-end FPS claim.
-- The optimized runtime linked and booted in Cemu. The 27 FPS hardware baseline belongs to the colour-fix build; hardware validation of batching is pending.
+- The optimized runtime linked and booted in Cemu. On real Wii U, a capture showed 29 FPS and most three-second counter windows were approximately 29.5–30.4 FPS during the movie. The earlier 27 FPS capture belongs to the colour-fix build. Gameplay is a separate workload and remains slower.
 
 The runtime colour fix and batching were uploaded as separate immutable RPX-only releases so their results can be distinguished. Existing ROMFS assets, game code and shader packs remain unchanged. Debugger on/off was briefly tried by the user without an apparent improvement; this is not a controlled plugin-performance study.
+
+## MH4U gameplay: native geometry shaders were silently disconnected
+
+Real-hardware town/dialogue captures showed approximately 33–35 FPS with normal graphics. A warm counter interval had no new texture uploads or fragment misses, and approximately 345 CPU geometry-shader draws / 633 input vertices per flip. Release-build CPU timers are disabled: the printed zero milliseconds and zero-percent GPU-thread busy fields are not performance measurements.
+
+The optional generated C geometry-shader tables were present in the executable, but GCC gave the runtime's weak declarations anonymous-namespace names. They did not resolve to the generated `gs_native_table` / `gs_native_count`, so the interpreter remained active. Move the C ABI declarations outside the anonymous namespace and validate linked symbols before producing the RPX. Games without generated tables retain the interpreter fallback.
+
+Validation and tooling:
+
+- The actual PowerPC build's symbol map now has the two defined C symbols and no namespace-mangled table references. The previous executable had unresolved namespace-mangled weak references.
+- Two captured geometry programs translated successfully; a third unsupported program stays interpreted. The captured programs and generated C remain private build inputs, not repository assets.
+- The differential test now runs natively on Linux, matches code and used-swizzle hashes before comparison, randomizes shader input registers, and checks dependent programs' output lanes. Its shader-generator stub now hashes bytes instead of returning zero, which previously reused the wrong decoded program when different programs had equal lengths.
+- 14,000 randomized runs / 28,000 emitted primitives matched the interpreter bit for bit. This validates shader arithmetic/output on the host; the corrected hardware run logs confirm native execution. A first interval reached 43.2 FPS, but later intervals were 34.7–37 FPS and the user still reported stutter. These are not proof of a sustained speedup.
+- The PC recorder allows the read-only `stats` command in its existing recorded runtime channel. The observed-cache append tool accepts SHDC revisions 2, 4 and 5; a separately prepared append-only pack has not been deployed as part of this RPX test.
+
+The first native-program update still had the linkage defect and showed no clear improvement. The corrected executable is an RPX-only update; ROMFS assets and the existing shader pack are retained. No full-speed gameplay claim is made yet. Short GPU-timestamp windows attributed about 13.2 ms to the main target and 11 ms to the present interval; these buckets can include submission gaps and presentation waits and must not be read as isolated shader execution times. A temporary lower-level resolution test produced no useful improvement and was restored. The user confirmed 480p was already selected. A subsequent RPX adds opt-in `cputime` counters for renderer stages and geometry work, disabled by default; it does not enable interrupt sampling or shader disassembly.
 
 ## Super Mario 3D Land: upstream 60 FPS mod
 
