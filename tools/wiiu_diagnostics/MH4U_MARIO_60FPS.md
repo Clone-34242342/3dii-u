@@ -1,0 +1,58 @@
+# MH4U shader registers and Mario 3D Land 60 FPS boot support
+
+These are **Cemu boot/functionality results**, not real-Wii-U rendering or performance validation. The Mario game is **Super Mario 3D Land**, not Super Mario 3D World.
+
+## Monster Hunter 4 Ultimate (USA)
+
+The ARM-to-PowerPC compilation completed, but offline shader validation rejected vertex shader 266: CafeGLSL used **54 registers**, while the renderer's vertex allocation remains **48**.
+
+The PICA relative-uniform helper previously selected between `vec4(1)` and a dynamically indexed buffer fetch. Rewriting it to fetch `f[min(u,95)]` unconditionally, then select constant one for indices 96–127, avoids excess register pressure. Indices are wrapped to seven bits after the existing signed-offset check. The fetched index is always valid. This changes neither the returned uniform nor the constant-one behavior; shader work was not removed, and the register limit was not relaxed.
+
+Compiler comparison on the same failing source:
+
+| Form | Registers |
+|---|---:|
+| Conditional buffer fetch | 54 |
+| Equivalent clamped fetch before selection | 32 |
+
+The complete rebuilt pack contains **604 vertex + 60 pixel shaders**. Maximum register counts are **37 vertex / 27 pixel**; all 664 programs pass `tools/gsh_rules.py`. The shader generator revision is raised to **5** so future runtime builds invalidate cached programs generated before this change.
+
+The actual WUHB booted in custom Cemu, completed first-run save formatting and SD extra-data creation, and reached the main menu. The user confirmed the game was running. An apparent pause during the opening sequence was not a confirmed crash. Gameplay coverage, real-hardware rendering and sustained performance remain untested.
+
+## Super Mario 3D Land: upstream 60 FPS mod
+
+Credit: [AlonBorodAHub/mario-3d-land-60fps](https://github.com/AlonBorodAHub/mario-3d-land-60fps), tested commit `eab11f6cc03c9df6ba06cd56af1ac28e7cf64a09`. This is an experimental USA Rev 1 interpolation mod targeting 60 Hz render updates while retaining 30 Hz gameplay updates. This PR supplies adaptation tooling and recompiler support, **not the upstream patch payload, game code or assets**.
+
+Simply applying its IPS before recompiling did not boot: replaced prologues stopped some entries from being discovered, branches targeted the original text segment's padding, and the initialized interpolation cache was outside the original initialized-data section. The first Cemu attempt reported no recompiled code at `0x003187b4`.
+
+`tools/prepare_mario_3d_land_60fps.py` handles the supported, hash-checked revision:
+
+1. Verify original USA Rev 1 code/header and the separately supplied IPS against known SHA-256 values. Other revisions fail before output is created.
+2. Apply the supplied IPS using the existing builder helper.
+3. Extend executable text to the end of its existing final page (`0x003a2000`), including the injected hook island.
+4. Expand initialized data through `0x004320c0` so the mod's initialized private cache is loaded instead of zeroed as BSS. Reduce BSS by the same byte count; total data+BSS footprint remains unchanged.
+5. Seed the replaced hook entries explicitly and regenerate `info.json` from the adjusted header. Existing ROMFS assets remain unchanged.
+6. Recompile the prepared ARM program normally. The decoder now lowers the mod's VFP modified-immediate constant moves; these are VFPv3 instructions used by an emulator-targeted mod, not an assertion that retail ARM11 supports VFPv3.
+
+Example, after extracting your own matching game and obtaining the upstream patch separately:
+
+```sh
+python tools/prepare_mario_3d_land_60fps.py \
+  /path/to/unmodified/extracted/g_aree \
+  /path/to/mario-3d-land-60fps/patch/code.ips \
+  /path/to/new/prepared/g_aree_60fps
+```
+
+Use that new extracted-game directory as the input to the normal builder/native build workflow. Recompile the code; an IPS alone cannot patch already generated PowerPC functions. Deploy the RPX with the prepared `code.bin` and `exheader.bin`, plus a matched shader GSH/index pair when changed. The existing adjacent `.wuhb.dev` release mechanism can carry these files while retaining the original WUHB's assets, icon and saves. It requires the PR's modified RPX loading module.
+
+### Validation
+
+- The portable preparation tool reproduced the locally tested code, header and `info.json` byte for byte.
+- `tools/test_vfp_immediate.py`: **1,792** single/double immediate/register combinations checked against independent IEEE bit expansion, plus reserved-encoding rejection. Included in `tools/selftest.py`.
+- Corrected Mario WUHB reached its title screen without the prior missing-code error; all **4,274** compiled shader programs passed the GPU rule checker.
+- Read-only Cemu debugger samples of the mod's own counters confirmed **two render updates per simulation update**. Most sampled five-second title-screen intervals were approximately **59–60 / 29–30 Hz**; one interval dipped to approximately **52 / 26 Hz**. This does not prove every presented frame is distinct, full-game 60 FPS, or hardware performance.
+- The user started gameplay and reported that it worked correctly. The counters above were not a controlled gameplay benchmark.
+- The IF-stack and command-list regression checks also passed. `git diff --check` passed.
+- The final cache-version-only RPX refresh is separate from these initial full-WUHB checks; it does not change game translation or shader arithmetic.
+
+No ROMs, game-derived shader source/binaries, generated game C, keys, memory dumps or raw private session logs are included in this report or PR.
