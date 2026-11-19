@@ -962,6 +962,21 @@ std::string gen_blit_fs() {
            "void main() { FragColor = texture(tex, vUv) * uTint + uAdd; }\n";
 }
 
+// A D24S8 image transferred as RGBA8: PICA's bytes are depth low,
+// middle, high, stencil; RGBA8 interprets those as A, B, G, R. Average
+// the packed channels, as the transfer engine does, rather than the depth.
+std::string gen_depth_copy_fs() {
+    return "#version 450\n"
+           "layout(location = 0) in vec2 vUv;\n"
+           "layout(location = 0) out vec4 FragColor;\n"
+           "layout(binding = 0) uniform sampler2D tex;\n"
+           "layout(binding = 0, std140) uniform Blit { vec4 uStep; vec4 uUnused; };\n"
+           "vec4 pack_depth(vec2 uv) { uint d = uint(round(clamp(texture(tex, uv).r, 0.0, 1.0) * 16777215.0));\n"
+           " return vec4(0.0, float((d >> 16) & 255u), float((d >> 8) & 255u), float(d & 255u)) / 255.0; }\n"
+           "void main() { vec2 h = uStep.xy; FragColor = (pack_depth(vUv-h) + pack_depth(vUv+vec2(h.x,-h.y))\n"
+           " + pack_depth(vUv+vec2(-h.x,h.y)) + pack_depth(vUv+h)) * 0.25; }\n";
+}
+
 // An ETC1 or ETC1A4 texture decoded by the GPU: the texture's bytes, copied as they are in the game's memory into an RGBA8 staging texture
 // (bytes, so no byte order question, as the tables) of one block per 2 or 4 texels, block i at texel (i % blocks per row) * k, in the PICA's
 // order: 8x8 tiles row by row, four 4x4 blocks per tile, alpha nibbles before the colour word in ETC1A4. vUv is the pixel position on the

@@ -295,12 +295,14 @@ bool in_test;
 std::string test_flags;
 
 bool run_command(int c, char *line) {
-    char word[8] = "", path[128] = "", name[16] = "";
+    char word[16] = "", path[128] = "", name[16] = "";
     u32 a = 0, b = 0;
     unsigned long long title = 0;
-    sscanf(line, "%7s", word);
+    sscanf(line, "%15s", word);
     if (!strcmp(word, "ps")) {
         wiiu::log_threads();
+    } else if (!strcmp(word, "stats")) {
+        wiiu::gfx_report();  // counters and any enabled GPU timestamps, published between frames
     } else if (!strcmp(word, "st")) {
         wiiu::log_status();
     } else if (!strcmp(word, "misses")) {

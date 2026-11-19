@@ -87,7 +87,7 @@ The native probes in `probes/` cover ring-buffer behavior, spinlock behavior, an
 * Six recorder integration tests, nine FTP publisher tests, five WUHB descriptor tests and the offscreen builder window check passed. The broad selftest was attempted on Linux, with many portable checks passing. It did **not** pass in full: Windows toolchain-dependent subprocess tests, Windows-only file-lock/share behavior and compiler policy mocks require their supported environment. Early Qt dependency failures were followed by a successful window rerun after installing PySide6. Normal/cold full port regression routes have not been completed for every title.
 * Historical Mario Maker builds reached gameplay on hardware but remained slow. Boot fixes are useful compatibility work; they do not establish acceptable performance. Mecha Marathon GPU rendering/performance and random hardware failures also remain open investigations.
 
-No ROMs, compiled game shaders, private memory/log captures, console keys, or game binaries belong in this submission. Share those locally only when needed to reproduce with a lawful dump. Reviewers can split the core fixes from the optional experimental debug environment before merging.
+No ROMs, compiled game shaders, private memory/log captures, console keys, or game binaries belong in this submission. The Ever Oasis evidence report includes selected gameplay screenshots explicitly authorized by the user, plus bounded performance excerpts. Share those locally only when needed to reproduce with a lawful dump. Reviewers can split the core fixes from the optional experimental debug environment before merging.
 
 Further Brain Age testing reached the professor transformation: hardware logs recorded a missing vertex state taking 3,363 ms to compile, plus multiple pixel compiles. A follow-up pack adds two observed vertex states and 38 pixel states. The right-side horn appearance and transformation stutter require retesting on hardware; compilation is a demonstrated contributor, not proof of the only performance bottleneck.
 
@@ -110,3 +110,7 @@ The optional [source patch and procedure](experiments/README.md) reproduce the b
 First-time FTPiiU publication also accepts its specific `553 No such file or directory` response when a new title has no prior activation marker. Other 553 errors still abort publication. The two additional publisher tests cover both cases; the first full Urban Champion deployment exercised the missing-marker case on hardware.
 
 For transfers that must not download payloads a second time, pass `--no-readback` to `tools/ftp_homebrew_dev.py`. This mode issues no `RETR` for uploaded files or the activation marker; it checks remote sizes and still activates the new release last, with rollback of the old marker on activation failure. It does not provide a remote content-hash comparison. The no-readback regression test rejects every attempted download.
+
+## Ever Oasis hardware follow-up
+
+[Rendering fixes, shader compiler diagnosis, 20 to 30 FPS hardware measurements, and screenshots](EVER_OASIS.md) document the latest Ever Oasis work. The report distinguishes measured Garden results from broader performance/stability claims and includes the costs and limits of the depth/stencil path.

@@ -315,6 +315,18 @@ class Game:
         self.gen_dir = f'{self.dir}/{self.gen}'
         self.safe_ranges = []  # with mode 'abi': address ranges generated the safe way (mixed)
         self.verified_entries = ()
+        # This BAGE executable's two locale conversion tables store their
+        # Thumb callbacks as signed offsets from each table field. Absolute
+        # pointer discovery misses them: startup and name conversion then
+        # dispatch to code that was never generated. Keep both directions of
+        # both tables, and only for the executable whose tables were checked.
+        if self.name in ('g_bage', 'g_bage_v1040'):
+            with open(self.dir + '/code.bin', 'rb') as code:
+                if hashlib.sha256(code.read()).hexdigest() in (
+                    '618a0a5463aab8532d6732f6dd58ebd132f3c4f60232414677b3ed5c61f99fed',
+                    'f67534af3a71220851cf28d53ab73d40d7965e012e292d9be444ce5a43c24967',
+                ):
+                    self.verified_entries = (0x00101559, 0x0010160d, 0x001016c5, 0x001017a9)
         # This ASRE base executable's sort routine splits around ARM calls that
         # retain live registers across generated entry points.
         if self.mode == 'abi' and self.name == 'g_asre':

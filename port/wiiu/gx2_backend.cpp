@@ -103,6 +103,7 @@ struct GtFrame {
 GtFrame gt[GT_FRAMES];
 u32 gt_cur;
 bool gt_on = true, gt_broken;
+std::atomic<bool> live_gpu_timing{false};  // opt-in GPU timestamps in a release build; no alarm-based CPU sampler
 struct GtSum {
     u32 tag;
     u8 kind;
@@ -116,7 +117,7 @@ volatile bool gt_reset;
 OSTime gt_last_end;
 
 void gt_mark(u8 kind, u32 tag) {
-    if (!kMeasure || !gt_on || gt_broken) return;
+    if ((!kMeasure && !live_gpu_timing.load(std::memory_order_relaxed)) || !gt_on || gt_broken) return;
     GtFrame &f = gt[gt_cur];
     if (!f.top) {
         f.top = (u64 *)MEMAllocFromDefaultHeapEx(GT_MARKS * 16, 0x100);
@@ -154,7 +155,7 @@ void gt_add(u8 kind, u32 tag, u64 ticks) {
 
 // At the end of a present, once the GPU has finished the frame before last: the oldest frame's stamps are read, and its slot is the next frame's.
 void gt_flip(u32 first_target) {
-    if (!kMeasure || !gt_on || gt_broken) return;
+    if ((!kMeasure && !live_gpu_timing.load(std::memory_order_relaxed)) || !gt_on || gt_broken) return;
     gt_mark(GT_END, 0);
     gt_cur = (gt_cur + 1) % GT_FRAMES;
     GtFrame &f = gt[gt_cur];
@@ -275,6 +276,7 @@ std::unordered_map<u64, VsEntry> vs_table;
 std::unordered_map<u64, PsEntry> ps_table;
 GX2VertexShader *vs_passthrough, *vs_blit;
 GX2PixelShader *ps_blit, *ps_fallback, *ps_fallback_tex, *ps_uber, *ps_uber_lit;
+GX2PixelShader *ps_depth_copy;
 GX2PixelShader *ps_decode[14];        // by texture format: decodes it on the GPU (gpu_decode); null in a pack from before it had that one
 // A bit per attribute format (s8, u8, s16, float) kept the old way: copied by itself, integers as floats made by the CPU. Files named "cpuattr"
 // (all), "cpuattr8" and "cpuattr16" set them, and "cemu" the signed bytes. None by default: bytes fetched a 4-byte word at a time (gpu_fetched)
@@ -465,6 +467,8 @@ void load_shader_tables() {
     vs_passthrough = load_vs(h->passthrough_vs);
     vs_blit = load_vs(h->blit_vs);
     ps_blit = load_ps(h->blit_ps);
+    const auto depth_copy = ps_table.find(fnv64(kDepthCopyKey, strlen(kDepthCopyKey)));
+    if (depth_copy != ps_table.end()) ps_depth_copy = load_ps(depth_copy->second.index);
     if (h->pad >= gfd_ps.size() || gfd_ps.size() - h->pad < 2) FATAL("shaders.idx fallback indices are out of range\n");
     ps_fallback = load_ps(h->pad);
     ps_fallback_tex = load_ps(h->pad + 1);
@@ -895,9 +899,16 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
         f.mipLevels = 1;
         // 24 bits of fixed point, as the PICA's depth buffer, not the usual 24-bit float: that has a 20-bit mantissa, so from the middle of the range out two depths a few
         // PICA steps apart are the same to it, and a floor mat drawn after the characters standing on it covered them on the console. Cemu's host GPU had kept them apart.
-        f.format = GX2_SURFACE_FORMAT_UNORM_R24_X8;
+        // Ever Oasis samples depth for its focus mask and uses stencil to
+        // clip effects in dialogue. Plain R32 fixed the sampled depth but
+        // lost stencil, exposing an opaque rectangular effect. GX2's legacy
+        // FLOAT_X8_X24 name is the 64-bit D32_FLOAT_S8_X24 format (0x81c):
+        // retain R32's 24-bit mantissa and the stencil channel together.
+        const bool sampleable_depth = fmt == 3 && g_game.program_id == 0x00040000001a4800ULL;
+        f.format = sampleable_depth ? GX2_SURFACE_FORMAT_FLOAT_X8_X24 : GX2_SURFACE_FORMAT_UNORM_R24_X8;
         f.aa = GX2_AA_MODE1X;
-        f.use = GX2_SURFACE_USE_DEPTH_BUFFER;
+        f.use = sampleable_depth ? (GX2SurfaceUse)(GX2_SURFACE_USE_DEPTH_BUFFER | GX2_SURFACE_USE_TEXTURE)
+                                 : GX2_SURFACE_USE_DEPTH_BUFFER;
         f.tileMode = GX2_TILE_MODE_DEFAULT;
         s->db.viewNumSlices = 1;
         s->db.depthClear = 1.0f;
@@ -1992,7 +2003,13 @@ void send_state(const DrawState &ds, Surface &c, bool has_depth, bool stencil) {
     // At 4.5 times the 3DS's size every other 3DS pixel edge lands on the centre of a TV pixel, where two quads meeting at that edge can both leave the pixel to the other: the
     // console drew Dream Team's text boxes with a thin line where their pieces meet, and Cemu's GPU never did. A quarter of a pixel moves every edge off the centres.
     const float nudge = Sx != floorf(Sx) || Sy != floorf(Sy) ? 0.25f : 0.0f;
-    GX2SetViewport(ds.vp_x * Sx + nudge, ds.vp_y * Sy + c.row0 + nudge, 2 * ds.vp_hw * Sx, 2 * ds.vp_hh * Sy, 0.0f, 1.0f);
+    // Our vertex shaders already emit PICA depth in [0,1]. GX2's viewport
+    // helper always applies (far-near)/2 and (near+far)/2, even with HalfZ
+    // clipping enabled. Ever Oasis reads that depth back for its focus mask:
+    // the extra 0.5*z+0.5 made the background much blurrier than the 3DS.
+    // Validate this mapping on the depth-reading title before broadening it.
+    const float near_z = g_game.program_id == 0x00040000001a4800ULL ? -1.0f : 0.0f;
+    GX2SetViewport(ds.vp_x * Sx + nudge, ds.vp_y * Sy + c.row0 + nudge, 2 * ds.vp_hw * Sx, 2 * ds.vp_hh * Sy, near_z, 1.0f);
     if (ds.scissor_mode == 3) {
         const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, c.w), x2 = std::clamp<s32>(ds.sc_x2, 0, c.w);
         const s32 y1 = std::clamp<s32>(ds.sc_y1, 0, c.h), y2 = std::clamp<s32>(ds.sc_y2, 0, c.h);
@@ -2419,12 +2436,14 @@ void decode_textures_first(const DrawState &ds) {
 
 // Sample one frame every 30 presents. Only the card thread emits the trace.
 constexpr u32 DRAW_TRACE_INTERVAL = 30;
-constexpr u32 DRAW_TRACE_CAPACITY = 32;
+constexpr u32 DRAW_TRACE_CAPACITY = 64;
 bool draw_trace_enabled;
 struct DrawTraceState {
     u64 vs, fs;
     u32 color, depth, width, height, depth_scale, depth_offset, flags, blend, color_mask;
     u32 shader;
+    std::array<u32, 12> textures;
+    std::array<float, 4> viewport;
     bool operator==(const DrawTraceState &) const = default;
 };
 struct DrawTraceFrame {
@@ -2466,7 +2485,11 @@ void trace_draw(const DrawState &ds, GX2PixelShader *ps, u64 vs) {
     const u32 blend = (u32)ds.eq_rgb | (u32)ds.eq_a << 4 | (u32)ds.sf_rgb << 8 |
                       (u32)ds.df_rgb << 12 | (u32)ds.sf_a << 16 | (u32)ds.df_a << 20;
     const DrawTraceState state{vs, key, ds.rt.color_addr, ds.rt.depth_addr, ds.rt.w, ds.rt.h,
-                              scale, offset, flags, blend, ds.color_mask, shader};
+                              scale, offset, flags, blend, ds.color_mask, shader,
+                              {ds.tex[0].face_addr[0], ds.tex[0].w, ds.tex[0].h, ds.tex[0].fmt,
+                               ds.tex[1].face_addr[0], ds.tex[1].w, ds.tex[1].h, ds.tex[1].fmt,
+                               ds.tex[2].face_addr[0], ds.tex[2].w, ds.tex[2].h, ds.tex[2].fmt},
+                              {ds.vp_x, ds.vp_y, 2 * ds.vp_hw, 2 * ds.vp_hh}};
     auto &frame = draw_trace_current;
     for (u32 i = 0; i < frame.count; ++i)
         if (frame.draws[i] == state)
@@ -3832,6 +3855,7 @@ struct LastTransfer {
 // waits for the GPU, and an upload. The texture's bytes aren't in guest memory then: a lookup there of another size or format than the
 // transfer's reads what was there before, and what the game puts there later counts as newer (Surface::copy).
 static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
+    gx2_flush_cpu_batch();
     gt_mark(GT_TRANSFER, out_paddr);
     const u32 in_w = in_dims & 0xffff, in_h = in_dims >> 16, out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
     const u32 scaling = (flags >> 24) & 3;
@@ -3843,13 +3867,22 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     const bool own_size = sy <= 1 && (flags & 0x22) == 0x20 && out_paddr >= mem::VRAM_PADDR && out_paddr < mem::VRAM_PADDR + mem::VRAM_SIZE;
     if ((flip && crop) || in_w < out_w0 || in_h < out_h0) return false;
     Surface *src = nullptr;
+    // Ever Oasis copies D24S8 as RGBA8 for its focus mask. Guest memory
+    // contains the clear value, not the GPU's depth; a CPU transfer therefore
+    // blurs the whole scene. Keep this experimental path limited to the
+    // observed title/format until stencil-preserving transfers are supported.
+    const bool depth_copy = ps_depth_copy && g_game.program_id == 0x00040000001a4800ULL
+        && (flags & 0x7722) == 0x20;
     for (auto &x : surfaces)
-        if (!x->depth && x->addr == in_paddr && x->w == in_w && x->h == in_h && !x->guest_newer &&
+        if ((!x->depth || (depth_copy && x->fmt == 3)) && x->addr == in_paddr && x->w == in_w && x->h == in_h && !x->guest_newer &&
             (x->sy > 1 || x->gpu_chain || (own_size && x->gpu_newer)))
             src = x.get();
     if (!src) return false;
     used(*src);
-    const bool own_size_copy = own_size && src->sy <= 1 && !src->gpu_chain;
+    // A small destination still accepts a downsample of an enlarged source.
+    // Requiring the source to be 1:1 rejected every such effect pass and
+    // forced a GPU readback followed by a CPU conversion and texture upload.
+    const bool own_size_copy = own_size && !src->gpu_chain;
     if (sy <= 1 && !src->gpu_chain && !own_size_copy) return false;
     // Neither bit 1 (linear in) nor bit 5 (left tiled): the picture lands in memory row by row, for whatever reads its bytes. Paper Mario's goes on to another
     // transfer here on the GPU; Luigi's Mansion 2's top screen halves go to texture copies into its LCD buffer, which read them back, and tiled they came out black.
@@ -3865,11 +3898,37 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     if (notes++ < 2) wiiu::note("copying surface %08x to %08x on the GPU", in_paddr, out_paddr);
     st_gpu_copies++;
     gx2_flush_cpu_batch();
+    // The copied window can be shorter than its power-of-two texture.
+    // Initialize the untouched rows too: real MEM2 allocations are not zeroed,
+    // and Ever Oasis's blur/bloom samples otherwise spread stale padding into
+    // the foreground. The other GPU texture-copy paths do this as well.
+    if (dst->first_use) {
+        dst->first_use = false;
+        GX2ClearColor(&dst->cb, 0, 0, 0, 0);
+        restore_context();
+    }
     flush_surface(*src);
-    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, src->tex.surface.image, src->tex.surface.imageSize);
+    if (!src->depth) GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, src->tex.surface.image, src->tex.surface.imageSize);
     GX2SetColorBuffer(&dst->cb, GX2_RENDER_TARGET_0);
     cur_color = nullptr;
     begin_blit();
+    GX2Texture depth_tex;
+    if (src->depth) {
+        memset(&depth_tex, 0, sizeof depth_tex);
+        depth_tex.surface = src->db.surface;
+        depth_tex.surface.use = (GX2SurfaceUse)(GX2_SURFACE_USE_DEPTH_BUFFER | GX2_SURFACE_USE_TEXTURE);
+        depth_tex.viewNumMips = depth_tex.viewNumSlices = 1;
+        depth_tex.compMap = 0x00010203;
+        GX2InitTextureRegs(&depth_tex);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, depth_tex.surface.image, depth_tex.surface.imageSize);
+        GX2SetPixelShader(ps_depth_copy);
+        auto *u = (u32 *)ring_alloc(256, 256);
+        memset(u, 0, 256);
+        u[0] = swap_float(scaling ? 0.5f / in_w : 0.0f);
+        u[1] = swap_float(scaling == 2 ? 0.5f / src->tex_h : 0.0f);
+        GX2Invalidate((GX2InvalidateMode)(GX2_INVALIDATE_MODE_CPU | GX2_INVALIDATE_MODE_UNIFORM_BLOCK), u, 32);
+        GX2SetPixelUniformBlock(0, 32, u);
+    }
     GX2SetViewport(0, (float)dst->row0, (float)dst->sw, (float)(dst->sh - dst->row0), 0, 1);
     GX2SetScissor(0, dst->row0, dst->sw, dst->sh - dst->row0);
     float *q = (float *)ring_alloc(4 * 16 + 64, 64);
@@ -3880,8 +3939,8 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     memcpy(q, data, sizeof data);
     DCFlushRange(q, sizeof data);
     GX2SetAttribBuffer(0, sizeof data, 16, q);
-    GX2SetPixelTexture(&src->tex, 0);
-    GX2SetPixelSampler(&blit_sampler, 0);
+    GX2SetPixelTexture(src->depth ? &depth_tex : &src->tex, 0);
+    GX2SetPixelSampler(src->depth ? &lut_sampler : &blit_sampler, 0);
     GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLE_STRIP, 4, 0, 1);
     state_lost = true;
     dst->gpu_newer = true;
@@ -4589,6 +4648,11 @@ void gfx_report_draw_trace() {
                  i, (unsigned long long)d.vs, (unsigned long long)d.fs, d.shader,
                  d.color, d.depth, d.width, d.height, d.depth_scale, d.depth_offset,
                  d.flags, d.blend, d.color_mask);
+        OSReport("[3dii-u draw] %u viewport=%.1f,%.1f,%.1f,%.1f tex0=%08x/%ux%u/%u tex1=%08x/%ux%u/%u tex2=%08x/%ux%u/%u\n",
+                 i, d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3],
+                 d.textures[0], d.textures[1], d.textures[2], d.textures[3],
+                 d.textures[4], d.textures[5], d.textures[6], d.textures[7],
+                 d.textures[8], d.textures[9], d.textures[10], d.textures[11]);
     }
 }
 
@@ -5106,7 +5170,10 @@ bool gfx_set(const char *name, u32 v) {
     else if (!strcmp(name, "halfss")) half_ss = v;  // a target its transfer scales down is drawn at the smaller size (note_downscaled); from the next one made
     else if (!strcmp(name, "capfps")) cap_fps = v;  // the game's frames a second (frame_cap_wait); 0 for as fast as it goes
     else if (!strcmp(name, "gsshared")) g_gs_shared = v;  // geometry shader runs on two threads (vertex.cpp: gs_run_shared)
-    else if (!strcmp(name, "gputime")) gt_on = v;  // the GPU's own time per pass (gt_mark), in the [prof] lines
+    else if (!strcmp(name, "gputime")) {  // the GPU's own time per pass (gt_mark), in the [prof] lines
+        gt_on = v;
+        live_gpu_timing.store(v != 0, std::memory_order_relaxed);
+    }
     else if (!strcmp(name, "dynres")) dyn_720 = v;           // the top screen's size follows the GPU at 720p too (dyn_res_update)
     else if (!strcmp(name, "toplevel")) dyn_force = v > 1 ? -1 : (int)v;  // 0 full size, 1 the lower, 2 as the GPU keeps up
     else if (!strcmp(name, "lowscale") && v >= 30 && v <= 100) dyn_low = v / 100.0f;  // the lower level's percent of full size each way
