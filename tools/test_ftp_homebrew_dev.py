@@ -77,6 +77,12 @@ class PublishTests(unittest.TestCase):
         self.ftp.missing_reply='553 File name not allowed'
         with self.assertRaises(error_perm):self.publish()
         self.assertNotIn(self.marker,self.ftp.files)
+    def test_no_readback_never_downloads_payload_or_marker(self):
+        def forbidden(*args,**kwargs):raise AssertionError('No RETR allowed')
+        self.ftp.retrbinary=forbidden
+        with contextlib.redirect_stdout(io.StringIO()):
+            dev.publish(self.ftp,'wiiu/apps/App.wuhb',self.rpx,self.content,'new-1',readback=False)
+        self.assertEqual(self.ftp.files[self.marker],b'new-1\n')
     def test_bad_paths(self):
         for p in ['wiiu/apps/../App.wuhb','wiiu/apps//App.wuhb','/wiiu/apps/App.wuhb','wiiu/apps/A\\B.wuhb']:
             with self.assertRaises(ValueError):dev.validate_bundle(p)

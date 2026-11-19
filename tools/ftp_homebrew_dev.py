@@ -45,7 +45,7 @@ def mkdirs(ftp, path):
             ftp.cwd(previous)
 
 
-def publish(ftp, bundle, rpx, content, release):
+def publish(ftp, bundle, rpx, content, release, *, readback=True):
     validate_bundle(bundle)
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', release):
         raise ValueError('Release ID must contain 1–64 letters, numbers, underscores or hyphens')
@@ -85,15 +85,24 @@ def publish(ftp, bundle, rpx, content, release):
             expected = sha256(stream.read()).digest()
             stream.seek(0)
             ftp.storbinary('STOR ' + remote, stream, blocksize=128 << 10)
-        if remote_hash(ftp, remote) != expected or p.stat().st_mtime_ns != before.st_mtime_ns:
-            raise ValueError('Readback verification failed: ' + relative)
+        if p.stat().st_mtime_ns != before.st_mtime_ns:
+            raise ValueError('Source changed during upload: ' + relative)
+        if readback:
+            if remote_hash(ftp, remote) != expected:
+                raise ValueError('Readback verification failed: ' + relative)
+        elif ftp.size(remote) != before.st_size:
+            raise ValueError('Uploaded file size differs: ' + relative)
         sent += before.st_size
-        print(f'Verified {relative}: {sent}/{total} bytes', flush=True)
+        action = 'Verified' if readback else 'Uploaded'
+        print(f'{action} {relative}: {sent}/{total} bytes', flush=True)
     pending = companion + '/active.' + uuid.uuid4().hex + '.upload'
     marker = (release + '\n').encode('ascii')
     ftp.storbinary('STOR ' + pending, BytesIO(marker))
-    if remote_hash(ftp, pending) != sha256(marker).digest():
-        raise ValueError('Activation marker readback failed')
+    if readback:
+        if remote_hash(ftp, pending) != sha256(marker).digest():
+            raise ValueError('Activation marker readback failed')
+    elif ftp.size(pending) != len(marker):
+        raise ValueError('Incomplete activation marker upload')
     active = companion + '/active.txt'
     backup = companion + '/active.' + uuid.uuid4().hex + '.bak'
     had_active = False
@@ -125,12 +134,13 @@ def main():
     ap.add_argument('--content', type=Path, help='Only changed content files; absent files use the original WUHB')
     ap.add_argument('--release', required=True)
     ap.add_argument('--port', type=int, default=21)
+    ap.add_argument('--no-readback', action='store_true', help='Skip downloading uploaded files again; check remote sizes only')
     args = ap.parse_args()
     try:
         with FTP(timeout=30) as ftp:
             ftp.connect(args.host, args.port)
             ftp.login()
-            publish(ftp, args.bundle, args.rpx, args.content, args.release)
+            publish(ftp, args.bundle, args.rpx, args.content, args.release, readback=not args.no_readback)
     except (*all_errors, OSError, ValueError) as error:
         ap.exit(1, f'Publish failed: {error}\n')
 
