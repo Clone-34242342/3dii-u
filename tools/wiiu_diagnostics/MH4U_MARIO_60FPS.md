@@ -1,6 +1,6 @@
 # MH4U shader registers and Mario 3D Land 60 FPS boot support
 
-These are **Cemu boot/functionality results**, not real-Wii-U rendering or performance validation. The Mario game is **Super Mario 3D Land**, not Super Mario 3D World.
+The initial port checks below are **Cemu boot/functionality results**. Later real-Wii-U movie validation is explicitly identified in its own section. The Mario game is **Super Mario 3D Land**, not Super Mario 3D World.
 
 ## Monster Hunter 4 Ultimate (USA)
 
@@ -18,6 +18,25 @@ Compiler comparison on the same failing source:
 The complete rebuilt pack contains **604 vertex + 60 pixel shaders**. Maximum register counts are **37 vertex / 27 pixel**; all 664 programs pass `tools/gsh_rules.py`. The shader generator revision is raised to **5** so future runtime builds invalidate cached programs generated before this change.
 
 The actual WUHB booted in custom Cemu, completed first-run save formatting and SD extra-data creation, and reached the main menu. The user confirmed the game was running. An apparent pause during the opening sequence was not a confirmed crash. Gameplay coverage, real-hardware rendering and sustained performance remain untested.
+
+## MH4U opening movie: yellow-screen fix and conversion work
+
+A later hardware test found the opening movie displayed solid yellow. The same defect reproduced in Cemu, while Azahar displayed the movie. This was a **3Dii U Y2R service defect**, not a shader-pack change or a missing movie asset.
+
+A Python-controlled Cemu breakpoint traced the setup IPC sequence: MH4U requests `GetStandardCoefficient` (`0x21`, index 0), then passes the returned values to `SetCoefficient` (`0x1e`). The service lacked the query and returned success without its four coefficient words. The next request contained leftover command-buffer values such as `0x4000` instead of the standard table, causing conversion to saturate to yellow.
+
+The service now implements both `GetStandardCoefficient` and `GetCoefficient`, packing signed 16-bit pairs into four little-endian IPC words independently of host byte order. A table query does not alter the active converter. Invalid standard-table indices return CAM's invalid-enum result. The actual rebuilt WUHB displayed the movie normally in Cemu; the user then confirmed normal video playback on **real Wii U** after an RPX-only FTP update (53,578,243 bytes, no payload readback). A hardware capture showed **27 FPS**, so this establishes the colour fix, not full-speed playback.
+
+The video path also performed a separate guest-memory copy for every output pixel. The optimization packs each 8×8 tile before writing it and splits batches at DMA transfer-unit boundaries, preserving gaps and memory layout. For MH4U's 512×240 RGB24 conversion, this reduces calls from **122,880 per frame to 1,920**. No pixels or frames are discarded.
+
+Validation:
+
+- `tools/test_y2r_coefficients.py` compiles the actual complete service with kernel stubs: standard-table queries, signed IPC packing, Set/Get round trips, invalid enums, neutral black/white conversion and batched DMA boundary/gap checks pass. The old service fails the new query test.
+- Differential native runs compared **640 combinations** of input/output formats, rotation, tiled/linear output and DMA units/gaps: all **2,621,440 output bytes** matched before/after batching.
+- A synthetic 512×240 RGB24 tiled conversion benchmark measured **1.433–1.487 ms/frame before** versus **0.755–0.803 ms/frame after**, approximately **1.8–1.9× faster on the host CPU**. These are not Wii U timings or an end-to-end FPS claim.
+- The optimized runtime linked and booted in Cemu. The 27 FPS hardware baseline belongs to the colour-fix build; hardware validation of batching is pending.
+
+The runtime colour fix and batching were uploaded as separate immutable RPX-only releases so their results can be distinguished. Existing ROMFS assets, game code and shader packs remain unchanged. Debugger on/off was briefly tried by the user without an apparent improvement; this is not a controlled plugin-performance study.
 
 ## Super Mario 3D Land: upstream 60 FPS mod
 

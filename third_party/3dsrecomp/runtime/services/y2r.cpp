@@ -47,13 +47,19 @@ struct DmaWriter {
     u32 at, left, unit, gap;
     explicit DmaWriter(const Dma &d) : at(d.addr), left(d.unit), unit(d.unit), gap(d.gap) {}
     void put(const u8 *p, u32 n) {
-        memcpy(gptr(at), p, n);
-        at += n;
-        if (!unit) return;
-        left -= std::min(left, n);
-        if (!left) {
-            at += gap;
-            left = unit;
+        while (n) {
+            const u32 run = unit ? std::min(left, n) : n;
+            memcpy(gptr(at), p, run);
+            at += run;
+            p += run;
+            n -= run;
+            if (unit) {
+                left -= run;
+                if (!left) {
+                    at += gap;
+                    left = unit;
+                }
+            }
         }
     }
 };
@@ -172,15 +178,15 @@ struct Y2rService : Service {
                 }
                 tiles.swap(turned);
             }
-            u8 px[4];
             if (block) {
                 std::vector<u32> shuffled(64);
                 for (u32 t = 0; t < tiles_across; t++) {
                     for (u32 i = 0; i < 64; i++) shuffled[order[i]] = tiles[t * 64 + i];
-                    for (u32 i = 0; i < 64; i++) {
-                        encode(shuffled[i], px);
-                        w.put(px, bytes);
-                    }
+                    // One DMA write per tile instead of per pixel. The writer
+                    // still splits at transfer-unit boundaries and applies gaps.
+                    u8 packed[64 * 4];
+                    for (u32 i = 0; i < 64; i++) encode(shuffled[i], packed + i * bytes);
+                    w.put(packed, 64 * bytes);
                 }
             } else {
                 for (u32 row = 0; row < rows; row++) {
@@ -212,6 +218,14 @@ struct Y2rService : Service {
         auto get = [&](u32 v) {
             ipc.ok(2);
             ipc.set(2, v);
+        };
+        // Replies contain four little-endian pairs of signed 16-bit coefficients,
+        // independent of the host byte order. Games may fetch a standard table
+        // and pass it back with SetCoefficient instead of SetStandardCoefficient.
+        auto coefficients = [&](const s16 *values) {
+            ipc.ok(5);
+            for (u32 i = 0; i < 4; i++)
+                ipc.set(2 + i, (u32)(u16)values[2 * i] | (u32)(u16)values[2 * i + 1] << 16);
         };
         switch (ipc.cmd()) {
         case 0x0001: input_format = ipc[1] & 0xff; ipc.ok(); break;
@@ -247,10 +261,15 @@ struct Y2rService : Service {
             for (u32 i = 0; i < 8; i++) co[i] = (s16)(ipc[1 + i / 2] >> (16 * (i & 1)));
             ipc.ok();
             break;
+        case 0x001F: coefficients(co); break;  // GetCoefficient
         case 0x0020:  // SetStandardCoefficient
             standard = std::min<u32>(ipc[1], 3);
             memcpy(co, kStandard[standard], sizeof co);
             ipc.ok();
+            break;
+        case 0x0021:  // GetStandardCoefficient: a query, not a change to the active table
+            if (ipc[1] >= 4) ipc.result(0xE0E053ED);  // CAM / InvalidEnumValue / InvalidArgument / Usage
+            else coefficients(kStandard[ipc[1]]);
             break;
         case 0x0022: alpha = ipc[1] & 0xffff; ipc.ok(); break;
         case 0x0023: get(alpha); break;
