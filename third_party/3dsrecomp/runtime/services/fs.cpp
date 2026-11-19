@@ -250,16 +250,23 @@ static std::vector<RomfsPatch> romfs_patches;
 struct RomfsExtra { u64 off, size; int fd; };
 static std::vector<RomfsExtra> romfs_extra;
 
+static ssize_t romfs_read_at(void *dst, size_t len, u64 off) {
+#ifdef __WIIU__
+    if (len <= UINT32_MAX && wiiu::direct_read(dst, (u32)len, off)) return (ssize_t)len;
+#endif
+    return pread(romfs_fd, dst, len, (off_t)off);
+}
+
 static void build_romfs_index() {
     std::vector<u8> hdr(0x28);
-    if (pread(romfs_fd, hdr.data(), 0x28, 0) != 0x28) return;
+    if (romfs_read_at(hdr.data(), 0x28, 0) != 0x28) return;
     auto u32at = [](const std::vector<u8> &b, size_t o) { u32 v; memcpy(&v, &b[o], 4); return le32(v); };
     u32 dmeta_off = u32at(hdr, 0x0C), dmeta_len = u32at(hdr, 0x10);
     u32 fmeta_off = u32at(hdr, 0x1C), fmeta_len = u32at(hdr, 0x20);
     u32 data_off = u32at(hdr, 0x24);
     std::vector<u8> dm(dmeta_len), fm(fmeta_len);
-    if (pread(romfs_fd, dm.data(), dmeta_len, dmeta_off) != (ssize_t)dmeta_len) return;
-    if (pread(romfs_fd, fm.data(), fmeta_len, fmeta_off) != (ssize_t)fmeta_len) return;
+    if (romfs_read_at(dm.data(), dmeta_len, dmeta_off) != (ssize_t)dmeta_len) return;
+    if (romfs_read_at(fm.data(), fmeta_len, fmeta_off) != (ssize_t)fmeta_len) return;
     auto name = [](const std::vector<u8> &b, size_t o, u32 len) {
         std::string s;
         for (u32 i = 0; i + 1 < len; i += 2) s += (char)b[o + i];
@@ -378,7 +385,7 @@ std::vector<u8> romfs_file(const std::string &path) {
     for (const auto &f : romfs_index)
         if (f.path == path) {
             std::vector<u8> d(f.size);
-            if (pread(romfs_fd, d.data(), f.size, (off_t)f.off) != (ssize_t)f.size) return {};
+            if (romfs_read_at(d.data(), f.size, f.off) != (ssize_t)f.size) return {};
             return d;
         }
     return {};
@@ -436,6 +443,7 @@ static std::string archive_dir(u32 id, const LowPath &p) {
 struct FileSession : Service {
     int fd = -1;
     bool romfs = false, written = false;
+    bool extdata = false;
     bool gamedata = false;  // read-only game data in a file of its own (an update's RomFS, DLC, system archives, ExeFS files): the RomFS's lock, never behind a save write-out
     u64 base = 0, size = 0;
     std::string path;
@@ -512,6 +520,12 @@ struct FileSession : Service {
             ipc.set(3, (len << 4) | 0xC);
             ipc.set(4, dst);
             if (romfs) romfs_read_delay(ipc, len, spent_ns);
+            if (extdata) {
+                // Azahar's extdata timing keeps these reads asynchronous to
+                // the game. Mario Maker advances its startup after the read.
+                const u64 delay = std::max<u64>((u64)len * 183 + 524879, 631826);
+                if (spent_ns < delay) sleep_current(delay - spent_ns, *ipc.lk);
+            }
             break;
         }
         case 0x0803: {  // Write(offset u64, size, flush, mapped buffer)
@@ -794,6 +808,7 @@ struct FsUser : Service {
     u32 open_file(Archive *a, const LowPath &p, u32 flags, ObjPtr *out) {
         if (a->id == 10 && (flags & 1)) return fs_err(700, 7, 28);
         auto fs = std::make_shared<FileSession>();
+        fs->extdata = a->id == 6 || a->id == 7;
         if (a->id == 0x2345678A) {
             std::string host = a->host;
             if (a->dlc) {  // the file path: open type, content index, section (0 RomFS), ExeFS name
@@ -892,9 +907,11 @@ struct FsUser : Service {
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             LowPath p = read_path(ipc[4], ipc[5], ipc[9]);
             ObjPtr f;
+            const bool extdata = a->id == 6 || a->id == 7;
             u32 r = open_file(a, p, ipc[6], &f);
             ipc.result(r, 1, 2);
             ipc.handles(2, {f}, true);
+            if (extdata) sleep_current(3085068, *ipc.lk);
             break;
         }
         case 0x0803: {  // OpenFileDirectly
