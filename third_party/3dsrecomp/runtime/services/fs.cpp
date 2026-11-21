@@ -24,13 +24,14 @@ namespace fsys = std::filesystem;
 
 #ifdef __WIIU__
 namespace wiiu {
+bool av_timing_enabled();
 void note(const char *fmt, ...);  // frontend_wiiu.cpp
 void fs_begin(u32 op);
 void fs_end();
 void romfs_begin();  // the game data's reads: a lock of their own (frontend_wiiu.cpp)
 void romfs_end();
 void direct_read_open(const char *path, int fd, u64 size);  // direct_read.cpp
-bool direct_read(void *dst, u32 len, u64 off);
+bool direct_read(void *dst, u32 len, u64 off, bool *cached = nullptr);
 long save_write(int fd, const void *data, u32 len, u64 at);  // save_storage.cpp
 void save_resize(int fd, u64 size);
 void save_dirty();
@@ -411,11 +412,42 @@ static void log_romfs_read(u64 off) {
 // its own "ready" flag after a synchronous load, leaving the village's bottom screen blank and untouchable).
 // What the read itself took here (spent_ns) counts towards it: a console's storage is no faster than a game card.
 // RECOMP_FS_DELAY=0 turns it off.
-static void romfs_read_delay(IPC &ipc, u32 len, u64 spent_ns) {
+static u64 romfs_read_delay(IPC &ipc, u32 len, u64 spent_ns, bool cached = false) {
     static const bool on = !getenv("RECOMP_FS_DELAY") || atoi(getenv("RECOMP_FS_DELAY")) != 0;
-    const u64 on_a_3ds = std::max<u64>((u64)len * 94 + 582778, 663124);
-    if (on && spent_ns < on_a_3ds) sleep_current(on_a_3ds - spent_ns, *ipc.lk);
+    // An opt-in host read-ahead hit already has its bytes in RAM. Preserve the
+    // asynchronous minimum, without charging another cartridge transfer for
+    // data whose physical read was charged to the earlier miss.
+    const u64 on_a_3ds = cached ? 663124 : std::max<u64>((u64)len * 94 + 582778, 663124);
+    const u64 wait = on && spent_ns < on_a_3ds ? on_a_3ds - spent_ns : 0;
+    if (wait) sleep_current(wait, *ipc.lk);
+    return wait;
 }
+
+#ifdef __WIIU__
+// All updates run with the kernel lock held, after run_blocked has rejoined
+// the guest. IO includes waiting for the RomFS read lock; resume is the time
+// outside that native operation. Neither is labelled as pure SD-device time.
+static void report_read_timing(u32 bytes, u64 io_ns, u64 spent_ns, u64 wait_ns) {
+    if (!wiiu::av_timing_enabled()) return;
+    static u64 start, total_bytes, count, max_io, max_resume, max_wait, total_io, fast_reads;
+    const u64 now = real_ns();
+    if (!start) start = now;
+    count++;
+    total_bytes += bytes;
+    total_io += io_ns;
+    fast_reads += io_ns < 1000000;
+    max_io = std::max(max_io, io_ns);
+    max_resume = std::max(max_resume, spent_ns > io_ns ? spent_ns - io_ns : 0);
+    max_wait = std::max(max_wait, wait_ns);
+    if (now - start < 2000000000ULL) return;
+    LOG("[fs-time] %llu reads, %llu KB in %llu ms; max native IO %llu us, resume %llu us, emulated wait %llu us; mean IO %llu us, fast reads %llu\n",
+        (unsigned long long)count, (unsigned long long)(total_bytes >> 10), (unsigned long long)((now - start) / 1000000),
+        (unsigned long long)(max_io / 1000), (unsigned long long)(max_resume / 1000), (unsigned long long)(max_wait / 1000),
+        (unsigned long long)(total_io / count / 1000), (unsigned long long)fast_reads);
+    start = now;
+    total_bytes = count = max_io = max_resume = max_wait = total_io = fast_reads = 0;
+}
+#endif
 
 static std::string archive_dir(u32 id, const LowPath &p) {
     std::string root = save_root();
@@ -484,13 +516,16 @@ struct FileSession : Service {
             s64 n;
             // Storage can take a long time to answer: the game's other threads run meanwhile, as they do on a 3DS (run_blocked)
             const auto began = std::chrono::steady_clock::now();
+            u64 io_ns = 0;
+            bool cached = false;
             run_blocked(*ipc.lk, [&] {
+            const auto io_began = std::chrono::steady_clock::now();
             if (romfs) {
                 FsIo io(0x0802);
                 log_romfs_read(base + off);
                 if (off >= size) n = 0;
 #ifdef __WIIU__
-                else if (wiiu::direct_read(gptr(dst), (u32)std::min<u64>(len, size - off), base + off)) n = (s64)std::min<u64>(len, size - off);
+                else if (wiiu::direct_read(gptr(dst), (u32)std::min<u64>(len, size - off), base + off, &cached)) n = (s64)std::min<u64>(len, size - off);
 #endif
                 else n = pread(romfs_fd, gptr(dst), (size_t)std::min<u64>(len, size - off), (off_t)(base + off));
                 for (auto &x : romfs_extra)
@@ -511,6 +546,7 @@ struct FileSession : Service {
                     n = pread(fd, gptr(dst), len, (off_t)off);
                 }
             }
+            io_ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - io_began).count();
             });
             const u64 spent_ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count();
             if (n < 0) n = 0;
@@ -519,7 +555,12 @@ struct FileSession : Service {
             ipc.set(2, (u32)n);
             ipc.set(3, (len << 4) | 0xC);
             ipc.set(4, dst);
-            if (romfs) romfs_read_delay(ipc, len, spent_ns);
+            if (romfs) {
+                const u64 wait_ns = romfs_read_delay(ipc, len, spent_ns, cached);
+#ifdef __WIIU__
+                report_read_timing(len, io_ns, spent_ns, wait_ns);
+#endif
+            }
             if (extdata) {
                 // Azahar's extdata timing keeps these reads asynchronous to
                 // the game. Mario Maker advances its startup after the read.
@@ -933,8 +974,15 @@ struct FsUser : Service {
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
             SAVE_SETTLE(path, true);
-            ipc.result(fsys::remove(path) ? 0 : ERR_FILE_NOT_FOUND);
-            save_changed(path);
+            // Filesystem failures are guest IPC results, not host exceptions.
+            // In a -fno-exceptions Wii U build the throwing overload terminates
+            // the application (Mario Maker's startup cleanup hit this path).
+            std::error_code ec;
+            const bool removed = fsys::remove(path, ec);
+            if (ec) LOG("[fs] DeleteFile failed archive=%u path=%s error=%d (%s)\n",
+                        a->id, path.c_str(), ec.value(), ec.message().c_str());
+            ipc.result(removed && !ec ? 0 : ERR_FILE_NOT_FOUND);
+            if (removed && !ec) save_changed(path);
             break;
         }
         case 0x0805: {  // RenameFile(transaction, src archive, src type, src size, dst archive, dst type, dst size, ...)

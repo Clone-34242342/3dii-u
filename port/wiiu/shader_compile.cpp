@@ -116,31 +116,37 @@ void cache_load() {
 }
 
 int compile_thread(int, void *) {
-    InitGLSLCompiler();
-    LOG("[glsl] compiler %s up\n", GetGLSLCompilerVersion());
     static char info[4096];
-    {  // two known small shaders first: whether compiling works here at all, how long one takes, and that a loop (r600's jump tracker) gets through: in
-        // Cemu it only does with tools/win/patch_cafeglsl_traps.py applied to the library
-        const std::string plain = gen_passthrough_vs();
-        const std::string with_loop = "#version 450\nlayout(location = 0) in vec4 aPos;\nlayout(binding = 0, std140) uniform VS { vec4 f[96]; vec4 uDraw; ivec4 uInt[4]; };\n"
-                                      "void main() { vec4 p = aPos; for (int i = 0; i <= uInt[0].x; i++) p += f[i]; gl_Position = p; }\n";
-        const struct {
-            const char *name;
-            const std::string *glsl;
-        } steps[] = {{"plain", &plain}, {"loop", &with_loop}};
-        for (const auto &s : steps) {
-            LOG("[glsl] test %s: compiling\n", s.name);
-            const OSTime t0 = OSGetSystemTime();
-            GX2VertexShader *v = nullptr;
-            info[0] = 0;
-            watched = 0;
-            busy_since = t0;
-            const GX2ShaderMode m = CompileVertexShader(s.glsl->c_str(), GLSL_COMPILE_BLOCK, &v, info, sizeof info, GLSL_COMPILER_FLAG_NONE);
-            busy_since = 0;
-            LOG("[glsl] test %s: mode %d, %s, %u ms: %.200s\n", s.name, (int)m, v ? "shader made" : "no shader", (u32)OSTicksToMilliseconds(OSGetSystemTime() - t0), info);
-            if (v) FreeVertexShader(v);
+    // Shipped shader packs may cover every draw. Do not initialize cafeglsl
+    // or compile its diagnostic shaders until a real missing shader needs it.
+    // Keep the same warm-up and validation before that first compilation.
+    bool initialized = false;
+    const auto initialize = [&] {
+        InitGLSLCompiler();
+        LOG("[glsl] compiler %s up\n", GetGLSLCompilerVersion());
+        {  // two known small shaders first: whether compiling works here at all, how long one takes, and that a loop (r600's jump tracker) gets through: in
+            // Cemu it only does with tools/win/patch_cafeglsl_traps.py applied to the library
+            const std::string plain = gen_passthrough_vs();
+            const std::string with_loop = "#version 450\nlayout(location = 0) in vec4 aPos;\nlayout(binding = 0, std140) uniform VS { vec4 f[96]; vec4 uDraw; ivec4 uInt[4]; };\n"
+                                          "void main() { vec4 p = aPos; for (int i = 0; i <= uInt[0].x; i++) p += f[i]; gl_Position = p; }\n";
+            const struct {
+                const char *name;
+                const std::string *glsl;
+            } steps[] = {{"plain", &plain}, {"loop", &with_loop}};
+            for (const auto &s : steps) {
+                LOG("[glsl] test %s: compiling\n", s.name);
+                const OSTime t0 = OSGetSystemTime();
+                GX2VertexShader *v = nullptr;
+                info[0] = 0;
+                watched = 0;
+                busy_since = t0;
+                const GX2ShaderMode m = CompileVertexShader(s.glsl->c_str(), GLSL_COMPILE_BLOCK, &v, info, sizeof info, GLSL_COMPILER_FLAG_NONE);
+                busy_since = 0;
+                LOG("[glsl] test %s: mode %d, %s, %u ms: %.200s\n", s.name, (int)m, v ? "shader made" : "no shader", (u32)OSTicksToMilliseconds(OSGetSystemTime() - t0), info);
+                if (v) FreeVertexShader(v);
+            }
         }
-    }
+    };
     for (;;) {
         Job j;
         OSLockMutex(&mutex);
@@ -153,6 +159,10 @@ int compile_thread(int, void *) {
         if (!any) {
             OSSleepTicks(OSMillisecondsToTicks(20));
             continue;
+        }
+        if (!initialized) {
+            initialize();
+            initialized = true;
         }
         const OSTime t0 = OSGetSystemTime();
         CompileDone d{j.vs, j.key, nullptr, nullptr, j.inputs};

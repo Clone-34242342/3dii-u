@@ -25,6 +25,7 @@ int g_verbose;
 static std::mutex log_mutex;
 static FILE *log_file;
 void (*g_fatal_hook)(const char *msg);
+extern "C" { u32 rt_bulk_copy_enabled = 1; }
 void watch_report();
 
 u64 g_frame;

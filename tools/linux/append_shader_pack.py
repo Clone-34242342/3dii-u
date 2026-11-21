@@ -42,6 +42,8 @@ def main():
     ap.add_argument('original', type=Path)
     ap.add_argument('extra', type=Path)
     ap.add_argument('output', type=Path)
+    ap.add_argument('--allow-streaming', action='store_true',
+                    help='Allow packs above 16 MiB for the runtime that streams GSH programs on demand')
     a = ap.parse_args()
     if a.output.exists(): ap.error('Output must be a new immutable directory')
     from native_build import load_builder
@@ -57,8 +59,9 @@ def main():
     prefix = [(k, h, d) for k, h, d in old if k != 1]
     merged = [(k, h, d) for k, h, d in blocks(a.output) if k != 1]
     if merged[:len(prefix)] != prefix: raise ValueError('Original shader blocks changed; do not deploy')
-    if (a.output/'shaders.gsh').stat().st_size > 16 << 20: raise ValueError('Pack exceeds resident limit')
-    receipt = dict(added_pixel_keys=added[0], added_vertex_keys=added[1], original_blocks_preserved=True,
+    if (a.output/'shaders.gsh').stat().st_size > 16 << 20 and not a.allow_streaming:
+        raise ValueError('Pack exceeds resident limit; use --allow-streaming only with a streaming runtime')
+    receipt = dict(streaming_allowed=a.allow_streaming, added_pixel_keys=added[0], added_vertex_keys=added[1], original_blocks_preserved=True,
                    hardware_status='not tested', sha256={n: hashlib.sha256((a.output/n).read_bytes()).hexdigest()
                    for n in ('shaders.gsh', 'shaders.idx')})
     (a.output/'build-receipt.json').write_text(json.dumps(receipt, indent=2)+'\n')

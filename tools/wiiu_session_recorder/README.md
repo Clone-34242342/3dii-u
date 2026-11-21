@@ -92,3 +92,37 @@ GPU timestamps are opt-in with `renderer --note "set gputime 1"`; disable them a
 The **Stream Aroma trace** checkbox pauses only the Aroma TCP stream, keeping the runtime debugger and recording active in the same session. Connect/Disconnect respects this setting, which is remembered for the next launch. Python control: `--control aroma --note off` or `--control aroma --note on`. The status reports `aroma_enabled` so a deliberate pause is distinguishable from a failed connection. Enable the stream when system/module trace evidence is needed.
 
 On one MH4U hardware session, a 12-second runtime-only test had one audio underrun while a separate 12-second Aroma-only window had 21. This implicates the high-volume system trace stream in that session; it does not identify an individual plugin or prove all gameplay slowdown has been fixed. Pausing the stream also means system trace messages are not captured during that interval; the game's buffered runtime log remains available.
+
+### Audio/presentation timing
+
+`--control renderer --note 'set avtime 1'` enables two-second audio wake/DSP-tick,
+AX queue/recovery and GPU-pump summaries without per-draw profiling or screenshots.
+Use `set avtime 0` afterward. Existing clients can use `set cputime 1` / `0`, which
+also controls these summaries alongside the existing per-draw CPU counters.
+Discard the first summary after enabling: it can contain earlier startup activity.
+`[pace-gap]` reports gaps above 50 ms and separates time before entering present
+from time spent inside it. This does not isolate decoding by itself.
+`[audio-ring]` wrapped observations/recoveries expose playback overtaking the
+writer; `[audio]` alone previously missed that case because modular queue depth
+looked like a full ring. A source/mixer discontinuity can still occur without an
+AX underrun. All these lines are saved in the ordinary `runtime.log`.
+
+### Cemu sessions
+
+Select **Cemu** in the Target selector, then use the same **Connect** and
+**Start recording** buttons. This connects to the custom Cemu build's forwarded
+3Dii U runtime console at `127.0.0.1:4405`; it does not attach GDB or pause the game.
+A running 3Dii U title with runtime console forwarding is required. Stock Cemu
+without that endpoint is not supported by this connection option.
+
+Cemu sessions go under `<output>/Cemu/<timestamp>/`, containing `runtime.log`
+and timestamped `events.jsonl`. `console.log` is empty because Aroma streaming
+and FTP GamePad captures apply only to the Wii U target. F9 still records a
+marker. Runtime state and statistics are requested every three seconds, with
+thread snapshots every thirty seconds; renderer timing switches remain opt-in.
+Hardware-specific heap-memory polling is disabled for Cemu.
+
+Changing targets disconnects and saves the current session so logs never mix.
+The Wii U address, Aroma preference and output root are preserved. The selected
+target is remembered. CLI options: `--target cemu`, `--cemu-host 127.0.0.1`,
+`--cemu-port 4405`; local control: `--control target --note cemu` (or `wiiu`).

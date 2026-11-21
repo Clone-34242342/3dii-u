@@ -33,7 +33,14 @@ int main(int argc,char**){
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('baseline_source',type=Path)
+    ap.add_argument('--output-format',type=int,choices=(0,1),default=1,
+                    help='timed movie format: 0 RGBA8 (Fantasy Life), 1 RGB8')
     args=ap.parse_args()
+    harness=HARNESS
+    if args.output_format==0:
+        harness=harness.replace('s.output_format=1;s.width=512','s.output_format=0;s.width=512')
+        harness=harness.replace('s.out={0x60000,368640,12288,0}',
+                                's.out={0x60000,491520,16384,0}')
     compiler=shlex.split(os.environ.get('CXX','c++'))
     if os.name=='nt' and 'CXX' not in os.environ:
         import sys
@@ -44,7 +51,7 @@ def main():
         for name,path in [('before',args.baseline_source),('after',ROOT/'third_party/3dsrecomp/runtime/services/y2r.cpp')]:
             source=path.read_text().replace('#include "../service.h"','').replace('#include "services.h"','')
             cpp=tmp/(name+'.cpp');exe=tmp/(name+('.exe' if os.name=='nt' else ''))
-            cpp.write_text(STUBS.replace('16384','2097152')+source+HARNESS)
+            cpp.write_text(STUBS.replace('16384','2097152')+source+harness)
             subprocess.run(compiler+['-std=c++20','-O2',str(cpp),'-o',str(exe)],check=True)
             executables[name]=exe;results[name]=subprocess.check_output([str(exe)])
         if results['before']!=results['after']:

@@ -28,6 +28,9 @@
 
 namespace kernel {
 void live_feed(const char *line);  // services/hid.cpp
+void diagnostics_report();
+void set_diagnostics_thread(u32 thread);
+void dump_threads();
 }
 
 u32 rt_log_read(u64 &pos, char *out, u32 max);  // core.cpp
@@ -301,6 +304,11 @@ bool run_command(int c, char *line) {
     sscanf(line, "%15s", word);
     if (!strcmp(word, "ps")) {
         wiiu::log_threads();
+    } else if (!strcmp(word, "diag")) {
+        kernel::diagnostics_report();
+        kernel::dump_threads();
+        wiiu::log_threads();
+        wiiu::gfx_report();
     } else if (!strcmp(word, "stats")) {
         wiiu::gfx_report();  // counters and any enabled GPU timestamps, published between frames
     } else if (!strcmp(word, "st")) {
@@ -327,7 +335,19 @@ bool run_command(int c, char *line) {
             SYSRelaunchTitle(0, nullptr);
         }
     } else if (sscanf(line, "set %15s %u", name, &a) == 2) {  // a renderer switch, from now on: uberall, uberfb, cpuvs 0|1, trace <draws>
-        LOG("[net] set %s %u: %s\n", name, a, wiiu::gfx_set(name, a) ? "done" : "no such switch");
+        bool accepted;
+        if (!strcmp(name, "avtime") && a <= 1) { wiiu::set_av_timing(a != 0); accepted = true; }
+        else if (!strcmp(name, "diag") && a <= 3) { wiiu::set_diagnostics_level(a); accepted = true; }
+        else if (!strcmp(name, "diagthread") && a <= 65535) { kernel::set_diagnostics_thread(a); accepted = true; }
+        else if (!strcmp(name, "bulkcopy") && a <= 1) { __atomic_store_n(&rt_bulk_copy_enabled, a, __ATOMIC_RELAXED); accepted = true; }
+        else if (!strcmp(name, "videoworker") && a <= 1) { wiiu::set_video_worker(a != 0); accepted = true; }
+        else {
+            accepted = wiiu::gfx_set(name, a);
+            // Existing recorder clients can request the expanded CPU timing
+            // sample without an application restart or another TCP connection.
+            if (accepted && !strcmp(name, "cputime")) wiiu::set_av_timing(a != 0);
+        }
+        LOG("[net] set %s %u: %s\n", name, a, accepted ? "done" : "no such switch");
     } else if (sscanf(line, "keep %15s %u", name, &a) == 2) {  // a debug file in the data folder, made or removed, for every boot from the next one on: no reinstall needed
         const std::string kept = wiiu::data_dir() + "/" + name;
         if (!a) remove(kept.c_str());

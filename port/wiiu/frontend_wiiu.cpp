@@ -150,6 +150,35 @@ static OSThread *spawn(OSThreadEntryPointFn fn, int core, int prio, u32 stack_si
 }
 
 static volatile bool quitting, gpu_parked, audio_parked, gfx_may_close;
+static OSEvent video_job, video_done;
+static OSMutex video_mutex;
+static void (*video_work)(void *);
+static void *video_context;
+static std::atomic<bool> video_worker_enabled{false};
+
+void wiiu::set_video_worker(bool enabled) { video_worker_enabled.store(enabled); }
+
+static int video_thread(int, void *) {
+    for (;;) {
+        OSWaitEvent(&video_job);
+        video_work(video_context);
+        OSSignalEvent(&video_done);
+    }
+    return 0;
+}
+
+bool wiiu::video_conversion_worker(void (*work)(void *), void *context) {
+    if (!video_worker_enabled.load()) return false;
+    // Called outside the guest kernel lock. The caller's context stays alive
+    // until conversion completes; serialize requests before publishing it.
+    OSLockMutex(&video_mutex);
+    video_work = work;
+    video_context = context;
+    OSSignalEvent(&video_job);
+    OSWaitEvent(&video_done);
+    OSUnlockMutex(&video_mutex);
+    return true;
+}
 static volatile bool gpu_pause, foreground_back;
 #ifdef LAYTON_PROF
 extern "C" BOOL GfxHeapInitMEM1();
@@ -196,14 +225,29 @@ static void gpu_trip() {
 
 // Opt-in hardware sample. Keep timing and reporting on the GPU thread.
 static bool perf_trace;
+static bool cpu_summary;  // per-title diagnostic marker; heavy kernel tracing remains opt-in
+static std::atomic<bool> av_timing{false};
+void wiiu::set_av_timing(bool on) { av_timing.store(on, std::memory_order_relaxed); }
+bool wiiu::av_timing_enabled() { return av_timing.load(std::memory_order_relaxed); }
+static std::atomic<OSTime> diagnostics_deadline{0};
+void wiiu::set_diagnostics_level(u32 level) {
+    level = std::min(level, 3u);
+    kernel::set_diagnostics_level(level);
+    set_av_timing(level != 0);
+    gfx_set("cputime", level >= 2 || (cpu_summary && level != 0));
+    gfx_set("gputime", level >= 3);
+    diagnostics_deadline.store(level >= 2 ? OSGetSystemTime() + OSSecondsToTicks(10) : 0);
+    LOG("[diag] level %u: summaries %u, all-thread/SVC/CPU timing %u, GPU stamps %u; detailed capture expires after 10 seconds\n",
+        level, level != 0, level >= 2, level >= 3);
+}
 
 static void report_gpu_timing(OSTime begin) {
     static OSTime start, last_flip;
     static u64 previous_flips;
     static u32 count, longest_gap, longest_pump;
     const OSTime now = OSGetSystemTime();
-    if (!start) start = now;
     const u64 flips = wiiu::gfx_flips();
+    if (!start) { start = last_flip = now; previous_flips = flips; return; }
     if (flips != previous_flips) {
         if (last_flip)
             longest_gap = std::max(longest_gap, (u32)OSTicksToMicroseconds(now - last_flip));
@@ -228,6 +272,14 @@ static int gpu_thread(int, void *) {
     stage("gpu thread ready");
     setjmp(gpu_restart);
     while (!quitting) {
+        const OSTime deadline = diagnostics_deadline.load();
+        if (deadline && OSGetSystemTime() >= deadline) {
+            // Expensive probes run only for a bounded sample. The summaries
+            // stay active so the before/after measurements remain available.
+            wiiu::set_diagnostics_level(1);
+            kernel::diagnostics_report();
+            wiiu::gfx_report();
+        }
         if (gpu_pause) {
             if (gpu_tripped) LOG("[home] the GPU thread was still drawing when GX2 went away\n");
             else wiiu::gfx_shutdown();
@@ -243,11 +295,20 @@ static int gpu_thread(int, void *) {
         // finished frame may be shown
         const bool waited = !OSWaitEventWithTimeout(&gpu_event, 2000000);  // nanoseconds
         const u64 done = kernel::gx_stats.cmdlists + kernel::gx_stats.transfers;
-        const OSTime t0 = (kMeasure || perf_trace) ? OSGetSystemTime() : 0;
+        const bool timed = perf_trace || av_timing.load(std::memory_order_relaxed);
+        const OSTime t0 = (kMeasure || timed) ? OSGetSystemTime() : 0;
         kernel::gsp_process_gx();
         if (!gpu_pause) wiiu::gfx_pump(waited && done == kernel::gx_stats.cmdlists + kernel::gx_stats.transfers);
-        if (kMeasure) wiiu::gfx_note_busy((u32)OSTicksToMicroseconds(OSGetSystemTime() - t0));
-        if (perf_trace) report_gpu_timing(t0);
+        if (kMeasure || timed) wiiu::gfx_note_busy((u32)OSTicksToMicroseconds(OSGetSystemTime() - t0));
+        if (timed) report_gpu_timing(t0);
+        if (cpu_summary && av_timing.load(std::memory_order_relaxed)) {
+            static OSTime report_at;
+            const OSTime now = OSGetSystemTime();
+            if (now >= report_at) {
+                wiiu::gfx_report();
+                report_at = now + OSSecondsToTicks(2);
+            }
+        }
     }
     if (!gpu_parked) wiiu::gfx_shutdown();
     gpu_parked = true;
@@ -453,6 +514,8 @@ static int audio_thread(int, void *) {
     OSTime gaps_logged = 0;
     // for the report of a gap, since the last one: the longest this thread went between two rounds, and the longest a frame took to make
     OSTime round = OSGetSystemTime(), away = 0, making = 0;
+    OSTime timing_report = round;
+    OSTime timing_away = 0, timing_making = 0;
     while (!quitting) {
         if (gpu_pause != silent) {
             silent = gpu_pause;
@@ -465,7 +528,16 @@ static int audio_thread(int, void *) {
         }
         const OSTime now = OSGetSystemTime();
         away = std::max(away, now - round);
+        timing_away = std::max(timing_away, now - round);
         round = now;
+        if (av_timing.load(std::memory_order_relaxed) && now - timing_report >= OSSecondsToTicks(2)) {
+            LOG("[audio-time] max wake gap %u us; max DSP tick %u us\n",
+                (u32)OSTicksToMicroseconds(timing_away), (u32)OSTicksToMicroseconds(timing_making));
+            audio::report_output_timing();
+            audio::report_dsp_timing();
+            timing_report = now;
+            timing_away = timing_making = 0;
+        }
         if (const int queued = audio::hle::host_queued(); queued >= 0) {
             // Once the voices play, a frame is made whenever what's queued falls under the cushion, so the sound keeps to the console's audio
             // clock. Made by the timer alone, production ran half a percent behind what the voices played, and the queue ran dry about once
@@ -482,8 +554,11 @@ static int audio_thread(int, void *) {
         // Nearly nothing left queued: this thread came too late, and the voices are about to play old sound again. Every time is on the log, so
         // a run can be held to none (tools/check_ports.py).
         if (const int queued = audio::hle::host_queued(); queued >= 0 && queued < 160) gaps++;
+        const OSTime tick_begin = OSGetSystemTime();
         kernel::dsp_tick();
-        making = std::max(making, OSGetSystemTime() - now);
+        const OSTime tick_time = OSGetSystemTime() - tick_begin;
+        making = std::max(making, tick_time);
+        timing_making = std::max(timing_making, tick_time);
         if (gaps && now - gaps_logged > (OSTime)OSSecondsToTicks(1)) {
             LOG("[audio] %u gaps: the sound ran out before the next frame of it was made (this thread was away for up to %u ms, a frame took up to %u ms)\n", gaps,
                 (u32)OSTicksToMilliseconds(away), (u32)OSTicksToMilliseconds(making));
@@ -820,6 +895,16 @@ static void read_mii_maker(FILE *f) {
 
 void frontend_run() {
     wiiu::profile_this_core();
+    OSInitEvent(&video_job, FALSE, OS_EVENT_MODE_AUTO);
+    OSInitEvent(&video_done, FALSE, OS_EVENT_MODE_AUTO);
+    OSInitMutex(&video_mutex);
+    spawn(video_thread, 0, 18, 256 << 10, "video converter");
+    LOG("[diag] comprehensive capture available: set diag 0..3, diag, stats, ps, bounded mem, screenshots and renderer switches\n");
+    if (FILE *f = fopen("fs:/vol/content/video-worker-enable", "rb")) {
+        fclose(f);
+        wiiu::set_video_worker(true);
+        LOG("[video] conversion worker enabled from content marker\n");
+    }
     OSThread *gpu = spawn(gpu_thread, 2, 16, 2 << 20, "gpu");
     host_threads[1] = gpu;
     host_threads[2] = spawn(hid_thread, 0, 16, 256 << 10, "hid");
@@ -909,10 +994,13 @@ void frontend_run() {
     LOG("[quit] audio thread %s after %d ms\n", audio_parked ? "stopped" : "still running", (int)OSTicksToMilliseconds(OSGetSystemTime() - audio_asked));
     audio::shutdown();
     LOG("[quit] sound system shut down\n");
+    OSReport("[3dii-u quit] entering final log sync\n");
     wiiu::fs_begin(0xC001);
     rt_log_sync();  // the lines since the card thread's last look, these [quit] ones among them: they never reached the file before
     wiiu::fs_end();
+    OSReport("[3dii-u quit] final log sync complete; flushing streams\n");
     fflush(nullptr);
+    OSReport("[3dii-u quit] streams flushed; returning from frontend\n");
 }
 
 // a crash shows what happened on the screen, so it can be reported: the addresses can be looked up against build/game.nm
@@ -1015,6 +1103,20 @@ int main(int argc, char **argv) {
     if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
     rt_log_open(wiiu::data_dir() + "/log.txt");
     perf_trace = wiiu::debug_flag("perftrace");
+    // An immutable diagnostic release can enable timing before its opening
+    // movie, without relying on a PC command arriving after boot.
+    if (FILE *timing = fopen("fs:/vol/content/avtiming-enable", "rb")) {
+        fclose(timing);
+        wiiu::set_av_timing(true);
+        LOG("[timing] audio/source and GPU-pump timing enabled by content marker\n");
+    }
+    if (FILE *timing = fopen("fs:/vol/content/cpu-timing-enable", "rb")) {
+        fclose(timing);
+        cpu_summary = true;
+        wiiu::set_av_timing(true);
+        wiiu::gfx_set("cputime", 1);
+        LOG("[timing] CPU render phases and two-second summaries enabled by content marker; detailed thread/SVC capture remains bounded\n");
+    }
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);
         extern bool g_log_each_line;

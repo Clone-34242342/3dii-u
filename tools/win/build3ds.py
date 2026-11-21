@@ -668,8 +668,10 @@ def check_registers(path, droppable=frozenset()):
             ps = max(ps, registers)
             broken += [f'pixel program: {what}' for what in bad]
     print(f'registers: vertex shaders use up to {vs} of 48, pixel shaders up to {ps} of 200')
-    if not vs or vs > 48 or ps > 200:
-        sys.exit('a shader needs more registers than the GPU gives it')
+    # Observed-cache batches can contain only pixel shaders. An absent vertex
+    # stage is valid here; still reject empty packs and either register limit.
+    if not (vs or ps) or vs > 48 or ps > 200:
+        sys.exit('empty shader pack or a shader needs more registers than the GPU gives it')
     if broken:
         sys.exit('shader programs a real GPU may not take (tools/gsh_rules.py):\n   ' + '\n   '.join(broken[:20]))
     if dropped:  # shaders.idx (shadergen.h): its header, the fragment entries, then the vertex ones, 16 bytes each, big-endian

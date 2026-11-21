@@ -74,6 +74,7 @@ def capture_gamepad(console, destination):
 class Recorder:
     def __init__(self, directory, screenshot_console=None):
         self.directory = directory
+        self.target = "wiiu"
         self.screenshot_console = screenshot_console
         self.screenshot_queue = deque()
         self.screenshot_worker = None
@@ -108,7 +109,7 @@ class Recorder:
 
     def heap_owner_fields(self):
         with self.lock:
-            return {0x80000020: "heap-spinlock", **{address + 0x1c: f"heap-mutex-{index}" for index, address in self.mapped_mutexes.items()}}
+            return {} if self.target == "cemu" else {0x80000020: "heap-spinlock", **{address + 0x1c: f"heap-mutex-{index}" for index, address in self.mapped_mutexes.items()}}
 
     def receive(self, data):
         # Heartbeat padding is NUL. Preserve the console's original CR/LF.
@@ -186,7 +187,7 @@ class Recorder:
         self.session = path
         self.bytes = self.runtime_bytes = self.markers = 0
         self.screenshot_status = ""
-        self.event("started", connected=self.connected, runtime_connected=self.runtime_connected)
+        self.event("started", target=self.target, connected=self.connected, runtime_connected=self.runtime_connected)
         for name in ("console.log", "runtime.log", "events.jsonl"):
             (path / name).chmod(0o600)
 
@@ -350,7 +351,16 @@ def read_preferences(path):
 
 
 class Controller:
-    def __init__(self, recorder, console, aroma_tcp_port=TCP_PORT, aroma_udp_port=UDP_PORT, runtime_port=4405, aroma_enabled=True, preferences_path=None):
+    def __init__(self, recorder, console, aroma_tcp_port=TCP_PORT, aroma_udp_port=UDP_PORT, runtime_port=4405, aroma_enabled=True, preferences_path=None, target="wiiu", cemu_host="127.0.0.1", cemu_port=4405):
+        if target not in ("wiiu", "cemu"):
+            raise ValueError("Target must be wiiu or cemu")
+        self.target = target
+        self.base_directory = recorder.directory
+        self.hardware_screenshot_console = recorder.screenshot_console
+        self.cemu_host, self.cemu_port = cemu_host, cemu_port
+        recorder.target = target
+        recorder.directory = self.base_directory / "Cemu" if target == "cemu" else self.base_directory
+        if target == "cemu": recorder.screenshot_console = None
         self.aroma_enabled = aroma_enabled
         self.preferences_path = preferences_path
         self.aroma_tcp_port, self.aroma_udp_port, self.runtime_port = aroma_tcp_port, aroma_udp_port, runtime_port
@@ -360,11 +370,53 @@ class Controller:
         self.receiver = None
         self.lock = threading.Lock()
 
+    def _disconnect(self):
+        if self.runtime_receiver:
+            self.runtime_receiver.done.set()
+            self.runtime_receiver.join(2)
+            if self.runtime_receiver.is_alive():
+                raise RuntimeError("Runtime receiver is still shutting down.")
+            self.runtime_receiver = None
+        if self.receiver:
+            self.receiver.done.set()
+            self.receiver.join(2)
+            if self.receiver.is_alive():
+                raise RuntimeError("The receiver is still shutting down.")
+            self.receiver = None
+
     def command(self, action, note=""):
         with self.lock:
+            if action == "diagnose":
+                if not self.runtime_receiver or not self.runtime_receiver.is_alive() or not self.recorder.runtime_connected:
+                    raise RuntimeError("Connect to the running game's debugger before capturing performance.")
+                self.recorder.command('start')
+                self.runtime_receiver.request('diag')
+                self.recorder.runtime_event('diagnostic_capture', level=2, duration_seconds=10)
+                action, note = 'renderer', 'set diag 2'
+            if action == "target":
+                if note not in ("wiiu", "cemu"):
+                    raise ValueError("Use target wiiu or cemu")
+                if note != self.target:
+                    self._disconnect()
+                    self.recorder.command("stop")
+                    self.target = self.recorder.target = note
+                    self.recorder.directory = self.base_directory / "Cemu" if note == "cemu" else self.base_directory
+                    self.recorder.screenshot_console = None if note == "cemu" else self.hardware_screenshot_console
+                    self.recorder.session = None
+                    self.recorder.bytes = self.recorder.runtime_bytes = self.recorder.markers = 0
+                    self.recorder.screenshot_status = ""
+                    if self.preferences_path:
+                        self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                        values = read_preferences(self.preferences_path)
+                        values['target'] = note
+                        pending = self.preferences_path.with_suffix('.tmp')
+                        pending.write_text(json.dumps(values) + '\n')
+                        pending.replace(self.preferences_path)
+                action = "status"
             if action == "toggle_connection":
                 action = "disconnect" if (self.receiver and self.receiver.is_alive()) or (self.runtime_receiver and self.runtime_receiver.is_alive()) else "connect"
             if action == "aroma":
+                if self.target == "cemu": raise ValueError("Aroma streaming is available for Wii U only")
                 if note not in ("on", "off"): raise ValueError('Use aroma on or off')
                 self.aroma_enabled = note == "on"
                 if not self.aroma_enabled and self.receiver:
@@ -385,26 +437,16 @@ class Controller:
                 self.recorder.runtime_event('aroma_stream_mode', enabled=self.aroma_enabled)
                 action = "status"
             if action == "connect":
-                if self.aroma_enabled and (not self.receiver or not self.receiver.is_alive()):
+                if self.target == "wiiu" and self.aroma_enabled and (not self.receiver or not self.receiver.is_alive()):
                     self.receiver = AromaReceiver(self.recorder, self.console, self.aroma_tcp_port, self.aroma_udp_port)
                     self.receiver.start()
                 if not self.runtime_receiver or not self.runtime_receiver.is_alive():
-                    self.runtime_receiver = RuntimeReceiver(self.recorder, self.console, self.runtime_port)
+                    self.runtime_receiver = RuntimeReceiver(self.recorder, self.cemu_host if self.target == "cemu" else self.console,
+                                                            self.cemu_port if self.target == "cemu" else self.runtime_port)
                     self.runtime_receiver.start()
                 action = "status"
             elif action == "disconnect":
-                if self.runtime_receiver:
-                    self.runtime_receiver.done.set()
-                    self.runtime_receiver.join(2)
-                    if self.runtime_receiver.is_alive():
-                        raise RuntimeError("Runtime receiver is still shutting down.")
-                    self.runtime_receiver = None
-                if self.receiver:
-                    self.receiver.done.set()
-                    self.receiver.join(2)
-                    if self.receiver.is_alive():
-                        raise RuntimeError("The receiver is still shutting down.")
-                    self.receiver = None
+                self._disconnect()
                 action = "status"
             if action in ("runtime", "renderer"):
                 if not self.runtime_receiver or not self.runtime_receiver.is_alive():
@@ -422,7 +464,9 @@ class Controller:
             result["runtime_listening"] = bool(self.runtime_receiver and self.runtime_receiver.is_alive())
             result["runtime_error"] = self.runtime_receiver.error if self.runtime_receiver else None
             result["aroma_enabled"] = self.aroma_enabled
-            result["console"] = self.console
+            result["console"] = self.cemu_host if self.target == "cemu" else self.console
+            result["target"] = self.target
+            result["runtime_port"] = self.cemu_port if self.target == "cemu" else self.runtime_port
             return result
 
 
@@ -526,10 +570,17 @@ def gui(controller, hotkey_enabled):
 
     root = tk.Tk()
     root.title("Wii U Session Recorder")
-    root.geometry("740x340")
+    root.geometry("780x380")
     root.minsize(650, 310)
     panel = ttk.Frame(root, padding=18)
     panel.pack(fill="both", expand=True)
+    target_row = ttk.Frame(panel)
+    target_row.pack(anchor="w", pady=(0, 8))
+    ttk.Label(target_row, text="Target: ").pack(side="left")
+    target_choice = tk.StringVar(value="Cemu" if controller.target == "cemu" else "Wii U")
+    target_box = ttk.Combobox(target_row, textvariable=target_choice, values=("Wii U", "Cemu"), state="readonly", width=12)
+    target_box.pack(side="left")
+    ttk.Label(target_row, text="  Switching targets stops and saves the current session.").pack(side="left")
     connection = tk.StringVar(value="Waiting for Aroma TCP logging")
     summary = tk.StringVar(value="Ready to record")
     location = tk.StringVar(value=str(controller.recorder.directory))
@@ -549,10 +600,20 @@ def gui(controller, hotkey_enabled):
             result = controller.command(action)
             if action == "mark":
                 message.set(f"Graphics glitch marked ({result['markers']})")
+            elif action == "diagnose":
+                message.set("Capturing performance for 10 seconds; results go to this session.")
             else:
                 message.set("")
         except (OSError, ValueError, RuntimeError) as exc:
             message.set(str(exc))
+
+    def change_target(_event):
+        try:
+            controller.command("target", "cemu" if target_choice.get() == "Cemu" else "wiiu")
+            message.set("Target changed. Connect, then start recording.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            message.set(str(exc))
+    target_box.bind("<<ComboboxSelected>>", change_target)
 
     link = ttk.Button(buttons, text="Connect", command=lambda: act("toggle_connection"))
     link.pack(side="left", padx=(0, 10))
@@ -560,11 +621,13 @@ def gui(controller, hotkey_enabled):
     mark = ttk.Button(buttons, text="Mark graphics glitch (F9)", command=lambda: act("mark"))
     record.pack(side="left", padx=(0, 10))
     mark.pack(side="left")
+    ttk.Button(buttons, text="Capture performance (10s)", command=lambda: act("diagnose")).pack(side="left", padx=(10, 0))
     aroma_choice = tk.BooleanVar(value=controller.aroma_enabled)
     def toggle_aroma():
         try: controller.command('aroma', 'on' if aroma_choice.get() else 'off')
         except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
-    ttk.Checkbutton(panel, text="Stream Aroma trace", variable=aroma_choice, command=toggle_aroma).pack(anchor="w")
+    aroma_toggle = ttk.Checkbutton(panel, text="Stream Aroma trace", variable=aroma_choice, command=toggle_aroma)
+    aroma_toggle.pack(anchor="w")
     ttk.Label(panel, textvariable=message).pack(anchor="w")
     shot_note = tk.StringVar()
     ttk.Label(panel, textvariable=shot_note, wraplength=610).pack(anchor="w")
@@ -575,7 +638,13 @@ def gui(controller, hotkey_enabled):
         while not pending.empty():
             act(pending.get())
         state = controller.command("status")
-        if state["listening"] or state["runtime_listening"]:
+        is_cemu = state["target"] == "cemu"
+        target_choice.set("Cemu" if is_cemu else "Wii U")
+        aroma_toggle.state(["disabled"] if is_cemu else ["!disabled"])
+        if is_cemu:
+            runtime = "connected" if state["runtime_connected"] else "waiting for game" if state["runtime_listening"] else "disconnected"
+            connection.set(f"Cemu runtime: {runtime} · {state['console']}:{state['runtime_port']}")
+        elif state["listening"] or state["runtime_listening"]:
             aroma_choice.set(state["aroma_enabled"])
             aroma = "paused" if not state["aroma_enabled"] else "connected" if state["connected"] else "waiting"
             runtime = "connected" if state["runtime_connected"] else "waiting for game"
@@ -607,10 +676,13 @@ def gui(controller, hotkey_enabled):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--console", default=os.environ.get("WIIU_HOST", "127.0.0.1"))
+    parser.add_argument("--target", choices=("wiiu", "cemu"))
+    parser.add_argument("--cemu-host", default="127.0.0.1")
+    parser.add_argument("--cemu-port", type=int, default=4405)
     parser.add_argument("--output", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--no-hotkeys", action="store_true")
     parser.add_argument("--no-screenshots", action="store_true")
-    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma"))
+    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma", "target", "diagnose"))
     parser.add_argument("--note", default="")
     args = parser.parse_args()
     if args.control:
@@ -620,8 +692,11 @@ def main():
     preferences = Path(os.environ.get('XDG_CONFIG_HOME', Path.home()/'.config'))/'wiiu-session-recorder/settings.json'
     enabled = read_preferences(preferences).get('aroma_enabled', True)
     if not isinstance(enabled, bool): enabled = True
+    target = args.target or read_preferences(preferences).get('target', 'wiiu')
+    if target not in ('wiiu', 'cemu'): target = 'wiiu'
     controller = Controller(Recorder(args.output, None if args.no_screenshots else args.console), args.console,
-                            aroma_enabled=enabled, preferences_path=preferences)
+                            aroma_enabled=enabled, preferences_path=preferences, target=target,
+                            cemu_host=args.cemu_host, cemu_port=args.cemu_port)
     with ControlServer(CONTROL, controller) as server:
         control_thread = threading.Thread(target=server.serve_forever, daemon=True)
         control_thread.start()

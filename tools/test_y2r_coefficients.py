@@ -90,11 +90,22 @@ int main(){
   for(u32 i=0;i<257;i++)stream[i]=(u8)(i*19);
   DmaWriter writer(Dma{2048,257,unit,5});
   writer.put(stream,13);writer.put(stream+13,0);writer.put(stream+13,244);
+  assert(writer.end==2048+257+(unit?256/unit*5:0));
   for(u32 i=0;i<257;i++)assert(memory[2048+i+(unit?i/unit*5:0)]==stream[i]);
   if(unit)for(u32 i=0;i<257/unit;i++)for(u32 gap=0;gap<5;gap++)
    assert(memory[2048+(i+1)*unit+i*5+gap]==0xA5);
  }
- puts("PASS: Y2R coefficient replies, video levels and batched DMA unit/gap boundaries");
+ // Continuous and patterned DMA readers retain their position across calls.
+ for(u32 step:{1u,2u})for(u32 unit:{0u,8u,64u}){
+  for(u32 i=0;i<memory.size();++i)memory[i]=(u8)(i*19+(i>>7));
+  DmaReader reader(Dma{2048,1024,unit,6},step);u8 read[129];
+  reader.read(read,17);reader.read(read+17,112);
+  for(u32 i=0;i<129;++i){
+   const u32 pos=i*step;
+   assert(read[i]==memory[2048+pos+(unit?pos/unit*6:0)]);
+  }
+ }
+ puts("PASS: Y2R coefficient replies, video levels and DMA reader/writer boundaries");
 }
 '''
 def main():

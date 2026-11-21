@@ -9,7 +9,7 @@ import time
 
 def checked_command(command, allow_renderer=False):
     command = command.strip()
-    if command in {'st', 'ps', 'stats'}:
+    if command in {'st', 'ps', 'stats', 'diag'}:
         return command
     match = re.fullmatch(r'mem ([0-9a-fA-F]{1,8}) ([0-9a-fA-F]{1,4})', command)
     if match:
@@ -17,16 +17,20 @@ def checked_command(command, allow_renderer=False):
         if 0 < size <= 4096 and address + size <= 0x100000000:
             return command
     if allow_renderer:
-        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime) [01]', command): return command
+        if re.fullmatch(r'set diag [0-3]', command): return command
+        match = re.fullmatch(r'set diagthread ([0-9]{1,5})', command)
+        if match and int(match[1]) <= 65535: return command
+        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy) [01]', command): return command
         if re.fullmatch(r'set toplevel [012]', command): return command
         match = re.fullmatch(r'set cpuattr ([0-9]{1,2})', command)
         if match and int(match[1]) <= 15: return command
         match = re.fullmatch(r'set trace ([0-9]{1,3})', command)
         if match and int(match[1]) <= 256: return command
-    raise ValueError('Use st, ps, stats, or bounded mem. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh/gputime/cputime 0|1, toplevel 0..2, cpuattr 0..15 and trace 0..256 only.')
+    raise ValueError('Use st, ps, stats, or bounded mem. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh/gputime/cputime/avtime 0|1, toplevel 0..2, cpuattr 0..15 and trace 0..256 only.')
 
 
 class RuntimeReceiver(threading.Thread):
+    STALE_TIMEOUT = 12.0
     def __init__(self, recorder, console, port=4405):
         super().__init__(daemon=True)
         self.recorder, self.console, self.port = recorder, console, port
@@ -45,6 +49,7 @@ class RuntimeReceiver(threading.Thread):
     def run(self):
         client = None
         next_connect = last_poll = last_threads = 0
+        last_received = time.monotonic()
         pending = ''
         previous_session = None
         owner_samples = {}
@@ -71,6 +76,7 @@ class RuntimeReceiver(threading.Thread):
                         client = None
                         continue
                     self.error = None
+                    last_received = time.monotonic()
                     self.recorder.runtime_connection(True)
                     previous_session = None
                     pending = ''
@@ -85,7 +91,10 @@ class RuntimeReceiver(threading.Thread):
                     if session:
                         if now - last_poll >= 3:
                             send('st')
-                            send('mem 80000000 80')
+                            if getattr(self.recorder, 'target', 'wiiu') == 'cemu':
+                                send('stats')
+                            else:
+                                send('mem 80000000 80')
                             for field in self.recorder.heap_owner_fields():
                                 if field != 0x80000020: send(f'mem {field:x} 20')
                             last_poll = now
@@ -101,12 +110,15 @@ class RuntimeReceiver(threading.Thread):
                         except queue.Empty:
                             break
                         send(command)
+                    if session and time.monotonic() - last_received > self.STALE_TIMEOUT:
+                        raise TimeoutError('Runtime console stopped replying; reconnecting')
                     ready, _, _ = select.select([client], [], [], 0.2)
                     if not ready:
                         continue
                     data = client.recv(65536)
                     if not data:
                         raise ConnectionResetError('Runtime console closed.')
+                    last_received = time.monotonic()
                     self.recorder.receive_runtime(data)
                     pending += data.decode(errors='replace')
                     lines = pending.split('\n')

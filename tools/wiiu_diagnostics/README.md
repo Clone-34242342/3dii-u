@@ -18,7 +18,16 @@ This source-only handoff collects the local debugging workflow alongside the 3Di
 | Cemu fork | Python/Aroma support fixes and tools exported as a pinned patch | Useful for reproducible debugger experiments; native heap hooks and GPU/cache behavior still differ from real hardware. |
 | PC recorder | One Connect and Record flow for Aroma and game runtime | Both logs, timestamps, offsets, and requested screenshots belong to the same session. |
 
-The broad compatibility changes here overlap earlier PRs #12 and #13; Fantasy Life SD and Mario Party CRO startup work also had earlier merged PRs #14 and #16. Review against current master instead of reapplying already merged fixes. This branch starts from master `479b55a`. The extra `third_party/3dsrecomp` changes are kept in a separate commit and retain EUPL-1.2.
+The broad compatibility changes here overlap earlier PRs #12 and #13; Fantasy Life SD and Mario Party CRO startup work also had earlier merged PRs #14 and #16. Review against current master instead of reapplying already merged fixes. This branch starts from master `479b55a`. Changes under `third_party/3dsrecomp` retain their EUPL-1.2 licensing.
+
+## Current investigation reports
+
+- [Mario Maker startup, rendering and save-layer findings](MARIO_MAKER_PERFORMANCE.md)
+- [Reconciliation of superseded Mario Maker draft #13](PR13_RECONCILIATION.md)
+- [Fantasy Life conversion worker, native copy and remaining movie bottleneck](FANTASY_LIFE_VIDEO.md)
+- [Planet Robobot experiments: performance benefit unconfirmed](ROBOBOT_AUDIO_PACING.md)
+- [Kid Icarus diagnostics and observed shader precompilation](KID_ICARUS_PERFORMANCE.md)
+- [Live bounded diagnostics and interpreting elapsed timings](COMPREHENSIVE_CAPTURE.md)
 
 ## Reproduce the binary-only update workflow
 

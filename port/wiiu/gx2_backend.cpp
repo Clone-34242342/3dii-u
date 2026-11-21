@@ -3585,15 +3585,18 @@ void forget_unused() {
 
 void draw_fps();  // the frame rate counter (below, beside the text it draws)
 
-// One clock read per present, independent of the expensive draw timers. Average
+// Two clock reads per present, independent of the expensive draw timers. Average
 // FPS alone hides a movie alternating normal frames and 15 FPS stretches. These
 // disjoint gap buckets remain in the PC runtime log without taking screenshots.
-static void report_frame_pacing() {
+static void report_frame_pacing(OSTime began) {
     static OSTime previous, start;
     static u32 buckets[6], count, longest;
     const OSTime now = OSGetSystemTime();
     if (!previous) { previous = start = now; return; }
     const u32 gap = (u32)OSTicksToMicroseconds(now - previous);
+    if (gap > 50000)
+        LOG("[pace-gap] gap %u us; before present %u us; present %u us\n", gap,
+            (u32)OSTicksToMicroseconds(began - previous), (u32)OSTicksToMicroseconds(now - began));
     previous = now;
     longest = std::max(longest, gap);
     const u32 bucket = gap <= 20000 ? 0 : gap <= 35000 ? 1 : gap <= 50000 ? 2 : gap <= 67000 ? 3 : gap <= 100000 ? 4 : 5;
@@ -3609,7 +3612,8 @@ static void report_frame_pacing() {
 }
 
 void present() {
-    const OSTime tp = prof_now();
+    const OSTime pacing_begin = OSGetSystemTime();
+    const OSTime tp = cpu_timing_enabled() ? pacing_begin : 0;
     gt_mark(GT_PRESENT, 0);
     if (dump_enabled && st_flips % 120 == 0) {
         dump_surface(tv_cb->surface, (wiiu::data_dir() + "/tv.ppm").c_str(), 2);
@@ -3662,7 +3666,7 @@ void present() {
     dyn_res_update();
     vtx_cache_flip();
     prof_add(P_PRESENT, tp);
-    report_frame_pacing();
+    report_frame_pacing(pacing_begin);
 }
 
 bool screen_fresh;
@@ -5097,6 +5101,27 @@ static void show_lcd_from_memory() {
 
 // (the GPU thread, after each look at its queue) quiet: it had nothing to do for its whole wait. present_rule.h says when a frame is shown.
 void gfx_pump(bool quiet) {
+    if (av_timing_enabled()) {
+        static OSTime since;
+        static u32 polls, blanks, idle, held;
+        static u32 pictures[2];
+        const OSTime now = OSGetSystemTime();
+        ++polls;
+        blanks += vblank_pending ? 1 : 0;
+        idle += quiet ? 1 : 0;
+        held += present_rule.fresh && present_rule.on_swaps() && !present_rule.swapped_drawn() ? 1 : 0;
+        if (!since) since = now;
+        if (now - since >= OSSecondsToTicks(2)) {
+            LOG("[present-time] polls %u vblanks %u quiet %u held %u pictures %u/%u fresh %x frame %x swap_due %x since_swap %u\n",
+                polls, blanks, idle, held,
+                st_pictures[0] >= pictures[0] ? st_pictures[0] - pictures[0] : st_pictures[0],
+                st_pictures[1] >= pictures[1] ? st_pictures[1] - pictures[1] : st_pictures[1],
+                present_rule.fresh, present_rule.frame, present_rule.swap_due, present_rule.since_swap);
+            pictures[0] = st_pictures[0]; pictures[1] = st_pictures[1];
+            polls = blanks = idle = held = 0;
+            since = now;
+        }
+    }
     if (!vblank_pending) {
         // the menu and the keyboard are drawn at a VBlank's look only, so while one is up nothing is shown in between
         if (!menu_is_open && !kb_active && present_rule.between(quiet)) {
@@ -5248,6 +5273,17 @@ static void write_report() {
         (list_ns - last_list_ns) / 1e6 / flips, ms(P_PRESENT), ms(P_WAIT), ms(P_SYNC), st_syncs / flips, st_luts / flips, draws / flips, ds_built / flips, st_flushes / flips, st_rehashes / flips, (u32)textures.size());
     last_list_ns = list_ns;
     LOG("[prof] the game's pictures a second: top screen %.1f, bottom screen %.1f\n", st_pictures[0] / secs, st_pictures[1] / secs);
+    // Swap requests (Azahar's application-FPS counter), changed LCD buffers,
+    // and copied pictures are different events. Log them together before
+    // treating a 30-picture rate as 30 frames of guest execution.
+    static kernel::GspFrameStats previous_flow{};
+    const auto flow = kernel::gsp_frame_stats();
+    LOG("[frame-flow] per second: vblank %.1f; swap requests top %.1f bottom %.1f; buffer changes top %.1f bottom %.1f; copies top %.1f bottom %.1f; presents %.1f\n",
+        (u32)(flow.vblanks - previous_flow.vblanks) / secs,
+        (u32)(flow.requests[0] - previous_flow.requests[0]) / secs, (u32)(flow.requests[1] - previous_flow.requests[1]) / secs,
+        (u32)(flow.changes[0] - previous_flow.changes[0]) / secs, (u32)(flow.changes[1] - previous_flow.changes[1]) / secs,
+        st_pictures[0] / secs, st_pictures[1] / secs, fps);
+    previous_flow = flow;
     st_pictures[0] = st_pictures[1] = 0;
     {
         u64 surf = 0;

@@ -30,6 +30,8 @@ class RuntimeServer(threading.Thread):
         self.port = self.listener.getsockname()[1]
         self.client = None
         self.commands = []
+        self.silent = False
+        self.connections = 0
 
     def run(self):
         pending = b''
@@ -38,6 +40,7 @@ class RuntimeServer(threading.Thread):
                 try:
                     if self.client is None:
                         self.client, _ = self.listener.accept()
+                        self.connections += 1
                         self.client.settimeout(0.1)
                     data = self.client.recv(4096)
                     if not data:
@@ -48,7 +51,8 @@ class RuntimeServer(threading.Thread):
                     while b'\n' in pending:
                         command, pending = pending.split(b'\n', 1)
                         self.commands.append(command)
-                        self.client.sendall(b'[runtime] reply ' + command + b'\n')
+                        if not self.silent:
+                            self.client.sendall(b'[runtime] reply ' + command + b'\n')
                 except socket.timeout:
                     continue
                 except OSError:
@@ -88,6 +92,40 @@ class DualChannelTests(unittest.TestCase):
         port = self.controller.receiver.listener.getsockname()[1]
         self.aroma = socket.create_connection(('127.0.0.1', port))
         wait_for(lambda: self.rec.connected and self.rec.runtime_connected)
+
+    def test_cemu_target_routes_and_separates_sessions(self):
+        self.connect()
+        hardware = Path(self.controller.command('start')['session'])
+        self.aroma.sendall(b'HARDWARE-ONLY\n')
+        wait_for(lambda: self.rec.bytes > 0)
+        self.controller.cemu_port = self.server.port
+        self.controller.cemu_host = '127.0.0.1'
+        self.rec.screenshot_console = 'hardware'
+        self.controller.hardware_screenshot_console = 'hardware'
+        state = self.controller.command('target', 'cemu')
+        self.assertFalse(state['recording'])
+        self.assertFalse(state['runtime_connected'])
+        self.assertTrue(self.controller.aroma_enabled)
+        self.assertIsNone(self.rec.screenshot_console)
+        self.assertEqual(self.rec.heap_owner_fields(), {})
+        before = len(self.server.commands)
+        self.controller.command('connect')
+        cemu = Path(self.controller.command('start')['session'])
+        self.assertEqual(cemu.parent, Path(self.tmp.name)/'Cemu')
+        wait_for(lambda: b'stats' in self.server.commands[before:])
+        self.assertFalse(self.controller.command('status')['listening'])
+        self.assertFalse(any(c.startswith(b'mem ') for c in self.server.commands[before:]))
+        wait_for(lambda: self.rec.runtime_bytes > 0)
+        self.controller.command('mark')
+        with self.assertRaises(ValueError): self.controller.command('aroma', 'on')
+        self.controller.command('target', 'wiiu')
+        self.assertEqual(self.rec.screenshot_console, 'hardware')
+        self.assertEqual(self.rec.directory, Path(self.tmp.name))
+        self.assertIn(b'HARDWARE-ONLY', (hardware/'console.log').read_bytes())
+        self.assertNotIn(b'HARDWARE-ONLY', (cemu/'runtime.log').read_bytes())
+        events = [json.loads(l) for l in (cemu/'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[0]['target'], 'cemu')
+        self.assertEqual(events[-1]['event'], 'stopped')
 
     def test_pause_aroma_preserves_runtime_and_recording(self):
         self.connect()
@@ -177,10 +215,10 @@ class DualChannelTests(unittest.TestCase):
         self.connect()
         self.controller.command('start')
         with self.assertRaises(ValueError): self.controller.command('runtime', 'set cpuvs 1')
-        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1', 'set gputime 0', 'set gputime 1', 'set cputime 1', 'set cputime 0', 'set toplevel 0', 'set toplevel 1', 'set toplevel 2']:
+        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1', 'set gputime 0', 'set gputime 1', 'set cputime 1', 'set cputime 0', 'set avtime 0', 'set avtime 1', 'set toplevel 0', 'set toplevel 1', 'set toplevel 2']:
             self.controller.command('renderer', command)
             wait_for(lambda: command.encode() in self.server.commands)
-        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'set gputime 2', 'set cputime 2', 'set toplevel 3', 'fw 1', 'relaunch', 'set uberall 1']:
+        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'set gputime 2', 'set cputime 2', 'set avtime 2', 'set toplevel 3', 'fw 1', 'relaunch', 'set uberall 1']:
             with self.assertRaises(ValueError): self.controller.command('renderer', command)
 
     def test_discovers_split_mutex_banner_and_captures_owner(self):
@@ -220,6 +258,41 @@ class DualChannelTests(unittest.TestCase):
         self.assertTrue(self.rec.connected)
         self.assertFalse(self.rec.runtime_connected)
         self.assertTrue(self.controller.command('status')['runtime_listening'])
+
+    def test_silent_runtime_reconnects_without_stopping_recording(self):
+        self.connect()
+        self.controller.command('start')
+        wait_for(lambda: self.rec.runtime_bytes > 0)
+        old_connections = self.server.connections
+        self.server.silent = True
+        self.controller.runtime_receiver.STALE_TIMEOUT = 0.4
+        wait_for(lambda: self.server.connections > old_connections)
+        self.server.silent = False
+        self.controller.runtime_receiver.STALE_TIMEOUT = 12
+        old_bytes = self.rec.runtime_bytes
+        self.controller.command('runtime', 'st')
+        wait_for(lambda: self.rec.runtime_bytes > old_bytes)
+        self.assertTrue(self.controller.command('status')['recording'])
+
+    def test_diagnostic_commands_are_bounded(self):
+        self.connect()
+        self.controller.command('start')
+        for command in ('set diag 0', 'set diag 1', 'set diag 2', 'set diag 3', 'set diagthread 0', 'set diagthread 12', 'set diagthread 65535'):
+            self.controller.command('renderer', command)
+            wait_for(lambda: command.encode() in self.server.commands)
+        self.controller.command('runtime', 'diag')
+        wait_for(lambda: b'diag' in self.server.commands)
+        for command in ('set diag 4', 'set diag -1', 'set diag 3; quit', 'set diagthread 65536', 'set diagthread -1'):
+            with self.assertRaises(ValueError): self.controller.command('renderer', command)
+
+    def test_diagnose_button_starts_recording_and_queues_capture(self):
+        self.connect()
+        self.controller.command('diagnose')
+        wait_for(lambda: b'set diag 2' in self.server.commands)
+        self.assertIn(b'diag', self.server.commands)
+        self.assertTrue(self.controller.command('status')['recording'])
+        events = [json.loads(l) for l in (self.rec.session/'events.jsonl').read_text().splitlines()]
+        self.assertTrue(any(e['event'] == 'diagnostic_capture' and e['duration_seconds'] == 10 for e in events))
 
 
 if __name__ == '__main__':unittest.main()

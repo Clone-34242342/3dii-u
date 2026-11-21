@@ -28,6 +28,9 @@ u8 *chunk;
 bool on;
 u64 source_offset, source_size;
 std::mutex read_m;
+bool read_ahead;  // opt-in for this immutable development release
+u64 cached_at, previous_end = ~0ULL;
+u32 cached_len;
 
 bool read_chunk(u32 n, u32 pos) {
     memset(&shim->request, 0, sizeof shim->request);
@@ -117,23 +120,48 @@ void direct_read_open(const char *path, int fd, u64 size) {
         }
     }
     on = true;
+    if (FILE *flag = fopen("fs:/vol/content/romfs-readahead-enable", "rb")) {
+        fclose(flag);
+        read_ahead = true;
+        LOG("[romfs-cache] bounded sequential read-ahead enabled (256 KB); immutable RomFS only\n");
+    }
     OSReport("[3dii-u fs] direct RomFS enabled: %s offset=%llu size=%llu, all 3 samples matched\n",
              physical.c_str(), (unsigned long long)source_offset, (unsigned long long)source_size);
 }
 
-bool direct_read(void *dst, u32 len, u64 off) {
+bool direct_read(void *dst, u32 len, u64 off, bool *cached) {
+    if (cached) *cached = false;
     std::lock_guard<std::mutex> lock(read_m);
     if (!on || !direct_source::fits(source_size, off, len)) return false;
+    bool cache_only = read_ahead;
     for (u32 done = 0; done < len;) {
+        const u64 at = off + done;
+        if (read_ahead && at >= cached_at && at - cached_at < cached_len) {
+            const u32 inside = (u32)(at - cached_at);
+            const u32 n = std::min(len - done, cached_len - inside);
+            memcpy((u8 *)dst + done, chunk + inside, n);
+            done += n;
+            continue;
+        }
         const u32 n = std::min(len - done, CHUNK);
-        if (!read_chunk(n, (u32)(source_offset + off + done))) {
-            OSReport("[3dii-u fs] direct read of %u at %08x failed: back to the system's file calls\n", n, (u32)off + done);
+        cache_only = false;
+        // Begin with the exact request after a seek. Only an observed
+        // sequential successor fetches extra data, bounded by the RomFS end.
+        const u32 wanted = read_ahead && at == previous_end ? std::max(n, 256u << 10) : n;
+        const u32 fetched = (u32)std::min<u64>(source_size - at, wanted);
+        cached_len = 0;  // IOS may partially overwrite the buffer on failure
+        if (!read_chunk(fetched, (u32)(source_offset + at))) {
+            OSReport("[3dii-u fs] direct read of %u at %08x failed: back to the system's file calls\n", fetched, (u32)at);
             on = false;
             return false;
         }
+        cached_at = at;
+        cached_len = fetched;
         memcpy((u8 *)dst + done, chunk, n);
         done += n;
     }
+    previous_end = off + len;
+    if (cached) *cached = cache_only;
     return true;
 }
 }  // namespace wiiu
