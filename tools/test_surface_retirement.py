@@ -14,14 +14,15 @@ import tempfile
 ROOT = Path(__file__).resolve().parent.parent
 
 PREAMBLE = r'''
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
 #include <memory>
 #include <cassert>
 #include <cstdio>
-using u64=uint64_t;
-struct Surface {u64 last_use=0; bool depth=false,in_list=false,shared_depth=false,gpu_newer=false,guest_newer=false,mem1=false; void *image(){return nullptr;} };
+using u64=uint64_t;using u32=uint32_t;
+struct Surface {u64 last_use=0; u32 addr=0x1000,written_lo=0,written_hi=0;bool first_use=false;u32 bytes()const{return 16;}bool depth=false,in_list=false,shared_depth=false,gpu_newer=false,guest_newer=false,mem1=false; void *image(){return nullptr;} };
 std::vector<std::unique_ptr<Surface>> surfaces;
 Surface *cur_color=nullptr,*cur_depth=nullptr;
 u64 use_counter=1900; bool state_sent_valid=true,state_lost=false;
@@ -41,7 +42,16 @@ int main(){
  s=add(false);cur_color=s;forget_unused();assert(surfaces.size()==1);cur_color=nullptr;cur_depth=s;forget_unused();assert(surfaces.size()==1);cur_depth=nullptr;
  s->in_list=true;forget_unused();assert(surfaces.size()==1);s->in_list=false;s->shared_depth=true;forget_unused();assert(surfaces.size()==1);s->shared_depth=false;forget_unused();assert(surfaces.empty());
  add(false);add(false);forget_unused();assert(surfaces.size()==1);forget_unused();assert(surfaces.empty());
- assert(writes==0 && archive[0]=='d');puts("PASS: real retirement function preserves reused archive and GPU-dirty surfaces, retires synchronized/depth targets, respects age and active references");
+ // Many completed scene lifetimes can retire once a definite write supersedes every byte.
+ for(int i=0;i<10000;++i){s=add(true);guest_wrote(*s,0x1000,16);assert(!s->gpu_newer && s->first_use);forget_unused();assert(surfaces.empty());}
+ s=add(true);guest_wrote(*s,0xff0,32);forget_unused();assert(surfaces.empty());
+ // A bounding span made from separated writes is not proof the gap was overwritten.
+ s=add(true);guest_wrote(*s,0x1000,4);guest_wrote(*s,0x100c,4);forget_unused();assert(surfaces.size()==1 && s->gpu_newer);
+ guest_wrote(*s,0x1000,15);forget_unused();assert(surfaces.size()==1);
+ guest_wrote(*s,0x1001,16);forget_unused();assert(surfaces.size()==1);
+ guest_wrote(*s,0x1000,16);forget_unused();assert(surfaces.empty());
+ s=add(true);guest_wrote(*s,0x1000,16);s->gpu_newer=true;s->guest_newer=false;guest_wrote(*s,0x1000,4);forget_unused();assert(surfaces.size()==1);surfaces.clear();
+ assert(writes==0 && archive[0]=='d');puts("PASS: real retirement function preserves reused archive and GPU-dirty surfaces, retires synchronized/depth targets, respects age and references; 10000 full-overwrite cycles reclaim without accumulation, partial/gapped writes retain GPU data");
 }
 '''
 
@@ -62,7 +72,9 @@ def main():
         tmp = Path(tmp)
         test = tmp / 'test.cpp'
         exe = tmp / ('test.exe' if os.name == 'nt' else 'test')
-        test.write_text(PREAMBLE + source[start:end] + TESTS)
+        write_start = source.index('static void guest_wrote(')
+        write_end = source.index('\n}\n', write_start) + 3
+        test.write_text(PREAMBLE + source[write_start:write_end] + source[start:end] + TESTS)
         subprocess.run(compiler + ['-std=c++20', '-O1', str(test), '-o', str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
 

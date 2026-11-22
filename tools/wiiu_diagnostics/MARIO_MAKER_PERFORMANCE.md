@@ -233,3 +233,14 @@ must not be silently described as a successful final flush or confused with
 the earlier recovered seek. Earlier successful writes/flushes do not prove
 that every future save/exit path is correct. Raw game data, compiled shaders,
 private binary excerpts and complete PC logs remain outside the repository.
+
+
+## Subsequent review hardening
+
+The original hardware test above used the first nonthrowing DeleteFile fix.
+The current source additionally distinguishes missing files from I/O and
+permission failures, checks absence before entering Aroma's remove wrapper,
+and retains cache entries after failed deletion. These changes are described
+and tested in [the review report](REVIEW_HARDENING.md); they have not replaced
+the user's working Wii U release. Render-target full-overwrite reclamation
+in that report likewise has unit/build validation, not a fresh hardware result.

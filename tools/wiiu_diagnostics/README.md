@@ -22,6 +22,9 @@ The broad compatibility changes here overlap earlier PRs #12 and #13; Fantasy Li
 
 ## Current investigation reports
 
+[Filesystem and render-target review hardening](REVIEW_HARDENING.md) explains
+the latest source changes, binary evidence and pending hardware validation.
+
 - [Mario Maker startup, rendering and save-layer findings](MARIO_MAKER_PERFORMANCE.md)
 - [Reconciliation of superseded Mario Maker draft #13](PR13_RECONCILIATION.md)
 - [Fantasy Life conversion worker, native copy and remaining movie bottleneck](FANTASY_LIFE_VIDEO.md)

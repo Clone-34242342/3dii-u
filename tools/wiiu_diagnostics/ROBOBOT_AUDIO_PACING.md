@@ -2,10 +2,9 @@
 
 ## Current status: experimental; stutter improvement unconfirmed
 
-Kirby / Planet Robobot investigation is paused at the user's request. Preserve
-the code, candidate builds and recordings. Do not describe these experiments as
-a confirmed fix for Planet Robobot's movie stutter, or promote its mixed mode as
-a validated performance default.
+Planet Robobot investigation is paused. Candidate builds and recordings remain
+available locally. Hardware testing did not demonstrate a stutter fix, and mixed
+compilation is not a validated performance default.
 
 The corrected mixed build passed the user's Cemu movie replay. After deploying
 it to the Wii U, the user reported the same lag at the same spots. The hardware

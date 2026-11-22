@@ -3139,6 +3139,13 @@ static void guest_wrote(Surface &s, u32 paddr, u32 size) {
     s.written_lo = fresh ? paddr : std::min(s.written_lo, paddr);
     s.written_hi = fresh ? paddr + size : std::max(s.written_hi, paddr + size);
     s.guest_newer = true;
+    // One definite write covering every guest byte supersedes the cached GPU
+    // image. Do not use written_lo/hi for this: that bounding span may have gaps.
+    // A partial write leaves the untouched GPU pixels authoritative.
+    if (paddr <= s.addr && (u64)size >= (u64)s.addr - paddr + s.bytes()) {
+        s.gpu_newer = false;
+        s.first_use = true;  // if reused as a target, upload the new guest contents
+    }
 }
 
 // The game's last texture copies and display transfers through guest memory (gpu/transfer.cpp), numbered: a top screen the game puts together
