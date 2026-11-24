@@ -26,6 +26,9 @@ with tempfile.TemporaryDirectory(prefix='copy32-') as tmp:
     af = gen.Emitter(an, str(d)); af.flag_returning.add(BASE)
     reference_flags = bf.emit_function(BASE).replace('f_00001000', 'reference_flags')
     optimized_flags = af.emit_function(BASE).replace('f_00001000', 'optimized_flags')
+    resumable = gen.Emitter(an, str(d)); resumable.resumable = True
+    resumed = resumable.emit_function(BASE).replace('f_00001000', 'resumable_copy')
+    entries = '\n'.join('case 0x%xu: resumable_copy(c, %d); break;' % (a,k) for a,_,k in resumable.entries)
     assert '__builtin_memcpy' in optimized
     for offset in range(29):
         changed = image.Image(str(d))
@@ -39,6 +42,7 @@ with tempfile.TemporaryDirectory(prefix='copy32-') as tmp:
 static u8 a[4<<20], b[4<<20], seed[4<<20];
 u8 *g_mem;
 volatile u32 rt_preempt_flag;
+volatile u32 rt_checkpoint_requested;
 u32 rt_bulk_copy_enabled=1;
 static u32 native_calls, preemptions;
 void rt_preempt(CPU *c) { (void)c; ++preemptions; }
@@ -49,6 +53,15 @@ REFERENCE
 OPTIMIZED
 REF_FLAGS
 OPT_FLAGS
+RESUMABLE
+static void resume_run(CPU *c) {
+ const u32 done=c->r[14]; c->pc=0x1000;
+ unsigned budget=100000;
+ while(c->pc!=done && budget--) {
+  switch(c->pc) { RESUME_ENTRIES default: assert(c->pc<0x1000 || c->pc>=0x1074); return; }
+ }
+ assert(c->pc==done);
+}
 static unsigned cases;
 static void check_one(u32 n,u32 src,u32 dst,u32 pending,int flags) {
  CPU x={0},y;
@@ -57,7 +70,7 @@ static void check_one(u32 n,u32 src,u32 dst,u32 pending,int flags) {
  x.nf=cases&1;x.zf=(cases>>1)&1;x.cf=(cases>>2)&1;x.vf=(cases>>3)&1;
  y=x;memcpy(a,seed,sizeof a);memcpy(b,seed,sizeof b);
  rt_preempt_flag=pending;g_mem=a;if(flags)reference_flags(&x,0);else reference(&x,0);
- native_calls=0;preemptions=0;g_mem=b;if(flags)optimized_flags(&y,0);else optimized(&y,0);
+ native_calls=0;preemptions=0;g_mem=b;if(flags==2)resume_run(&y);else if(flags)optimized_flags(&y,0);else optimized(&y,0);
  if(memcmp(&x,&y,sizeof x)||memcmp(a,b,sizeof a)) {
   fprintf(stderr,"copy mismatch n=%u src=%x dst=%x pending=%u\n",n,src,dst,pending);
   for(u32 i=0;i<sizeof x/4;++i)if(((u32*)&x)[i]!=((u32*)&y)[i])fprintf(stderr,"state word %u: %08x != %08x\n",i,((u32*)&x)[i],((u32*)&y)[i]);
@@ -70,7 +83,7 @@ static void check_one(u32 n,u32 src,u32 dst,u32 pending,int flags) {
  ++cases;
 }
 static void check(u32 n,u32 src,u32 dst,u32 pending) {
- check_one(n,src,dst,pending,0);check_one(n,src,dst,pending,1);
+ check_one(n,src,dst,pending,0);check_one(n,src,dst,pending,1);check_one(n,src,dst,pending,2);
 }
 int main(void) {
  for(u32 i=0;i<sizeof seed;++i)seed[i]=(u8)(i*37u+(i>>9));
@@ -88,7 +101,7 @@ int main(void) {
  rt_bulk_copy_enabled=0;check(491520,0x10000,0x200000,0);
  printf("PASS: %u copies; complete CPU state, flags, memory, overlap, tails and pending preemption\n",cases);
 }
-'''.replace('REFERENCE', reference).replace('OPTIMIZED', optimized).replace('REF_FLAGS', reference_flags).replace('OPT_FLAGS', optimized_flags)
+'''.replace('REFERENCE', reference).replace('OPTIMIZED', optimized).replace('REF_FLAGS', reference_flags).replace('OPT_FLAGS', optimized_flags).replace('RESUMABLE', resumed).replace('RESUME_ENTRIES', entries)
     (d/'test.c').write_text(harness)
     subprocess.run(['cc', '-std=gnu11', '-O2', '-fno-strict-aliasing',
         '-I'+str(ROOT/'third_party/3dsrecomp/runtime'), str(d/'test.c'), '-o', str(d/'test')], check=True)

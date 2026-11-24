@@ -630,6 +630,9 @@ class Emitter:
         self.safe_ranges = []
         self.cur_abi = False
         self.bulk_copy = True
+        # Experimental dispatcher-boundary execution. This removes generated guest
+        # call stacks; kernel/service continuations still need separate handling.
+        self.resumable = False
 
     def is_safe(self, addr):
         return any(lo <= (addr & ~1) < hi for lo, hi in self.safe_ranges)
@@ -650,6 +653,8 @@ class Emitter:
         return '(' + ' || '.join('((%s) & ~1u) - 0x%xu < 0x%xu' % (expr, lo, hi - lo) for lo, hi in self.safe_ranges) + ')'
 
     def emit_function(self, key):
+        if self.resumable and (self.abi or self.safe_ranges):
+            raise ValueError('resumable generation cannot mix ABI or safe-range code')
         an = self.an
         th = key & 1
         start = key & ~1
@@ -658,7 +663,7 @@ class Emitter:
         addrs = sorted(insts)
         out_mask = self.custom_out.get(key, 0) if abi else 0
         self.override = {}
-        fused = self.fuse_compares(insts, th, start) if self.flag_opt else {}
+        fused = self.fuse_compares(insts, th, start) if self.flag_opt and not self.resumable else {}
         try:
             return self._emit_function(key, insts, addrs, th, start, out_mask, fused)
         finally:
@@ -701,7 +706,7 @@ class Emitter:
         abi = self.cur_abi
         an = self.an
         bulk_copy = self.bulk_copy and not abi and not th and matches_copy32(getattr(an, 'img', None), start, addrs)
-        if self.flag_opt:
+        if self.flag_opt and not self.resumable:
             lo = flags.liveness(insts, th, start, an.funcs, key in self.flag_returning, self.flag_reading_entries)
             for a, i in insts.items():
                 c = flags.strip_dead(i, lo[a])
@@ -722,14 +727,18 @@ class Emitter:
                 for t in i.jt:
                     if (t & 1) == th:
                         labels.add(t & ~1)
+                        if self.resumable and (t & ~1) in insts:
+                            resume.append(t & ~1)
             if i.kind in (CALL, ICALL, SVC) and i.falls_through:
                 nxt = a + i.size
                 if nxt in insts:
-                    if i.kind != SVC:
+                    if i.kind != SVC or self.resumable:
                         resume.append(nxt)
+            if self.resumable and i.kind == B and i.target in insts and i.target <= a:
+                resume.append(i.target)
             if i.falls_through:
                 labels.add(a + i.size) if False else None
-        resume = [] if abi else sorted(set(resume))
+        resume = [] if abi else sorted(set(resume) - ({start} if self.resumable else set()))
         labels |= set(resume)
         regs = set()
         vregs = set()
@@ -848,7 +857,9 @@ class Emitter:
                     prev_falls = nxt
                 else:
                     # a tail call into the following function
-                    if self.leaves_safe() and not self.is_safe(nxt):
+                    if self.resumable:
+                        out.append('  SO(); c->pc = 0x%xu; return;' % (nxt | th))
+                    elif self.leaves_safe() and not self.is_safe(nxt):
                         out.append('  { SO(); %s %s(c, 0); %s return; }' % (self.KEEP, fname(nxt | th), self.BACK))
                     else:
                         out.append('  SO(); __attribute__((musttail)) return %s(c, 0);' % fname(nxt | th))
@@ -865,7 +876,16 @@ class Emitter:
         an = self.an
         body = []
         body += self.override.get(i.addr, i.code)
-        if i.kind == OP:
+        if self.resumable and i.kind in (CALL, ICALL, JMP):
+            target = '0x%xu' % i.target if i.kind == CALL else 'tpc'
+            body.append('SO(); c->pc = %s; return;' % target)
+        elif self.resumable and i.kind == B and (i.target | th) in an.funcs and i.target != (key & ~1):
+            body.append('SO(); c->pc = 0x%xu; return;' % (i.target | th))
+        elif self.resumable and i.kind == B and i.target <= i.addr:
+            body.append('if (__builtin_expect(rt_preempt_flag || rt_checkpoint_requested, 0)) { SO(); c->pc = 0x%xu; return; } goto L_%x;' % (i.target | th, i.target))
+        elif self.resumable and i.kind == SVC:
+            body.append('SO(); c->pc = 0x%xu; rt_svc(c, 0x%x); return;' % ((i.addr + i.size) | th, i.imm))
+        elif i.kind == OP:
             pass
         elif i.kind == B:
             t = i.target
@@ -1175,7 +1195,7 @@ class Emitter:
                         changed = True
 
     def run(self, keys):
-        if self.flag_opt:
+        if self.flag_opt and not self.resumable:
             self.find_flag_returning(keys)
         os.makedirs(self.outdir, exist_ok=True)
         for f in os.listdir(self.outdir):
@@ -1221,6 +1241,7 @@ class Emitter:
                 f.write('  {0x%xu, %s, %d},\n' % (addr, fn, k))
                 cnt += 1
             f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
+            f.write('const u32 guest_resumable = %d;\n' % self.resumable)
             cros = self.an.img.cros
             if cros:
                 f.write('\nconst u32 guest_has_static_module = 1;\n')
@@ -1251,9 +1272,12 @@ def main():
     ap.add_argument('--lazy', help='only emit the function at this address (and new functions it calls)')
     ap.add_argument('--lazy-out', help='C file for --lazy')
     ap.add_argument('--abi', action='store_true', help='Wii U mode: trust the calling convention, drop resume points')
+    ap.add_argument('--resumable', action='store_true', help='experimental: return to dispatcher at calls, services and loop backedges; not whole-game save states')
     ap.add_argument('--safe-range', action='append', default=[], metavar='LO-HI',
                     help='with --abi: generate the functions in this address range (hex) the safe way; may be given more than once')
     args = ap.parse_args()
+    if args.resumable and (args.abi or args.safe_range or args.lazy or args.lazy_out):
+        ap.error('--resumable requires a separate full build without --abi, --safe-range or --lazy')
     if args.lazy:
         return lazy(args)
     img = Image(args.gamedir)
@@ -1267,6 +1291,7 @@ def main():
     keys = an.discover()
     em = Emitter(an, args.outdir)
     em.abi = args.abi
+    em.resumable = args.resumable
     em.safe_ranges = [tuple(int(x, 16) for x in r.split('-')) for r in args.safe_range]
     files = em.run(keys)
     with open(os.path.join(args.outdir, 'funcs.txt'), 'w') as f:

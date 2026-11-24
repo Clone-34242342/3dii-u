@@ -23,6 +23,8 @@ namespace wiiu { bool av_timing_enabled(); }
 #include "service.h"
 #include "services/services.h"
 
+extern u64 rt_lookups, rt_lookup_misses;
+
 namespace kernel {
 
 std::mutex kmutex;
@@ -46,6 +48,27 @@ void set_diagnostics_level(u32 level) { diagnostics_level.store(std::min(level, 
 struct SvcSample { u32 thread = 0, svc = 0, lr = 0, count = 0; const char *kind = "svc"; u64 total = 0, max = 0; };
 static SvcSample svc_samples[128];
 static u32 svc_samples_dropped;
+#ifdef RECOMP_RESUMABLE
+// One guest runner writes the cumulative SVC clock; reporting never resets it.
+// Batch summaries are merged/read under kmutex and allocate no sample storage.
+static u64 runner_svc_ns;
+struct RunnerSample {
+    u32 thread = 0, batches = 0, steps = 0;
+    u64 elapsed = 0, service = 0, scheduler = 0, max_batch = 0, lookups = 0, misses = 0;
+};
+static RunnerSample runner_samples[32];
+static void record_runner(u32 thread, u32 steps, u64 elapsed, u64 service,
+                          u64 scheduler, u64 lookups, u64 misses) {
+    for (auto &s : runner_samples) {
+        if (s.batches && s.thread != thread) continue;
+        s.thread = thread; ++s.batches; s.steps += steps;
+        s.elapsed += elapsed; s.service += std::min(service, elapsed);
+        s.scheduler += scheduler; s.max_batch = std::max(s.max_batch, elapsed);
+        s.lookups += lookups; s.misses += misses;
+        return;
+    }
+}
+#endif
 static void record_diagnostic(Thread *t, u32 svc, u32 lr, const char *kind, u64 elapsed) {
     for (auto &s : svc_samples) {
         if (s.count && (s.thread != t->id || s.svc != svc || s.lr != lr || strcmp(s.kind, kind))) continue;
@@ -56,6 +79,15 @@ static void record_diagnostic(Thread *t, u32 svc, u32 lr, const char *kind, u64 
     ++svc_samples_dropped;
 }
 void diagnostics_report_locked() {
+#ifdef RECOMP_RESUMABLE
+    for (auto &s : runner_samples) if (s.batches) {
+        LOG("[guest-cpu] thread %u batches %u steps %u execute-us %llu svc-inclusive-us %llu scheduler-inclusive-us %llu max-batch-us %llu lookups %llu misses %llu\n",
+            s.thread, s.batches, s.steps, (unsigned long long)((s.elapsed - s.service) / 1000),
+            (unsigned long long)(s.service / 1000), (unsigned long long)(s.scheduler / 1000),
+            (unsigned long long)(s.max_batch / 1000), (unsigned long long)s.lookups, (unsigned long long)s.misses);
+        s = RunnerSample{};
+    }
+#endif
     for (auto &s : svc_samples) if (s.count) {
         LOG("[guest-svc] kind %s thread %u svc %02x lr %08x calls %u inclusive-us %llu max-us %llu\n",
             s.kind, s.thread, s.svc, s.lr, s.count, (unsigned long long)(s.total / 1000), (unsigned long long)(s.max / 1000));
@@ -73,6 +105,12 @@ u32 heap_size, linear_used;
 static thread_local Thread *tls_thread;
 #endif
 static void flush_deferred();
+#ifdef RECOMP_RESUMABLE
+static std::vector<std::weak_ptr<Object>> &checkpoint_objects() {
+    static auto *objects = new std::vector<std::weak_ptr<Object>>;
+    return *objects;
+}
+#endif
 static std::atomic<int> lock_wanted;  // host threads in lock_soon: svc_dispatch lets them go first
 
 bool lock_soon(Lock &lk) {
@@ -105,6 +143,9 @@ bool lock_soon(Lock &lk) {
 
 // ---------------------------------------------------------------- handles
 Handle add_handle(ObjPtr o) {
+#ifdef RECOMP_RESUMABLE
+    checkpoint_objects().push_back(o);
+#endif
     Handle h = next_handle++;
     handles[h] = std::move(o);
     return h;
@@ -132,6 +173,9 @@ std::shared_ptr<Event> make_event(ResetType rt, const char *name) {
     auto e = std::make_shared<Event>();
     e->reset = rt;
     e->name = name;
+#ifdef RECOMP_RESUMABLE
+    checkpoint_objects().push_back(e);
+#endif
     return e;
 }
 
@@ -172,8 +216,27 @@ u64 system_tick() {
 }
 
 // timeouts run on a host thread
+#ifdef RECOMP_RESUMABLE
+static std::function<void()> restore_timeout(const TimeoutState &);
+struct TimedCallback {
+    std::function<void()> fn;
+    TimeoutState state;
+    void operator()() { fn(); }
+    void state_fields(checkpoint::Archive &a) {
+        a.fields(state.kind, state.object, state.service, state.generation, state.argument);
+        if (state.kind == TimeoutKind::Unknown) { a.fail("unidentified timeout callback"); return; }
+        if (a.reading && a.ok) {
+            fn = restore_timeout(state);
+            if (!fn) a.fail("timeout cannot be reconstructed");
+        }
+    }
+};
+using TimeoutCallback = TimedCallback;
+#else
+using TimeoutCallback = std::function<void()>;
+#endif
 struct TimeoutQueue {
-    std::multimap<u64, std::function<void()>> q;
+    std::multimap<u64, TimeoutCallback> q;
     std::condition_variable cv;
     std::thread th;
 };
@@ -217,8 +280,16 @@ void set_clock_speed(u32 pct) {
     tq_wake();  // pending timeouts now fall due at another real time
 }
 
-void add_timeout(u64 deadline, std::function<void()> fn) {
+void add_timeout(u64 deadline, std::function<void()> fn
+#ifdef RECOMP_RESUMABLE
+    , TimeoutState state
+#endif
+) {
+#ifdef RECOMP_RESUMABLE
+    tq.q.emplace(deadline, TimedCallback{std::move(fn), std::move(state)});
+#else
     tq.q.emplace(deadline, std::move(fn));
+#endif
     tq_wake();
 }
 
@@ -272,11 +343,22 @@ static void switch_from(Thread *cur, Lock &lk) {
     }
     if (next == cur) return;
     kstats.switches++;
+#ifdef RECOMP_RESUMABLE
+    // The sole guest host returns to its dispatcher after the SVC. No guest
+    // thread is suspended inside this C++ frame in the experimental runtime.
+    return;
+#endif
     cur->cv.wait(lk, [&] { return running == cur; });
 }
 
 void resume_thread(Thread *t) {
     if (t->status == TStatus::Dead || t->status == TStatus::Ready || t->status == TStatus::Running) return;
+#ifdef RECOMP_RESUMABLE
+    if (t->status == TStatus::WaitSync || t->status == TStatus::WaitArb) {
+        t->cpu.r[0] = t->wait_result;
+        if (t->status == TStatus::WaitSync && t->wait_out_index) t->cpu.r[1] = (u32)t->wait_index;
+    }
+#endif
 #ifdef __WIIU__
     if ((t->id == 1 || detailed_diagnostics(t)) && wiiu::av_timing_enabled()) {
         t->diag_ready_at = real_ns();
@@ -331,6 +413,12 @@ void schedule_async() {
 
 void reschedule(Lock &lk) {
     Thread *cur = current_thread();
+#ifdef RECOMP_RESUMABLE
+    // A service can install a sleep before SendSyncRequest's final reschedule.
+    // It has already yielded; making it ready here would cancel the wait and
+    // strand the thread selected by switch_from in Running status.
+    if (running != cur || cur->status != TStatus::Running) return;
+#endif
     Thread *best = best_ready();
     if (!best || best->priority >= cur->priority) return;
     make_ready(cur, true);
@@ -399,13 +487,21 @@ void sleep_current(u64 ns, Lock &lk) {
     u64 gen = t->wait_gen;
     add_timeout(now_ns() + ns, [t, gen] {
         if (t->wait_gen == gen && t->status == TStatus::WaitSleep) resume_thread(t);
-    });
+    } STATE_TIMEOUT(TimeoutKind::Sleep, t->shared_from_this(), nullptr, gen));
     block_current(lk);
 }
 
 // Storage is what this is for. A read used to keep the CPU: every other thread of the game, its sound thread among them, stood still for as
 // long as the storage took, which on a console is most of a transition between scenes, and the sound stuttered through each one (2026-11-10).
 void run_blocked(Lock &lk, const std::function<void()> &work) {
+#ifdef RECOMP_RESUMABLE
+    // Synchronous host I/O is deliberately slower but leaves no native
+    // service continuation to serialize. Other host workers retain kmutex.
+    lk.unlock();
+    work();
+    lk.lock();
+    return;
+#endif
     Thread *cur = current_thread();
 #ifdef __WIIU__
     const bool timed = detailed_diagnostics(cur);
@@ -501,13 +597,45 @@ static void timer_schedule(std::shared_ptr<Timer> tm, s64 delay) {
         if (tm->generation != gen) return;
         tm->fire();
         if (tm->interval > 0) timer_schedule(tm, tm->interval);
-    });
+    } STATE_TIMEOUT(TimeoutKind::Timer, tm, nullptr, gen));
 }
 
 void Timer::fire() {
     signaled = true;
     wakeup_waiters();
 }
+
+#ifdef RECOMP_RESUMABLE
+void persistent_gsp_irq(u32);
+static std::function<void()> restore_timeout(const TimeoutState &s) {
+    if (s.kind == TimeoutKind::Sleep || s.kind == TimeoutKind::WaitSync || s.kind == TimeoutKind::WaitArb) {
+        auto t = std::dynamic_pointer_cast<Thread>(s.object);
+        if (!t) return {};
+        return [t, s] {
+            const TStatus expected = s.kind == TimeoutKind::Sleep ? TStatus::WaitSleep :
+                                     s.kind == TimeoutKind::WaitSync ? TStatus::WaitSync : TStatus::WaitArb;
+            if (t->wait_gen != s.generation || t->status != expected) return;
+            if (s.kind != TimeoutKind::Sleep) t->wait_result = RES_TIMEOUT;
+            if (s.kind == TimeoutKind::WaitSync) t->wait_index = -1;
+            resume_thread(t.get());
+        };
+    }
+    if (s.kind == TimeoutKind::Timer) {
+        auto tm = std::dynamic_pointer_cast<Timer>(s.object);
+        if (!tm) return {};
+        return [tm, s] {
+            if (tm->generation != s.generation) return;
+            tm->fire();
+            if (tm->interval > 0) timer_schedule(tm, tm->interval);
+        };
+    }
+    if (s.kind == TimeoutKind::Service && s.service)
+        return [s] { s.service->persistent_timeout(s.generation, s.argument); };
+    if (s.kind == TimeoutKind::GspIrq && s.argument <= 6)
+        return [s] { persistent_gsp_irq(s.argument); };
+    return {};
+}
+#endif
 
 // ---------------------------------------------------------------- threads
 static u32 alloc_tls() {
@@ -521,6 +649,9 @@ static u32 alloc_tls() {
 }
 
 static void thread_exit_locked(Thread *t, Lock &lk);
+#ifdef RECOMP_RESUMABLE
+static void resumable_runner();
+#endif
 
 #ifdef __WIIU__
 static OSThread *guest_hosts[64];
@@ -539,7 +670,11 @@ static void *thread_main(void *arg) {
         Lock lk(kmutex);
         t->cv.wait(lk, [&] { return running == t; });
     }
+#ifdef RECOMP_RESUMABLE
+    resumable_runner();
+#else
     run_guest(&t->cpu);
+#endif
     Lock lk(kmutex);
     thread_exit_locked(t, lk);
     return nullptr;
@@ -588,15 +723,24 @@ std::shared_ptr<Thread> create_thread(u32 entry, u32 arg, u32 stack_top, s32 pri
     t->cpu.thread = t.get();
     threads.push_back(t);
 #ifdef __WIIU__
+#ifdef RECOMP_RESUMABLE
+    if (threads.size() == 1)
+#endif
     start_guest_host(t.get());
 #else
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64 << 20);
     pthread_t pt;
+#ifdef RECOMP_RESUMABLE
+    if (threads.size() == 1) {
+#endif
     if (pthread_create(&pt, &attr, thread_main, t.get())) FATAL("pthread_create failed\n");
     t->mach = pthread_mach_thread_np(pt);
     pthread_detach(pt);
+#ifdef RECOMP_RESUMABLE
+    }
+#endif
 #endif
     if (start) make_ready(t.get());
     return t;
@@ -622,12 +766,91 @@ static void thread_exit_locked(Thread *t, Lock &lk) {
         next->status = TStatus::Running;
         next->cv.notify_one();
     }
+#ifndef RECOMP_RESUMABLE
     lk.unlock();
     pthread_exit(nullptr);
+#endif
 }
+
+#ifdef RECOMP_RESUMABLE
+extern "C" const u32 guest_resumable;
+static void resumable_runner() {
+    if (!guest_resumable) FATAL("resumable kernel requires resumable generated code\n");
+    LOG("[state] experimental single-runner scheduler active\n");
+    for (;;) {
+        std::unique_lock<checkpoint::Gate> checkpoint_lock(checkpoint::gate());
+        // A reload may release a thread that was created after the checkpoint.
+        // Timer callbacks must not inspect the previous step's TLS pointer.
+#ifdef __WIIU__
+        OSSetThreadSpecific(OS_THREAD_SPECIFIC_0, nullptr);
+#else
+        tls_thread = nullptr;
+#endif
+        Thread *t;
+#ifdef __WIIU__
+        const bool sample_runner = diagnostics_level.load(std::memory_order_relaxed) >= 2;
+        const u64 scheduler_begin = sample_runner ? real_ns() : 0;
+#endif
+        {
+            Lock lk(kmutex);
+            while (!tq.q.empty() && tq.q.begin()->first <= now_ns()) {
+                auto fn = std::move(tq.q.begin()->second);
+                tq.q.erase(tq.q.begin());
+                fn();
+            }
+            flush_deferred();
+            if (running) {
+                Thread *best = best_ready();
+                if (best && best->priority < running->priority) {
+                    make_ready(running, true);
+                    running = nullptr;
+                }
+            }
+            rt_preempt_flag = 0;
+            schedule_async();
+            t = running;
+        }
+        if (!t) {
+            checkpoint_lock.unlock(); // video/audio/input must be able to make a waiting guest ready
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
+        }
+#ifdef __WIIU__
+        OSSetThreadSpecific(OS_THREAD_SPECIFIC_0, t);
+#else
+        tls_thread = t;
+#endif
+#ifdef __WIIU__
+        const bool sampled = sample_runner && detailed_diagnostics(t);
+        const u64 batch_begin = sampled ? real_ns() : 0;
+        const u64 svc_begin = runner_svc_ns, lookups_begin = rt_lookups, misses_begin = rt_lookup_misses;
+#endif
+        unsigned steps = 0;
+        for (; steps < 256;) {
+            run_guest_step(&t->cpu); ++steps;
+            if (t->cpu.pc == EXIT_MAGIC || running != t || t->status != TStatus::Running || rt_preempt_flag || rt_checkpoint_requested) break;
+        }
+#ifdef __WIIU__
+        if (sampled) {
+            const u64 elapsed = real_ns() - batch_begin;
+            Lock lk(kmutex);
+            record_runner(t->id, steps, elapsed, runner_svc_ns - svc_begin,
+                          batch_begin - scheduler_begin, rt_lookups - lookups_begin, rt_lookup_misses - misses_begin);
+        }
+#endif
+        if (t->cpu.pc == EXIT_MAGIC && t->status != TStatus::Dead) {
+            Lock lk(kmutex);
+            thread_exit_locked(t, lk);
+        }
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- memory bookkeeping
 struct Region {
+#ifdef RECOMP_RESUMABLE
+    void state_fields(checkpoint::Archive &a) { a.fields(base, size, perm, state); }
+#endif
     u32 base, size, perm, state;
 };
 static std::map<u32, Region> regions;  // by base
@@ -738,6 +961,7 @@ static void wait_on(Thread *t, std::vector<std::shared_ptr<WaitObject>> objs, bo
                     CPU *c, bool out_index) {
     t->wait_objs = objs;
     t->wait_all = all;
+    t->wait_out_index = out_index;
     t->status = TStatus::WaitSync;
     t->wait_result = RES_TIMEOUT;
     t->wait_index = -1;
@@ -749,7 +973,7 @@ static void wait_on(Thread *t, std::vector<std::shared_ptr<WaitObject>> objs, bo
             t->wait_result = RES_TIMEOUT;
             t->wait_index = -1;
             resume_thread(t);
-        });
+        } STATE_TIMEOUT(TimeoutKind::WaitSync, t->shared_from_this(), nullptr, gen));
     }
     block_current(lk);
     c->r[0] = t->wait_result;
@@ -874,7 +1098,7 @@ static u32 svc_arbitrate(CPU *c, Lock &lk) {
                 if (t->wait_gen != gen || t->status != TStatus::WaitArb) return;
                 t->wait_result = RES_TIMEOUT;
                 resume_thread(t);
-            });
+            } STATE_TIMEOUT(TimeoutKind::WaitArb, t->shared_from_this(), nullptr, gen));
         }
         block_current(lk);
         return t->wait_result == RES_TIMEOUT ? RES_TIMEOUT : RES_OK;
@@ -1128,7 +1352,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
                 u64 gen = t->wait_gen;
                 add_timeout(now_ns() + (u64)std::max<s64>(ns, 0), [t, gen] {
                     if (t->wait_gen == gen && t->status == TStatus::WaitSleep) resume_thread(t);
-                });
+                } STATE_TIMEOUT(TimeoutKind::Sleep, t->shared_from_this(), nullptr, gen));
                 block_current(lk);
             }
             break;
@@ -1307,9 +1531,11 @@ std::string kstats_report(u64 frames) {
         snprintf(b, sizeof b, "%s %s %.1f", i ? "," : " | requests:", r[i].second.c_str(), (double)r[i].first / frames);
         out += b;
     }
-    snprintf(b, sizeof b, " | indirect jumps %.1f, %.1f not in the cache", (double)rt_lookups / frames, (double)rt_lookup_misses / frames);
+    static u64 previous_lookups, previous_misses;
+    const u64 lookups = rt_lookups, misses = rt_lookup_misses;
+    snprintf(b, sizeof b, " | indirect jumps %.1f, %.1f not in the cache", (double)(lookups - previous_lookups) / frames, (double)(misses - previous_misses) / frames);
     out += b;
-    rt_lookups = rt_lookup_misses = 0;
+    previous_lookups = lookups; previous_misses = misses;
     const bool ipc = kstats.ipc;
     kstats = KStats{};
     kstats.ipc = ipc;
@@ -1342,8 +1568,12 @@ void svc_dispatch(CPU *c, u32 imm) {
     svc_locked(c, imm, lk);
 #ifdef __WIIU__
     if (timed) {
+        const u64 completed = real_ns();
+#ifdef RECOMP_RESUMABLE
+        runner_svc_ns += completed - asked;
+#endif
         record_diagnostic(t, imm, caller, "lock-acquire", entered - asked);
-        record_diagnostic(t, imm, caller, "svc", real_ns() - entered);
+        record_diagnostic(t, imm, caller, "svc", completed - entered);
         static u64 report_at;
         const u64 now = real_ns();
         if (now - report_at >= 2000000000ULL) {
@@ -1439,7 +1669,18 @@ void start(const BootInfo &bi) {
     const u32 clear = ((g_game.data_addr + g_game.data_size + g_game.bss_size + 0xFFFFF) & ~0xFFFFFu) + 0x100000;
     mem::lend(ro_has_modules() ? std::max(clear, 0x04000000u) : clear, mem::HEAP_BASE);
 #endif
+#ifndef RECOMP_RESUMABLE
     tq.th = std::thread(timeout_thread);
+#else
+    // Interrupt long guest-only loops so the dispatcher can process timers.
+    // This host pulse owns no guest state and is not part of a checkpoint.
+    tq.th = std::thread([] {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            rt_preempt_flag = 1;
+        }
+    });
+#endif
     tq.th.detach();
     u32 stack_top = mem::STACK_TOP;
     add_region(stack_top - bi.stack_size, bi.stack_size, 3, 7);
@@ -1450,6 +1691,102 @@ void start(const BootInfo &bi) {
 }
 
 }  // namespace kernel
+
+#ifdef RECOMP_RESUMABLE
+namespace kernel {
+u32 persistent_sharedmem_callback(const SharedMem &);
+bool persistent_sharedmem_callback(SharedMem &, u32);
+bool capture_object(checkpoint::Image &im, const ObjPtr &o) {
+    if (!o || !im.objects.insert(o.get()).second) return true;
+    im.restore.push_back([o] {});  // pin identity until the session checkpoint is discarded
+    im.take(o->name);
+    if (auto w = std::dynamic_pointer_cast<WaitObject>(o)) im.take(w->waiters);
+#define TAKE(P, F) im.take(P->F)
+    switch (o->type()) {
+    case Type::Event: { auto p = std::static_pointer_cast<Event>(o); TAKE(p, reset); TAKE(p, signaled); break; }
+    case Type::Mutex: { auto p = std::static_pointer_cast<Mutex>(o); TAKE(p, owner); TAKE(p, lock_count); break; }
+    case Type::Semaphore: { auto p = std::static_pointer_cast<Semaphore>(o); TAKE(p, count); TAKE(p, max); break; }
+    case Type::Timer: { auto p = std::static_pointer_cast<Timer>(o); TAKE(p, reset); TAKE(p, signaled); TAKE(p, initial); TAKE(p, interval); TAKE(p, generation); break; }
+    case Type::SharedMem: {
+        auto p = std::static_pointer_cast<SharedMem>(o);
+        TAKE(p, backing); TAKE(p, size); TAKE(p, my_perm); TAKE(p, other_perm);
+        if (im.archive) {
+            u32 kind = im.archive->reading ? 0 : persistent_sharedmem_callback(*p);
+            im.archive->io(kind);
+            if (kind > 1) { im.archive->fail("unidentified shared-memory callback"); return false; }
+            if (im.archive->reading) im.restore.push_back([p, kind] { persistent_sharedmem_callback(*p, kind); });
+        }
+        break;
+    }
+    case Type::Thread: {
+        auto p = std::static_pointer_cast<Thread>(o);
+        if (p->in_svc != -1) return false;
+        TAKE(p, id); TAKE(p, priority); TAKE(p, status); TAKE(p, cpu); TAKE(p, tls); TAKE(p, entry); TAKE(p, ready_seq);
+        TAKE(p, wait_objs); TAKE(p, wait_all); TAKE(p, wait_out_index); TAKE(p, wait_result); TAKE(p, wait_index);
+        TAKE(p, wait_gen); TAKE(p, arb_addr); TAKE(p, arb);
+        if (im.archive && im.archive->reading) im.restore.push_back([p] { p->cpu.thread = p.get(); });
+        for (auto &w : p->wait_objs) if (!capture_object(im, w)) return false;
+        break;
+    }
+    case Type::Session: {
+        auto p = std::static_pointer_cast<Session>(o);
+        if (im.archive) { im.take(p->service); break; }
+        if (im.objects.insert(p->service.get()).second && !p->service->capture(im)) {
+            LOG("[state] unsupported service: %s\n", p->service->name.c_str()); return false;
+        }
+        break;
+    }
+    case Type::Arbiter: case Type::Process: case Type::ResLimit: break;
+    default: return false;
+    }
+#undef TAKE
+    return true;
+}
+}
+
+bool checkpoint::kernel_capture(Image &im) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    if (ro_has_modules()) { LOG("[state] dynamic modules are unsupported\n"); return false; }
+    im.take(handles); im.take(threads); im.take(running); im.take(next_handle); im.take(next_thread_id);
+    im.take(ready_counter); im.take(tls_used); im.take(heap_size); im.take(linear_used);
+    im.take(regions); im.take(linear_free); im.take(tq.q); im.take(deferred_work); im.take(boot_ns);
+    const u64 clock = now_ns();
+    im.restore.push_back([clock] {
+        std::lock_guard<std::mutex> lk(clock_m); clock_vbase = clock; clock_rbase = real_ns();
+    });
+    im.take(clock_pct);
+    // Retain all live object identities, including service-owned events whose
+    // guest handle has been closed. Dead weak references cost no payload.
+    for (auto &weak : checkpoint_objects()) if (auto o = weak.lock()) if (!capture_object(im, o)) return false;
+    for (auto &t : threads) if (!capture_object(im, t)) return false;
+    // Capture canonical guest ranges only. The unused code/heap gap is lent
+    // to the host allocator on Wii U and must never be rewound as guest RAM.
+    std::map<u32, u32> spans;
+    auto span = [&](u32 base, u32 size) { if (size && !mem::lent(base, size)) spans[base] = std::max(spans[base], size); };
+    for (auto &[base, r] : regions) if (r.perm & 1) span(base, r.size);
+    span(g_game.text_addr, g_game.text_size); span(g_game.ro_addr, g_game.ro_size); span(g_game.data_addr, g_game.data_size + g_game.bss_size);
+    // The free map covers the linear allocator's unused ranges. Capture its
+    // allocated complement and the system reservation, not all 128 MiB.
+    u32 linear_at = mem::LINEAR_BASE;
+    for (auto [base, size] : linear_free) {
+        if (base > linear_at) span(linear_at, base - linear_at);
+        linear_at = std::max(linear_at, base + size);
+    }
+    if (linear_at < mem::LINEAR_BASE + mem::LINEAR_SIZE)
+        span(linear_at, mem::LINEAR_BASE + mem::LINEAR_SIZE - linear_at);
+    span(mem::VRAM_BASE, mem::VRAM_SIZE);
+    span(mem::DSP_BASE, 0x90000); span(mem::HLE_BASE, mem::HLE_SIZE);
+    u32 first = 0, end = 0;
+    for (auto [base, size] : spans) {
+        if (end && base > end) { im.memory(gptr(first), end - first); first = base; }
+        if (!end) first = base;
+        end = std::max(end, base + size);
+    }
+    if (end > first) im.memory(gptr(first), end - first);
+    return im.ok;
+}
+#endif
 
 extern "C" void rt_svc(CPU *c, u32 imm) { kernel::svc_dispatch(c, imm); }
 
@@ -1462,3 +1799,135 @@ extern "C" void rt_preempt(CPU *) {
     flush_deferred();
     reschedule(lk);
 }
+
+#ifdef RECOMP_RESUMABLE
+namespace kernel {
+class PersistentGraph {
+    checkpoint::Image &image;
+    checkpoint::Archive &archive;
+    std::vector<ObjPtr> objects{nullptr};
+    std::vector<std::shared_ptr<Service>> services{nullptr};
+    std::map<const Object *, u32> object_ids;
+    std::map<const Service *, u32> service_ids;
+public:
+    explicit PersistentGraph(checkpoint::Image &im) : image(im), archive(*im.archive) {
+        archive.object = [this](ObjPtr &p) { object(p); };
+        archive.service = [this](std::shared_ptr<Service> &p) { service(p); };
+    }
+    ~PersistentGraph() { archive.object = {}; archive.service = {}; }
+    void object(ObjPtr &p) {
+        u32 id = 0;
+        bool fresh = false;
+        if (!archive.reading && p) {
+            auto [it, inserted] = object_ids.emplace(p.get(), objects.size());
+            id = it->second; fresh = inserted;
+            if (fresh) objects.push_back(p);
+        }
+        archive.io(id);
+        if (!archive.ok) return;
+        if (!id) { if (archive.reading) p.reset(); return; }
+        if (archive.reading) {
+            if (id < objects.size()) { p = objects[id]; return; }
+            if (id != objects.size() || id > 16384) { archive.fail("invalid object ID"); return; }
+            fresh = true;
+        }
+        if (!fresh) return;
+        Type type = archive.reading ? Type::Event : p->type();
+        std::string name = archive.reading ? std::string{} : p->name;
+        archive.fields(type, name);
+        if (!archive.ok) return;
+        if (archive.reading) {
+            switch (type) {
+            case Type::Event: p = std::make_shared<Event>(); break;
+            case Type::Mutex: p = std::make_shared<Mutex>(); break;
+            case Type::Semaphore: p = std::make_shared<Semaphore>(); break;
+            case Type::Timer: p = std::make_shared<Timer>(); break;
+            case Type::Thread: p = std::make_shared<Thread>(); break;
+            case Type::SharedMem: p = std::make_shared<SharedMem>(); break;
+            case Type::Session: p = std::make_shared<Session>(); break;
+            case Type::Arbiter: p = std::make_shared<Arbiter>(); break;
+            case Type::Process: p = std::make_shared<Process>(); break;
+            case Type::ResLimit: p = std::make_shared<ResLimit>(); break;
+            default: archive.fail("unsupported object kind"); return;
+            }
+            p->name = name;
+            objects.push_back(p); // cycles can refer back before their fields are decoded
+            checkpoint_objects().push_back(p);
+        }
+        if (!capture_object(image, p)) archive.fail("object cannot be persisted");
+    }
+    void service(std::shared_ptr<Service> &p) {
+        u32 id = 0; bool fresh = false;
+        if (!archive.reading && p) {
+            auto [it, inserted] = service_ids.emplace(p.get(), services.size());
+            id = it->second; fresh = inserted;
+            if (fresh) services.push_back(p);
+        }
+        archive.io(id);
+        if (!archive.ok) return;
+        if (!id) { if (archive.reading) p.reset(); return; }
+        if (archive.reading) {
+            if (id < services.size()) { p = services[id]; return; }
+            if (id != services.size() || id > 4096) { archive.fail("invalid service ID"); return; }
+            fresh = true;
+        }
+        if (!fresh) return;
+        std::string name = archive.reading ? std::string{} : p->name;
+        archive.io(name);
+        if (archive.reading && archive.ok) {
+            p = persistent_service(name);
+            if (!p) { archive.fail("service cannot be reconstructed"); return; }
+            services.push_back(p);
+        }
+        if (archive.ok && !p->capture(image)) archive.fail("service cannot be persisted");
+    }
+};
+}
+#endif
+
+#ifdef RECOMP_RESUMABLE
+bool checkpoint::kernel_persist(Image &im) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    if (!im.archive || ro_has_modules()) return false;
+    flush_deferred();
+    im.archive_graph = std::make_shared<PersistentGraph>(im);
+    im.fields(handles, threads, running, self_process, self_reslimit, next_handle, next_thread_id,
+              ready_counter, tls_used, heap_size, linear_used, regions, linear_free, tq.q, boot_ns, clock_pct);
+    u64 clock = now_ns();
+    im.archive->io(clock);
+    im.restore.push_back([clock] {
+        std::lock_guard<std::mutex> lk(clock_m); clock_vbase = clock; clock_rbase = real_ns();
+    });
+    std::vector<std::pair<u32,u32>> spans;
+    if (!im.archive->reading) {
+        std::map<u32,u32> selected;
+        auto span = [&](u32 base, u32 size) { if (size && !mem::lent(base,size)) selected[base] = std::max(selected[base],size); };
+        for (auto &[base,r] : regions) if (r.perm & 1) span(base,r.size);
+        span(g_game.text_addr,g_game.text_size); span(g_game.ro_addr,g_game.ro_size);
+        span(g_game.data_addr,g_game.data_size+g_game.bss_size);
+        u32 at=mem::LINEAR_BASE;
+        for (auto [base,size] : linear_free) { if (base>at) span(at,base-at); at=std::max(at,base+size); }
+        if (at<mem::LINEAR_BASE+mem::LINEAR_SIZE) span(at,mem::LINEAR_BASE+mem::LINEAR_SIZE-at);
+        span(mem::VRAM_BASE,mem::VRAM_SIZE); span(mem::DSP_BASE,0x90000); span(mem::HLE_BASE,mem::HLE_SIZE);
+        u32 begin=0,end=0;
+        for (auto [base,size] : selected) {
+            if (end && base>end) { spans.emplace_back(begin,end-begin); begin=base; }
+            if (!end) begin=base;
+            end=std::max(end,base+size);
+        }
+        if (end>begin) spans.emplace_back(begin,end-begin);
+    }
+    im.archive->io(spans);
+    u64 end=0;
+    for (auto [base,size] : spans) {
+        if (!im.archive->ok) break;
+        if (!size || base<0x100000 || base<end || (u64)base+size>0x20000000ull || mem::lent(base,size)) {
+            im.archive->fail("invalid guest memory span"); break;
+        }
+        end=(u64)base+size;
+        im.memory(gptr(base),size);
+    }
+    return im.ok && im.archive->ok;
+}
+#endif

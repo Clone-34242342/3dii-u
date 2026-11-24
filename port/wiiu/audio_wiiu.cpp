@@ -80,6 +80,15 @@ void init() {
     write_pos = CUSHION;
 }
 void set_volume(float v) { gain = v; }
+#ifdef RECOMP_RESUMABLE
+void checkpoint_clear_output() {
+    for (int c = 0; c < 2; c++) if (ring[c]) {
+        memset(ring[c], 0, RING * 2); DCFlushRange(ring[c], RING * 2);
+    }
+    write_pos = playing ? (play_pos() + CUSHION) % RING : CUSHION;
+}
+#endif
+
 // silence while the HOME Menu is up: the voices would otherwise repeat what's in the ring
 void pause(bool on) {
     if (!playing || !voice[0] || !voice[1]) return;

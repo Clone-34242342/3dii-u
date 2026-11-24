@@ -131,6 +131,7 @@ std::array<u8, 0x60> player_mii() {
 }
 
 struct Ptm : Service {
+    SERVICE_CHECKPOINT(Ptm)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -174,6 +175,7 @@ struct Ptm : Service {
 };
 
 struct Ac : Service {
+    SERVICE_CHECKPOINT(Ac)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -208,6 +210,7 @@ struct Ac : Service {
 };
 
 struct Frd : Service {
+    SERVICE_CHECKPOINT(Frd)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -270,6 +273,7 @@ struct Frd : Service {
 };
 
 struct Ndm : Service {
+    SERVICE_CHECKPOINT(Ndm)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -285,6 +289,7 @@ struct Ndm : Service {
 };
 
 struct Cecd : Service {
+    SERVICE_CHECKPOINT(Cecd, info, state)
     using Service::Service;
     std::shared_ptr<Event> info = make_event(ONESHOT, "cecd info");
     std::shared_ptr<Event> state = make_event(ONESHOT, "cecd state");
@@ -360,6 +365,7 @@ struct Cecd : Service {
 };
 
 struct Boss : Service {
+    SERVICE_CHECKPOINT(Boss)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -390,6 +396,30 @@ struct Boss : Service {
 // they have got (3dbrew: MIC Shared Memory).
 struct Mic : Service {
     using Service::Service;
+#ifdef RECOMP_RESUMABLE
+    bool persistent_supported() const override { return true; }
+    bool capture(checkpoint::Image &im) override {
+        // Host microphone input stays live. Rewind the guest buffer/cursor and
+        // its saved timeout, then reopen/close the host stream to match it.
+        // Do not copy a native microphone handle or enqueue a second tick.
+        bool saved_sampling = sampling;
+        if (im.archive) im.archive->io(saved_sampling);
+        im.restore.push_back([this, saved_sampling] {
+            // Microphone input is live host state. An already-running stream
+            // does not need teardown/reinitialization when rewinding the game.
+            if (sampling && !saved_sampling) mic_host_stop();
+            else if (!sampling && saved_sampling) mic_host_start();
+        });
+        im.take(buf_full); im.take(mem);
+        im.take(start); im.take(end); im.take(pos); im.take(rate); im.take(generation);
+        im.take(encoding); im.take(gain); im.take(power); im.take(clamp);
+        im.take(loop); im.take(sampling);
+        return true;
+    }
+#endif
+#ifdef RECOMP_RESUMABLE
+    void persistent_timeout(u64 g, u32) override { tick(static_cast<u32>(g)); }
+#endif
     std::shared_ptr<Event> buf_full = make_event(ONESHOT, "mic");
     std::shared_ptr<SharedMem> mem;
     u32 start = 0, end = 0, pos = 0, rate = 32730, generation = 0;
@@ -427,7 +457,7 @@ struct Mic : Service {
             pos += step;
         }
         w32(mem->backing + mem->size - 4, pos);
-        if (sampling) add_timeout(now_ns() + 10000000, [this, g] { tick(g); });
+        if (sampling) add_timeout(now_ns() + 10000000, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
     }
     void handle(IPC &ipc) override {
         static const u32 rates[4] = {32730, 16360, 10910, 8180};
@@ -453,7 +483,7 @@ struct Mic : Service {
                 LOG("[mic] sampling at %u Hz, encoding %u, %u bytes%s\n", rate, encoding, end - start, loop ? ", looped" : "");
                 mic_host_start();
                 const u32 g = generation;
-                add_timeout(now_ns() + 10000000, [this, g] { tick(g); });
+                add_timeout(now_ns() + 10000000, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
             }
             ipc.ok();
             break;
@@ -525,6 +555,26 @@ void hid_extra_pad_live(u32 buttons) {
 // Keep queue accounting private: shared memory belongs to the guest and cannot supply trusted write offsets.
 struct Ir : Service {
     using Service::Service;
+#ifdef RECOMP_RESUMABLE
+    bool persistent_supported() const override { return true; }
+    bool capture(checkpoint::Image &im) override {
+        // Avoid copying this resource-owning service: its destructor adjusts
+        // the global count used to detect a connected Circle Pad Pro.
+        im.take(conn); im.take(recv); im.take(send); im.take(mem);
+        im.take(shared_size); im.take(packets_max); im.take(data_max);
+        im.take(first); im.take(next); im.take(used); im.take(head); im.take(lengths);
+        im.take(period_ms); im.take(generation);
+        bool saved_connected = connected;
+        if (im.archive) im.archive->io(saved_connected);
+        im.restore.push_back([this, saved_connected] { connection(saved_connected); });
+        // The kernel snapshot already owns the matching poll timeout. Physical
+        // stick/button input remains live; do not create a duplicate poll.
+        return true;
+    }
+#endif
+#ifdef RECOMP_RESUMABLE
+    void persistent_timeout(u64 g, u32) override { poll(static_cast<u32>(g)); }
+#endif
     std::shared_ptr<Event> conn = make_event(ONESHOT, "ir conn");
     std::shared_ptr<Event> recv = make_event(ONESHOT, "ir recv");
     std::shared_ptr<Event> send = make_event(ONESHOT, "ir send");
@@ -637,7 +687,7 @@ struct Ir : Service {
         const u32 g = generation;
         add_timeout(now_ns() + period_ms * 1000000ull, [weak, g] {
             if (auto service = weak.lock()) static_cast<Ir *>(service.get())->poll(g);
-        });
+        } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
     }
     void poll(u32 g) {  // (kernel lock held)
         if (g != generation || !connected || !period_ms || !mapped()) return;
@@ -816,6 +866,7 @@ struct Uds : Service {
 };
 
 struct Generic : Service {
+    SERVICE_CHECKPOINT(Generic)
     using Service::Service;
     void handle(IPC &ipc) override { unimplemented(ipc); }
 };
@@ -823,6 +874,7 @@ struct Generic : Service {
 // ssl:C has no network behind it, but games take their random numbers from it: Pokemon Ultra Sun seeds its own generator with them at
 // every start and save. Unanswered, the buffer stayed as the game left it, and every start rolled the same.
 struct Ssl : Service {
+    SERVICE_CHECKPOINT(Ssl)
     using Service::Service;
     void handle(IPC &ipc) override {
         if (ipc.cmd() != 0x0011) return unimplemented(ipc);
@@ -846,6 +898,7 @@ struct Ssl : Service {
 // (as an unimplemented command returns) read as "yes" from what the last request left there: Luigi's Mansion: Dark Moon then started in
 // its Thrill Tower multiplayer, as a child looking for its host ("Connection error", "Waiting for player"), not at its title screen.
 struct DlpSrvr : Service {
+    SERVICE_CHECKPOINT(DlpSrvr)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
@@ -863,6 +916,7 @@ struct DlpSrvr : Service {
 // holds the DLC title's content infos (index, type, id, size, ownership; 0x18 bytes each), dlc_title.bin and update_title.bin a title info
 // each (title id, size, version, type), dlc_ticket.bin a ticket info. With none of them nothing is installed.
 struct Am : Service {
+    SERVICE_CHECKPOINT(Am)
     using Service::Service;
     static std::vector<u8> records(const char *name) {
         std::vector<u8> d;
@@ -1111,3 +1165,16 @@ std::shared_ptr<SharedMem> load_shared_font() {
 }
 
 }  // namespace kernel
+
+#ifdef RECOMP_RESUMABLE
+namespace kernel {
+u32 persistent_sharedmem_callback(const SharedMem &sm) {
+    return !sm.on_move ? 0 : sm.on_move == relocate_shared_font ? 1 : 0xffffffffu;
+}
+bool persistent_sharedmem_callback(SharedMem &sm, u32 kind) {
+    if (kind > 1) return false;
+    sm.on_move = kind ? relocate_shared_font : nullptr;
+    return true;
+}
+}
+#endif

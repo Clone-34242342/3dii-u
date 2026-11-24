@@ -49,6 +49,7 @@
 #include "wiiu.h"
 #include "physical_file.h"
 #include "shader_compile.h"
+#include "checkpoint.h"
 
 static const char *const CONTENT_DIR = "fs:/vol/content";
 void rt_log_sync();
@@ -297,8 +298,14 @@ static int gpu_thread(int, void *) {
         const u64 done = kernel::gx_stats.cmdlists + kernel::gx_stats.transfers;
         const bool timed = perf_trace || av_timing.load(std::memory_order_relaxed);
         const OSTime t0 = (kMeasure || timed) ? OSGetSystemTime() : 0;
-        kernel::gsp_process_gx();
-        if (!gpu_pause) wiiu::gfx_pump(waited && done == kernel::gx_stats.cmdlists + kernel::gx_stats.transfers);
+        {
+            checkpoint::Scope state_lock(checkpoint::gate());
+            kernel::gsp_process_gx();
+            if (!gpu_pause) wiiu::gfx_pump(waited && done == kernel::gx_stats.cmdlists + kernel::gx_stats.transfers);
+        }
+#ifdef RECOMP_RESUMABLE
+        checkpoint::pump(); // never upgrade a reader into an exclusive capture
+#endif
         if (kMeasure || timed) wiiu::gfx_note_busy((u32)OSTicksToMicroseconds(OSGetSystemTime() - t0));
         if (timed) report_gpu_timing(t0);
         if (cpu_summary && av_timing.load(std::memory_order_relaxed)) {
@@ -729,6 +736,7 @@ volatile bool wiiu::settings_due;
 static int card_thread(int, void *) {
     for (u32 pass = 1;; pass++) {
         OSSleepTicks(OSMillisecondsToTicks(200));
+        checkpoint::Scope state_lock(checkpoint::gate());
         wiiu::gfx_report_draw_trace();
         if (want_hang_dump) {
             const u32 seconds = want_hang_dump - 1;
@@ -783,8 +791,28 @@ static wiiu::PhysicalFile recovery_file;
 static std::atomic<u32> recovery_kind{0};
 static std::atomic<bool> recovery_report_done{false};
 static OSContext recovery_fault_context;
+// Capture the faulting thread's own stack while it is stopped, including
+// Aroma module stacks in mapped memory. Never follow an arbitrary address.
+static u32 recovery_stack_count, recovery_stack_frames[32][3];
+static u32 recovery_stack_low, recovery_stack_high;
+static void recovery_capture_stack(const OSContext *ctx) {
+    recovery_stack_count = 0;
+    const auto *thread = OSGetCurrentThread();
+    recovery_stack_low = (u32)thread->stackEnd;
+    recovery_stack_high = (u32)thread->stackStart;
+    u32 sp = ctx->gpr[1];
+    while (recovery_stack_count < 32 && !(sp & 3) &&
+           recovery_stack_high >= 8 && sp >= recovery_stack_low && sp <= recovery_stack_high - 8) {
+        const auto *frame = reinterpret_cast<const u32 *>(sp);
+        const u32 next = frame[0];
+        auto *out = recovery_stack_frames[recovery_stack_count++];
+        out[0] = sp; out[1] = next; out[2] = frame[1];
+        if (next <= sp) break;
+        sp = next;
+    }
+}
 alignas(64) static u8 recovery_bytes[8192];
-static_assert(320 + 5 * sizeof(OSContext) <= sizeof recovery_bytes);
+static_assert(320 + 5 * sizeof(OSContext) + 16 + sizeof recovery_stack_frames <= sizeof recovery_bytes);
 static char recovery_path[192];
 static bool recovery_file_open;
 
@@ -800,7 +828,7 @@ static void recovery_write_report(u32 kind) {
     memset(recovery_bytes, 0, sizeof recovery_bytes);
     memcpy(recovery_bytes, "3DSAFE1", 7);
     auto *words = (u32 *)recovery_bytes;
-    words[2] = 1; words[3] = kind;
+    words[2] = 2; words[3] = kind;
     words[4] = (u32)(g_game.program_id >> 32); words[5] = (u32)g_game.program_id;
     const u64 time = OSGetSystemTime(), frame = g_frame, lists = kernel::gx_stats.cmdlists;
     words[6] = (u32)(time >> 32); words[7] = (u32)time;
@@ -822,7 +850,15 @@ static void recovery_write_report(u32 kind) {
         contexts++;
     }
     words[12] = contexts;
-    const unsigned size = 320 + contexts * sizeof(OSContext);
+    unsigned size = 320 + contexts * sizeof(OSContext);
+    if (kind == 3) {
+        auto *stack = reinterpret_cast<u32 *>(recovery_bytes + size);
+        stack[0] = 0x53544B31; // STK1: bounded native stack records
+        stack[1] = recovery_stack_count;
+        stack[2] = recovery_stack_low; stack[3] = recovery_stack_high;
+        memcpy(stack + 4, recovery_stack_frames, recovery_stack_count * sizeof recovery_stack_frames[0]);
+        size += 16 + recovery_stack_count * sizeof recovery_stack_frames[0];
+    }
     words[73] = size;
     const bool saved = recovery_file_open && recovery_file.write(recovery_bytes, size) && recovery_file.flush();
     recovery_file.close();
@@ -1028,6 +1064,7 @@ static BOOL on_exception(OSContext *ctx, const char *what) {
     // the watchdog thread logs it: the exception's own stack is small, and this thread may hold the log's lock
     memcpy(crash_msg, msg, sizeof crash_msg);
     memcpy(&recovery_fault_context, ctx, sizeof(OSContext));
+    recovery_capture_stack(ctx);
     recovery_kind.store(3, std::memory_order_release);
     OSReport("[3dii-u crash] %s", msg);
     for (const OSTime until = OSGetSystemTime() + OSMillisecondsToTicks(1500);
@@ -1094,6 +1131,16 @@ int main(int argc, char **argv) {
     stage("loading game content");
     load_game(CONTENT_DIR);
     stage("game loaded");
+#ifdef RECOMP_RESUMABLE
+    checkpoint::initialize_persistent();
+#endif
+#ifdef RECOMP_RESUMABLE
+    if (FILE *state_check = fopen("fs:/vol/content/state-heap-check", "rb")) {
+        fclose(state_check);
+        checkpoint::set_heap_checks(true);
+        OSReport("[state-heap] phased mapped-heap validation enabled\n");
+    }
+#endif
     recovery_prepare();
     spawn(recovery_thread, -1, 12, 128 << 10, "safety guard");
     std::filesystem::create_directories(kernel::save_root(), no_save);

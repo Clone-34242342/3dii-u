@@ -125,7 +125,13 @@ void save_lock() { g_save_mx.lock(); }
 void save_unlock() { g_save_mx.unlock(); }
 namespace kernel {
 // A change to the game's own save (savedata/, extdata/): cloud saves upload it a little later
+#ifdef RECOMP_RESUMABLE
+static u64 checkpoint_write_epoch;
+#endif
 static void save_changed(const std::string &path) {
+#ifdef RECOMP_RESUMABLE
+    ++checkpoint_write_epoch;
+#endif
     SAVE_DIRTY();
     static const std::string root = save_root() + "/";
     if (path.compare(0, root.size(), root)) return;
@@ -198,6 +204,9 @@ static std::string sanitize(const std::string &s) {
 
 // ---- archives
 struct Archive {
+#ifdef RECOMP_RESUMABLE
+    void state_fields(checkpoint::Archive &a) { a.fields(id, host, romfs, dlc); }
+#endif
     u32 id;
     std::string host;  // host folder for directory-backed archives, or the RomFS image of a system archive
     bool romfs = false;
@@ -499,6 +508,7 @@ static std::string archive_dir(u32 id, const LowPath &p) {
 // ---- file and directory sessions
 struct FileSession : Service {
     int fd = -1;
+    int open_flags = O_RDONLY;
     bool romfs = false, written = false;
     bool extdata = false;
     bool gamedata = false;  // read-only game data in a file of its own (an update's RomFS, DLC, system archives, ExeFS files): the RomFS's lock, never behind a save write-out
@@ -508,6 +518,85 @@ struct FileSession : Service {
     std::shared_ptr<wiiu::SaveFile> held;  // a save file of the game's, in memory: no storage behind its reads and writes
 #endif
     FileSession() : Service("fs file") {}
+#ifdef RECOMP_RESUMABLE
+    bool persistent_supported() const override { return true; }
+    bool capture(checkpoint::Image &im) override {
+        if (im.archive) return persist(im);
+        im.take(open_flags); im.take(fd); im.take(romfs); im.take(written); im.take(extdata); im.take(gamedata);
+        im.take(base); im.take(size); im.take(path);
+#ifdef __WIIU__
+        im.take(held);
+#endif
+        return true;
+    }
+    bool persist(checkpoint::Image &im) {
+        auto &a = *im.archive;
+        bool saved_romfs = romfs, saved_written = written, saved_extdata = extdata, saved_gamedata = gamedata;
+        u64 saved_base = base, saved_size = size, length = 0, fingerprint = 0;
+        int flags = open_flags;
+        std::string saved_path = path;
+        a.fields(saved_romfs, saved_written, saved_extdata, saved_gamedata, saved_base, saved_size, flags, saved_path);
+        if (!a.ok) return false;
+        if (!a.reading && !saved_romfs) {
+            if (saved_path.empty()) { a.fail("open file has no reopenable path"); return false; }
+            if (!file_fingerprint(length, fingerprint)) { a.fail("could not fingerprint open file"); return false; }
+        }
+        a.fields(length, fingerprint);
+        if (a.reading && a.ok) {
+            // This instance was freshly constructed by PersistentGraph; no live
+            // service is mutated until the staged image is committed.
+            romfs = saved_romfs; extdata = saved_extdata; gamedata = saved_gamedata;
+            base = saved_base; size = saved_size; path = saved_path; open_flags = flags & O_RDWR;
+            if (!romfs) {
+                const auto normalized = fsys::path(path).lexically_normal().generic_string();
+                auto inside = [&](const std::string &root) { return !root.empty() && normalized.rfind(root + "/", 0) == 0; };
+                if (path.find('\0') != std::string::npos || normalized != path || (!inside(g_game.dir) && !inside(g_save_base))) {
+                    a.fail("saved file path is outside title storage"); return false;
+                }
+                fd = open(path.c_str(), open_flags); // never create/truncate a permanent save
+                if (fd < 0) { a.fail("saved file cannot be reopened"); return false; }
+#ifdef __WIIU__
+                if (!path.compare(0,g_save_base.size(),g_save_base)) {
+                    held = wiiu::save_file_open(path,fd);
+                    if (held) { close(fd); fd=-1; }
+                }
+#endif
+                u64 actual_length=0, actual_fingerprint=0;
+                if (!file_fingerprint(actual_length,actual_fingerprint) || actual_length!=length || actual_fingerprint!=fingerprint) {
+                    a.fail("permanent file changed since this state was saved"); return false;
+                }
+            }
+        }
+        // Retain the normal session callbacks too, so subsequent loads of this
+        // newly reconstructed state can use the in-memory path.
+        auto *stream = im.archive; im.archive = nullptr;
+        const bool result = capture(im); im.archive = stream;
+        if (a.reading) im.restore.push_back([this, saved_written] { written = saved_written; });
+        return result && a.ok;
+    }
+    bool file_fingerprint(u64 &length, u64 &fingerprint) {
+        length = file_size();
+        // Immutable game files can be large; their executable/build identity
+        // is checked globally, with a per-file size check here.
+        if (gamedata) { fingerprint = 0; return true; }
+        if (length > (16u << 20)) return false;
+        fingerprint = 14695981039346656037ull;
+        u8 buffer[4096];
+        for (u64 at=0; at<length;) {
+            const u32 count = std::min<u64>(sizeof buffer,length-at);
+            long got;
+#ifdef __WIIU__
+            if (held) got = wiiu::save_file_read(*held,buffer,count,at);
+            else
+#endif
+            got = pread(fd,buffer,count,at);
+            if (got != (long)count) return false;
+            for (u32 i=0;i<count;++i) fingerprint = (fingerprint ^ buffer[i]) * 1099511628211ull;
+            at += count;
+        }
+        return true;
+    }
+#endif
     ~FileSession() override {
 #ifdef __WIIU__
         if (held) {
@@ -672,6 +761,7 @@ struct FileSession : Service {
 };
 
 struct DirSession : Service {
+    SERVICE_CHECKPOINT(DirSession, entries, pos)
     std::vector<fsys::directory_entry> entries;
     size_t pos = 0;
     DirSession() : Service("fs dir") {}
@@ -829,6 +919,7 @@ int mii_maker_place(u32 n) {
 
 // ---- fs:USER
 struct FsUser : Service {
+    SERVICE_CHECKPOINT(FsUser)
     using Service::Service;
 
     u32 open_archive(u32 id, const LowPath &p, u64 *out) {
@@ -883,6 +974,7 @@ struct FsUser : Service {
                 snprintf(nm, sizeof nm, "%08x.romfs", p.data.size() >= 8 ? p.word(1) : 0);
                 host += nm;
             }
+            fs->path = host;
             fs->fd = open(host.c_str(), O_RDONLY);
             if (fs->fd < 0) return ERR_NOT_FOUND;
             fs->gamedata = true;
@@ -901,14 +993,16 @@ struct FsUser : Service {
                 if (!name.empty() && name[0] == '.') name = name.substr(1);
                 fs->romfs = false;
                 fs->gamedata = true;
-                fs->fd = open((g_game.dir + EXEFS_PREFIX + name + ".bin").c_str(), O_RDONLY);
+                fs->path = g_game.dir + EXEFS_PREFIX + name + ".bin";
+                fs->fd = open(fs->path.c_str(), O_RDONLY);
                 VLOG("[fs] SelfNCCH ExeFS %s -> %s\n", nm, fs->fd >= 0 ? "ok" : "missing");
                 if (fs->fd < 0) return ERR_NOT_FOUND;
             } else if (p.data.size() >= 4 && p.word(0) == 5) {
                 // an update's own RomFS (builder/dumps.py), which the game lays over its base RomFS itself
                 fs->romfs = false;
                 fs->gamedata = true;
-                fs->fd = open((g_game.dir + "/update_romfs.bin").c_str(), O_RDONLY);
+                fs->path = g_game.dir + "/update_romfs.bin";
+                fs->fd = open(fs->path.c_str(), O_RDONLY);
                 VLOG("[fs] SelfNCCH update RomFS -> %s\n", fs->fd >= 0 ? "ok" : "missing");
                 if (fs->fd < 0) return ERR_NOT_FOUND;
             } else if (p.data.size() >= 4 && p.word(0) != 0) {
@@ -921,6 +1015,7 @@ struct FsUser : Service {
             int oflags = (flags & 2) ? O_RDWR : O_RDONLY;
             if (flags & 4) oflags |= O_CREAT;
             if (fsys::is_directory(path)) return fs_err(250, 7, 28);
+            fs->open_flags = oflags & O_RDWR;
             fs->fd = open(path.c_str(), oflags, 0644);
             if (fs->fd < 0) {
                 VLOG("[fs] open %s failed\n", path.c_str());
@@ -1197,4 +1292,27 @@ struct FsUser : Service {
 
 void register_fs() { register_service(std::make_shared<FsUser>("fs:USER")); }
 
+
+#ifdef RECOMP_RESUMABLE
+void checkpoint_fs(checkpoint::Image &im) {
+    im.take(archives); im.take(next_archive);
+    const auto epoch = checkpoint_write_epoch;
+    im.validate.push_back([epoch] {
+        if (checkpoint_write_epoch == epoch) return true;
+        LOG("[state] validation failed: permanent-save epoch %llu -> %llu\n", (unsigned long long)epoch, (unsigned long long)checkpoint_write_epoch);
+        return false;
+    });
+}
+#endif
+
 }  // namespace kernel
+
+#ifdef RECOMP_RESUMABLE
+namespace kernel {
+std::shared_ptr<Service> persistent_file_service(const std::string &name) {
+    if (name == "fs file") return std::make_shared<FileSession>();
+    if (name == "fs dir") return std::make_shared<DirSession>();
+    return nullptr;
+}
+}
+#endif

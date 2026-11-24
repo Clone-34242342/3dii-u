@@ -163,6 +163,7 @@ static void no_gpu_timeout() {
 
 void gsp_frame_boundary();
 void gsp_vblank() {
+    checkpoint::Scope state_lock(checkpoint::gate());
     gsp_frame_boundary();
     Lock lk(kmutex);
     no_gpu_timeout();
@@ -317,7 +318,7 @@ void gsp_process_gx() {
         if ((c[0] & 0xFF) == 0x04) {
             // Texture copies complete late: Super Mario 3D Land hangs after the title screen otherwise
             // (the same workaround as Citra's delay_texture_copy_completion).
-            add_timeout(now_ns() + 1000000, [] { signal_irq(PPF); });
+            add_timeout(now_ns() + 1000000, [] { signal_irq(PPF); } STATE_TIMEOUT(TimeoutKind::GspIrq, nullptr, nullptr, 0, PPF));
             irqs.clear();
         }
         for (Irq i : irqs) signal_irq(i);
@@ -332,6 +333,7 @@ void gsp_process_gx() {
 void frontend_wake();
 
 struct GspGpu : Service {
+    SERVICE_CHECKPOINT(GspGpu)
     using Service::Service;
     // GSP's register offsets count from 0x1EB00000: the LCDs' framebuffer registers are at 0x400400 (top screen) and 0x400500 (bottom)
     void write_hw_regs(u32 reg, u32 size, u32 src) {
@@ -477,5 +479,20 @@ struct GspGpu : Service {
 void register_gsp() {
     register_service(std::make_shared<GspGpu>("gsp::Gpu"));
 }
+
+
+#ifdef RECOMP_RESUMABLE
+void persistent_gsp_irq(u32 id) { signal_irq(static_cast<Irq>(id)); }
+void checkpoint_gsp(checkpoint::Image &im) {
+    im.take(gsp.shm); im.take(gsp.rights_thread); im.take(gsp.next_thread);
+    for (auto &event : gsp.irq_event) im.take(event);
+    im.memory(gsp.registered, sizeof gsp.registered);
+    im.memory(gsp.fb, sizeof gsp.fb); im.memory(gsp.lcd, sizeof gsp.lcd);
+    im.take(gsp.queue); im.take(gsp.busy);
+    im.memory(swap_count, sizeof swap_count); im.memory(swap_requests, sizeof swap_requests);
+    im.take(vblank_count); im.take(swapped);
+    if (!im.archive) capture_object(im, gsp.shm);
+}
+#endif
 
 }  // namespace kernel

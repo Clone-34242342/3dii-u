@@ -10,6 +10,7 @@
 #endif
 
 #include "gpu/pica.h"
+#include "checkpoint.h"
 
 namespace gpu {
 
@@ -801,3 +802,20 @@ void flush() {
 }
 
 }  // namespace gpu
+
+#ifdef RECOMP_RESUMABLE
+namespace gpu { bool gx2_checkpoint(checkpoint::Image &im); }
+bool checkpoint::gpu_capture(Image &im) {
+    using namespace gpu;
+    ensure_init(); raster_flush();
+    state_fields([&](void *p, size_t n) { im.memory(p, n); });
+    if (!gx2_checkpoint(im)) return false;
+    im.restore.push_back([] {
+        g.vs.dirty = g.gs.dirty = true;
+        g.vs.prog = g.gs.prog = nullptr;
+        g.light_lut_dirty = g.fog_lut_dirty = g.pt_dirty = true;
+        ++g.regs_version; g.ds_version = 0;
+    });
+    return true;
+}
+#endif

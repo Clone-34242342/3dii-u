@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "../audio_iface.h"
+#include "../checkpoint.h"
 #include "dsp_hle.h"
 #include "host.h"
 
@@ -196,6 +197,9 @@ StereoFrame generate_frame(Dsp &d, bool seen) {
 
 namespace audio {
 using namespace hle;
+#ifdef RECOMP_RESUMABLE
+static u64 checkpoint_codec_epoch;
+#endif
 
 // Builds without a decoder give silence, so that choosing those tracks can't leave the game waiting: port/aac/aac_ffmpeg.cpp has the real ones.
 extern "C" __attribute__((weak, noinline)) void aac_host_reset() {}
@@ -250,6 +254,9 @@ static void aac_request(Dsp &d, const u8 *data) {
 }
 
 void pipe_write(u32 pipe, const u8 *data, u32 size) {
+#ifdef RECOMP_RESUMABLE
+    if (pipe == 3) ++checkpoint_codec_epoch;
+#endif
     Dsp &d = dsp();
     std::lock_guard lk(d.lock);
     if (pipe == 3 && size == 32) {
@@ -338,5 +345,23 @@ void report_dsp_timing() {
     for (unsigned i = 0; i < d.sources.size(); ++i) d.sources[i].report_timing(i);
     d.timed_frames = d.reused = d.unseen = d.max_stale = 0;
 }
+
+
+#ifdef RECOMP_RESUMABLE
+void checkpoint_audio(checkpoint::Image &im) {
+    const auto epoch = checkpoint_codec_epoch;
+    im.validate.push_back([epoch] {
+        if (checkpoint_codec_epoch == epoch) return true;
+        LOG("[state] validation failed: native-codec epoch %llu -> %llu\n", (unsigned long long)epoch, (unsigned long long)checkpoint_codec_epoch);
+        return false;
+    });
+    Dsp &d = dsp();
+    std::lock_guard lock(d.lock);
+    im.take(d.power); for (auto &pipe : d.pipes) im.take(pipe);
+    im.take(d.sources); im.take(d.mixer); im.take(d.backup_ram);
+    im.take(d.backup_sources); im.take(d.backup_mixer);
+    im.take(d.frames); im.take(d.last_counter); im.take(d.fresh);
+}
+#endif
 
 }  // namespace audio

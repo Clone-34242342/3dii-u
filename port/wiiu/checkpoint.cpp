@@ -1,0 +1,275 @@
+#include "checkpoint.h"
+#ifdef RECOMP_RESUMABLE
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <coreinit/debug.h>
+#include <gx2/event.h>
+#ifdef __WIIU__
+#include <coreinit/memexpheap.h>
+#endif
+#include "kernel.h"
+#include "loader.h"
+
+namespace wiiu { const std::string &data_dir(); void save_flush(bool); }
+
+namespace kernel {
+void checkpoint_services(checkpoint::Image &);
+void checkpoint_hid(checkpoint::Image &);
+void checkpoint_dsp(checkpoint::Image &);
+void checkpoint_gsp(checkpoint::Image &);
+void checkpoint_fs(checkpoint::Image &);
+bool checkpoint_apt(checkpoint::Image &);
+}
+namespace audio { void checkpoint_audio(checkpoint::Image &); void pause(bool); void checkpoint_clear_output(); }
+namespace mem { void checkpoint_allocator(checkpoint::Image &); }
+extern "C" {
+volatile u32 g_3dii_state_command;
+volatile u32 g_3dii_state_status;
+volatile u32 g_3dii_state_bytes;
+}
+namespace checkpoint {
+static std::unique_ptr<Image> slot;
+static std::atomic<bool> slot_available{false};
+Gate &gate() { static auto *value = new Gate; return *value; }
+void Gate::lock() {
+    for (;;) {
+        while (paused.load(std::memory_order_acquire)) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        readers.fetch_add(1, std::memory_order_seq_cst);
+        if (!paused.load(std::memory_order_seq_cst)) return;
+        readers.fetch_sub(1, std::memory_order_release);
+    }
+}
+void Gate::unlock() { readers.fetch_sub(1, std::memory_order_release); }
+void Gate::freeze() {
+    writer.lock();
+    paused.store(true, std::memory_order_seq_cst);
+    rt_checkpoint_requested = 1;
+    while (readers.load(std::memory_order_seq_cst)) std::this_thread::sleep_for(std::chrono::microseconds(100));
+}
+void Gate::thaw() {
+    rt_checkpoint_requested = 0;
+    paused.store(false, std::memory_order_release);
+    writer.unlock();
+}
+
+bool services_capture(Image &im) {
+    kernel::checkpoint_services(im);
+    kernel::checkpoint_hid(im); kernel::checkpoint_dsp(im);
+    kernel::checkpoint_gsp(im); kernel::checkpoint_fs(im);
+    mem::checkpoint_allocator(im);
+    return kernel::checkpoint_apt(im);
+}
+void audio_capture(Image &im) { audio::checkpoint_audio(im); }
+static bool heap_checks_enabled;
+void set_heap_checks(bool enabled) { heap_checks_enabled = enabled; }
+static bool check_shared_heap(const char *phase) {
+    if (!heap_checks_enabled) return true;
+#ifdef __WIIU__
+    auto *heap = reinterpret_cast<MEMExpHeap *>(0x80000000u);
+    if (heap->header.tag != MEM_EXPANDED_HEAP_TAG) {
+        OSReport("[state-heap] %s: mapped root unavailable\n", phase);
+        return true;
+    }
+    // Aroma's MEMCheckExpHeap hook takes the same external mutex as every
+    // mapped-root allocation/free. No racing manual walk of allocator links.
+    OSReport("[state-heap] checking %s\n", phase);
+    const bool ok = MEMCheckExpHeap(&heap->header, MEM_EXP_HEAP_CHECK_FLAGS_LOG_ERRORS);
+    OSReport("[state-heap] %s: %s\n", phase, ok ? "OK" : "DAMAGED");
+    return ok;
+#else
+    (void)phase; return true;
+#endif
+}
+static std::atomic<bool> disk_available{false};
+static u64 initial_code_hash;
+extern "C" const char g_build_stamp[] __attribute__((weak));
+static u64 state_hash(const void *data, size_t size, u64 hash = 14695981039346656037ull) {
+    const auto *p = static_cast<const u8 *>(data);
+    for (size_t i=0;i<size;++i) hash = (hash ^ p[i]) * 1099511628211ull;
+    return hash;
+}
+static std::string state_path() {
+#ifdef __WIIU__
+    char name[64]; snprintf(name,sizeof name,"/checkpoint-%016llx.bin",(unsigned long long)g_game.program_id);
+    return wiiu::data_dir()+name;
+#else
+    return g_save_base+"/checkpoint.bin";
+#endif
+}
+struct DiskHeader {
+    char magic[8];
+    u32 version, endian;
+    u64 title, build, code, size, checksum;
+};
+static DiskHeader state_header() {
+    DiskHeader h{}; memcpy(h.magic,"3DSTATE",7);h.version=1;h.endian=0x12345678;
+    h.title=g_game.program_id;h.code=initial_code_hash;
+    const char *build=g_build_stamp ? g_build_stamp : "host fixture";
+    h.build=state_hash(build,strlen(build));
+    return h;
+}
+void initialize_persistent() {
+    initial_code_hash=state_hash(gptr(g_game.text_addr),g_game.text_size);
+    initial_code_hash=state_hash(gptr(g_game.ro_addr),g_game.ro_size,initial_code_hash);
+    initial_code_hash=state_hash(gptr(g_game.data_addr),g_game.data_size,initial_code_hash);
+    FILE *f=fopen(state_path().c_str(),"rb");
+    disk_available.store(f!=nullptr,std::memory_order_release);
+    if(f)fclose(f);
+}
+static bool persistent_capture(Image &im) {
+    auto phase = [&](const char *name, bool ok) {
+        if (!ok || !im.ok || !im.archive->ok) {
+            LOG("[state-file] %s failed at payload byte %llu: %s\n", name, (unsigned long long)im.archive->bytes,
+                im.archive->error ? im.archive->error : "capture rejected");
+            return false;
+        }
+        return true;
+    };
+    if (!phase("kernel",kernel_persist(im))) return false;
+    if (!phase("services",services_capture(im))) return false;
+    audio_capture(im);if (!phase("audio",im.ok)) return false;
+    return phase("GPU",gpu_capture(im));
+}
+static void detach_archive(Image &im) {
+    im.archive_graph.reset(); // adapters refer to the stack-owned stream
+    im.archive=nullptr;
+}
+static std::unique_ptr<Image> save_persistent() {
+#ifdef __WIIU__
+    wiiu::save_flush(true); // durable game files must match the fingerprints in the state
+#endif
+    const std::string path=state_path(), temporary=path+".new", backup=path+".bak";
+    FILE *f=fopen(temporary.c_str(),"wb");
+    if(!f){LOG("[state-file] cannot open temporary state file\n");return {};}
+    auto h=state_header();
+    bool ok=fwrite(&h,1,sizeof h,f)==sizeof h;
+    auto im=std::make_unique<Image>();
+    Archive stream(f,false);im->archive=&stream;
+    if(ok)ok=persistent_capture(*im);
+    detach_archive(*im);
+    if(ok){h.size=stream.bytes;h.checksum=stream.hash;ok=!fseek(f,0,SEEK_SET)&&fwrite(&h,1,sizeof h,f)==sizeof h&&!fflush(f);}
+    if(fclose(f))ok=false;
+    if(!ok){LOG("[state-file] save refused: %s\n",stream.error ? stream.error : "capture or file I/O failed");remove(temporary.c_str());return {};}
+    remove(backup.c_str());
+    const bool backed=rename(path.c_str(),backup.c_str())==0;
+    if(rename(temporary.c_str(),path.c_str())){
+        if(backed)rename(backup.c_str(),path.c_str());
+        LOG("[state-file] could not publish complete state\n");return {};
+    }
+    disk_available.store(true,std::memory_order_release);
+    LOG("[state-file] SAVED %llu bytes to %s; RAM checkpoint retained\n",(unsigned long long)h.size,path.c_str());
+    return im;
+}
+static std::unique_ptr<Image> load_persistent() {
+    FILE *f=fopen(state_path().c_str(),"rb");
+    if(!f){LOG("[state-file] no persistent state\n");return {};}
+    DiskHeader h{}, expected=state_header();
+    bool ok=fread(&h,1,sizeof h,f)==sizeof h && !memcmp(h.magic,expected.magic,8) && h.version==expected.version && h.endian==expected.endian &&
+            h.title==expected.title && h.build==expected.build && h.code==expected.code && h.size<=Archive::limit;
+    if(!ok){LOG("[state-file] incompatible/truncated header; game unchanged\n");fclose(f);return {};}
+    u8 buffer[4096];u64 left=h.size, hash=14695981039346656037ull;
+    while(ok&&left){size_t count=std::min<u64>(sizeof buffer,left);ok=fread(buffer,1,count,f)==count;if(ok)hash=state_hash(buffer,count,hash);left-=count;}
+    ok=ok&&hash==h.checksum&&fgetc(f)==EOF&&!ferror(f);
+    if(!ok||fseek(f,sizeof h,SEEK_SET)){LOG("[state-file] checksum/length check failed; game unchanged\n");fclose(f);return {};}
+    auto im=std::make_unique<Image>();Archive stream(f,true);im->archive=&stream;
+    ok=persistent_capture(*im)&&stream.bytes==h.size&&stream.hash==h.checksum;
+    detach_archive(*im);fclose(f);
+    if(!ok){LOG("[state-file] load refused before commit: %s\n",stream.error ? stream.error : "state reconstruction failed");return {};}
+    for(auto &validate:im->validate)if(!validate()){LOG("[state-file] validation failed before commit\n");return {};}
+    LOG("[state-file] REBUILT persistent checkpoint: %u bytes of RAM/resources\n",(u32)im->bytes);
+    return im;
+}
+
+bool has_state() { return slot_available.load(std::memory_order_acquire) || disk_available.load(std::memory_order_acquire); }
+const char *result_message() {
+    switch (g_3dii_state_status) {
+    case 1: return "SESSION STATE SAVED";
+    case 2: return "SESSION STATE LOADED";
+    case 4: return "STATE SAVED TO FILE AND RAM";
+    case 5: return "STATE LOADED FROM FILE";
+    case 0x80000006: return "STATE FILE FAILED: SEE DIAGNOSTIC LOG";
+    case 0x80000002: return "SAVE FAILED: UNSUPPORTED SERVICE OR APPLET";
+    case 0x80000003: return "LOAD REFUSED: EMPTY SLOT OR CHANGED SAVE/RESOURCES";
+    case 0x80000005: return "STATE OPERATION REFUSED: SHARED HEAP DAMAGED";
+    case 0x80000004: return "SAVE FAILED: NOT ENOUGH SNAPSHOT MEMORY";
+    default: return nullptr;
+    }
+}
+void request(unsigned command) { __atomic_store_n(&g_3dii_state_command, command, __ATOMIC_RELEASE); }
+void pump() {
+    const unsigned command = __atomic_exchange_n(&g_3dii_state_command, 0, __ATOMIC_ACQ_REL);
+    if (!command) return;
+    ExclusiveScope lock(gate());
+    if (command == 3) { slot.reset(); slot_available.store(false, std::memory_order_release); g_3dii_state_status = 0; g_3dii_state_bytes = 0; return; }
+    if (!check_shared_heap("before checkpoint operation")) {
+        g_3dii_state_status = 0x80000005;
+        OSReport("[state] operation refused: shared mapped heap was already damaged\n");
+        return;
+    }
+    audio::pause(true);
+    GX2DrawDone();
+    if (command == 4) {
+        slot.reset();slot_available.store(false,std::memory_order_release);g_3dii_state_bytes=0;
+        slot=save_persistent();
+        slot_available.store(bool(slot),std::memory_order_release);
+        g_3dii_state_status=slot ? 4 : 0x80000006;
+        if(slot)g_3dii_state_bytes=slot->bytes;
+    } else if (command == 1) {
+        // One physical RAM slot. Keeping the old 153 MiB image while building
+        // its replacement exhausted the console on the second save.
+        slot.reset();
+        slot_available.store(false, std::memory_order_release);
+        g_3dii_state_bytes = 0;
+        auto candidate = std::make_unique<Image>();
+        bool captured = gpu_capture(*candidate);
+        candidate->boundaries.emplace_back(candidate->restore.size(), "after GPU restore");
+        if (captured) captured = kernel_capture(*candidate);
+        candidate->boundaries.emplace_back(candidate->restore.size(), "after kernel and guest RAM restore");
+        if (captured) captured = services_capture(*candidate);
+        candidate->boundaries.emplace_back(candidate->restore.size(), "after services restore");
+        if (captured) audio_capture(*candidate);
+        candidate->boundaries.emplace_back(candidate->restore.size(), "after DSP restore");
+        if (captured && candidate->ok) {
+            g_3dii_state_bytes = candidate->bytes;
+            slot = std::move(candidate);
+            slot_available.store(true, std::memory_order_release);
+            g_3dii_state_status = 1;
+            OSReport("[state] SAVED session checkpoint: %u bytes, %u restore records; live %u, peak %u bytes\n", g_3dii_state_bytes, (u32)slot->restore.size(), (u32)Image::Bytes::live.load(), (u32)Image::Bytes::peak.load());
+        } else {
+            g_3dii_state_status = candidate->ok ? 0x80000002 : 0x80000004;
+            OSReport("[state] save rejected: %s; slot empty, game continues\n", candidate->ok ? "unsupported kernel/service or active applet" : "checkpoint memory budget/allocation exhausted");
+        }
+    } else if (command == 2 || command == 5) {
+        bool from_file=false;
+        if (!slot || command==5) {
+            slot.reset();slot_available.store(false,std::memory_order_release);g_3dii_state_bytes=0;
+            slot=load_persistent();from_file=bool(slot);
+            slot_available.store(bool(slot),std::memory_order_release);
+            if(slot)g_3dii_state_bytes=slot->bytes;
+        }
+        bool valid = bool(slot);
+        if (slot) for (auto &validate : slot->validate) if (!validate()) valid = false;
+        if (!valid) {
+            g_3dii_state_status = 0x80000003;
+            OSReport("[state] load rejected before modifying state: no slot, resource changed, unsupported service used, or permanent save changed\n");
+        } else {
+            size_t restored = 0, boundary = 0;
+            for (auto &restore : slot->restore) {
+                restore(); ++restored;
+                while (boundary < slot->boundaries.size() && slot->boundaries[boundary].first == restored) {
+                    if (!check_shared_heap(slot->boundaries[boundary].second))
+                        FATAL("checkpoint restore damaged shared heap at %s\n", slot->boundaries[boundary].second);
+                    ++boundary;
+                }
+            }
+            audio::checkpoint_clear_output();
+            g_3dii_state_status = from_file ? 5 : 2;
+            OSReport("[state] LOADED session checkpoint: %u bytes\n", g_3dii_state_bytes);
+        }
+    }
+    check_shared_heap("after checkpoint operation");
+    audio::pause(false);
+}
+}
+#endif

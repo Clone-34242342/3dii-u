@@ -20,6 +20,9 @@ namespace kernel {
 namespace {
 
 struct Dma {
+#ifdef RECOMP_RESUMABLE
+    void state_fields(checkpoint::Archive &a) { a.fields(addr, size, unit, gap); }
+#endif
     u32 addr = 0, size = 0, unit = 0, gap = 0;
 };
 
@@ -85,6 +88,7 @@ constexpr s16 kStandard[4][8] = {
 };
 
 struct Y2rService : Service {
+    SERVICE_CHECKPOINT(Y2rService, done, input_format, output_format, rotation, block, spatial, temporal, interrupt, width, lines, alpha, standard, co, dither, y, u, v, yuyv, out, warned_rotation, busy)
     using Service::Service;
     std::shared_ptr<Event> done = make_event(ONESHOT, "y2r");
     u32 input_format = 0, output_format = 0, rotation = 0, block = 0, spatial = 0, temporal = 0, interrupt = 0;

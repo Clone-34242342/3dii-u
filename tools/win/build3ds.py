@@ -312,6 +312,10 @@ class Game:
             with open(self.dir + '/code.bin', 'rb') as code:
                 safe |= hashlib.sha256(code.read()).hexdigest() == safe_code_hashes[self.name]
         self.gen, self.mode, self.opt = ('gen_safe', 'safe', ['-O1']) if safe else ('gen_abi', 'abi', [])
+        # This testing build enables session checkpoints for every title.
+        # Keep a conventional-compiler escape hatch for compatibility testing.
+        if os.environ.get('THREEDII_SESSION_STATES', '1') != '0':
+            self.gen, self.mode, self.opt = 'gen_resumable', 'resumable', ['-O1']
         self.gen_dir = f'{self.dir}/{self.gen}'
         self.safe_ranges = []  # with mode 'abi': address ranges generated the safe way (mixed)
         self.verified_entries = ()
@@ -384,7 +388,11 @@ def game_env(g):
 
 def do_gen(g, args, gen_dir=None, abi=None):
     argv = [sys.executable, ROOT + '/tools/win/gen_lf.py', g.dir, gen_dir or g.gen_dir, '--extra', functions_list(g)]
-    if g.mode == 'abi' if abi is None else abi:
+    if g.mode == 'resumable':
+        if abi:
+            raise ValueError('resumable code cannot be generated with ABI mode')
+        argv.append('--resumable')
+    elif g.mode == 'abi' if abi is None else abi:
         argv.append('--abi')
         argv += [f'--safe-range={lo:x}-{hi:x}' for lo, hi in getattr(g, 'safe_ranges', [])]
     r = run(argv, cwd=ROOT + '/third_party/3dsrecomp', env=game_env(g), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
@@ -426,6 +434,7 @@ def obj_name(src):
 def build_runtime(g, args):
     """the runtime every game links: one build of it serves them all"""
     obj_dir = f'{WORK}/rt_measure' if MEASURE else f'{WORK}/rt_std'
+    if g.mode == 'resumable': obj_dir += '_resumable'
     os.makedirs(obj_dir, exist_ok=True)
     skip = {'frontend.cpp', 'main.cpp', 'host_sdl.cpp', 'watch.cpp', 'profile.cpp'}  # shadergen.cpp runs on the console too, for shader_compile.cpp
     sources = []
@@ -433,6 +442,7 @@ def build_runtime(g, args):
         sources += [s.replace('\\', '/') for s in sorted(glob.glob(pat)) if os.path.basename(s) not in skip]
     items = []
     extra = shlex.split(args.extra_flags or '')
+    if g.mode == 'resumable' and '-DRECOMP_RESUMABLE' not in extra: extra.append('-DRECOMP_RESUMABLE')
     only = set((args.only or '').replace(' ', '').split(',')) - {''}
     for s in sources:
         base = os.path.basename(s)

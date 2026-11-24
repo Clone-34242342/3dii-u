@@ -115,6 +115,7 @@ static void fill_block(u32 id, u32 dst, u32 size) {
 }
 
 struct Cfg : Service {
+    SERVICE_CHECKPOINT(Cfg)
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {

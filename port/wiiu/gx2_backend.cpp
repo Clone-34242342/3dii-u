@@ -50,6 +50,7 @@
 #include "latte_program.h"
 #include "gfd_index.h"
 #include "memory_fills.h"
+#include "checkpoint.h"
 #include "loader.h"
 #include "present_rule.h"
 #include "screen_layouts.h"
@@ -681,7 +682,14 @@ GX2AttribStream float4_stream(u32 location, u32 buffer, u32 offset, bool instanc
 }
 
 // ---------------------------------------------------------------- surfaces
+#ifdef RECOMP_RESUMABLE
+static u64 checkpoint_surface_identity;
+#endif
 struct Surface {
+#ifdef RECOMP_RESUMABLE
+    u64 checkpoint_identity = ++checkpoint_surface_identity;
+    u32 checkpoint_pins = 0;
+#endif
     u32 addr = 0, w = 0, h = 0, fmt = 0;
     bool depth = false, mem1 = false;
     float sx = 1, sy = 1;  // surface pixels per PICA pixel
@@ -714,6 +722,12 @@ struct Surface {
     void *image() { return depth ? db.surface.image : cb.surface.image; }
     u32 image_size() { return depth ? db.surface.imageSize : cb.surface.imageSize; }
 };
+#ifdef RECOMP_RESUMABLE
+static std::shared_ptr<Surface> checkpoint_pin(Surface *surface) {
+    ++surface->checkpoint_pins;
+    return {surface, [](Surface *p) { --p->checkpoint_pins; }};
+}
+#endif
 std::vector<std::unique_ptr<Surface>> surfaces;
 u64 use_counter;  // presents so far: when a texture or a target was last used
 inline void used(Surface &s) { s.last_use = use_counter; }
@@ -3577,6 +3591,11 @@ void forget_unused() {
     constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
     for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
         Surface &s = **it;
+#ifdef RECOMP_RESUMABLE
+        // A live session checkpoint owns this target until replaced/discarded.
+        // Idle cache eviction must not invalidate a previously successful save.
+        if (s.checkpoint_pins) continue;
+#endif
         if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || s.shared_depth) continue;
         if (!s.depth && s.gpu_newer) continue;
         if (void *image = s.image()) {
@@ -4459,6 +4478,248 @@ void gx2_finish_list() {
 
 bool get_display_image_for(u32, u32, u32, const u32 **, int *, int *) { return false; }
 
+
+#ifdef RECOMP_RESUMABLE
+bool gx2_checkpoint(checkpoint::Image &im);
+static void release_state_surface(Surface &s) {
+    if (!s.shared_depth && s.image()) {
+        if (!s.mem1) free(s.image()); else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(s.image());
+    }
+}
+static void portable_surface_fields(checkpoint::Archive &a, Surface &s) {
+    a.fields(s.addr, s.w, s.h, s.fmt, s.depth, s.sx, s.sy, s.base_sx, s.base_sy,
+             s.dyn_level, s.dyn_f, s.sw, s.sh, s.tex_h, s.row0, s.gpu_newer, s.guest_newer,
+             s.written_since_flush, s.first_use, s.gpu_chain, s.copy, s.written_lo, s.written_hi,
+             s.drawn, s.last_use, s.linear, s.clear_pending, s.in_list, s.sampled, s.was_sampled);
+}
+struct PersistentTargets {
+    std::vector<std::unique_ptr<Surface>> owned;
+    std::vector<Surface *> pointers;
+    bool installed = false;
+    ~PersistentTargets() { for (auto &s : owned) release_state_surface(*s); }
+};
+static bool allocate_state_surface(Surface &s) {
+    // Fresh native resources: the file contains no GX2 object layouts/pointers.
+    GX2Surface &f = s.depth ? s.db.surface : s.cb.surface;
+    f = {}; f.dim = GX2_SURFACE_DIM_TEXTURE_2D; f.width = s.sw; f.height = s.sh;
+    f.depth = 1; f.mipLevels = 1; f.aa = GX2_AA_MODE1X; f.tileMode = GX2_TILE_MODE_DEFAULT;
+    if (s.depth) {
+        const bool sampled = s.fmt == 3 && g_game.program_id == 0x00040000001a4800ULL;
+        f.format = sampled ? GX2_SURFACE_FORMAT_FLOAT_X8_X24 : GX2_SURFACE_FORMAT_UNORM_R24_X8;
+        f.use = sampled ? (GX2SurfaceUse)(GX2_SURFACE_USE_DEPTH_BUFFER | GX2_SURFACE_USE_TEXTURE) : GX2_SURFACE_USE_DEPTH_BUFFER;
+        s.db.viewNumSlices = 1; s.db.depthClear = 1.0f;
+    } else {
+        f.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+        f.use = (GX2SurfaceUse)(GX2_SURFACE_USE_COLOR_BUFFER | GX2_SURFACE_USE_TEXTURE);
+        s.cb.viewNumSlices = 1;
+    }
+    GX2CalcSurfaceSizeAndAlignment(&f);
+    if (!f.imageSize || f.imageSize > 64u << 20) return false;
+    f.image = memalign(f.alignment, f.imageSize);
+    if (!f.image) return false;
+    for_gpu_writes(f.image, f.imageSize);
+    s.mem1 = s.shared_depth = false;
+    if (s.depth) GX2InitDepthBufferRegs(&s.db);
+    else {
+        GX2InitColorBufferRegs(&s.cb);
+        s.tex = {}; s.tex.surface = f; s.tex.viewNumMips = 1; s.tex.viewNumSlices = 1; s.tex.compMap = 0x00010203;
+        GX2InitTextureRegs(&s.tex);
+    }
+    return true;
+}
+static bool gx2_persist(checkpoint::Image &im) {
+    auto &a = *im.archive;
+    gx2_flush_cpu_batch(); GX2DrawDone();
+    u32 count = a.reading ? 0 : (u32)surfaces.size(); a.io(count);
+    if (count > 256) { a.fail("too many saved GPU surfaces"); return false; }
+    auto targets = std::make_shared<PersistentTargets>();
+    for (u32 i=0; a.ok && i<count; ++i) {
+        auto fresh = std::make_unique<Surface>();
+        Surface *p = a.reading ? fresh.get() : surfaces[i].get();
+        portable_surface_fields(a, *p);
+        if (!a.ok) return false;
+        if (!p->w || !p->h || p->w>4096 || p->h>4096 || !p->sw || !p->sh || p->sw>4096 || p->sh>4096 ||
+            p->tex_h < p->h || p->fmt>(p->depth ? 3u : 4u) || !std::isfinite(p->sx) || !std::isfinite(p->sy) || p->sx<=0 || p->sy<=0) {
+            a.fail("invalid saved GPU surface"); return false;
+        }
+        if (a.reading) {
+            if (!allocate_state_surface(*p)) { a.fail("cannot allocate saved GPU surface"); return false; }
+            targets->pointers.push_back(p); targets->owned.push_back(std::move(fresh));
+        }
+        GX2Surface linear = p->depth ? p->db.surface : p->cb.surface;
+        linear.tileMode = in_cemu ? GX2_TILE_MODE_LINEAR_SPECIAL : GX2_TILE_MODE_LINEAR_ALIGNED;
+        linear.image = linear.mipmaps = nullptr;
+        GX2CalcSurfaceSizeAndAlignment(&linear);
+        u32 size = linear.imageSize; a.io(size);
+        if (!a.ok || size != linear.imageSize || size>64u<<20) { a.fail("invalid saved GPU image size"); return false; }
+        if (!a.reading) {
+            linear.image = memalign(linear.alignment,size);
+            if (!linear.image) { a.fail("cannot stage saved GPU image"); return false; }
+            DCInvalidateRange(linear.image,size);
+            GX2CopySurface(p->depth ? &p->db.surface : &p->cb.surface,0,0,&linear,0,0);
+            restore_context(); draw_done(); DCInvalidateRange(linear.image,size);
+            a.raw(linear.image,size); free(linear.image); linear.image=nullptr;
+        } else {
+            auto pixels = im.copy_bytes(nullptr,size);
+            if (!pixels) return false;
+            a.raw(pixels->data,size);
+            if (!a.ok) return false;
+            auto metadata = std::make_shared<Surface>(*p);
+            auto upload = [p, linear, pixels, metadata] {
+                // Ownership fields describe the freshly allocated resource, not the old process.
+                const u32 pins = p->checkpoint_pins;
+                *p = *metadata; p->checkpoint_pins = pins;
+                GX2Surface from = linear;
+                from.image = memalign(from.alignment,from.imageSize);
+                if (!from.image) FATAL("no memory for restored GPU upload\n");
+                memcpy(from.image,pixels->data,from.imageSize); DCFlushRange(from.image,from.imageSize);
+                GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE,from.image,from.imageSize);
+                GX2CopySurface(&from,0,0,p->depth ? &p->db.surface : &p->cb.surface,0,0);
+                restore_context(); draw_done(); free(from.image);
+            };
+            upload(); // Allocate/upload before any guest state is changed.
+            im.restore.push_back(upload);
+            ++p->checkpoint_pins;
+            auto pin = std::shared_ptr<Surface>(p,[targets](Surface *surface) { --surface->checkpoint_pins; });
+            im.validate.push_back([pin, p, targets, metadata] {
+                if (!targets->installed) return true;
+                return std::any_of(surfaces.begin(),surfaces.end(),[p,metadata](const auto &s){
+                    return s.get()==p && s->checkpoint_identity==metadata->checkpoint_identity &&
+                           s->image()==metadata->image() && s->image_size()==metadata->image_size();
+                });
+            });
+        }
+    }
+    auto index = [&](Surface *p) {
+        if (!p) return 0u;
+        for (u32 i=0;i<count;++i) if ((a.reading ? targets->pointers[i] : surfaces[i].get())==p) return i+1;
+        a.fail("saved target reference is not in the surface table"); return 0u;
+    };
+    u32 color = a.reading ? 0 : index(cur_color), depth = a.reading ? 0 : index(cur_depth), owner = a.reading ? 0 : index(depth_owner);
+    a.fields(color,depth,owner);
+    std::vector<u32> reads;
+    if (!a.reading) for (auto *p : read_targets) reads.push_back(index(p));
+    a.io(reads);
+    std::array<LastTransfer,3> transfers{};
+    u32 transfer_indices[3]{};
+    for (u32 i=0;i<3;++i) {
+        if (!a.reading) { transfers[i]=last_transfer[i]; transfer_indices[i]=index(transfers[i].src); }
+        auto &t=transfers[i];
+        a.fields(transfer_indices[i],t.in_paddr,t.out_paddr,t.in_dims,t.out_dims,t.flags,t.out_size);
+    }
+    if (color>count || depth>count || owner>count || reads.size()>256) a.fail("invalid GPU target reference");
+    for (auto i:reads) if (i>count) a.fail("invalid GPU read-target reference");
+    for (auto i:transfer_indices) if (i>count) a.fail("invalid GPU transfer reference");
+    im.fields(gpu_writes,use_counter,memory_write_seq);
+    im.memory(memory_writes,sizeof memory_writes); // numeric physical addresses/lengths only
+    if (a.reading && a.ok) {
+        im.restore.push_back([targets,color,depth,owner,reads,transfers,indices=std::array<u32,3>{transfer_indices[0],transfer_indices[1],transfer_indices[2]}] {
+            std::set<Surface *> keep(targets->pointers.begin(),targets->pointers.end());
+            for (auto it=surfaces.begin();it!=surfaces.end();) {
+                if (keep.count(it->get())) {++it;continue;}
+                release_state_surface(**it); it=surfaces.erase(it);
+            }
+            if (!targets->installed) {
+                for (auto &s:targets->owned) surfaces.push_back(std::move(s));
+                targets->owned.clear(); targets->installed=true;
+            }
+            auto target=[&](u32 i)->Surface* {return i ? targets->pointers[i-1] : nullptr;};
+            cur_color=target(color); cur_depth=target(depth); depth_owner=target(owner);
+            read_targets.clear();for(auto i:reads) read_targets.push_back(target(i));
+            for(u32 i=0;i<3;++i){last_transfer[i]=transfers[i];last_transfer[i].src=target(indices[i]);}
+            memory_fills.standing.clear();memory_fills.notice_due=false; // derived acceleration cache
+            vtx_invalidate(0,~0u);
+            mark_textures(mem::FCRAM_PADDR,mem::LINEAR_SIZE,true);mark_textures(mem::VRAM_PADDR,mem::VRAM_SIZE,true);
+            state_sent_valid=false;state_lost=true;
+        });
+    }
+    if (!a.ok) return false;
+    if (!a.reading) {
+        auto *stream=im.archive;im.archive=nullptr;
+        const bool result=gx2_checkpoint(im);im.archive=stream;
+        return result;
+    }
+    return im.ok;
+}
+
+bool gx2_checkpoint(checkpoint::Image &im) {
+    if (im.archive) return gx2_persist(im);
+    gx2_flush_cpu_batch();
+    GX2DrawDone();
+    std::set<Surface *> saved_targets;
+    for (auto &surface : surfaces) {
+        Surface *p = surface.get();
+        saved_targets.insert(p);
+        const void *image = p->image();
+        const u32 bytes = p->image_size();
+        const u64 identity = p->checkpoint_identity;
+        auto pin = checkpoint_pin(p);
+        im.validate.push_back([pin, p, image, bytes, identity] {
+            for (auto &s : surfaces) if (s.get() == p) {
+                const bool valid = s->checkpoint_identity == identity && s->image() == image && s->image_size() == bytes;
+                if (!valid) LOG("[state] validation failed: GPU surface %08x changed identity/image/size\n", (u32)p);
+                return valid;
+            }
+            LOG("[state] validation failed: saved GPU surface %08x was retired\n", (u32)p);
+            return false;
+        });
+        // Surface has no owning destructor; native image ownership stays with
+        // the renderer. Validate its lifetime before any restore writes.
+        auto metadata = std::make_shared<Surface>(*p);
+        im.restore.push_back([p, metadata] { *p = *metadata; });
+        if (image && bytes) {
+            // Cemu keeps rendered pixels in host GPU textures. Reading its
+            // emulated tiled allocation directly can return stale CPU bytes.
+            // An explicit linear staging copy works on Cemu and hardware.
+            GX2Surface staging = p->depth ? p->db.surface : p->cb.surface;
+            staging.tileMode = in_cemu ? GX2_TILE_MODE_LINEAR_SPECIAL : GX2_TILE_MODE_LINEAR_ALIGNED;
+            staging.image = nullptr;
+            staging.mipmaps = nullptr;
+            GX2CalcSurfaceSizeAndAlignment(&staging);
+            staging.image = memalign(staging.alignment, staging.imageSize);
+            if (!staging.image) return false;
+            DCInvalidateRange(staging.image, staging.imageSize);
+            GX2CopySurface(p->depth ? &p->db.surface : &p->cb.surface, 0, 0, &staging, 0, 0);
+            restore_context(); draw_done();
+            DCInvalidateRange(staging.image, staging.imageSize);
+            auto pixels = im.copy_bytes(staging.image, staging.imageSize);
+            free(staging.image); staging.image = nullptr;
+            if (!pixels) return false;
+            im.restore.push_back([p, staging, pixels] {
+                GX2Surface upload = staging;
+                upload.image = memalign(upload.alignment, upload.imageSize);
+                if (!upload.image) FATAL("no memory for checkpoint GPU upload\n");
+                memcpy(upload.image, pixels->data, upload.imageSize);
+                DCFlushRange(upload.image, upload.imageSize);
+                GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, upload.image, upload.imageSize);
+                GX2CopySurface(&upload, 0, 0, p->depth ? &p->db.surface : &p->cb.surface, 0, 0);
+                restore_context(); draw_done();
+                free(upload.image);
+            });
+        }
+    }
+    im.take(cur_color); im.take(cur_depth); im.take(depth_owner); im.take(read_targets);
+    im.take(gpu_writes); im.take(use_counter); im.take(memory_fills);
+    im.memory(last_transfer, sizeof last_transfer);
+    im.memory(memory_writes, sizeof memory_writes); im.take(memory_write_seq);
+    im.restore.push_back([saved_targets] {
+        for (auto it = surfaces.begin(); it != surfaces.end();) {
+            if (saved_targets.count(it->get())) { ++it; continue; }
+            Surface &s = **it;
+            if (!s.shared_depth && s.image()) {
+                if (!s.mem1) free(s.image()); else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(s.image());
+            }
+            it = surfaces.erase(it);
+        }
+        vtx_invalidate(0, ~0u);
+        mark_textures(mem::FCRAM_PADDR, mem::LINEAR_SIZE, true);
+        mark_textures(mem::VRAM_PADDR, mem::VRAM_SIZE, true);
+        state_sent_valid = false;
+    });
+    return true;
+}
+#endif
+
 }  // namespace gpu
 
 namespace wiiu {
@@ -4710,7 +4971,13 @@ void gfx_vblank() { vblank_pending = true; }
 // ---- options menu state; the input thread changes it, the GPU thread draws it
 // A game that's held to a frame rate (cap_game) has a line to let it run free, between the volume and quitting: its cutscenes are timed for
 // that rate, the rest of it may look better without (the user, 2026-11-14)
-static int menu_items() { return cap_game ? 10 : 9; }
+static int menu_items() {
+    return (cap_game ? 10 : 9)
+#ifdef RECOMP_RESUMABLE
+        + 2
+#endif
+        ;
+}
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
 static volatile bool menu_quit;
@@ -4781,7 +5048,16 @@ void menu_input(u32 pressed) {
         g_settings.show_fps = !g_settings.show_fps;
         wiiu::settings_due = true;
     }
-    if (count == 10 && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) cap_fps = cap_fps ? 0 : cap_game;
+    if (cap_game && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) cap_fps = cap_fps ? 0 : cap_game;
+#ifdef RECOMP_RESUMABLE
+    if (pressed & VPAD_BUTTON_A) {
+        const int save_item = cap_game ? 9 : 8;
+        if (menu_item == save_item || menu_item == save_item + 1) {
+            checkpoint::request(menu_item == save_item ? 4 : 2);
+            menu_is_open = false;
+        }
+    }
+#endif
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
         if (menu_item == count - 1) menu_quit = true;
@@ -4804,9 +5080,9 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
     const int count = menu_items();
-    const float rowh = count == 10 ? 33 : 36, top = 114;  // a tenth line (the frame limit): closer together, in the same box
+    const float rowh = count > 10 ? 27 : count == 10 ? 33 : 36, top = 114;  // a tenth line (the frame limit): closer together, in the same box
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
-    draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + (count == 10 ? 32 : 38), 0, 0, 1, 1);
+    draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + (count > 10 ? 27 : count == 10 ? 32 : 38), 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
     GX2SetPixelSampler(&lut_sampler, 0);
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
@@ -4828,16 +5104,27 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     snprintf(res, sizeof res, "RESOLUTION: %dP", g_settings.resolution);
     if (cap_fps) snprintf(cap, sizeof cap, "FRAME LIMIT: %u", (unsigned)cap_fps);
     else snprintf(cap, sizeof cap, "FRAME LIMIT: OFF");
-    const char *items[10] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF",
-                             count == 10 ? cap : "QUIT TO WII U MENU", "QUIT TO WII U MENU"};
-    for (int i = 0; i < count; i++) {
-        draw_text(w, h, items[i], 165, top + i * rowh + 4, 4);
+    const char *items[12] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF"};
+    int item_count = 8;
+    if (cap_game) items[item_count++] = cap;
+#ifdef RECOMP_RESUMABLE
+    items[item_count++] = "SAVE STATE";
+    items[item_count++] = checkpoint::has_state() ? "LOAD STATE" : "LOAD STATE (EMPTY)";
+#endif
+    items[item_count++] = "QUIT TO WII U MENU";
+    for (int i = 0; i < item_count; i++) {
+        draw_text(w, h, items[i], 165, top + i * rowh + 4, count > 10 ? 3 : 4);
     }
     set_blit_colors(0.45f, 0.3f, 0.15f, 0, 0, 0);
     const char *hint = "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
     if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS";  // a game takes its language as it starts
     if (menu_item == 5 && pad_layout == 1) hint = "TOUCH IS OFF WHILE THE GAMEPAD SHOWS THE TOP";
     if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "RESOLUTION CHANGES WHEN THE GAME NEXT STARTS";  // targets keep their size
+#ifdef RECOMP_RESUMABLE
+    const int state_item = cap_game ? 9 : 8;
+    if (menu_item == state_item || menu_item == state_item + 1)
+        if (const char *result = checkpoint::result_message()) hint = result;
+#endif
     draw_text(w, h, hint, 165, 446, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
 }

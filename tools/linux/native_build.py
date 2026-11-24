@@ -53,8 +53,12 @@ def main():
     ap.add_argument("--sdk-alias", type=Path)
     ap.add_argument("--tools-dir", type=Path)
     ap.add_argument("--jobs", type=int, default=min(3, os.cpu_count() or 1))
+    ap.add_argument("--resumable", action="store_true", help="experimental dispatcher-boundary code; not whole-game save states (use a separate --work and --output)")
     a = ap.parse_args()
     if a.jobs < 1: ap.error("--jobs must be positive")
+    if a.resumable and a.command != 'code': ap.error('--resumable applies only to code')
+    if a.resumable and a.work == ROOT / 'build_native':
+        a.work = ROOT / 'build_native_resumable'
     b = load_builder(a.work, a.compiler)
     if a.command == "selftest":
         sys.path.insert(0, str(ROOT / "tools"))
@@ -84,8 +88,11 @@ def main():
         if a.cafeglsl_ppc: b.CAFEGLSL_PPC = str(a.cafeglsl_ppc.resolve())
         os.environ.update(DEVKITPRO=str(alias), DEVKITPPC=str(alias / "devkitPPC"), PATH=str(tools.resolve()) + os.pathsep + str(alias / "devkitPPC/bin") + os.pathsep + str(alias / "tools/bin") + os.pathsep + os.environ["PATH"])
     game = b.Game(a.name or a.game_dir.name, str(a.game_dir.resolve()))
+    if a.resumable:
+        game.gen, game.mode, game.opt, game.safe_ranges = 'gen_resumable', 'resumable', ['-O1'], []
+        game.gen_dir = game.dir + '/' + game.gen
     game.out = str(a.output.resolve()); game.rpx = game.out + "/" + game.name + ".rpx"; game.nm = game.out + "/game.nm"; game.shaders = game.out + "/shaders"
-    args = SimpleNamespace(jobs=a.jobs, force=False, extra_flags=None, only=None, opt=None, link_flags=None)
+    args = SimpleNamespace(jobs=a.jobs, force=False, extra_flags='-DRECOMP_RESUMABLE' if a.resumable else None, only=None, opt=None, link_flags=None)
     if a.command == "code": b.build_code(game, args)
     else: b.build_shaders(game, args)
 

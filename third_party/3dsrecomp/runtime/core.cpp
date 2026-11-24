@@ -25,7 +25,7 @@ int g_verbose;
 static std::mutex log_mutex;
 static FILE *log_file;
 void (*g_fatal_hook)(const char *msg);
-extern "C" { u32 rt_bulk_copy_enabled = 1; }
+extern "C" { u32 rt_bulk_copy_enabled = 1; volatile u32 rt_checkpoint_requested = 0; }
 void watch_report();
 
 u64 g_frame;
@@ -210,6 +210,10 @@ u32 vaddr_to_paddr(u32 va) {
     if (va >= DSP_BASE && va < DSP_BASE + DSP_SIZE) return va - DSP_BASE + DSP_PADDR;
     return 0;
 }
+
+#ifdef RECOMP_RESUMABLE
+void checkpoint_allocator(checkpoint::Image &im) { im.take(hle_next); }
+#endif
 
 u32 hle_alloc(u32 size, u32 align) {
     u32 a = (hle_next + align - 1) & ~(align - 1);
@@ -470,6 +474,15 @@ void run_guest(CPU *c) {
         e->fn(c, e->entry);
     }
 }
+
+#ifdef RECOMP_RESUMABLE
+void run_guest_step(CPU *c) {
+    if (c->pc == EXIT_MAGIC) return;
+    const GuestEntry *e = lookup_cached(c->pc);
+    if (!e) e = dispatch_miss(c);
+    e->fn(c, e->entry);
+}
+#endif
 
 // Debugging: generated C with logging inserted by hand (tools/dbg_inject.py) can't call rt_log, which is C++.
 extern "C" void rt_debug_log(const char *fmt, ...) {

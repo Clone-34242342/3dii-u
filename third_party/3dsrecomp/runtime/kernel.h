@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "rt.h"
+#include "checkpoint.h"
 
 using Handle = u32;
 
@@ -48,6 +49,9 @@ struct Object : std::enable_shared_from_this<Object> {
     std::string name;
 };
 using ObjPtr = std::shared_ptr<Object>;
+#ifdef RECOMP_RESUMABLE
+bool capture_object(checkpoint::Image &image, const ObjPtr &object);
+#endif
 
 struct WaitObject : Object {
     std::vector<Thread *> waiters;
@@ -198,7 +202,21 @@ u64 now_ns();   // the guest clock: real time scaled by the game speed
 u64 real_ns();
 void set_clock_speed(u32 percent);
 u64 system_tick();
-void add_timeout(u64 deadline_ns, std::function<void()> fn);  // (lock held) run fn (lock held) at deadline
+#ifdef RECOMP_RESUMABLE
+enum class TimeoutKind : u32 { Unknown, Sleep, WaitSync, WaitArb, Timer, Service, GspIrq };
+struct TimeoutState {
+    TimeoutKind kind = TimeoutKind::Unknown;
+    ObjPtr object;
+    std::shared_ptr<Service> service;
+    u64 generation = 0;
+    u32 argument = 0;
+};
+void add_timeout(u64 deadline_ns, std::function<void()> fn, TimeoutState state = {});
+#define STATE_TIMEOUT(...) , kernel::TimeoutState{__VA_ARGS__}
+#else
+void add_timeout(u64 deadline_ns, std::function<void()> fn);
+#define STATE_TIMEOUT(...)
+#endif  // (lock held) run fn (lock held) at deadline
 void timers_poke();  // have the timer thread look at its queue now
 
 std::shared_ptr<Event> make_event(ResetType rt, const char *name);
