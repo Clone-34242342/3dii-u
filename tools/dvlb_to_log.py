@@ -374,7 +374,7 @@ def main():
             agree += 1
         else:
             differ += 1
-    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} command-list and {discovered} material selections; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
+    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} from command lists, {discovered} material selections; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
     if not check:
         with open(f'{game}/shader_logs/dvlb.bin', 'wb') as f:
             f.write(out)
