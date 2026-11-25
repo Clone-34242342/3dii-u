@@ -621,13 +621,15 @@ try:
     # Queue selection is a snapshot. Only a completed worker, including a failed launch, can advance it.
     kept_st = dict(state.st)
     kept_game, kept_update, kept_save = state.game, state.update, state.save_in
-    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'building', 'view', 'updateState')}
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'building', 'view', 'updateState')}
     card = os.path.join(base, 'test card')
     os.makedirs(card)
 
-    def enqueue(name, target='folder'):
-        state.game = SimpleNamespace(path=os.path.join(base, name + '.3ds'), name=name, encrypted=lambda: False)
+    def enqueue(name, target='folder', language='Console default'):
+        state.game = SimpleNamespace(path=os.path.join(base, name + '.3ds'), name=name,
+                                     title_id=int.from_bytes(name.encode()[:8], 'little'), encrypted=lambda: False)
         state.set(gameName=name, target=target)
+        state.setGameLanguage(language)
         state.enqueueBuild()
 
     def complete(result=None):
@@ -654,8 +656,9 @@ try:
              mock.patch.object(gui.subprocess, 'Popen', side_effect=[worker, OSError('launch failed'), worker, worker]) as launch:
             state.update = SimpleNamespace(path='queued update.cia')
             state.save_in = 'queued save folder'
-            enqueue('First')
-            enqueue('First')
+            enqueue('First', language='French')
+            assert json.load(open(settings))['game_languages'][f'{state.game.title_id:016x}'] == 'French'
+            enqueue('First', language='German')
             assert state.queuePending == 1 and state.dialog['title'] == 'That output is already queued'
             state.answer(True)
             state.update = state.save_in = None
@@ -677,6 +680,7 @@ try:
             assert first_args[first_args.index('--otp') + 1] == 'first otp'
             assert first_args[first_args.index('--update') + 1] == 'queued update.cia'
             assert first_args[first_args.index('--save') + 1] == 'queued save folder'
+            assert first_args[first_args.index('--language') + 1] == 'French'
             assert first_env['THREEDII_BUILD'] == 'first work folder' and first_env['BOOT9_PATH'] == 'first keys'
             state.build()
             state.clearQueue()
@@ -689,7 +693,7 @@ try:
             assert queue_status() == ['Done', 'Failed', 'Building', 'Queued']
             assert state.queueItems[1]['detail'] == 'launch failed'
             third_args = launch.call_args.args[0]
-            assert third_args[third_args.index('--card') + 1] == card and '--save' not in third_args
+            assert third_args[third_args.index('--card') + 1] == card and '--save' not in third_args and '--language' not in third_args
             with mock.patch.object(gui, 'WIN', True), mock.patch.object(gui.subprocess, 'run'):
                 gui.App.stop_for_close(state)
             complete()

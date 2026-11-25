@@ -41,6 +41,7 @@ void apt_notify(u32 signal);
 // cfg (languages.h has the rule)
 extern int g_system_language;  // the console's own language: the frontend sets it before the game starts (-1: none)
 u32 cfg_languages();           // the languages the game's regions have, a bit each
+int cfg_menu_language(int chosen);  // apply the build and console defaults to a menu choice
 int cfg_language();            // the one the game is told, the same all run
 
 // gsp

@@ -163,8 +163,12 @@ def tool(name):
     return module
 
 
+LANGUAGES = ('Japanese', 'English', 'French', 'German', 'Italian', 'Spanish',
+             'Simplified Chinese', 'Korean', 'Dutch', 'Portuguese', 'Russian', 'Traditional Chinese')
+
+
 def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
-               boot_sound=None, screen_art=None):
+               boot_sound=None, screen_art=None, *, language=None):
     """the title every game gets, then its update, DLC and optional Download Play archive"""
     tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
                                        info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel,
@@ -173,6 +177,9 @@ def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', re
     for f in os.listdir(game_dir):
         if f.startswith(('update_', 'dlc_')) or f == 'dlp_child.romfs':
             os.link(os.path.join(game_dir, f), os.path.join(content, f))
+    if language:
+        with open(os.path.join(content, 'language.txt'), 'w', encoding='ascii') as f:
+            f.write(f'{LANGUAGES.index(language)}\n')
 
 
 @contextmanager
@@ -278,6 +285,7 @@ def main():
     ap.add_argument('--boot-sound', help="the game's own start-up sound, a .btsnd (tools/make_boot_sound.py); the one for every game otherwise")
     ap.add_argument('--save', help="a 3DS save to pack in, which the game takes on the console (saves.py): Checkpoint's, JKSM's or an emulator's folder")
     ap.add_argument('--no-menu', action='store_true', help='no options menu in the game: clicking the left stick does nothing (content/no_menu)')
+    ap.add_argument('--language', choices=LANGUAGES, help='default game language, when supported (otherwise follows the console)')
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
     ap.add_argument('--tdb', help="a folder for GameTDB's list of 3DS games and libretro's of title screens, where the Virtual Console's screens "
@@ -594,7 +602,8 @@ def build(a):
         released = covers.released(game.product, a.tdb)
         case_scan = bool(a.art) and covers.is_case_scan(a.art, a.tdb)  # the folder is the covers' own
         title_shot = covers.title_screen(game.product, [game.name] + covers.other_names(game.product, a.tdb), a.tdb)
-    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound, title_shot)
+    make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound, title_shot,
+               language=a.language)
     if a.save:
         import saves
         try:

@@ -4735,13 +4735,13 @@ static std::atomic<bool> menu_restore_confirm;
 
 // The game's language from its next start, as cfg.cpp will pick it (services/languages.h). settings.ini keeps a choice; the card thread
 // writes it (frontend_wiiu.cpp), as this one, the input thread, would wait out any save being written.
-static int menu_language() { return kernel::pick_language(kernel::cfg_languages(), g_settings.language, kernel::g_system_language); }
+static int menu_language() { return kernel::cfg_menu_language(g_settings.language); }
 static void next_language(int dir) {
     const u32 offered = kernel::cfg_languages();
     int l = menu_language();
     do l = (l + dir + 12) % 12;
     while (!(offered >> l & 1));
-    const int keep = l == kernel::pick_language(offered, -1, kernel::g_system_language) ? -1 : l;  // the console's own: following it again
+    const int keep = l == kernel::cfg_menu_language(-1) ? -1 : l;
     if (keep == g_settings.language) return;
     g_settings.language = keep;
     wiiu::settings_due = true;

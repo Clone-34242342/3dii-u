@@ -830,6 +830,17 @@ ApplicationWindow {
                             Pill { text: "Choose"; accessibleName: "Choose a 3DS save to pack in"; tone: "cyan"; onClicked: app.hasGame ? app.bringSave() : app.chooseGame() }
                             Pill { text: "Remove"; accessibleName: "Remove the 3DS save"; tone: "red"; onClicked: app.removeSave() }
                         }
+                        CardRow {
+                            visible: app.hasGame
+                            label: "Game language"; sub: "Used when the game supports it."
+                            ComboBox {
+                                width: 205
+                                Accessible.name: "Game language"
+                                model: app.gameLanguages
+                                currentIndex: app.gameLanguage ? app.gameLanguages.indexOf(app.gameLanguage) : 0
+                                onActivated: app.setGameLanguage(currentText)
+                            }
+                        }
                     }
 
                     Card {
