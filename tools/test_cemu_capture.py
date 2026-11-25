@@ -12,12 +12,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runner', type=Path)
     cases = ('available', 'dense', 'missing', 'exited', 'pad_exception', 'fatal', 'guest_exit', 'guest_exit_pad',
-             'guest_exit_no_images', 'stale_locked', 'stale_recreated', 'partial', 'empty', 'no_signal', 'foreign_log')
+             'guest_exit_no_images', 'stale_locked', 'stale_recreated', 'partial', 'empty', 'no_signal', 'foreign_log',
+             'checkpoint', 'checkpoint_missing', 'checkpoint_stale')
     parser.add_argument('--case', choices=cases)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     source = (args.runner or root / 'tools/win/cemu_run.ps1').read_text()
     shot = function(source, 'function Shot(')
+    guest_log = function(source, 'function Guest-Log {') if 'function Guest-Log {' in source else ''
     guest = function(source, 'function Guest-Exited {') if 'function Guest-Exited {' in source else ''
     report_exit = function(source, 'function Report-CemuExit {')
     cleanup_start = source.index('if (Test-Path -LiteralPath "$sd\\log.txt")')
@@ -29,6 +31,7 @@ def main():
 $ErrorActionPreference = 'Stop'
 $mode = $args[0]
 $Seconds = 90; $Shots = 24; $shotDir = 'unused'; $Out = 'unused'; $sd = $args[1]
+$CaptureAfterCommand = if ($mode -like 'checkpoint*') { 123 } else { 0 }
 if ($mode -eq 'dense') { $Seconds = 345; $Shots = 138 }
 $p = [pscustomobject]@{HasExited=$false;ExitCode=0;StartTime=[datetime]::new(2026,1,1,0,0,0,[DateTimeKind]::Utc)}
 $script:fakeClock = [pscustomobject]@{Elapsed=[pscustomobject]@{TotalSeconds=0.0}}
@@ -54,6 +57,9 @@ function Start-Sleep {
       'empty' { Write-GuestLog '' }
       'no_signal' { Write-GuestLog "   100 [hang] frame stopped`n   100 [quit] audio thread stopped after 0 ms`n" }
       'foreign_log' { [IO.File]::WriteAllText("$sd\other-title.log", "   100 [quit] sound system shut down`n") }
+      'checkpoint' { Write-GuestLog "   100 [live] command 123 starts (720 frames)`r`n" }
+      'checkpoint_missing' { Write-GuestLog "   100 [live] command 1234 starts (720 frames)`n" }
+      'checkpoint_stale' { Write-GuestLog "   100 [live] command 123 starts (720 frames)`n" $true }
     }
   }
   if ($script:fakeClock.Elapsed.TotalSeconds -gt 1000) { throw 'Unbounded capture loop' }
@@ -77,7 +83,7 @@ $script:cacheDrops = 0
 function Drop-Caches { $script:cacheDrops++ }
 if ($mode -eq 'stale_locked') { Write-GuestLog "   100 [quit] sound system shut down`n" $true }
 '''
-    fixture += '\n' + cleanup + '\n' + guest + '\n' + report_exit + '\n' + shot + '\n$caught=$false\ntry {\n' + loop + '\n} catch { $caught=$true }\n'
+    fixture += '\n' + cleanup + '\n' + guest_log + '\n' + guest + '\n' + report_exit + '\n' + shot + '\n$caught=$false\ntry {\n' + loop + '\n} catch { $caught=$true }\n'
     fixture += r'''
 if ($mode -ne 'pad_exception' -and $caught) { throw 'Unexpected capture failure' }
 if ($mode -eq 'pad_exception' -and -not $caught) { throw 'Exception fixture did not execute' }
@@ -97,6 +103,10 @@ if ($mode -eq 'exited' -and $script:fakeClock.Elapsed.TotalSeconds -gt 18.6) { t
 if ($mode -eq 'fatal' -and ($script:captured -ne 10 -or $script:fakeClock.Elapsed.TotalSeconds -gt 19.6)) { throw 'Did not capture one final pair after the fatal log' }
 if ($mode -in @('guest_exit','guest_exit_no_images') -and $script:fakeClock.Elapsed.TotalSeconds -gt 19.1) { throw "Continued capturing after current-session runtime shutdown: $($script:fakeClock.Elapsed.TotalSeconds) seconds, $($script:captured) screenshots" }
 if ($mode -eq 'guest_exit_pad' -and ($script:captured -ne 1 -or $script:fakeClock.Elapsed.TotalSeconds -gt 4.6)) { throw 'Did not stop safely during the GamePad pair' }
+if ($mode -eq 'checkpoint' -and ($script:captured -ne 2*$Shots -or $script:posted[0] -ne 21)) { throw 'Did not wait for the guest checkpoint' }
+if ($mode -in @('checkpoint_missing','checkpoint_stale') -and ($script:captured -ne 0 -or $script:fakeClock.Elapsed.TotalSeconds -ne $Seconds)) {
+  throw 'Captured an unverified route or exceeded the deadline waiting for a checkpoint'
+}
 if ($mode -like 'guest_exit*' -and $p.HasExited) { throw 'Fixture must leave the Cemu GUI alive' }
 $normalExit = Report-CemuExit
 if ($mode -like 'guest_exit*') {
@@ -123,7 +133,7 @@ if ((Report-CemuExit -CloseRequested) -notlike 'Cemu exited by itself, code 2' -
                                  '-File', str(path), case, str(case_dir)], capture_output=True, text=True, timeout=15)
         if result.returncode:
             raise AssertionError(case + ': ' + result.stdout + result.stderr)
-        report = json.loads(result.stdout)
+        report = json.loads(result.stdout.splitlines()[-1])
         print(f'Cemu capture: {case}, {report["seconds"]:.1f} simulated seconds, {report["captures"]} screenshots')
 
 

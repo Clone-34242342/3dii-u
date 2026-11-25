@@ -3,7 +3,7 @@
 # Nothing else on the screen can end up in the result. Waits for another run to finish instead of closing it.
 # Cemu runs on a Windows desktop of its own, never shown, so it can't cover the user's screen or take their keyboard (the user's rule, 2026-11-07).
 param([string]$Rpx, [string]$Low, [int]$Seconds = 120, [int]$Shots = 6, [string]$Out, [switch]$Interpreter,
-      [string]$CemuDir = (Join-Path $PSScriptRoot '..\..\build_win\cemu'))
+      [string]$CemuDir = (Join-Path $PSScriptRoot '..\..\build_win\cemu'), [int]$CaptureAfterCommand = 0)
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
 public class W3 {
@@ -68,15 +68,18 @@ $null = $p.Handle  # keep the exit status readable after Windows removes the pro
 function Post([uint32]$msg, [int]$key, [int64]$l) {  # a key message, to Cemu's own windows only
   foreach ($h in [W3]::Windows([uint32]$p.Id, $true)) { [W3]::PostMessage($h, $msg, [IntPtr]$key, [IntPtr]$l) | Out-Null }
 }
+function Guest-Log {
+  if (-not $logFresh) { return '' }
+  try {
+    if ([IO.File]::GetLastWriteTimeUtc("$sd\log.txt") -lt $p.StartTime.ToUniversalTime()) { return '' }
+    return [IO.File]::ReadAllText("$sd\log.txt")
+  } catch { return '' }
+}
 function Guest-Exited {
   param([switch]$IncludeFatal)
-  if (-not $logFresh) { return $false }
-  try {
-    if ([IO.File]::GetLastWriteTimeUtc("$sd\log.txt") -lt $p.StartTime.ToUniversalTime()) { return $false }
-    $text = [IO.File]::ReadAllText("$sd\log.txt")
-    return $text -cmatch '(?m)^[ \t]*[0-9]+ \[quit\] sound system shut down\r?\n' -or
-      ($IncludeFatal -and $text -cmatch '(?m)^[ \t]*[0-9]+ FATAL: [^\r\n]+\r?\n')
-  } catch { return $false }
+  $text = Guest-Log
+  return $text -cmatch '(?m)^[ \t]*[0-9]+ \[quit\] sound system shut down\r?\n' -or
+    ($IncludeFatal -and $text -cmatch '(?m)^[ \t]*[0-9]+ FATAL: [^\r\n]+\r?\n')
 }
 function Report-CemuExit {
   param([switch]$CloseRequested)
@@ -100,11 +103,25 @@ function Shot([string]$name) {  # Cemu's screenshot (F12) of what its window sho
 $per = $Seconds / [double][Math]::Max($Shots, 1)
 $captureBudget = $Seconds + 10  # enough for the final TV/Pad pair, even when neither screenshot arrives
 $captureClock = [Diagnostics.Stopwatch]::StartNew()
-for ($n = 0; $n -lt $Shots -and -not $p.HasExited -and $captureClock.Elapsed.TotalSeconds -lt $captureBudget; $n++) {
-  $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
+$captureStart = 0
+if ($CaptureAfterCommand -gt 0) {
+  $per = 0
+  $command = "(?m)^[ \t]*([0-9]+) \[live\] command $CaptureAfterCommand starts \([0-9]+ frames\)\r?\n"
+  while (-not $p.HasExited -and $captureClock.Elapsed.TotalSeconds -lt $Seconds -and -not (Guest-Exited -IncludeFatal)) {
+    if ((Guest-Log) -cmatch $command) {
+      $captureStart = $captureClock.Elapsed.TotalSeconds
+      $per = ($Seconds - $captureStart) / [double][Math]::Max($Shots, 1)
+      Write-Output "Capture started after guest command $CaptureAfterCommand at frame $($Matches[1])."
+      break
+    }
+    Start-Sleep -Milliseconds 250
+  }
+}
+for ($n = 0; $n -lt $Shots -and $per -gt 0 -and -not $p.HasExited -and $captureClock.Elapsed.TotalSeconds -lt $captureBudget; $n++) {
+  $wait = [int](($captureStart + $per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
   while ($wait -gt 0 -and -not $p.HasExited -and -not (Guest-Exited -IncludeFatal)) {
     Start-Sleep -Milliseconds ([Math]::Min($wait, 1000))
-    $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
+    $wait = [int](($captureStart + $per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
   }
   if ($p.HasExited -or (Guest-Exited)) { break }
   Shot ("tv_{0:d2}.png" -f $n)

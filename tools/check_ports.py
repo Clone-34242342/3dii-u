@@ -274,10 +274,12 @@ def file_stamp(path):
         return None
 
 
-def cemu(t, seconds, interp, shots=None, captures=None):
+def cemu(t, seconds, interp, shots=None, captures=None, *, after_command=0):
     ps = ['powershell', '-NoProfile', '-File', ROOT + '/tools/win/cemu_run.ps1', '-Rpx', t.rpx, '-Low', t.low, '-Seconds', str(seconds), '-Shots', str(SHOTS if shots is None else shots), '-Out', captures or t.data + '/shots/cemu']
     if interp:
         ps.append('-Interpreter')
+    if after_command:
+        ps += ['-CaptureAfterCommand', str(after_command)]
     ps += ['-CemuDir', t.cemu_dir]
     guest, emulator = t.common + '/log.txt', t.cemu_dir + '/portable/log.txt'
     old_guest, old_emulator = file_stamp(guest), file_stamp(emulator)
