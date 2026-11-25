@@ -68,8 +68,10 @@ void run_guest(CPU *) { assert(false); }
 std::string read_cstr(u32,size_t) { assert(false); return {}; }
 void cloud_save_written() {}
 namespace stacks { void save_written(const std::string &) {} }
+static std::vector<std::pair<u32, u32>> gpu_writes;
 namespace kernel {
 void gsp_cache_op(u32,u32,bool) { assert(false); }
+void gsp_cpu_wrote(u32 addr, u32 size) { gpu_writes.emplace_back(addr, size); }
 void register_all_services() { assert(false); }
 const std::vector<std::array<u8,0x60>> &console_miis(int *) { assert(false); static const std::vector<std::array<u8,0x60>> none;return none; }
 u16 mii_crc16(const u8 *,size_t) { assert(false);return 0; }
@@ -293,6 +295,25 @@ static void session_write(kernel::FileSession &file,const std::string &bytes) {
 static std::string session_read(kernel::FileSession &file,u32 n) {
     single_file_ipc(file,0x080200C2,{0,0,n,(n<<4)|0xC,0x6000});return std::string((char*)gptr(0x6000),r32(0x1008));
 }
+static void read_notifies_gpu(const fs::path &path) {
+    put(path, "texture");
+    kernel::FileSession file;
+    file.fd = ::open(path.generic_string().c_str(), O_RDONLY | O_BINARY);
+    assert(file.fd >= 0);
+
+    gpu_writes.clear();
+    assert(session_read(file, 4) == "text");
+    assert(session_read(file, 32) == "texture");
+    const std::vector<std::pair<u32, u32>> expected{{0x6000, 4}, {0x6000, 7}};
+    assert(gpu_writes == expected);
+
+    single_file_ipc(file, 0x080200C2, {7, 0, 4, (4 << 4) | 0xC, 0x6000});
+    assert(r32(0x1008) == 0);
+    fail_read = true;
+    assert(session_read(file, 4).empty());
+    fail_read = false;
+    assert(gpu_writes == expected);
+}
 static void direct_ownership(const fs::path &folder) {
     std::vector<std::shared_ptr<kernel::FileSession>> budget;
     for(int i=0;i<3;++i) {const std::string name="budget/"+std::to_string(i);put(folder/name,std::string(CACHE_FILE_MAX,'b'));budget.push_back(open_session(folder,name));assert(budget.back()->held);}
@@ -389,6 +410,7 @@ int main(int argc,char **argv) {
         assert(wiiu::save_settle(path.generic_string(),true));assert(get(path)==bytes && cache.empty() && cached_bytes==0);file.reset();assert(weak.expired());
     }
     cache_budget(root/"budget");
+    read_notifies_gpu(root/"gpu_read");
     direct_ownership(root/"direct");
     free(g_mem);puts("FS save: real IPC/scheduler Open/Write/GetSize/SetSize, checkpoint/archive-close contention, all settle callers, pending-writer rename protection, failure/retry/concurrent updates,128 ownership cycles, capacity/admission/shrink budgets and direct/cache lifetime isolation passed");
 }

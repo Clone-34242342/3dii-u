@@ -110,7 +110,9 @@ static void update_framebuffer(int screen) {
 
 // A service wrote guest memory the GPU may read: tell the GPU thread, in order with the GX commands.
 void gsp_cpu_wrote(u32 vaddr, u32 size) {
-    std::array<u32, 8> c{CPU_WRITE, vaddr, size};
+    const u32 paddr = mem::vaddr_to_paddr(vaddr);
+    if (!paddr || !size) return;
+    std::array<u32, 8> c{CPU_WRITE, paddr, size};
     std::lock_guard<std::mutex> lk(gsp.qm);
     gsp.queue.push_back(c);
     gsp.busy++;
@@ -293,7 +295,7 @@ void gsp_process_gx() {
                 if (u32 pa = c[i + 1] ? va2pa(c[i]) : 0) gpu::invalidate_memory(pa, c[i + 1]);
             break;
         case CPU_WRITE:  // A service wrote bytes, rather than just flushing a CPU cache.
-            if (u32 pa = va2pa(c[1])) gpu::service_written(pa, c[2]);
+            gpu::service_written(c[1], c[2]);
             break;
         case CPU_FLUSH:
             if (u32 pa = va2pa(c[1])) gpu::invalidate_memory(pa, c[2]);

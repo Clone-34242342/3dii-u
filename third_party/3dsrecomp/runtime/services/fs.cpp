@@ -513,6 +513,7 @@ struct FileSession : Service {
             });
             const u64 spent_ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count();
             if (n < 0) n = 0;
+            if (n) gsp_cpu_wrote(dst, (u32)n);
             if (g_verbose >= 2) LOG("[fs] read %s off %llx len %x -> %lld\n", romfs ? "romfs" : path.c_str(), (unsigned long long)off, len, (long long)n);
             ipc.ok(2, 2);
             ipc.set(2, (u32)n);
