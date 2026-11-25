@@ -1022,6 +1022,9 @@ void frontend_run() {
     quitting = true;
     gfx_may_close = true;
     OSJoinThread(gpu, nullptr);
+#ifdef RECOMP_RESUMABLE
+    checkpoint::finish_pending_write();
+#endif
     // The sound system is always shut down before the game goes: left running, its voices play from memory the system is about to take back, and
     // the Wii U Menu hangs as it starts (testers' NSMB2 and 3D Land, 2026-11-09). The audio thread used to get 100 ms to stop, and a late one
     // meant no shutdown at all, with nothing logged. A busy game's can be late, so it gets 2 s, and the shutdown happens either way.

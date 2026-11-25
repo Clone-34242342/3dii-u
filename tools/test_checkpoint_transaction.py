@@ -19,6 +19,12 @@ u8 *g_mem;
 void rt_log(const char *, ...) {}
 extern "C" { volatile u32 rt_checkpoint_requested; }
 extern "C" volatile u32 g_3dii_state_status;
+extern "C" volatile u32 g_3dii_state_command;
+static std::atomic<bool> hold_writer{false},writer_entered{false};
+namespace checkpoint { void test_writer_gate() {
+ writer_entered=true;
+ while(hold_writer.load())std::this_thread::yield();
+} }
 static unsigned epoch, cpu=4, gpu=8, cleared;
 static bool fail, fail_memory, resource_valid=true;
 static std::array<u8,32> ram{};
@@ -106,12 +112,39 @@ int main(int argc, char **argv) {
  command(2); assert(g_3dii_state_status==0x80000003);
  g_game.program_id=0x00040000001a4800ULL; command(1); assert(g_3dii_state_status==1);
  command(3);
- checkpoint::initialize_persistent();cpu=123;gpu=456;ram[3]=71;
- command(4);assert(g_3dii_state_status==4);command(3); // discard all RAM checkpoint ownership
+ checkpoint::initialize_persistent();
+ {
+  checkpoint::Archive a(nullptr,false);checkpoint::Image im;im.archive=&a;im.max_bytes=1;
+  im.memory(ram.data(),ram.size());assert(!im.ok&&a.staged.empty());
+ }
+ // Save replacement requests coalesce while a writer owns the immutable chunks.
+ for(unsigned i=0;i<30;++i){cpu=i;command(4);if(i%3==0)command(2);command(4); }
+ while(checkpoint::saving_to_disk() || g_3dii_state_command) {checkpoint::pump();std::this_thread::yield();}
+ checkpoint::finish_pending_write();command(3);cpu=999;command(5);
+ assert(g_3dii_state_status==5 && cpu==29);
+ command(3);
+ cpu=123;gpu=456;ram[3]=71;
+ hold_writer=true;writer_entered=false;
+ command(4);assert(g_3dii_state_status==4);wait_true(writer_entered);
+ assert(checkpoint::saving_to_disk());
+ cpu=987;gpu=654;ram[3]=19;command(2);
+ assert(g_3dii_state_status==2&&cpu==123&&gpu==456&&ram[3]==71);
+ assert(checkpoint::saving_to_disk()); // restore didn't wait for the deliberately blocked writer
+ cpu=888;ram[3]=27; // changing live RAM must not alter the pending file
+ hold_writer=false;checkpoint::finish_pending_write();command(3); // discard all RAM checkpoint ownership
  cpu=987;gpu=654;ram[3]=19;
  command(5);assert(g_3dii_state_status==5&&cpu==123&&gpu==456&&ram[3]==71);
  command(3);
  FILE*f=fopen((g_save_base+"/checkpoint.bin").c_str(),"r+b");assert(f);fseek(f,-1,SEEK_END);int ch=fgetc(f);fseek(f,-1,SEEK_END);fputc(ch^1,f);fclose(f);
+ cpu=111;gpu=222;ram[3]=33;command(5);
+ assert((g_3dii_state_status&0x80000000)&&cpu==111&&gpu==222&&ram[3]==33);
+ // Restore the original byte, then reject a valid-checksum payload with trailing data.
+ f=fopen((g_save_base+"/checkpoint.bin").c_str(),"r+b");assert(f);fseek(f,-1,SEEK_END);fputc(ch,f);fclose(f);
+ f=fopen((g_save_base+"/checkpoint.bin").c_str(),"ab");assert(f);fputc(0,f);fclose(f);
+ cpu=111;gpu=222;ram[3]=33;command(5);
+ assert((g_3dii_state_status&0x80000000)&&cpu==111&&gpu==222&&ram[3]==33);
+ // A truncated payload must also reject without applying any restore callback.
+ f=fopen((g_save_base+"/checkpoint.bin").c_str(),"wb");assert(f);fputc(0,f);fclose(f);
  cpu=111;gpu=222;ram[3]=33;command(5);
  assert((g_3dii_state_status&0x80000000)&&cpu==111&&gpu==222&&ram[3]==33); // corrupt file never partially restores
 
@@ -123,7 +156,7 @@ with tempfile.TemporaryDirectory(prefix='checkpoint-transaction-') as tmp:
     (p/'coreinit/debug.h').write_text('#pragma once\ninline void OSReport(const char *, ...) {}\n')
     (p/'gx2/event.h').write_text('#pragma once\ninline void GX2DrawDone() {}\n')
     (p/'test.cpp').write_text(source)
-    subprocess.run(['c++','-std=c++20','-DRECOMP_RESUMABLE','-O2','-pthread',
+    subprocess.run(['c++','-std=c++20','-DRECOMP_RESUMABLE','-DCHECKPOINT_TEST_WORKER_GATE','-O2','-pthread',
                     '-I'+str(p),'-I'+str(RUNTIME),str(p/'test.cpp'),
                     str(ROOT/'port/wiiu/checkpoint.cpp'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test'),str(p)],check=True)

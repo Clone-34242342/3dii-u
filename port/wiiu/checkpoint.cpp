@@ -7,6 +7,7 @@
 #include <gx2/event.h>
 #ifdef __WIIU__
 #include <coreinit/memexpheap.h>
+#include <coreinit/thread.h>
 #endif
 #include "kernel.h"
 #include "loader.h"
@@ -135,58 +136,92 @@ static void detach_archive(Image &im) {
     im.archive_graph.reset(); // adapters refer to the stack-owned stream
     im.archive=nullptr;
 }
+static std::atomic<bool> disk_writing{false};
+static std::atomic<int> disk_result{0};
+static std::atomic<bool> disk_cancel{false};
+bool saving_to_disk() { return disk_writing.load(std::memory_order_acquire); }
+static std::thread disk_worker;
+struct JoinDiskWorker { ~JoinDiskWorker() { if(disk_worker.joinable())disk_worker.join(); } };
+static JoinDiskWorker join_disk_worker;
+void finish_pending_write() {
+    // Called explicitly before filesystem/log shutdown; _exit skips destructors.
+    if(disk_worker.joinable())disk_worker.join();
+}
 static std::unique_ptr<Image> save_persistent() {
+    if (disk_worker.joinable()) disk_worker.join();
 #ifdef __WIIU__
-    wiiu::save_flush(true); // durable game files must match the fingerprints in the state
+    wiiu::save_flush(true);
 #endif
-    const std::string path=state_path(), temporary=path+".new", backup=path+".bak";
-    FILE *f=fopen(temporary.c_str(),"wb");
-    if(!f){LOG("[state-file] cannot open temporary state file\n");return {};}
-    auto h=state_header();
-    bool ok=fwrite(&h,1,sizeof h,f)==sizeof h;
     auto im=std::make_unique<Image>();
-    Archive stream(f,false);im->archive=&stream;
-    if(ok)ok=persistent_capture(*im);
+    Archive stream(nullptr,false);im->archive=&stream;
+    const bool captured=persistent_capture(*im);
     detach_archive(*im);
-    if(ok){h.size=stream.bytes;h.checksum=stream.hash;ok=!fseek(f,0,SEEK_SET)&&fwrite(&h,1,sizeof h,f)==sizeof h&&!fflush(f);}
-    if(fclose(f))ok=false;
-    if(!ok){LOG("[state-file] save refused: %s\n",stream.error ? stream.error : "capture or file I/O failed");remove(temporary.c_str());return {};}
-    remove(backup.c_str());
-    const bool backed=rename(path.c_str(),backup.c_str())==0;
-    if(rename(temporary.c_str(),path.c_str())){
-        if(backed)rename(backup.c_str(),path.c_str());
-        LOG("[state-file] could not publish complete state\n");return {};
-    }
-    disk_available.store(true,std::memory_order_release);
-    LOG("[state-file] SAVED %llu bytes to %s; RAM checkpoint retained\n",(unsigned long long)h.size,path.c_str());
+    if (!captured || !stream.ok || !im->ok) return {};
+    auto h=state_header();h.size=stream.bytes;
+    auto path=state_path();
+    disk_cancel=false;disk_result=0;disk_writing.store(true,std::memory_order_release);
+    disk_worker=std::thread([chunks=std::move(stream.staged),path,h]() mutable {
+#ifdef CHECKPOINT_TEST_WORKER_GATE
+        extern void test_writer_gate();test_writer_gate();
+#endif
+#ifdef __WIIU__
+        OSSetThreadPriority(OSGetCurrentThread(),16); // background I/O must not inherit the GPU worker's priority
+#endif
+        const auto started=std::chrono::steady_clock::now();
+        const auto temporary=path+".new",backup=path+".bak";
+        FILE *f=fopen(temporary.c_str(),"wb");bool ok=f!=nullptr;
+        if (f) {
+            setvbuf(f,nullptr,_IOFBF,256u<<10);
+            ok=fwrite(&h,1,sizeof h,f)==sizeof h;
+            h.checksum=14695981039346656037ull;
+            for (auto &chunk:chunks) {
+                if (disk_cancel.load(std::memory_order_acquire)) {ok=false;break;}
+                if (!ok) break;
+                h.checksum=state_hash(chunk->data(),chunk->size(),h.checksum);
+                ok=fwrite(chunk->data(),1,chunk->size(),f)==chunk->size();
+            }
+            if(ok)ok=!fseek(f,0,SEEK_SET)&&fwrite(&h,1,sizeof h,f)==sizeof h&&!fflush(f);
+            if(fclose(f))ok=false;
+        }
+        if(disk_cancel.load(std::memory_order_acquire))ok=false;
+        if(ok) {
+            remove(backup.c_str());const bool backed=rename(path.c_str(),backup.c_str())==0;
+            if(rename(temporary.c_str(),path.c_str())) {if(backed)rename(backup.c_str(),path.c_str());ok=false;}
+        }
+        if(!ok)remove(temporary.c_str());
+        LOG("[state-time] background save: %llu bytes, %llu ms, %s\n",(unsigned long long)h.size,(unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count(),ok ? "complete" : disk_cancel.load() ? "superseded" : "failed");
+        disk_result.store(ok ? 1 : disk_cancel.load(std::memory_order_acquire) ? 2 : -1,std::memory_order_release);
+        disk_writing.store(false,std::memory_order_release);
+    });
     return im;
 }
 static std::unique_ptr<Image> load_persistent() {
+    const auto started=std::chrono::steady_clock::now();
     FILE *f=fopen(state_path().c_str(),"rb");
     if(!f){LOG("[state-file] no persistent state\n");return {};}
+    setvbuf(f,nullptr,_IOFBF,256u<<10);
     DiskHeader h{}, expected=state_header();
     bool ok=fread(&h,1,sizeof h,f)==sizeof h && !memcmp(h.magic,expected.magic,8) && h.version==expected.version && h.endian==expected.endian &&
             h.title==expected.title && h.build==expected.build && h.code==expected.code && h.size<=Archive::limit;
     if(!ok){LOG("[state-file] incompatible/truncated header; game unchanged\n");fclose(f);return {};}
-    u8 buffer[4096];u64 left=h.size, hash=14695981039346656037ull;
-    while(ok&&left){size_t count=std::min<u64>(sizeof buffer,left);ok=fread(buffer,1,count,f)==count;if(ok)hash=state_hash(buffer,count,hash);left-=count;}
-    ok=ok&&hash==h.checksum&&fgetc(f)==EOF&&!ferror(f);
-    if(!ok||fseek(f,sizeof h,SEEK_SET)){LOG("[state-file] checksum/length check failed; game unchanged\n");fclose(f);return {};}
-    auto im=std::make_unique<Image>();Archive stream(f,true);im->archive=&stream;
-    ok=persistent_capture(*im)&&stream.bytes==h.size&&stream.hash==h.checksum;
+    auto im=std::make_unique<Image>();Archive stream(f,true);stream.payload_limit=h.size;im->archive=&stream;
+    ok=persistent_capture(*im)&&stream.bytes==h.size&&stream.hash==h.checksum&&fgetc(f)==EOF&&!ferror(f);
     detach_archive(*im);fclose(f);
     if(!ok){LOG("[state-file] load refused before commit: %s\n",stream.error ? stream.error : "state reconstruction failed");return {};}
     for(auto &validate:im->validate)if(!validate()){LOG("[state-file] validation failed before commit\n");return {};}
     LOG("[state-file] REBUILT persistent checkpoint: %u bytes of RAM/resources\n",(u32)im->bytes);
+    LOG("[state-time] persistent %s: %llu bytes, %llu ms, one payload pass\n", stream.reading ? "load" : "save", (unsigned long long)stream.bytes, (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count());
     return im;
 }
 
 bool has_state() { return slot_available.load(std::memory_order_acquire) || disk_available.load(std::memory_order_acquire); }
 const char *result_message() {
+    if (saving_to_disk()) return "SAVING TO SD...";
+    if (disk_result.load()==-1) return "SD SAVE FAILED; RAM STATE RETAINED";
     switch (g_3dii_state_status) {
     case 1: return "SESSION STATE SAVED";
     case 2: return "SESSION STATE LOADED";
-    case 4: return "STATE SAVED TO FILE AND RAM";
+    case 4: return disk_result.load()==1 ? "STATE SAVED TO SD AND RAM" : "STATE CAPTURED IN RAM";
     case 5: return "STATE LOADED FROM FILE";
     case 0x80000006: return "STATE FILE FAILED: SEE DIAGNOSTIC LOG";
     case 0x80000002: return "SAVE FAILED: UNSUPPORTED SERVICE OR APPLET";
@@ -198,8 +233,22 @@ const char *result_message() {
 }
 void request(unsigned command) { __atomic_store_n(&g_3dii_state_command, command, __ATOMIC_RELEASE); }
 void pump() {
+    if (!saving_to_disk() && disk_result.load(std::memory_order_acquire)==1) disk_available.store(true,std::memory_order_release);
     const unsigned command = __atomic_exchange_n(&g_3dii_state_command, 0, __ATOMIC_ACQ_REL);
     if (!command) return;
+    // A RAM restore only reads immutable snapshot buffers shared with the writer.
+    // Disk reconstruction and replacement captures still wait for publication.
+    if (saving_to_disk() && !(command==2 && slot)) {
+        if (command==4) {
+            disk_cancel.store(true,std::memory_order_release);
+            unsigned empty=0;
+            __atomic_compare_exchange_n(&g_3dii_state_command,&empty,4,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+        } else if (command==2 || command==5) {
+            unsigned empty=0;
+            __atomic_compare_exchange_n(&g_3dii_state_command,&empty,command,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED);
+        }
+        return;
+    }
     ExclusiveScope lock(gate());
     if (command == 3) { slot.reset(); slot_available.store(false, std::memory_order_release); g_3dii_state_status = 0; g_3dii_state_bytes = 0; return; }
     if (!check_shared_heap("before checkpoint operation")) {
@@ -216,6 +265,7 @@ void pump() {
         g_3dii_state_status=slot ? 4 : 0x80000006;
         if(slot)g_3dii_state_bytes=slot->bytes;
     } else if (command == 1) {
+        disk_result=0;
         // One physical RAM slot. Keeping the old 153 MiB image while building
         // its replacement exhausted the console on the second save.
         slot.reset();

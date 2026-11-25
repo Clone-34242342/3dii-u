@@ -15,6 +15,11 @@
 namespace gpu {
 
 GpuState g;
+#ifdef __WIIU__
+std::atomic<bool> g_pool_idle_spin{false};
+#else
+std::atomic<bool> g_pool_idle_spin{true};
+#endif
 bool g_stats = false, g_trace = false;
 double g_t_shade = 0, g_t_setup = 0, g_t_flush = 0;
 double now_ms() {
@@ -133,6 +138,13 @@ std::vector<std::thread> workers;
 // never destroyed: detached workers may still be waiting on them during process exit
 std::mutex &pool_mtx = *new std::mutex;
 std::condition_variable &pool_cv = *new std::condition_variable;
+#ifdef __WIIU__
+// A 750 has no cheap 64-bit atomic load: the shim takes a shared spinlock.
+// Sleeping an idle worker leaves core 0 available to the lower-priority compiler.
+constexpr u32 kIdleSpinLimit=0;
+#else
+constexpr u32 kIdleSpinLimit=20000;
+#endif
 std::atomic<u64> pool_work{0};  // gen << 48 | n << 24 | next
 std::atomic<u32> pool_done{0};
 std::atomic<u32> pool_sleepers{0};
@@ -166,7 +178,7 @@ void worker_main(u32 tid) {
         u32 gen;
         u32 spins = 0;
         while ((gen = (u32)(pool_work.load(std::memory_order_acquire) >> 48)) == seen) {
-            if (++spins < 20000) {
+            if (++spins < (g_pool_idle_spin.load(std::memory_order_relaxed) ? 20000u : kIdleSpinLimit)) {
                 cpu_relax();
             } else {
                 std::unique_lock<std::mutex> lk(pool_mtx);

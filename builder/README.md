@@ -175,3 +175,49 @@ Windows 10 or 11 for now (Linux is planned):
 ## Optional hardware development tools
 
 See [the source-only hardware debugging handoff](../tools/wiiu_diagnostics/README.md) for incremental RPX/content transfers, the dual-channel PC recorder, pinned Aroma/Cemu patches, validation results and known limitations. These tools are opt-in developer features; the experimental Aroma heap workaround needs separate review. The language GUI is functional but could use visual and UX polish before release.
+
+### Shared hardware-observed fragment coverage
+
+The normal GUI shader stage also reads `observed_fragments.json` beside a
+known title's shader logs. It compiles missing fragment keys on the PC and
+adds them to the generated pack, preserving existing shader mappings. No
+console warm-up or separate Wii U program is required. Dark Moon currently
+includes 167 captured fragment states; this is coverage of tested states,
+not a claim that every runtime combination is known.
+
+Maintainers can export the fragment-only metadata from a console SHDC cache:
+
+```sh
+python tools/harvest_observed_fragments.py CACHE.bin games/TITLE/shader_logs/observed_fragments.json
+```
+
+Captured vertex GLSL is deliberately excluded: it may contain translated game
+programs. Fragment catalogs contain generated renderer GLSL and keys, plus the
+source cache hash. Their renderer-source fingerprint must match the builder;
+a changed renderer skips stale catalogs with a build-log explanation. Regenerate
+and validate catalogs when changing shader generation or key definitions.
+The packer retains the catalog in standalone Windows builds. The additional
+shaders pass the same CafeGLSL and Wii U register checks as other PC shaders.
+Hardware behavior still needs testing against a fresh runtime cache.
+
+## Shader feature reports
+
+The shader build writes `shader-feature-report.json` beside the shader pack.
+It records actual GPU translator rejections, by shader identity, entry, boolean
+variant and translator location. CPU fallback remains available; a rejection is
+not proof that the game will crash. A clean report covers only discovered shader
+variants, not all states that the game may construct during play.
+
+When there are rejections, `report-shader-issue.txt` contains a GitHub issue link
+with a short template. Review and submit it, attaching the JSON report and adding
+the Builder version, game region/update and affected scene. Reports contain no
+shader instructions, generated GLSL or game assets. Nothing is uploaded
+automatically. The GUI and command-line build use the same report step.
+
+For developer asset analysis, `tools/analyze_pica_shaders.py` accepts a captured
+shader log, optional `--recipes` and `--game` paths, and a required `--out` JSON
+path. It connects instruction-memory fingerprints and RomFS recipe offsets to
+DVLE symbol names. Its static counts are structural estimates, not timings.
+Symbol tables include helper functions, so a label alone must not be made into
+a draw variant without the material's uniforms and output mapping. The separate
+geometry-native translator probe does not describe GPU translator support.

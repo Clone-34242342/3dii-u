@@ -1,4 +1,5 @@
-// Build step: compiles every shader the game needs ahead of time, so nothing compiles at run time.
+// Build step: translates discovered shader states ahead of time. States only
+// assembled during gameplay may still need runtime compilation or fallback.
 //   shadergen <pipelines.bin> <fs and vs log dir> <output dir> <glsl compiler>
 // Inputs: the fragment state list shipped with the recompiler, plus what runs of the game recorded (vs_log.bin, fs_log.bin) and
 // what the console logged as missing (shader_misses.bin, same records). Outputs shaders.gsh and shaders.idx.
@@ -12,6 +13,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "shadergen.h"
@@ -205,7 +207,14 @@ int main(int argc, char **argv) {
     const u32 passthrough = add_vs(gen_passthrough_vs());
     const u32 blit_vs = add_vs(gen_blit_vs());
     u32 failed = 0;
-    std::set<std::pair<u32, u32>> failed_seen;
+    // Machine-readable failures survive the abbreviated build log. No shader
+    // words or generated source belong in a user-submitted diagnostic report.
+    std::string diagnostics = "stage\tprogram_id\tentry\tvariant\tpc\ttranslator_line\tfeature\n";
+    auto diagnostic = [&](const char *stage, u64 program_id, u32 entry, u32 variant, u32 pc, int line, const char *feature) {
+        diagnostics += std::string(stage) + "\t" + std::to_string(program_id) + "\t" + std::to_string(entry) + "\t" + std::to_string(variant) + "\t" +
+                       std::to_string(pc) + "\t" + std::to_string(line) + "\t" + feature + "\n";
+    };
+    std::set<std::tuple<u64, u32, u32>> failed_seen;
     for (const VsRecord &r : vs_records) {
         std::vector<u32> code = r.code, swz = r.swz;
         const u32 nc = (u32)code.size(), ns = (u32)swz.size();
@@ -237,9 +246,10 @@ int main(int argc, char **argv) {
             u32 inputs = 0;
             const std::string src = gen_vs_glsl(p, r.entry, bm, iu, r.slots, &inputs);
             if (src.empty()) {
-                if (!failed_seen.count({r.entry, bm})) {
-                    failed_seen.insert({r.entry, bm});
+                if (!failed_seen.count({identity, r.entry, bm})) {
+                    failed_seen.insert({identity, r.entry, bm});
                     printf("not translated: entry %03x, bools %04x: shader.cpp line %d gave up at instruction %03x\n", r.entry, bm, gpu::shader_glsl_fail_line, gpu::shader_glsl_fail_at);
+                    diagnostic("vertex", identity, r.entry, bm, gpu::shader_glsl_fail_at, gpu::shader_glsl_fail_line, "translation_rejected");
                 }
                 failed++;
                 continue;
@@ -254,6 +264,7 @@ int main(int argc, char **argv) {
             const std::string src = gen_vs_glsl(p, r.entry, 0, iu, r.slots, &inputs, open);
             if (src.empty()) {
                 printf("not translated: open bools, entry %03x, mask %04x: shader.cpp line %d gave up at instruction %03x\n", r.entry, open, gpu::shader_glsl_fail_line, gpu::shader_glsl_fail_at);
+                diagnostic("vertex_open_bools", identity, r.entry, open, gpu::shader_glsl_fail_at, gpu::shader_glsl_fail_line, "translation_rejected");
                 failed++;
             }
             else vs_index[vs_variant_key(p, r.entry, none, r.slots, open)] = {add_vs(src), inputs};
@@ -284,6 +295,13 @@ int main(int argc, char **argv) {
         const std::string src = gen_gsx_glsl(vs, r.vs.entry, vbm, (const u8 (*)[4])r.vs.iu, gs, r.gs.entry, gbm, (const u8 (*)[4])r.gs.iu, r.vs_outmask, r.gs_in,
                                              r.gs_perm, r.gs.slots, r.turns, &inputs, &tris);
         if (src.empty() || tris > 0xffff) {
+            // GSX may fail before the vertex translator's diagnostic variables
+            // are updated, so do not attach a stale instruction/line to it.
+            u64 geometry_id;
+            u32 geometry_bools, geometry_loops;
+            shader_entry_info(gs, r.gs.entry, &geometry_id, &geometry_bools, &geometry_loops);
+            diagnostic("geometry_pipeline", geometry_id, r.gs.entry, gbm, 0, 0,
+                       src.empty() ? "translation_rejected" : "triangle_count_limit");
             failed++;
             continue;
         }
@@ -297,6 +315,7 @@ int main(int argc, char **argv) {
     std::string listed;
     for (u32 i : gsx_shaders) listed += std::to_string(i) + "\n";
     write_file(glsl + "/gsx.txt", listed);
+    write_file(out + "/shader-diagnostics.tsv", diagnostics);
     printf("%zu fragment and %zu vertex shaders to compile (%u drawing geometry shaders); %u variants could not be translated\n", ps_files.size(), vs_files.size(),
            gsx, failed);
 

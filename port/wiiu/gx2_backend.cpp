@@ -70,6 +70,9 @@ extern "C" void GX2SampleBottomGPUCycle(uint64_t *cycle);
 extern "C" uint64_t GX2GPUTimeToCPUTime(uint64_t time);
 
 namespace wiiu {
+#ifdef RECOMP_RESUMABLE
+void draw_state_saving_on(GX2ColorBuffer *cb);
+#endif
 static void relieve_mem1();  // fast memory found full the first time (beside tv_buffer_to_mem2, which it uses)
 }
 
@@ -2636,7 +2639,8 @@ bool gx2_gsx_ready(const Gx2Draw &d) {
 bool gx2_draw(const Gx2Draw &d) {
     const DrawState &ds = *d.ds;
     if (ds.skip || ds.shadow_mode || ds.gas || !ds.rt.color_addr || !pptr(ds.rt.color_addr) || (ds.rt.color_fmt & 0x80)) return true;
-    if (gxt_cpu_vs) return false;  // debug aid: tells a wrong vertex shader from anything else
+    gpu_fallback_why=GPUF_MISSING_VS;gpu_fallback_key=0;
+    if (gxt_cpu_vs) {gpu_fallback_why=GPUF_FORCED;return false;}  // debug aid: tells a wrong vertex shader from anything else
     lap_start();
     // usually the same vertex program as the last draw
     static struct {
@@ -2654,8 +2658,9 @@ bool gx2_draw(const Gx2Draw &d) {
         vk.key = vs_variant_key(d.prog, d.entry, g.vs.b, d.slot_src);
     }
     const u64 key = d.gs ? gsx_key(d) : vk.key;
+    gpu_fallback_key=key;
     auto it = vs_table.find(key);
-    if (d.gs && (it == vs_table.end() || it->second.index == MISSED)) return false;  // (gx2_gsx_ready has logged the miss)
+    if (d.gs && (it == vs_table.end() || it->second.index == MISSED)) {gpu_fallback_why=GPUF_MISSING_GS;return false;}  // (gx2_gsx_ready has logged the miss)
     if (it == vs_table.end()) {
         // No shader for this draw's own set of bools. Where its entry reads more of them than a build makes every set of, the pack has one
         // that reads them as it runs (kVsBoolsMade), and this draw's key gets that shader.
@@ -2710,7 +2715,7 @@ bool gx2_draw(const Gx2Draw &d) {
         u32 streams = 0;
         for (u32 k = 0; k < run_vertices; k++)
             for (u32 r = 0; r < 16; r++) streams += (vs.inputs >> r & 1) && (k ? vs.vertex_loc[k - 1][r] : vs.location[r]) >= 0;
-        if (vs.corner < 0 || streams > 15 || ((u64)(d.count / run_vertices) * streams + 3 * (vs.inputs >> 16)) * 16 > (4u << 20)) return false;
+        if (vs.corner < 0 || streams > 15 || ((u64)(d.count / run_vertices) * streams + 3 * (vs.inputs >> 16)) * 16 > (4u << 20)) {gpu_fallback_why=GPUF_LIMIT;return false;}
     }
     gx2_flush_cpu_batch();
     const u8 *ip = nullptr;
@@ -3578,6 +3583,11 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
         else GX2InitColorBufferRegs(&to);
     }
     if (to.surface.image) GX2CopySurface(&from->surface, 0, 0, &to.surface, 0, 0);
+#ifdef RECOMP_RESUMABLE
+    // Compose only onto the temporary scanout copy. The retained game picture
+    // must never contain the spinner, even when the game stops redrawing.
+    if (to.surface.image && checkpoint::saving_to_disk()) wiiu::draw_state_saving_on(&to);
+#endif
     GX2CopyColorBufferToScanBuffer(to.surface.image ? &to : from, target);
 }
 
@@ -5128,6 +5138,23 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     draw_text(w, h, hint, 165, 446, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
 }
+#ifdef RECOMP_RESUMABLE
+void draw_state_saving_on(GX2ColorBuffer *cb) {
+    const u32 w=854,h=480;
+    GX2SetColorBuffer(cb,GX2_RENDER_TARGET_0);cur_color=nullptr;begin_blit();
+    GX2SetViewport(0,0,(float)cb->surface.width,(float)cb->surface.height,0,1);
+    GX2SetScissor(0,0,cb->surface.width,cb->surface.height);
+    GX2SetPixelTexture(&black_tex,0);GX2SetPixelSampler(&blit_sampler,0);
+    set_blit_colors(0,0,0,0.04f,0.04f,0.04f);draw_rect(w,h,630,444,848,478,0,0,1,1);
+    GX2SetPixelTexture(&font_tex,0);GX2SetPixelSampler(&lut_sampler,0);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY,1,FALSE,TRUE);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0,GX2_BLEND_MODE_SRC_ALPHA,GX2_BLEND_MODE_INV_SRC_ALPHA,GX2_BLEND_COMBINE_MODE_ADD,FALSE,GX2_BLEND_MODE_ONE,GX2_BLEND_MODE_ZERO,GX2_BLEND_COMBINE_MODE_ADD);
+    set_blit_colors(1,1,1,0,0,0);
+    char label[]="SAVING TO SD  /";
+    label[14]="/-_>"[(OSTicksToMilliseconds(OSGetSystemTime())/150)%4];
+    draw_text(w,h,label,640,452,2);
+}
+#endif
 static void draw_menu() {
     draw_menu_on(drc_cb);
     draw_menu_on(tv_cb);
@@ -5436,6 +5463,12 @@ void gfx_pump(bool quiet) {
         draw_keyboard();
         screen_fresh = true;
     }
+#ifdef RECOMP_RESUMABLE
+    static bool saving_was_visible;
+    const bool saving_now=checkpoint::saving_to_disk();
+    if (saving_now || saving_was_visible) screen_fresh=true;
+    saving_was_visible=saving_now;
+#endif
     static u32 swaps_seen[2];  // each screen's swaps (services/gsp.cpp) up to the last VBlank's look
     unsigned swapped = 0;
     for (int s = 0; s < 2; s++) {
@@ -5503,6 +5536,8 @@ bool gfx_set(const char *name, u32 v) {
         uber_fallback = v;
         forget_ps = true;
     } else if (!strcmp(name, "cpuvs")) gxt_cpu_vs = v;
+    else if (!strcmp(name, "poolspin") && v<=1) g_pool_idle_spin.store(v!=0,std::memory_order_relaxed);
+    else if (!strcmp(name, "vssimd") && v<=1) g_cpu_vs_simd.store(v!=0,std::memory_order_relaxed);
     else if (!strcmp(name, "cpuattr") && v <= 15) gxt_cpu_attr = v;
     else if (!strcmp(name, "drawtrace") && v <= 1) draw_trace_enabled = v;
     else if (!strcmp(name, "vtxcache")) {  // the vertex data cache (vtx_cached); off drops what it holds
@@ -5596,6 +5631,11 @@ static void write_report() {
             n += snprintf(line + n, sizeof line - n, " (of which the vertex shader %.2f ms, the geometry shader's runs %.2f ms, of those about %.2f ms its EMITs: %.0f primitives)",
                           vtx_cpu.geometry_vs_ms / flips, vtx_cpu.geometry_gs_ms / flips, vtx_cpu.geometry_emit_ms / flips, vtx_cpu.geometry_prims / flips);
         if (n) LOG("[vtx] shaded on the CPU, per flip%s\n", line);
+        if (gpu_fallback_draws[0] || gpu_fallback_draws[1] || gpu_fallback_draws[2] || gpu_fallback_draws[3])
+            LOG("[fallback-route] missing vertex %llu; forced CPU %llu; missing geometry %llu; GPU resource limit %llu; CPU shader SIMD %u\n",
+                (unsigned long long)gpu_fallback_draws[0],(unsigned long long)gpu_fallback_draws[1],(unsigned long long)gpu_fallback_draws[2],(unsigned long long)gpu_fallback_draws[3],(unsigned)g_cpu_vs_simd.load());
+        for(auto &count:gpu_fallback_draws)count=0;
+        vtx_report_hotspots();
         vtx_cpu = {};
     }
     LOG("[prof] vertex data per draw: %.1f streams, %.0f vertices, %.1f KB; %.0f%% of streams from the cache (%u entries, %u KB)\n", st_attr_streams / draws,

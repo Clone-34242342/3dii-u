@@ -20,7 +20,7 @@ def checked_command(command, allow_renderer=False):
         if re.fullmatch(r'set diag [0-3]', command): return command
         match = re.fullmatch(r'set diagthread ([0-9]{1,5})', command)
         if match and int(match[1]) <= 65535: return command
-        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy) [01]', command): return command
+        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy|vssimd|poolspin) [01]', command): return command
         if re.fullmatch(r'set toplevel [012]', command): return command
         match = re.fullmatch(r'set cpuattr ([0-9]{1,2})', command)
         if match and int(match[1]) <= 15: return command

@@ -209,6 +209,33 @@ def parse(blob):
     return code, swz, entries
 
 
+def labels(blob):
+    """DVLE debug labels: (stage, instruction offset, declared length, name).
+
+    These include subroutines, not just drawable entry points. They are useful
+    for asset analysis, but must not be turned into draw records without the
+    material's uniforms and output mapping.
+    """
+    n = struct.unpack_from('<I', blob, 4)[0]
+    if not 1 <= n <= 256:
+        raise ValueError('no program count')
+    for at in struct.unpack_from(f'<{n}I', blob, 8):
+        if blob[at:at + 4] != b'DVLE':
+            raise ValueError('no DVLE')
+        table, count = struct.unpack_from('<II', blob, at + 32)
+        symbols, size = struct.unpack_from('<II', blob, at + 56)
+        if at + table + count * 16 > len(blob) or at + symbols + size > len(blob):
+            raise ValueError('truncated DVLE labels')
+        for i in range(count):
+            _, start, length, offset = struct.unpack_from('<4I', blob, at + table + i * 16)
+            if offset >= size:
+                raise ValueError('label name outside symbol table')
+            end = blob.find(b'\0', at + symbols + offset, at + symbols + size)
+            if end < 0:
+                raise ValueError('unterminated label name')
+            yield blob[at + 6], start, length, blob[at + symbols + offset:end].decode('utf-8', errors='replace')
+
+
 def slots_for(outs):
     # as the game's output registers would be set from this table: each semantic's parts, from the components that register writes
     s = [-1] * 24

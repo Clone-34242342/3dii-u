@@ -8,6 +8,10 @@ source=r'''
 struct State { std::string name; std::vector<unsigned> q; std::map<unsigned,std::string> m;
  void state_fields(checkpoint::Archive&a){a.fields(name,q,m);} };
 int main(){
+ std::array<u8,70000> staged_data{};staged_data[69999]=71;
+ checkpoint::Archive staged(nullptr,false);staged.raw(staged_data.data(),staged_data.size());
+ assert(staged.ok&&staged.staged.size()==2&&staged.staged.back()->back()==71);
+ staged_data[69999]=0;assert(staged.staged.back()->back()==71);
  FILE*f=tmpfile();assert(f);State s{"Mario",{1,3,7},{{4,"event"}}};
  checkpoint::Archive out(f,false);out.io(s);assert(out.ok);auto hash=out.hash, size=out.bytes;
  rewind(f);State restored;checkpoint::Archive in(f,true);in.io(restored);

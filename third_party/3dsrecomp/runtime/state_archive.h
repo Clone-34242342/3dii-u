@@ -20,17 +20,31 @@ namespace kernel { struct Object; struct Service; }
 namespace checkpoint {
 struct Archive {
     FILE *file;
+    std::vector<std::shared_ptr<std::vector<u8>>> staged;
+    bool buffering() const { return !file && !reading; }
     bool reading, ok = true;
     const char *error = nullptr;
     uint64_t bytes = 0, hash = 14695981039346656037ull;
     static constexpr uint64_t limit = 256ull << 20;
+    uint64_t payload_limit = limit; // file header bounds reconstruction before commit
     std::function<void(std::shared_ptr<kernel::Object>&)> object;
     std::function<void(std::shared_ptr<kernel::Service>&)> service;
     Archive(FILE *f, bool read) : file(f), reading(read) {}
     void fail(const char *why) { if (ok) error = why; ok = false; }
     void raw(void *p, size_t n) {
         if (!ok) return;
-        if (n > limit - bytes) { fail("state exceeds size limit"); return; }
+        if (bytes > payload_limit || n > payload_limit - bytes) { fail("state exceeds size limit"); return; }
+        if (buffering()) {
+            // Immutable chunks are shared with RAM restore callbacks.
+            if (bytes+n > (160u<<20)) { fail("background snapshot memory budget exceeded"); return; }
+            for (size_t at=0;at<n;) {
+                const size_t count=std::min<size_t>(n-at,64u<<10);
+                staged.push_back(std::make_shared<std::vector<u8>>((u8*)p+at,(u8*)p+at+count));
+                at+=count;
+            }
+            bytes += n;
+            return; // checksum belongs to the background writer
+        }
         const size_t done = reading ? fread(p, 1, n, file) : fwrite(p, 1, n, file);
         if (done != n) { fail("state I/O incomplete"); return; }
         for (size_t i = 0; i < n; ++i) hash = (hash ^ static_cast<uint8_t *>(p)[i]) * 1099511628211ull;

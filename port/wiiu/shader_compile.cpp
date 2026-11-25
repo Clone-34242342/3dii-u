@@ -21,6 +21,7 @@
 
 #include "latte_program.h"
 #include "shader_compile.h"
+#include "shader_queue.h"
 #include "shadergen.h"
 #include "wiiu.h"
 #include "physical_file.h"
@@ -35,6 +36,7 @@ struct Job {
     u64 key;
     u32 inputs;
     std::string glsl;
+    bool demanded = false;
     u32 tries = 0;  // compiles that came back hollow (compile_thread)
 };
 OSMutex mutex;
@@ -191,7 +193,7 @@ int compile_thread(int, void *) {
             LOG("[glsl] vertex %016llx came back hollow: %s\n", (unsigned long long)j.key, again ? "trying again" : "given up");
             if (again) OSSleepTicks(OSMillisecondsToTicks(250));
             OSLockMutex(&mutex);
-            if (again) jobs.push_front(std::move(j));
+            if (again) compile_queue::enqueue(jobs,std::move(j));
             else known.erase(j.key);
             OSUnlockMutex(&mutex);
             continue;
@@ -262,18 +264,21 @@ void shader_compile_watch() {
     wiiu::log_threads();  // memory only: this is the GPU thread, which never waits for the card
 }
 
-// A draw is waiting for this one, so it goes ahead of everything the cache queued at the start, and a shader the cache queued that a draw now
-// asks for moves up to the front: after a start with a few hundred cached shaders a miss used to wait its turn behind all of them, its draws
-// going through the fallback for as many seconds.
+// Prioritize demanded vertex work, then demanded pixels, then cache warm-up.
+// Repeated demand promotes a cached record without duplicating its compile.
 void shader_compile_request(bool vs, u64 key, std::string glsl, u32 inputs) {
     OSLockMutex(&mutex);
-    if (known.insert(key).second) jobs.push_front(Job{vs, false, key, inputs, std::move(glsl)});
+    if (known.insert(key).second) {
+        Job j{vs,false,key,inputs,std::move(glsl)};j.demanded=true;
+        compile_queue::enqueue(jobs,std::move(j));
+    }
     else
         for (auto it = jobs.begin(); it != jobs.end(); ++it)
             if (it->key == key && it->vs == vs) {
                 Job j = std::move(*it);
                 jobs.erase(it);
-                jobs.push_front(std::move(j));
+                j.demanded=true;
+                compile_queue::enqueue(jobs,std::move(j));
                 break;
             }
     OSUnlockMutex(&mutex);

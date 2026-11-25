@@ -82,6 +82,23 @@ struct Image {
         return saved;
     }
     void memory(void *ptr, size_t size) {
+        if (archive && archive->buffering()) {
+            if (bytes > max_bytes || size > max_bytes-bytes) { ok=false;return; }
+            for (size_t at=0; ok && at<size;) {
+                size_t part=std::min<size_t>(size-at,64u<<10);
+                archive->raw((u8*)ptr+at,part);
+                if (!archive->ok) { ok=false; return; }
+                auto saved=archive->staged.back();bytes+=part;
+                restore.push_back([target=(u8*)ptr+at,saved,part] {
+                    memcpy(target,saved->data(),part);
+#ifdef __WIIU__
+                    DCFlushRange(target,part);
+#endif
+                });
+                at+=part;
+            }
+            return;
+        }
         if (archive && !archive->reading) {
             archive->raw(ptr, size);
             if (!archive->ok) { ok = false; return; }
@@ -115,6 +132,8 @@ void audio_capture(Image &image);
 void request(unsigned command);  // 1 RAM save, 2 automatic load, 3 RAM discard, 4 persistent save, 5 file load
 void pump();                     // GPU thread only, outside native guest execution
 bool has_state();
+bool saving_to_disk();
+void finish_pending_write();
 const char *result_message();
 void set_heap_checks(bool enabled);
 void initialize_persistent();

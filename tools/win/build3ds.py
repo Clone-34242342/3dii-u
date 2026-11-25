@@ -781,10 +781,19 @@ def build_shaders(g, args):
     os.makedirs(g.shaders, exist_ok=True)
     empty = WORK + '/shadergen/no_pipelines.bin'
     open(empty, 'wb').close()
+    diagnostic_file = g.shaders + '/shader-diagnostics.tsv'
+    if os.path.exists(diagnostic_file):
+        os.remove(diagnostic_file)
     r = run([exe, g.pipelines or empty, g.dir + '/shader_logs', g.shaders, '-'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-600:].strip())
+    sys.path.insert(0, ROOT + '/tools')
+    import shader_diagnostics
+    shader_diagnostics.write_report(g.shaders, g.name)
     if r.returncode:
         sys.exit('shadergen failed')
+    sys.path.insert(0, ROOT + '/tools')
+    import observed_fragments
+    observed_fragments.inject(ROOT, g.dir + '/shader_logs', g.shaders)
     compile_shaders(g.shaders, args.jobs)
     shutil.rmtree(g.shaders + '/glsl', ignore_errors=True)  # compiled into shaders.gsh; nothing reads the GLSL after
 

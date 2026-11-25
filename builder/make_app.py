@@ -34,7 +34,7 @@ NAME = '3Dii U Builder'
 # what the build's scripts import that the window's code doesn't (they're run from the repository by path, so PyInstaller can't see them)
 SCRIPT_MODULES = ('urllib.request', 'ssl',  # covers.py, when the window is the frozen app
                   'wave',  # tools/make_boot_sound.py, for the window's start-up sound
-                  'argparse', 'bisect', 'builtins', 'concurrent.futures', 'filecmp', 'glob', 'hashlib', 'mmap', 'runpy', 'shlex', 'zlib',
+                  'argparse', 'bisect', 'builtins', 'csv', 'concurrent.futures', 'filecmp', 'glob', 'hashlib', 'mmap', 'runpy', 'shlex', 'zlib',
                   'cryptography.hazmat.primitives.ciphers')  # the last for phase0/tools/pack_wup.py, which packs the WUP
 EXCLUDE = ('numpy', 'PIL', 'tkinter', 'PySide6.QtWebEngineCore', 'PySide6.QtWebEngineWidgets', 'PySide6.QtWebEngineQuick', 'PySide6.QtPdf',
            'PySide6.QtMultimedia', 'PySide6.Qt3DCore', 'PySide6.QtCharts', 'PySide6.QtDataVisualization', 'PySide6.QtGraphs', 'PySide6.QtQuick3D')
@@ -85,6 +85,8 @@ def bundle_logs(src, dst):
     from the dump. Returns (records as recipes, records left out)."""
     logs, out = os.path.join(src, 'shader_logs'), os.path.join(dst, 'shader_logs')
     os.makedirs(out, exist_ok=True)
+    catalog = os.path.join(logs, 'observed_fragments.json')
+    if os.path.isfile(catalog): shutil.copy2(catalog, out)
     dvlb = os.path.join(logs, 'dvlb.bin')
     progs = shaderlogs.programs(dvlb) if os.path.isfile(dvlb) else set()
     recipes, shipped = 0, set()

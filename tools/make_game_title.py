@@ -247,6 +247,12 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan.
     pad_art: a picture of its own for the GamePad's start-up screen, shown as it is. boot_sound: the game's own start-up sound (a .btsnd,
     tools/make_boot_sound.py), in place of the one this PC has for every game."""
+    # Reject a title's content directory passed as system archives. Copying it
+    # after the game files would silently replace this game's code and header.
+    reserved = {'exheader.bin', 'code.bin', 'romfs.bin', 'exefs_icon.bin', 'shaders.gsh', 'shaders.idx', 'live.txt'}
+    collisions = reserved.intersection(os.listdir(archives))
+    if collisions:
+        raise ValueError('system archives folder contains game content: ' + ', '.join(sorted(collisions)))
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):

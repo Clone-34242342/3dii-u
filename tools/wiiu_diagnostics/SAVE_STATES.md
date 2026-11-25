@@ -28,6 +28,25 @@ checkpoint. Saving approximately 106 MB on the Wii U can take substantially
 longer than loading a RAM checkpoint. These files are separate from ordinary
 in-game progress saves.
 
+Persistent capture now stages immutable chunks shared with the RAM checkpoint.
+The paused phase still captures state and flushes game saves; a background worker
+then checksums and writes those chunks to SD. A same-session RAM load can finish
+while that write remains pending. Replacement file-save requests cancel/coalesce
+the old writer before a new capture; file loads wait for publication. Shutdown
+joins the writer before filesystem/log teardown. A failed disk write retains the
+RAM checkpoint. This does not make capture itself instantaneous.
+
+The saving indicator is composed onto temporary TV/GamePad scanout copies, not
+the retained game surfaces, and the first frame after completion removes it even
+when the game has stopped redrawing. Persistent loads reconstruct and checksum
+the payload in one pass, validate it, then commit; they no longer read the entire
+payload twice. Checksums, identity checks and bounded reconstruction remain.
+
+Host transaction tests cover a deliberately blocked disk writer, RAM restore
+before publication, 30 replacement requests, failure handling and corrupt-file
+rejection. The async revisions were built and uploaded for Planet Robobot;
+full repeated real-hardware stress testing and all-title behavior remain open.
+
 ## Observed validation
 
 - Kirby Triple Deluxe: three repeated save/load cycles on Wii U after the
