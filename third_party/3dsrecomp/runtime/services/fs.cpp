@@ -1031,8 +1031,22 @@ struct FsUser : Service {
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
             if (!SAVE_SETTLE(path, true)) { ipc.result(ERR_IO); break; }
-            ipc.result(fsys::remove(path) ? 0 : ERR_FILE_NOT_FOUND);
-            save_changed(path);
+            // Some Wii U filesystems report I/O errors when removing an absent file.
+            std::error_code ec;
+            const auto status = fsys::symlink_status(path, ec);
+            if (status.type() == fsys::file_type::not_found || ec == std::errc::no_such_file_or_directory) {
+                ipc.result(ERR_FILE_NOT_FOUND);
+                break;
+            }
+            if (fsys::is_directory(status)) { ipc.result(fs_err(250, 9)); break; }
+            const bool removed = !ec && fsys::remove(path, ec);
+            if (ec && ec != std::errc::no_such_file_or_directory) {
+                LOG("[fs] DeleteFile failed archive=%u path=%s error=%d\n", a->id, path.c_str(), ec.value());
+                ipc.result(ec == std::errc::not_a_directory ? ERR_PATH_NOT_FOUND : ERR_IO);
+                break;
+            }
+            ipc.result(removed ? 0 : ERR_FILE_NOT_FOUND);
+            if (removed) save_changed(path);
             break;
         }
         case 0x0805: {  // RenameFile(transaction, src archive, src type, src size, dst archive, dst type, dst size, ...)

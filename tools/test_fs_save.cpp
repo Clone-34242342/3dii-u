@@ -330,6 +330,27 @@ int main(int argc,char **argv) {
     kernel::FsUser user("fs:USER");const fs::path archive=root/"archive";fs::create_directory(archive);kernel::archives[1]={4,archive.generic_string()};
     memcpy(gptr(0x5000),"victim",7);memcpy(gptr(0x5100),"dest",5);
     const auto victim=archive/"victim",dest=archive/"dest";
+    auto delete_victim = [&] {
+        kernel::Lock lock(kernel::kmutex);
+        ipc_words(0x08040142,{0,1,0,3,7,0,0x5000});
+        kernel::IPC ipc(nullptr,0x1000,&lock);
+        user.handle(ipc);
+        return r32(0x1004);
+    };
+    assert(delete_victim() == kernel::ERR_FILE_NOT_FOUND);
+    put(victim/"keep","directory data");
+    assert(delete_victim() == kernel::fs_err(250, 9));
+    assert(get(victim/"keep") == "directory data");
+    fs::remove(victim/"keep");
+    assert(delete_victim() == kernel::fs_err(250, 9) && fs::is_directory(victim));
+    fs::remove(victim);
+    put(victim,"file data");
+    int lock_fd = -1;
+    assert(_sopen_s(&lock_fd, victim.string().c_str(), O_RDONLY | O_BINARY, _SH_DENYRW, 0) == 0);
+    assert(delete_victim() == kernel::ERR_IO);
+    ::close(lock_fd);
+    assert(get(victim) == "file data");
+    assert(delete_victim() == 0 && !fs::exists(victim));
     fault_call(user,victim,victim.generic_string(),0x08040142,{0,1,0,3,7,0,0x5000});
     fs::remove(victim);
     fault_call(user,victim,victim.generic_string(),0x08050244,{0,1,0,3,7,1,0,3,5,0,0x5000,0,0x5100},true,dest);
