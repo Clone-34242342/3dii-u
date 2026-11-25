@@ -184,6 +184,27 @@ def programs(game):
             yield from plain(inner)
 
 
+def material_records(game):
+    """Shader selections in recognized tagged materials, independent of runs."""
+    import tagged_materials
+    for name in ('romfs.bin', 'update_romfs.bin'):
+        path = os.path.join(game, name)
+        if not os.path.isfile(path) or not os.path.getsize(path):
+            continue
+        with open(path, 'rb') as f:
+            with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                for at, size in romfs_files(data):
+                    if data[at:at + 4] != tagged_materials.MAGIC:
+                        continue
+                    if size > 64 << 20 or at > len(data) or size > len(data) - at:
+                        print('tagged material discovery skipped an oversized/truncated asset', file=sys.stderr)
+                        continue
+                    try:
+                        yield from tagged_materials.shader_records(data[at:at + size], sys.modules[__name__])
+                    except (ValueError, struct.error, IndexError) as e:
+                        print(f'tagged material discovery incomplete: {e}', file=sys.stderr)
+
+
 def parse(blob):
     n = struct.unpack_from('<I', blob, 4)[0]
     if not 1 <= n <= 256:
@@ -210,6 +231,33 @@ def parse(blob):
     return code, swz, entries
 
 
+def labels(blob):
+    """DVLE debug labels: (stage, instruction offset, declared length, name).
+
+    These include subroutines, not just drawable entry points. They are useful
+    for asset analysis, but must not be turned into draw records without the
+    material's uniforms and output mapping.
+    """
+    n = struct.unpack_from('<I', blob, 4)[0]
+    if not 1 <= n <= 256:
+        raise ValueError('no program count')
+    for at in struct.unpack_from(f'<{n}I', blob, 8):
+        if blob[at:at + 4] != b'DVLE':
+            raise ValueError('no DVLE')
+        table, count = struct.unpack_from('<II', blob, at + 32)
+        symbols, size = struct.unpack_from('<II', blob, at + 56)
+        if at + table + count * 16 > len(blob) or at + symbols + size > len(blob):
+            raise ValueError('truncated DVLE labels')
+        for i in range(count):
+            _, start, length, offset = struct.unpack_from('<4I', blob, at + table + i * 16)
+            if offset >= size:
+                raise ValueError('label name outside symbol table')
+            end = blob.find(b'\0', at + symbols + offset, at + symbols + size)
+            if end < 0:
+                raise ValueError('unterminated label name')
+            yield blob[at + 6], start, length, blob[at + symbols + offset:end].decode('utf-8', errors='replace')
+
+
 def slots_for(outs):
     # as the game's output registers would be set from this table: each semantic's parts, from the components that register writes
     s = [-1] * 24
@@ -227,10 +275,10 @@ def gs_record(entry, code, swz):
     return out + struct.pack(f'<{len(code)}I', *code) + struct.pack(f'<{len(swz)}I', *swz)
 
 
-def record(entry, code, swz, b, slots):
+def record(entry, code, swz, b, slots, integers=bytes(16)):
     out = b'VS  ' + struct.pack('<III', entry, len(code), len(swz))
     out += struct.pack(f'<{len(code)}I', *code) + struct.pack(f'<{len(swz)}I', *swz)
-    out += bytes(b) + bytes(16) + bytes(x & 255 for x in slots)
+    out += bytes(b) + bytes(integers) + bytes(x & 255 for x in slots)
     return out
 
 
@@ -363,6 +411,12 @@ def write_records(game, check, lists=b'', archived=()):
         loaded += 1
         table.setdefault(start_of(entry, code), slots)
     out += lists
+    discovered = 0
+    for material in material_records(game):
+        for entry, code, _swz, slots in vertex_records(material):
+            table.setdefault(start_of(entry, code), slots)
+        out += material
+        discovered += 1
     agree = differ = unknown = 0
     missing = set()
     for entry, code, _swz, got in logged(game):
@@ -376,7 +430,7 @@ def write_records(game, check, lists=b'', archived=()):
             agree += 1
         else:
             differ += 1
-    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} from command lists; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
+    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} from command lists, {discovered} material selections; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
     if not check:
         with open(f'{game}/shader_logs/dvlb.bin', 'wb') as f:
             f.write(out)
