@@ -16,6 +16,8 @@ static u64 clock_ns = 0, host_serial = 0;
 static bool available = true, fresh = true, opened = false, writable = true, published = false;
 static u32 receive_address = 0x1d0001, receive_capacity = 40;
 static int starts = 0, stops = 0, writes = 0;
+static u32 last_write_addr, last_write_size;
+static bool last_write_exact;
 static std::shared_ptr<kernel::Service> service;
 static std::vector<kernel::ObjPtr> handles;
 static std::multimap<u64, std::function<void()>> timers;
@@ -41,7 +43,19 @@ void run_blocked(Lock &, const std::function<void()> &f) { f(); }
 u64 now_ns() { return clock_ns; }
 void add_timeout(u64 deadline, std::function<void()> f) { assert(deadline > clock_ns); timers.emplace(deadline, std::move(f)); }
 bool guest_writable(u32 addr, u32 size) { return writable && size && addr >= 0x1000 && (u64)addr + size <= memory.size(); }
-void gsp_cpu_wrote(u32 addr, u32 size) { assert(guest_writable(addr, size)); writes++; published = true; }
+void gsp_cpu_wrote(u32 addr, u32 size) {
+    assert(guest_writable(addr, size));
+    last_write_addr = addr;
+    last_write_size = size;
+    last_write_exact = true;
+    writes++;
+    published = true;
+}
+void gsp_cache_op(u32 addr, u32 size, bool cpu_will_read) {
+    assert(!cpu_will_read);
+    gsp_cpu_wrote(addr, size);
+    last_write_exact = false;
+}
 std::shared_ptr<Event> make_event(ResetType reset, const char *name) {
     auto event = std::make_shared<Event>(); event->reset = reset; event->name = name; return event;
 }
@@ -430,6 +444,7 @@ static void y2r_parity() {
         assert(call(0x18, {0x190001, 32, 0, 0}) == 0);
         auto done = event_call(0xf, {});
         assert(call(0x26) == 0 && done->signaled);
+        assert(last_write_exact && last_write_addr == 0x190001 && last_write_size == 32);
         for (u32 i = 0; i < 32; i++) {
             assert(memory[0x180001 + i] == (y == 16 ? 0 : 0xff));
             assert(memory[0x180001 + i] == memory[0x190001 + i]);
@@ -437,6 +452,44 @@ static void y2r_parity() {
         service = camera;
     }
     assert(call(0x3a) == 0);
+}
+
+static void y2r_strided_output() {
+    const auto camera = service;
+    kernel::register_y2r();
+    constexpr u32 src = 0x170001, dst = 0x190001;
+    assert(call(0x29, {4 | 3 << 8 | 1 << 24, 8 | 8 << 16, 2 | 0xff << 16}) == 0);
+    assert(call(0x13, {src, 128, 0, 0}) == 0);
+    for (u32 unit : {4u, 3u}) {
+        constexpr u32 gap = 4;
+        const u32 span = 128 + 127 / unit * gap;
+        assert(call(0x18, {dst, 128, unit, gap}) == 0);
+        std::fill_n(memory.data() + dst, span + 1, 0xcc);
+        for (u8 y : {16, 235}) {
+            for (u32 i = 0; i < 128; ++i) memory[src + i] = i & 1 ? 128 : y;
+            assert(call(0x26) == 0);
+            assert(!last_write_exact && last_write_addr == dst && last_write_size == span);
+            for (u32 i = 0; i <= span; ++i)
+                assert(memory[dst + i] == (i == span || i % (unit + gap) >= unit ? 0xcc : y == 16 ? 0 : 0xff));
+        }
+        for (u32 i = 0; i < 64; ++i) {
+            memory[src + 2 * i] = ((i & 1) ^ ((i >> 3) & 1)) ? 235 : 16;
+            memory[src + 2 * i + 1] = 128;
+        }
+        assert(call(0x26) == 0);
+        for (u32 i = 0; i < 128; ++i) {
+            const u32 pixel = i / 2;
+            const u8 expected = ((pixel & 1) ^ ((pixel >> 1) & 1)) ? 0xff : 0;
+            assert(memory[dst + i + i / unit * gap] == expected);
+        }
+    }
+    const int old_writes = writes;
+    assert(call(0x18, {dst, 127, 4, 4}) == 0 && call(0x26) == kernel::RES_INVALID_ADDRESS);
+    assert(call(0x18, {static_cast<u32>(memory.size()) - 128, 128, 4, 4}) == 0 &&
+           call(0x26) == kernel::RES_INVALID_ADDRESS);
+    assert(writes == old_writes);
+    published = false;
+    service = camera;
 }
 
 static void query_replies() {
@@ -618,6 +671,7 @@ int main(int argc, char **argv) {
     ipc_service();
     cadence_and_packages();
     y2r_parity();
+    y2r_strided_output();
     query_replies();
     byte_arguments();
     y2r_coefficients();

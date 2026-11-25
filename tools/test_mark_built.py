@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_ports as cp  # noqa: E402
@@ -23,5 +24,21 @@ cp.mark_built('two', 2000, 'Game Two (0004000000222200): Not tested\n')
 assert (name('g_one_v1'), name('g_two_v1')) == ('one', 'two'), "the other build leaves the first one's mark"
 cp.mark_built('three', 2000, 'no title line: the build failed before it\n')
 assert (name('g_one_v1'), name('g_two_v1')) == ('one', 'two'), 'nothing marked without the game named'
+
+title = Path(d) / 'builder_work/g_one_v1/out/title'
+(title / 'code').mkdir(parents=True)
+(title / 'code/app.xml').write_text('<app><title_id>000500003d001111</title_id></app>')
+(title / 'code/game.rpx').write_bytes(b'rpx')
+(title / 'content').mkdir()
+romfs = title / 'content/romfs.bin'
+romfs.write_bytes(b'fixture')
+cp.mark_built('one', 2000, 'Game One (0004000000111100): Not tested\n')
+assert cp.built_from_dump('one').rpx == (title / 'code/game.rpx').as_posix()
+romfs.write_bytes(b'torn')
+assert cp.built_from_dump('one') is None, 'a shortened payload cannot pass as a playable cached title'
+romfs.unlink()
+assert cp.built_from_dump('one') is None, 'a deleted payload cannot pass as a playable cached title'
+romfs.write_bytes(b'fixture')
+assert cp.built_from_dump('one') is not None
 shutil.rmtree(d)
 print('mark_built: ok')

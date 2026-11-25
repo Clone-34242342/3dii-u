@@ -19,12 +19,13 @@ bool replay_target_counters(FILE *file) {
     }
     u64 cpu_route = 0;
     for (u64 count : gpu::g_cpu_route) cpu_route += count;
-    const bool okay = gpu::st_draws == 6 && !gpu::st_cpu_draws && !cpu_draws &&
+    const bool okay = gpu::st_draws == 6 && gpu::st_immediate_draws == 1 && !gpu::vtx_immediate_cpu_runs && !gpu::st_cpu_draws && !cpu_draws &&
         !cpu_vertices && !cpu_route && !gpu::st_ps_misses && gpu::miss_buf.empty();
     fprintf(file, "{\"backend\":\"productionGX2\",\"resolution\":%u,\"diagnostic_1x\":%s,"
-        "\"native_draws\":%llu,\"cpu_batches\":%llu,\"cpu_draws\":%llu,\"cpu_vertices\":%llu,"
+        "\"native_draws\":%llu,\"immediate_native_draws\":%llu,\"immediate_cpu_runs\":%llu,\"cpu_batches\":%llu,\"cpu_draws\":%llu,\"cpu_vertices\":%llu,"
         "\"cpu_route\":%llu,\"pixel_misses\":%llu,\"shader_miss_bytes\":%u,\"pass\":%s}",
         gpu::top_rows, replay_default_480 ? "false" : "true", (unsigned long long)gpu::st_draws,
+        (unsigned long long)gpu::st_immediate_draws, (unsigned long long)gpu::vtx_immediate_cpu_runs,
         (unsigned long long)gpu::st_cpu_draws, (unsigned long long)cpu_draws,
         (unsigned long long)cpu_vertices, (unsigned long long)cpu_route,
         (unsigned long long)gpu::st_ps_misses, (u32)gpu::miss_buf.size(), okay ? "true" : "false");

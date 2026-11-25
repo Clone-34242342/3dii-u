@@ -34,8 +34,8 @@ static int read(Surfaces &surfaces, Memory &memory, uint32_t addr, uint32_t size
     });
     return count;
 }
-static void retire(Surfaces &surfaces, Memory &memory, size_t index) {
-    assert(sr::retire(*surfaces[index], surfaces, [&](Surface &s, const sr::Spans &owned) { materialize(s, memory, owned); }));
+static void retire(Surfaces &surfaces, size_t index) {
+    assert(sr::retire(*surfaces[index], surfaces));
     surfaces.erase(surfaces.begin() + index);
 }
 static void cpu_write(Surfaces &surfaces, Memory &memory, uint32_t addr, uint32_t size, uint8_t value) {
@@ -120,8 +120,12 @@ int main() {
         Memory memory{};
         cpu_write(surfaces, memory, 35, 1, 9);
         if (newer_already_read) assert(read(surfaces, memory, 32, 16) == 1);
-        retire(surfaces, memory, 1);  // dirty and clean aliases must both preserve ownership after deletion
-        assert(read(surfaces, memory, 16, 48) == 1);
+        else {
+            assert(!sr::retire(*surfaces[1], surfaces));
+            assert(read(surfaces, memory, 16, 48) == 2);
+        }
+        retire(surfaces, 1);
+        assert(read(surfaces, memory, 16, 48) == (newer_already_read ? 1 : 0));
         for (unsigned i = 16; i < 64; ++i) assert(memory[i] == (i == 35 ? 9 : i >= 32 && i < 48 ? 2 : 1));
         old.drawn = 3; old.gpu_newer = true; old.value = 3;
         assert(read(surfaces, memory, 16, 48) == 1);  // a later draw reclaims retired ownership
@@ -129,11 +133,13 @@ int main() {
     }
     {
         Surfaces surfaces;
-        add(surfaces, 16, 32, 1, 1);
+        auto &surface = add(surfaces, 16, 32, 1, 1);
         Memory memory{};
         cpu_write(surfaces, memory, 19, 2, 9);
         cpu_write(surfaces, memory, 27, 3, 8);
-        retire(surfaces, memory, 0);  // partial CPU writes cannot discard GPU-owned gaps on eviction
+        assert(!sr::retire(surface, surfaces));  // partial CPU writes leave GPU-owned gaps
+        assert(read(surfaces, memory, 16, 32) == 1);
+        retire(surfaces, 0);
         for (unsigned i = 16; i < 48; ++i)
             assert(memory[i] == (i >= 19 && i < 21 ? 9 : i >= 27 && i < 30 ? 8 : 1));
     }
@@ -142,14 +148,26 @@ int main() {
         auto &old = add(surfaces, 16, 48, 1, 1);
         auto &middle = add(surfaces, 32, 16, 2, 2);
         Memory memory{};
-        assert(!sr::retire(middle, surfaces, [](auto &, const auto &) {})); // failed readback retains ownership and target
+        assert(!sr::retire(middle, surfaces)); // live GPU bytes survive, even with no readback buffer
         assert(old.written.empty() && !old.guest_newer && middle.gpu_newer);
         add(surfaces, 32, 16, 3, 3);
-        assert(sr::retire(middle, surfaces, [](auto &, const auto &) { assert(false); })); // fully occluded: no staging needed
-        surfaces.erase(surfaces.begin() + 1);
-        retire(surfaces, memory, 1);
+        retire(surfaces, 1); // fully superseded by a newer alias
+        assert(read(surfaces, memory, 32, 16) == 1);
+        retire(surfaces, 1);
         read(surfaces, memory, 16, 48);
         for (unsigned i = 16; i < 64; ++i) assert(memory[i] == (i >= 32 && i < 48 ? 3 : 1));
+    }
+    {
+        Surfaces surfaces;
+        auto &surface = add(surfaces, 16, 32, 1, 1);
+        Memory memory{};
+        // Ordinary CPU stores can reuse a target address without notifying the renderer.
+        std::fill_n(memory.begin() + 16, 32, 9);
+        assert(!sr::retire(surface, surfaces));
+        for (unsigned i = 16; i < 48; ++i) assert(memory[i] == 9);
+        cpu_write(surfaces, memory, 16, 32, 9);
+        retire(surfaces, 0);
+        for (unsigned i = 16; i < 48; ++i) assert(memory[i] == 9);
     }
     {
         Surfaces surfaces;
@@ -195,5 +213,5 @@ int main() {
         read(surfaces, memory, 0, memory.size());
         assert(memory == expected);
     }
-    puts("surface readback: CPU spans, disjoint targets, alias retirement, readback failure, bounds and 200 ownership cases passed");
+    puts("surface readback: CPU spans, disjoint targets, safe retirement, bounds and 200 ownership cases passed");
 }

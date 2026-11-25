@@ -243,6 +243,7 @@ void cache_load() {
 void start_compiler() {
     InitGLSLCompiler();
     LOG("[glsl] compiler %s up\n", GetGLSLCompilerVersion());
+    if (g_verbose < 2) return;
     static char info[4096];
     {  // two known small shaders first: whether compiling works here at all, how long one takes, and that a loop (r600's jump tracker) gets through: in
         // Cemu it only does with tools/win/patch_cafeglsl_traps.py applied to the library

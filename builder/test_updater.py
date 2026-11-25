@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import updater as up  # noqa: E402
 assert 'ssl' not in sys.modules and 'urllib.request' not in sys.modules, 'app.py imports updater at every start: urllib and ssl load only when used'
 assert "ssl" not in sys.modules and "urllib.request" not in sys.modules, "app.py imports updater at every start: urllib and ssl load only when used"
+from unittest import mock
 
 up.LOCK_WAIT, up.DIED = 0.3, 1  # short waits keep this quick
 TOP, P = up.TOP, up.DOWNLOADS
@@ -403,12 +404,15 @@ with tempfile.TemporaryDirectory() as tmp:
     print('hold_version ok')
 
     # hand_over: a version that ends at once with an error has failed, and the app opens as itself
-    put(state='trying')
-    assert up.hand_over(sys.executable, ['-c', 'import sys; sys.exit(3)']) is False and record()['state'] == 'failed' and up.failed_tags() == [NEW]
-    put(state='trying')
-    assert up.hand_over(sys.executable, ['-c', 'pass']) is True and record()['state'] == 'trying', 'closed at once by the person: no failure'
-    put(state='trying')
-    assert up.hand_over(sys.executable, ['-c', 'import time; time.sleep(5)']) is True and record()['state'] == 'trying'
+    with mock.patch.object(up.subprocess, 'Popen') as spawn:
+        put(state='trying')
+        spawn.return_value.wait.return_value = 3
+        assert up.hand_over(exe, []) is False and record()['state'] == 'failed' and up.failed_tags() == [NEW]
+        put(state='trying')
+        spawn.return_value.wait.return_value = 0
+        assert up.hand_over(exe, []) is True and record()['state'] == 'trying', 'closed at once by the person: no failure'
+        spawn.return_value.wait.side_effect = subprocess.TimeoutExpired(exe, up.DIED)
+        assert up.hand_over(exe, []) is True and record()['state'] == 'trying'
     print('hand_over exit ok')
 
     # who may hand over

@@ -175,21 +175,24 @@ _qt = None  # the application Qt draws text with, made once
 CONSOLE_ART = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'art', 'vc_console_3ds.png')
 
 
-def console_screens(art, smdh_path, released='', case_scan=False, top_screen=False):
+def console_screens(art, smdh_path, released='', case_scan=False, top_screen=False, icon=None):
     """The start-up screens as the Wii U's Virtual Console draws a DS game's (the user's picture of one, 2026-11-14): "Virtual Console" at the
     top left, a large faint 3DS behind it all on the right (CONSOLE_ART), and across the middle a white band holding the game's picture, the
     console's name, the game's name from its SMDH, and released ("Released in Europe: 2011", say), or its publisher without one. The picture
     is the game's title screen where there is one, as the Virtual Console shows (top_screen: libretro's picture of both screens, one above the
-    other, of which the top one shows), else its art; a GameTDB cover (case_scan: 768x680, the case's front) gives the case without the strip
-    with the console's name down its side, shown whole. {'bootTvTex.tga': rows, 'bootDrcTex.tga': rows}, as art_pixels gives them, or None if
-    art can't be read."""
+    other, of which the top one shows), else its art or SMDH icon. A GameTDB cover (case_scan: 768x680, the case's front) gives the case without
+    the strip with the console's name down its side, shown whole. Returns both boot textures, or None if no usable art or icon was supplied."""
     global _qt
     from PySide6.QtCore import QRectF, Qt
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen
     _qt = QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
-    cover = QImage(art)
+    cover = QImage(art) if art else QImage()
     if cover.isNull():
-        return None
+        if icon is None:
+            return None
+        pixels = bytes(channel for row in icon for pixel in row for channel in pixel)
+        cover = QImage(pixels, 48, 48, 48 * 3, QImage.Format_RGB888)
+        case_scan = False
     if case_scan:  # a GameTDB case scan: its white strip down the right goes, and the whole height stays (a logo can sit low on it)
         cover = cover.copy(0, 0, 684, 680)
     if top_screen and cover.height() > cover.width() * 0.9:  # both screens, the bottom one under the top: the top one, 5:3, alone
@@ -319,9 +322,12 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     write_tga(os.path.join(meta_dir, 'bootLogoTex.tga'), icon, 170, 42, 32, 0, (0, 0, 0))
     write_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), icon, 854, 480, 24, 6, BACKGROUND)
     write_tga(os.path.join(meta_dir, 'bootTvTex.tga'), icon, 1280, 720, 24, 10, BACKGROUND)
-    band = screen_art or art  # the Virtual Console's picture: the title screen, else the art
-    screens = console_screens(band, os.path.join(game, 'exefs', 'icon.bin'), released, case_scan and not screen_art,
-                              top_screen=bool(screen_art)) if style == 'console' and band else None
+    screens = None
+    if style == 'console':
+        if screen_art:
+            screens = console_screens(screen_art, icon_bin, released, top_screen=True)
+        if screens is None:
+            screens = console_screens(art, icon_bin, released, case_scan, icon=icon)
     for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
         rows = screens[tga] if screens and tga in screens else art_pixels(picture, w, h, (0, 0, 0)) if picture else None
         if rows:

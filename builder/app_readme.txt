@@ -23,6 +23,8 @@ WHAT YOU NEED
     In the builder, press "Folder" next to "3DS System Files" and choose that 0004009b folder. Copied this way the files are
     encrypted, so the builder needs your 3DS keys (boot9.bin) to read them.
   The builder also looks in Citra's user folder, and in Downloads, Desktop and Documents. It copies them once and keeps them for every game after.
+- For standard 3DS Mii QR codes, put just the slot0x31KeyN line from your own 3DS key file in 3dii-u/mii_qr.key on your Wii U SD card before
+  starting the game. The key stays on the card outside the install package.
 
 
 GETTING STARTED
@@ -33,6 +35,7 @@ GETTING STARTED
 3. Click the big "+" tile (or press Ctrl+O) and choose your dump. The builder then asks about the game's update, DLC and mods.
 4. Under "Your Files", each light turns cyan once the builder has that file.
 5. Under "Put it on", choose your SD card or a folder, then press "Build It!".
+   For several games, configure each one and press "Add to queue". Press "Run queue" to build them in order.
    Big games take a while: the game's code is recompiled for the Wii U and its shaders are compiled ahead of time.
    The first build also compiles the builder's own runtime, so it takes a few minutes longer than the rest.
 6. Put the SD card in the Wii U and install the game with WUP Installer GX2.
@@ -41,22 +44,14 @@ GETTING STARTED
 
 WHICH GAMES WORK
 
-- "Complete on Wii U": finished. Confirmed on a real Wii U to run as the game should, with no known problems left:
-  New Super Mario Bros. 2.
-- "Plays on Wii U": tested on a real Wii U, and it plays; some things may still be rough:
-  Tomodachi Life, Paper Mario: Sticker Star, Mario & Luigi: Dream Team, Mario & Luigi: Paper Jam,
-  Mario & Luigi: Superstar Saga + Bowser's Minions, Mario & Luigi: Bowser's Inside Story + Bowser Jr.'s Journey,
-  Professor Layton and the Azran Legacy, Professor Layton and the Miracle Mask,
-  and The Legend of Zelda: Ocarina of Time 3D (American version, contributor-reported console play;
-  audio and graphics reports remain under investigation).
-  Either badge shows when your dump is the same edition that was tested. They were tested without updates.
-- "Runs in Cemu" (the Games page): built with this builder and played in the Cemu emulator, not yet on a real Wii U:
-  Mario Kart 7, The Legend of Zelda: A Link Between Worlds, Metroid: Samus Returns, Kirby: Triple Deluxe, Rhythm Heaven Megamix,
-  Phoenix Wright: Ace Attorney Trilogy, Animal Crossing: New Leaf, Kid Icarus: Uprising, Super Mario 3D Land and Miitopia.
+Open Games > Compatibility List. Choose "Plays on Wii U" for hardware playtests or "Plays in Cemu" for emulator playtests.
+The notes describe the tested edition, the sections played, and any known problems.
+
+- "Complete on Wii U" means the game was confirmed to play as expected on hardware.
+- "Plays on Wii U" and "Plays in Cemu" describe gameplay on the named platform. Some games appear in both lists.
+- "Limited" means an earlier stage such as startup or setup was checked.
+- "Untested" means gameplay on that platform is unverified. Updates, DLC, and mods can change compatibility.
 - The right stick and ZL/ZR provide Circle Pad Pro input when a game connects to that accessory. Otherwise ZL/ZR also act as L/R.
-  The PR #44 contributor reports Majora's Mask 3D play in Cemu; that game remains Untested here, with no console report.
-- "Untested": every other game, and any game with a mod. It may play, it may not start, or it may stop partway.
-  Reports on these games help the most.
 
 
 IF A GAME RUNS SLOWLY OR FREEZES ON THE WII U
@@ -111,7 +106,10 @@ WHAT STAYS ON YOUR PC
 
 UI and art design by syntcity.
 Virtual Console-style icon design by Walegy: https://github.com/J-Glitch2502/3dii-u/issues/45
-Ocarina of Time 3D build-mode support and the Circle Pad Pro/New 3DS input foundation by creeper88-boy:
+Compressed-CRO and static-module startup support by Clone-34242342:
+https://github.com/J-Glitch2502/3dii-u/pull/16
+First-trial extraction fixes, Ocarina of Time 3D build-mode support and the Circle Pad Pro/New 3DS input foundation by creeper88-boy:
+https://github.com/J-Glitch2502/3dii-u/pull/24
 https://github.com/J-Glitch2502/3dii-u/pull/42
 https://github.com/J-Glitch2502/3dii-u/pull/44
 

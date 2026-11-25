@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <filesystem>
 #include <chrono>
 #include <functional>
@@ -673,14 +674,25 @@ static FormatInfo format_info(const std::string &dir) {
     return info;
 }
 
-static void create_gamecoin(const std::string &dir) {
-    fsys::create_directories(dir);
+static bool create_gamecoin(const std::string &dir) {
+    std::error_code ec;
+    fsys::create_directories(dir, ec);
+    if (ec) return false;
     struct { u32 magic; u16 coins, coins_today; u32 steps, last_steps; u16 year; u8 month, day; } gc{le32(0x4F00), le16(10), 0, 0, 0, le16(2014), 1, 1};
-    if (FILE *f = fopen((dir + "/gamecoin.dat").c_str(), "wb")) {
-        fwrite(&gc, sizeof gc, 1, f);
-        fclose(f);
+    const std::string path = dir + "/gamecoin.dat", fresh = path + ".3diiu-new";
+    if (fsys::exists(path, ec)) return fsys::is_regular_file(path, ec) && !ec;
+    if (ec) return false;
+    FILE *f = fopen(fresh.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(&gc, sizeof gc, 1, f) == 1;
+    if (fflush(f)) ok = false;
+    if (fclose(f)) ok = false;
+    if (ok && !fsys::exists(path, ec) && !ec && !rename(fresh.c_str(), path.c_str())) {
+        LOG("[fs] created shared extdata F000000B with gamecoin.dat (10 Play Coins)\n");
+        return true;
     }
-    LOG("[fs] created shared extdata F000000B with gamecoin.dat (10 Play Coins)\n");
+    fsys::remove(fresh, ec);
+    return fsys::is_regular_file(path, ec) && !ec;
 }
 
 // Mii Maker's database (CFL_DB.dat, in the same extdata), with the console's own Miis put in, once a boot: games list them as Mii Maker's
@@ -689,24 +701,84 @@ static void create_gamecoin(const std::string &dir) {
 // (big-endian), then "CFRA" with its own CRC at 0xE4BE. A Mii already there with the same id and console stays where it is, a new one
 // takes the first free place, and each is written naming the place it lies at (page and slot, in its third byte). A 3DS keeps a Mii at
 // the place it names, and games find it again by that: Super Mario 3D Land shows no face on a save file whose Mii names a place where the
-// database holds another Mii. So a Mii keeps its place from one start to the next, whatever else the console gains or loses. The
-// player's own is placed first and always gets a place: with all hundred taken by others, the last.
+// database holds another Mii. Existing entries stay in their slots. The player's own is imported first when there is room.
 static std::vector<int> mii_places;  // where each of console_miis() lies, or -1: every place was taken
+static bool read_mii_db(FILE *f, std::vector<u8> &db) {
+    const bool ok = fseek(f, 0, SEEK_END) == 0 && ftell(f) == (long)db.size() && fseek(f, 0, SEEK_SET) == 0 &&
+                    fread(db.data(), 1, db.size(), f) == db.size() && !ferror(f);
+    const int closed = fclose(f);
+    return ok && !closed;
+}
+
+static bool write_mii_db(const std::string &path, const std::vector<u8> &db, bool had) {
+    const std::string fresh = path + ".3diiu-new", old = path + ".3diiu-old";
+    std::error_code ec;
+    fsys::remove(fresh, ec);
+    if (ec) return false;
+    FILE *f = fopen(fresh.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(db.data(), 1, db.size(), f) == db.size();
+    if (fflush(f)) ok = false;
+    if (fclose(f)) ok = false;
+    if (ok) {
+        std::vector<u8> check(db.size());
+        f = fopen(fresh.c_str(), "rb");
+        ok = f && read_mii_db(f, check) && check == db;
+    }
+    if (!ok) {
+        fsys::remove(fresh, ec);
+        return false;
+    }
+    if (had) {
+        fsys::remove(old, ec);
+        if (ec || rename(path.c_str(), old.c_str())) {
+            fsys::remove(fresh, ec);
+            return false;
+        }
+    } else if (fsys::exists(path, ec) || ec) {
+        fsys::remove(fresh, ec);
+        return false;  // a database appeared after the missing-file read
+    }
+    if (rename(fresh.c_str(), path.c_str())) {
+        if (!had || !rename(old.c_str(), path.c_str())) fsys::remove(fresh, ec);
+        return false;  // a failed rollback keeps the prior database in .3diiu-old
+    }
+    if (had) fsys::remove(old, ec);
+    return true;
+}
+
 static void sync_mii_db(const std::string &dir) {
     static bool done;
     if (done) return;
-    done = true;
+    static std::chrono::steady_clock::time_point retry_after;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < retry_after) return;
+    struct Cooldown {
+        std::chrono::steady_clock::time_point &after;
+        ~Cooldown() { after = std::chrono::steady_clock::now() + std::chrono::seconds(1); }
+    } cooldown{retry_after};  // include slow failed I/O before the next lookup can retry
+    std::error_code ec;
+    if (!create_gamecoin(dir)) return;
     int mine;
     const auto &miis = console_miis(&mine);
-    mii_places.assign(miis.size(), -1);
-    if (miis.empty()) return;
+    std::vector<int> places(miis.size(), -1);
+    if (miis.empty()) { mii_places.clear(); done = true; return; }
     const size_t players = mine < 0 ? 0 : (size_t)mine;  // as player_mii() has it
     const std::string path = dir + "/CFL_DB.dat";
+    const std::string old = path + ".3diiu-old";
+    const bool had_old = fsys::exists(old, ec);
+    if (ec) return;
+    const bool exists = fsys::exists(path, ec);
+    if (ec) return;
+    if (had_old && !exists && rename(old.c_str(), path.c_str())) return;
     std::vector<u8> db(0x4BD20, 0);
     bool had = false;
     if (FILE *f = fopen(path.c_str(), "rb")) {
-        had = fread(db.data(), 1, db.size(), f) == db.size() && !memcmp(db.data(), "CFOG", 4);
-        fclose(f);
+        had = read_mii_db(f, db) && !memcmp(db.data(), "CFOG", 4);
+        if (!had) { LOG("[fs] Mii Maker's existing database could not be read; kept unchanged\n"); return; }
+    } else if (errno != ENOENT || exists || had_old) {
+        LOG("[fs] Mii Maker's database could not be opened; kept unchanged\n");
+        return;
     }
     auto put_crc = [&](u32 from, u32 at) {
         const u16 c = mii_crc16(&db[from], at - from);
@@ -722,31 +794,42 @@ static void sync_mii_db(const std::string &dir) {
         put_crc(0xC820, 0xE4BE);
     }
     const std::vector<u8> before(db.begin(), db.begin() + 0xC820);
+    constexpr int official_slots = 100;
+    constexpr int reserved_for_game = 10;  // Leave one page for Miis the game creates or copies to Mii Maker.
+    int free_slots = 0;
+    for (int i = 0; i < official_slots; i++) {
+        if (mii_id_empty(&db[8 + i * 0x5C + 0x0C])) free_slots++;
+    }
     u32 placed = 0;
     for (size_t k = 0; k < miis.size(); k++) {
         const size_t n = k == 0 ? players : k <= players ? k - 1 : k;  // the player's, then the rest in their order
         int slot = -1, empty = -1;
-        for (int i = 0; i < 100 && slot < 0; i++) {
+        for (int i = 0; i < official_slots && slot < 0; i++) {
             const u8 *s = &db[8 + i * 0x5C];
             if (!memcmp(s + 0x0C, &miis[n][0x0C], 10)) slot = i;  // the same Mii: its id and the console that made it
-            else if (empty < 0 && !(s[0x0C] | s[0x0D] | s[0x0E] | s[0x0F])) empty = i;
+            else if (empty < 0 && mii_id_empty(s + 0x0C)) empty = i;
         }
-        if (slot < 0) slot = empty;
-        if (slot < 0 && n == players) slot = 99;
-        if (slot < 0) continue;  // all 100 places taken, by other Miis
+        if (slot < 0) {
+            if (empty < 0 || free_slots <= reserved_for_game) continue;
+            slot = empty;
+            free_slots--;
+        }
         u8 *s = &db[8 + slot * 0x5C];
         memcpy(s, miis[n].data(), 0x5C);
         s[0x02] = (u8)(slot / 10 | slot % 10 << 4);
-        mii_places[n] = slot;
+        places[n] = slot;
         placed++;
     }
     put_crc(0, 0xC81E);
-    if (had && std::equal(before.begin(), before.end(), db.begin())) return;
-    fsys::create_directories(dir);
-    if (FILE *f = fopen(path.c_str(), "wb")) {
-        fwrite(db.data(), 1, db.size(), f);
-        fclose(f);
+    if (!(had && std::equal(before.begin(), before.end(), db.begin()))) {
+        fsys::create_directories(dir, ec);
+        if (ec || !write_mii_db(path, db, had)) {
+            LOG("[fs] Mii Maker's database update failed; prior database kept\n");
+            return;
+        }
     }
+    mii_places = std::move(places);
+    done = true;
     LOG("[fs] Mii Maker's database: %u Mii%s from this console\n", placed, placed == 1 ? "" : "s");
 }
 
@@ -754,7 +837,6 @@ static void sync_mii_db(const std::string &dir) {
 // brought up to date here if the game hasn't opened it yet: in the folder a console has from the start, as open_archive makes it.
 int mii_maker_place(u32 n) {
     const std::string dir = g_save_base + "/shared/extdata/00000000f000000b";
-    if (!fsys::exists(dir)) create_gamecoin(dir);
     sync_mii_db(dir);
     return n < mii_places.size() ? mii_places[n] : -1;
 }
@@ -784,13 +866,21 @@ struct FsUser : Service {
                 LOG("[fs] OpenArchive: unsupported archive %x path %s\n", id, p.str().c_str());
                 return ERR_NOT_FOUND;
             }
-            if (id == 9 || id == 10) fsys::create_directories(a.host);
-            if (id == 7 && p.word(1) == 0xF000000B && !fsys::exists(a.host)) create_gamecoin(a.host);
-            if (id == 7 && p.word(1) == 0xF000000B) sync_mii_db(a.host);
-            if (!fsys::exists(a.host)) {
+            std::error_code ec;
+            if (id == 9 || id == 10) fsys::create_directories(a.host, ec);
+            if (ec) return ERR_IO;
+            bool exists = fsys::exists(a.host, ec);
+            if (ec) return ERR_IO;
+            if (id == 7 && p.word(1) == 0xF000000B) {
+                if (!create_gamecoin(a.host)) return ERR_IO;
+                exists = true;
+                sync_mii_db(a.host);
+            }
+            if (!exists) {
                 VLOG("[fs] archive %x (%s) not formatted\n", id, a.host.c_str());
                 return id == 4 ? ERR_NOT_FORMATTED : ERR_NOT_FOUND;
             }
+            if (!fsys::is_directory(a.host, ec) || ec) return ERR_IO;
         }
         *out = next_archive++;
         archives[*out] = a;

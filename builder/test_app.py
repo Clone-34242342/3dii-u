@@ -64,7 +64,7 @@ try:
     with mock.patch.dict(os.environ, {'THREEDII_ROOT': engine, 'THREEDII_WORK': work, 'THREEDII_BUILD': other}), \
             mock.patch.object(app.sys, 'argv', ['Builder.exe', '--pipeline', '--game', 'unused']):
         app.use_engine(engine)
-    assert not os.path.exists(other_cache), 'a pipeline inherited the engine but reused another build folder\'s stale objects'
+    assert os.path.exists(other_cache), 'dispatch must leave refresh to the locked pipeline'
     print('fresh_cache ok')
     # Cache refresh must reject aliases before deleting anything or publishing its stamp.
     protected = Path(base) / 'synthetic-nand' / 'title.tik'
@@ -216,7 +216,8 @@ try:
     print('packaging DLL search order ok')
     # a game called Complete must have its confirmed shader list before the app is made; the list's notes and other games don't count
     games = os.path.join(base, 'games')
-    compat = {'_about': 'notes', '_cemu': [{'status': 'Cemu'}], '1': {'slug': 'done', 'status': 'Complete'}, '2': {'slug': 'plays', 'status': 'Plays'}}
+    compat = {'_about': 'notes', '_wiiu': {'3': {'status': 'Plays'}}, '_cemu': {'4': {'name': 'Cemu only'}},
+              '1': {'slug': 'done', 'status': 'Complete'}, '2': {'slug': 'plays', 'status': 'Plays'}}
     assert make_app.unconfirmed(compat, games) == ['done']
     listed = os.path.join(games, 'done', 'shader_logs', 'confirmed.bin')
     os.makedirs(os.path.dirname(listed))

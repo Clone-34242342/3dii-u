@@ -9,7 +9,7 @@ No game data and no keys come with the builder. Everything it builds from is you
 ## Using it
 
 1. Open **`3Dii U Builder.exe`** in `dist/3Dii U Builder`. That folder is the whole app: copy it anywhere, as it needs no Python and no toolchain. To run the builder from the source instead, double-click `3Dii U Builder.pyw`.
-2. Click **Choose a game** (the big **+** tile, or Ctrl+O) and pick a dump. It can be a `.3ds`, `.cci`, `.cia`, `.cxi` or `.app` file, encrypted or already decrypted. The tile shows the game's art, and under it its name and maker, and a badge says how well it's known to run: **Complete on Wii U** for a finished game, **Plays on Wii U** for the other tested games, **Untested** for the rest.
+2. Click **Choose a game** (the big **+** tile, or Ctrl+O) and pick a dump. It can be a `.3ds`, `.cci`, `.cia`, `.cxi` or `.app` file, encrypted or already decrypted. The tile shows the game's art, name, maker, and compatibility badge.
 3. The builder then asks about the **update** and the **DLC**, right in its window:
    - If they're in the same folder as the game, it names them and asks whether to use them.
    - If not, it asks whether you have them, and lets you pick the files.
@@ -20,33 +20,21 @@ No game data and no keys come with the builder. Everything it builds from is you
    - **Wii U otp.bin** comes from your own console's NAND backup. The WUP is packed with the key inside it; the builder never shows or stores that key.
 5. **Put it on**: your SD card (cards set up for a Wii U come first), or a folder.
 6. **Build It!** It takes a while, longer for bigger games: the game's code is recompiled for the Wii U and its shaders are compiled ahead of time. You see each stage tick off. Your PC stays usable meanwhile, **Cancel** stops it cleanly, and **Details** shows everything the build prints.
+   - To build several games, configure each one and press **Add to queue**. **Run queue** builds them in order using the options and destination each entry had when you added it. A failed build leaves a result in the list and the next one starts. **Stop queue** cancels the active build and leaves the waiting entries ready to run again. The list lasts until you close the Builder.
 7. Put the card in your Wii U and install with **WUP Installer GX2**. If you installed an older build of the same game, delete that one first (System Settings, Data Management), then install the new one.
 
-**Games** in the bar on the left holds the games you picked before and lists the games tested on a real Wii U; **Help** answers questions about what you need, and holds the version, the update check and the light or dark look.
+**Games** in the bar on the left holds the games you picked before and the **Compatibility List**. **Help** covers what you need, app updates, and the light and dark themes.
 
 Saves live in the game's own save storage on the console, like any installed game. They show up in Data Management.
 
 ## Which games work
 
-`compat.json` lists the games tested on a real Wii U. They build with the same title IDs as the builds already handed out, so a rebuild replaces the old one. All of these play:
-
-- Tomodachi Life
-- New Super Mario Bros. 2
-- Paper Mario: Sticker Star
-- Mario & Luigi: Dream Team
-- Mario & Luigi: Paper Jam
-- Mario & Luigi: Superstar Saga + Bowser's Minions
-- Mario & Luigi: Bowser's Inside Story + Bowser Jr.'s Journey
-- Professor Layton and the Azran Legacy
-- Professor Layton and the Miracle Mask
-- The Legend of Zelda: Ocarina of Time 3D (American version, contributor-reported console play; outstanding audio and graphics reports remain under investigation)
-
-Any other game builds as **untested**. It gets a title ID of its own (`000500003Dxxxxxx`, kept clear of real Wii U titles), and code finders run on it, but nobody has played it yet: it may not start, or it may stop partway.
+Open **Games → Compatibility List** for Wii U and Cemu playtests. The records in [`compat.json`](compat.json) are keyed by 3DS program ID so different editions can have separate results. Read the notes for the tested settings and known issues. The top-level profiles also preserve the Wii U title IDs of existing builds.
 
 **Updates and DLC** are read the way a 3DS reads them:
 - An update brings its own code and its own RomFS, which the game lays over the original files itself.
 - DLC brings one RomFS per content, which the game finds through the same calls it makes on a 3DS.
-- The nine tested games were tested without updates, so with one they count as untested too.
+- Check the game's playtest note for any update or DLC used in testing.
 
 ## Mods
 
@@ -81,6 +69,7 @@ Windows 10 or 11 for now (Linux is planned):
   - The NAND's contents may be NCCH (`<n>.app`, encrypted as on the 3DS or not) or RomFS images already taken out (`<n>.app.romfs`). A folder of `<title id>.romfs` files works too.
   - Each row under "Your Files" has an "Info" button that explains its file to testers (`gui.HELP`).
   - Without the Mii data and the shared font, the app and `pipeline.py` won't build. A Miitopia built without them stopped on the console with `[err:f] result c8804478`.
+  - To scan or generate standard 3DS Mii QR codes on Wii U, put the `slot0x31KeyN` line from your own 3DS key file in `3dii-u/mii_qr.key` on the Wii U SD card before launching the game. The file can also contain just the 32 hexadecimal digits. It stays on your card outside the install package.
   - If a build ever lacks one, the runtime's error screen names the missing archive.
 - Free disk space of about three times the game's size while it builds. Work files are deleted at the end.
 - From the source: Python 3.10 or newer, `pip install PySide6-Essentials pyctr pycryptodome` once, and the build tools `tools/win/build3ds.py` uses. Install each once:
@@ -97,9 +86,9 @@ Windows 10 or 11 for now (Linux is planned):
   - It leaves out the parts of Qt the window never loads.
   - It puts the engine beside the app, in this repository's own layout. That includes what runs of the games learned: where their code starts, and the render states they met.
   - None of the games' code goes in. A run's shader log keeps each vertex record's whole shader memory, which is the game's own code. So `shaderlogs.py` ships each record as a fingerprint of the program of the game's DVLB it ran, beside the log in a `.vsf` file, and a build finds the program in the user's own dump again (dvlb.bin). Checked on the nine games: the shader generator makes the same shaders from these as from the full logs, except that it declares fewer unused inputs.
-  - A memory no DVLB program starts ships as a recipe instead (`.vsr`): where its words lie in the game's own `code.bin` and `romfs.bin`, or in a romfs file once unpacked (Yaz0, LZ10, LZ11). The build lays it out from the user's dump and checks it against the record's fingerprint, so another version of the game just leaves it out. Short runs must lie near long ones, so a recipe can't spell code out of coincidences.
+  - A capture can also ship as a recipe (`.vsr`) made of offsets in the game's own files or in programs discovered in those files. The scanner finds shader binaries in LZ11-compressed GARC entries as well as plain files. For a capture assembled from several programs, the recipe records the source of every word and the build checks the fingerprint of the completed memory.
     - The Mario & Luigi engine keeps a shader as plain words in its `code.bin` and loads a romfs program after it. That's 115 records the app used to leave out, and all of them come back now.
-    - For a game this repository keeps no dump of, `python builder/shaderlogs.py --recipes <extracted game folder> games/g_<code>/shader_logs` writes its `recipes.vsr`, which the app ships.
+    - With a current extracted build, `python builder/shaderlogs.py --recipes <extracted game folder> games/g_<code>/shader_logs` writes the recipes for those captures. It uses the build's own `shader_logs/dvlb.bin` to find combinations of discovered programs.
   - A game `compat.json` calls Complete also ships `confirmed.bin`: every fragment state the build it was confirmed with compiled ahead. A build compiles that list first, whatever its other logs hold (only a `--cold` build, which takes nothing a run learned, goes without it). Without it a later app could drop some of them: the states a build guesses beyond the logs are picked up to a limit, in an order that one more logged state changes (56 guesses out and 12 in for NSMB2, from a single new record). After a game is confirmed finished on a console, `python builder/shaderlogs.py --confirm <that build's shader_logs> games/<slug>/shader_logs` writes the list (a Builder build keeps its folder with `--keep`), and `make_app.py` won't make an app with a Complete game that has none.
   - A record still left out is drawn the CPU way on the console. Most of those are another game's, from a console log that collects every game: NSMB2's 17, for one, which NSMB2 never draws.
   - For an untested game built from the source, the build leaves its `dvlb.bin` where its runs' logs go (`games/g_<code>/shader_logs`), so the next app can fingerprint them. The console tools (`tools/console_*`), with this PC's paths and its console's address, stay out.

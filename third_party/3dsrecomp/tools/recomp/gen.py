@@ -24,8 +24,10 @@ def fname(key):
 
 
 class Analyzer:
-    def __init__(self, image, log=print):
+    def __init__(self, image, log=print, *, abi=False, mixed_abi=False):
         self.img = image
+        self.abi = abi
+        self.mixed_abi = mixed_abi
         self.ctx = arm.Ctx(image.ro_read)
         self.cache = {}
         self.log = log
@@ -204,7 +206,7 @@ class Analyzer:
         elif (w & 0x0FFFFFF0) == 0x008FF100:
             kind = 'add'
         if kind is None:
-            return None
+            return self.relative_word_table(i) or self.pc_relative_jump(i)
         rm = w & 15
         if kind == 'add':
             t = self.byte_table(a, rm)
@@ -241,6 +243,99 @@ class Analyzer:
                     if e is None or (e >> 24) != 0xEA:
                         break
         return targets if targets else None
+
+    def relative_word_table(self, i):
+        """ARM's `adr base, table; ldr delta, [base, index]; add pc, base, delta` switch."""
+        # shortcut: keep mixed-ABI jumps on the dispatcher until case labels can preserve ABI transitions.
+        if self.mixed_abi or (self.abi and i.kind == ICALL) or i.word & 0xFFF0FFF0 != 0xE080F000:
+            return None
+        operands = {(i.word >> 16) & 15, i.word & 15}
+        img = self.img
+        load = i.addr - 4
+        word = img.read32(load)
+        if word is not None and word & 0xFFFFFFF0 == 0xE1A0E000 and 14 not in operands:
+            load -= 4  # mov lr, rX before a jump returning through that register
+            word = img.read32(load)
+        if word is None or word & 0xFFF00FF0 not in (0xE7900000, 0xE7900100) or word & 15 == 15:
+            return None
+        rb, rd = (word >> 16) & 15, (word >> 12) & 15
+        if rb == rd or 15 in operands or {rb, rd} != operands:
+            return None
+        for adr in range(load - 4, load - 52, -4):
+            op = self.decode(adr, 0)
+            if op is None or op.kind != OP:
+                return None
+            if self.writes(adr, rb):
+                break
+        else:
+            return None
+        word = op.word
+        kind = word & 0xFFFFF000
+        if kind not in (0xE28F0000 | rb << 12, 0xE24F0000 | rb << 12):
+            return None
+        imm = arm.ror(word & 0xFF, ((word >> 8) & 15) * 2)
+        base = adr + 8 + (-imm if word & 0x00400000 else imm)
+        segment = img.seg_of(adr)
+        if base & 3 or adr <= base <= i.addr or img.seg_of(base) is not segment:
+            return None
+        # shortcut: scan contiguous aligned offsets within the segment, until more index bounds can be proven.
+        limit = min(adr if base < adr else segment.addr + segment.size, base + 4096)
+        targets = []
+        end = base
+        for slot in range(base, limit, 4):
+            if slot >= limit:
+                break
+            delta = img.ro_read(slot)
+            if delta is None:
+                break
+            if delta == 0 and targets:  # an unused index in a sparse table
+                continue
+            target = (base + delta) & 0xFFFFFFFF
+            if target & 3 or img.seg_of(target) is not segment or base <= target <= slot:
+                break
+            targets.append(target)
+            end = slot + 4
+            if target > base:
+                limit = min(limit, target)
+        if len(targets) < 2 or any(base <= target < end for target in targets):
+            return None
+        if i.kind == JMP and load == adr + 4 and i.addr == load + 4 and 14 not in operands:
+            link = self.pc_relative_pair(adr - 8, 14)
+            # shortcut: a hand-written return can carry any register, so register these continuations only with full-state returns.
+            if link is not None and self.abi:
+                return None
+            i.link = link
+        return targets
+
+    def pc_relative_pair(self, addr, reg):
+        """An ARM ADR followed by an immediate adjustment of the same register."""
+        def adjustment(word, rn):
+            if word is None:
+                return None
+            operands = rn << 16 | reg << 12
+            op = word & 0xFFFFF000
+            if op not in (0xE2800000 | operands, 0xE2400000 | operands):
+                return None
+            imm = arm.ror(word & 0xFF, ((word >> 8) & 15) * 2)
+            return -imm if word & 0x00400000 else imm
+
+        base = adjustment(self.img.read32(addr), 15)
+        delta = adjustment(self.img.read32(addr + 4), reg)
+        if base is None or delta is None:
+            return None
+        target = (addr + 8 + base + delta) & 0xFFFFFFFF
+        return target if not target & 3 and self.img.in_text(target) else None
+
+    def pc_relative_jump(self, i):
+        if self.mixed_abi or i.word & 0x0FFFFFF0 != 0x01A0F000 or i.word & 15 >= 13:
+            return None
+        reg = i.word & 15
+        target = self.pc_relative_pair(i.addr - 8, reg)
+        if target is None:
+            prev = self.decode(i.addr - 4, 0)
+            if prev is not None and prev.kind == OP and not self.writes(prev.addr, reg):
+                target = self.pc_relative_pair(i.addr - 12, reg)
+        return [target] if target is not None else None
 
     def thumb_table(self, i):
         """RVCT's Thumb switch on a table of byte (or halfword) offsets right after the jump:
@@ -407,6 +502,8 @@ class Analyzer:
                     work.append(tk)
             if i.kind == JMP and i.jt is None:
                 i.jt = self.jump_table(i, th)
+            if i.kind == ICALL and not th and i.jt is None:
+                i.jt = self.relative_word_table(i)
             if i.kind == JMP and i.jt:
                 for t in i.jt:
                     if (t & 1) == th and t not in insts:
@@ -578,6 +675,12 @@ class Analyzer:
                                 continue
                             self.funcs[t] = True
                             queue.append(t)
+                    if i.kind == JMP and not i.thumb and i.jt and i.link is not None:
+                        # Some ARM table dispatches build a continuation in lr before jumping to a case.
+                        if i.addr - 16 in insts and i.addr - 12 in insts:
+                            lit_candidates.add(i.link)
+                    if i.kind == ICALL and i.jt:
+                        lit_candidates.update(i.jt)
                     if i.reads_pc_lit is not None:
                         v = img.read32(i.reads_pc_lit)
                         if v is not None and img.in_text(v & ~1):
@@ -769,6 +872,9 @@ class Emitter:
                 for t in i.jt:
                     if (t & 1) == th:
                         labels.add(t & ~1)
+                        # Another computed branch can enter a relative word table's case directly.
+                        if not abi and not th and i.word & 0xFFF0FFF0 == 0xE080F000 and t != start:
+                            resume.append(t)
             if i.kind in (CALL, ICALL, SVC) and i.falls_through:
                 nxt = a + i.size
                 if nxt in insts:
@@ -1257,10 +1363,14 @@ class Emitter:
             f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
             cros = self.an.img.cros
             if cros:
+                f.write('\nconst u32 guest_has_static_module = 1;\n')
+            if cros and cros.mods:
                 # the slots the runtime's ldr:ro moves each CRO module's code to (tools/recomp/cro.py)
                 f.write('\nconst GuestCro guest_cros[] = {\n')
                 for m in cros.mods:
-                    f.write('  {"%s", 0x%xu, 0x%xu},\n' % (m.name, m.base, m.slot_size()))
+                    # Fixed-width octal escapes cannot absorb following characters in a C literal.
+                    name = ''.join(chr(b) if 32 <= b <= 126 and b not in b'"\\?' else f'\\{b:03o}' for b in m.name.encode('latin-1'))
+                    f.write('  {"%s", 0x%xu, 0x%xu},\n' % (name, m.base, m.slot_size()))
                 f.write('};\nconst u32 guest_cro_count = %d;\n' % len(cros.mods))
             # classes by name, for profiles that find addresses through RTTI (tools/recomp/rtti.py)
             cls = sorted(rtti.classes(self.an.img).items())
@@ -1289,7 +1399,7 @@ def main():
     if args.lazy:
         return lazy(args)
     img = Image(args.gamedir)
-    an = Analyzer(img)
+    an = Analyzer(img, abi=args.abi, mixed_abi=args.abi and bool(args.safe_range))
     for path in args.extra:
         if os.path.exists(path):
             for line in open(path):

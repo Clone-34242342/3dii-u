@@ -47,9 +47,15 @@ with tempfile.TemporaryDirectory() as tmp:
     assert sorted(got) == sorted(dumps.ESSENTIAL_ARCHIVES), got
     assert dumps.have_system_archives(out)
     assert open(os.path.join(out, '0004009b00010202.romfs'), 'rb').read()[4:] == b'0004009b00010202' * 4
+    words = ('000400db00010302',)
+    broken = os.path.join(out, words[0] + '.romfs')
+    open(broken, 'wb').write(b'\0' * 64)
+    assert dumps.have_system_archives(out) and not dumps.have_system_archives(out, words)
+    assert words[0] in dumps.import_system_archives(sd, out, tmp)
+    assert dumps.have_system_archives(out, words)
 
     again = os.path.join(tmp, 'again')  # a folder of <title id>.romfs, as the builder keeps them
-    assert sorted(dumps.import_system_archives(out, again, tmp)) == sorted(dumps.ESSENTIAL_ARCHIVES)
+    assert sorted(dumps.import_system_archives(out, again, tmp)) == sorted(dumps.ESSENTIAL_ARCHIVES + words)
     assert dumps.import_system_archives(out, out, tmp)  # importing a folder into itself leaves it as it was
     assert not dumps.have_system_archives(os.path.join(tmp, 'nothing'))
 
@@ -73,6 +79,8 @@ with tempfile.TemporaryDirectory() as tmp:
         pass
 
     with mock.patch.object(pipeline, 'ARCHIVES', cached), \
+            mock.patch.object(pipeline, 'BUILD', tmp), \
+            mock.patch.object(pipeline, 'WORK', os.path.join(tmp, 'workspace')), \
             mock.patch.object(pipeline, 'WORK_GAMES', os.path.join(tmp, 'work')), \
             mock.patch.object(pipeline, 'profile_for', return_value=None), \
             mock.patch.object(pipeline.user_files, 'check_otp', return_value=None), \

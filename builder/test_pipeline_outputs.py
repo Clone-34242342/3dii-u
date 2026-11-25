@@ -1,6 +1,8 @@
 """Failure injection for replacing a built WUP or its SD-card copy; all files are synthetic."""
 import os
+import hashlib
 from pathlib import Path
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +10,19 @@ from contextlib import ExitStack
 from unittest import mock
 
 import pipeline
+
+
+def fake_tmd(marker, title_id=0x000500003d000863):
+    issuer = b'Root-CA00000003-CP0000000b'.ljust(0x40, b'\0')
+    record = struct.pack('>IHHQ', 0, 0, 1, len(marker)) + hashlib.sha1(marker).digest().ljust(0x20, b'\0')
+    infos = (struct.pack('>HH', 0, 1) + hashlib.sha256(record).digest()).ljust(0x900, b'\0')
+    header = bytearray(0x204)
+    struct.pack_into('>I', header, 0, 0x00010004)
+    header[0x140:0x180] = issuer
+    struct.pack_into('>Q', header, 0x18C, title_id)
+    struct.pack_into('>H', header, 0x1DE, 1)
+    header[0x1E4:] = hashlib.sha256(infos).digest()
+    return bytes(header) + infos + record
 
 
 class OutputTests(unittest.TestCase):
@@ -18,15 +33,25 @@ class OutputTests(unittest.TestCase):
         self.target = self.root / 'output' / 'Game'
         for folder, data in ((self.source, b'new'), (self.target, b'old')):
             folder.mkdir(parents=True)
-            (folder / 'title.tmd').write_bytes(data)
+            (folder / 'title.tmd').write_bytes(fake_tmd(data))
 
     def tearDown(self):
         assert self.source.resolve().is_relative_to(self.root) and self.target.resolve().is_relative_to(self.root)
         self.temp.cleanup()
 
+    def test_disk_estimate_for_unpacked_cemu_checks(self):
+        gib = 1 << 30
+        base = mock.Mock(size=3 * gib, kind='game')
+        update = mock.Mock(size=gib // 2, kind='update')
+        dlc = mock.Mock(size=gib // 4, kind='dlc')
+        extras = [update, dlc]
+        self.assertEqual(pipeline.required_disk(base, extras, [], True), 7 * gib)
+        self.assertEqual(pipeline.required_disk(base, extras, [base, dlc], True), 10 * gib)
+        self.assertEqual(pipeline.required_disk(base, extras, [base, dlc], False), 69 * gib // 4)
+
     def old_intact(self):
         self.assertTrue(self.target.is_dir(), 'the last good output was removed')
-        self.assertEqual((self.target / 'title.tmd').read_bytes(), b'old')
+        self.assertEqual((self.target / 'title.tmd').read_bytes(), fake_tmd(b'old'))
 
     def test_copy_rename_failure(self):
         rename = os.rename
@@ -61,15 +86,15 @@ class OutputTests(unittest.TestCase):
 
     def test_copy_success(self):
         pipeline.copy_to(str(self.source), str(self.target.parent))
-        self.assertEqual((self.target / 'title.tmd').read_bytes(), b'new')
-        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+        self.assertEqual((self.target / 'title.tmd').read_bytes(), fake_tmd(b'new'))
+        self.assertEqual([p for p in self.target.parent.iterdir() if p.is_dir()], [self.target])
 
     def test_copy_verification_failure(self):
         with mock.patch.object(pipeline.filecmp, 'cmpfiles', return_value=([], ['title.tmd'], [])):
             with self.assertRaises(SystemExit):
                 pipeline.copy_to(str(self.source), str(self.target.parent))
         self.old_intact()
-        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+        self.assertEqual([p for p in self.target.parent.iterdir() if p.is_dir()], [self.target])
 
     def test_copy_failed_rollback_keeps_backup(self):
         rename = os.rename
@@ -84,7 +109,7 @@ class OutputTests(unittest.TestCase):
                 pipeline.copy_to(str(self.source), str(self.target.parent))
         backups = list(self.target.parent.glob('.3diiu-*/previous/title.tmd'))
         self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), b'old')
+        self.assertEqual(backups[0].read_bytes(), fake_tmd(b'old'))
 
     def test_hard_stop_during_swap_keeps_backup(self):
         script = '''
@@ -103,20 +128,20 @@ pipeline.copy_to(sys.argv[1], sys.argv[2])
         self.assertEqual(r.returncode, 23, r.stderr)
         backups = list(self.target.parent.glob('.3diiu-*/previous/title.tmd'))
         self.assertEqual(len(backups), 1)
-        self.assertEqual(backups[0].read_bytes(), b'old')
+        self.assertEqual(backups[0].read_bytes(), fake_tmd(b'old'))
         self.assertIn(str(backups[0].parent), r.stdout)
 
     def test_pack_success(self):
         def packed(argv, **kwargs):
             out = Path(argv[-1])
             out.mkdir()
-            (out / 'title.tmd').write_bytes(b'new')
+            (out / 'title.tmd').write_bytes(fake_tmd(b'new'))
             return subprocess.CompletedProcess(argv, 0, 'packed')
 
         with mock.patch.object(pipeline.subprocess, 'run', side_effect=packed):
             pipeline.pack_wup('unused', 'unused', str(self.target))
-        self.assertEqual((self.target / 'title.tmd').read_bytes(), b'new')
-        self.assertEqual(list(self.target.parent.iterdir()), [self.target])
+        self.assertEqual((self.target / 'title.tmd').read_bytes(), fake_tmd(b'new'))
+        self.assertEqual([p for p in self.target.parent.iterdir() if p.is_dir()], [self.target])
 
     def test_failed_retry_preserves_wup_left_by_card_failure(self):
         engine, build = self.root / 'engine', self.root / 'build'
@@ -157,11 +182,11 @@ def build_shaders(*args): pass
             if Path(argv[1]).name == 'pack_game_wup.py':
                 out = Path(argv[-1])
                 out.mkdir()
-                (out / 'title.tmd').write_bytes(b'completed WUP')
+                (out / 'title.tmd').write_bytes(fake_tmd(b'completed WUP'))
             return subprocess.CompletedProcess(argv, 0, '')
 
         with ExitStack() as stack:
-            for owner, name, value in ((pipeline, 'ROOT', str(engine)), (pipeline, 'BUILD', str(build)),
+            for owner, name, value in ((pipeline, 'ROOT', str(engine)), (pipeline, 'BUILD', str(build)), (pipeline, 'WORK', str(build)),
                                       (pipeline, 'WORK_GAMES', str(build / 'builder_work')), (pipeline, 'ARCHIVES', str(build / 'archives')),
                                       (pipeline.sys, 'platform', 'win32'),
                                       (pipeline.sys, 'argv', ['pipeline.py', '--game', 'made-up.3ds', '--otp', 'unused', '--card', str(self.root / 'card')])):
@@ -184,7 +209,7 @@ def build_shaders(*args): pass
             with self.assertRaises(ExtractionFailed):
                 pipeline.main()
             self.assertTrue(completed[0].is_file(), 'retry discarded the completed WUP before producing its replacement')
-            self.assertEqual(completed[0].read_bytes(), b'completed WUP')
+            self.assertEqual(completed[0].read_bytes(), fake_tmd(b'completed WUP'))
 
     def test_compiler_policy_and_discovery_without_learned_assets(self):
         import json

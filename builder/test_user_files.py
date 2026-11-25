@@ -41,6 +41,8 @@ with tempfile.TemporaryDirectory() as tmp:
     assert uf.bundled(clean) == []
     put(clean, 'engine/deep/SeedDB.bin', b'x')
     assert [os.path.basename(p) for p in uf.bundled(clean)] == ['SeedDB.bin']
+    put(clean, 'engine/deep/Mii_QR.KEY', b'placeholder')
+    assert {os.path.basename(p) for p in uf.bundled(clean)} == {'SeedDB.bin', 'Mii_QR.KEY'}
 
     # Release checks reject recognizable raw dumps anywhere in the engine, without
     # rejecting the shader records and resources the builder deliberately ships.

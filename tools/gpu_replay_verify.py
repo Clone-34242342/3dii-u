@@ -12,7 +12,7 @@ import compare
 import pngdiff
 
 CASES = {'clear': (400, 240, None), 'triangle': (400, 240, (255, 0, 0, 255)),
-         'depth': (400, 240, (0, 255, 0, 255)), 'texture': (400, 240, (255, 255, 0, 255)),
+         'depth': (400, 240, (0, 255, 0, 255)), 'texture': (400, 240, None),
          'blend': (400, 240, (80, 64, 64, 255)), 'bottom_clear': (320, 240, None)}
 BACKGROUND = bytes((16, 32, 48, 255))
 
@@ -27,8 +27,16 @@ def make_analytical(folder):
         # Clip coordinates Â±3/4 map to a centered rectangle occupying3/4 of both
         # axes. After LCD rotation its bounds are x=[50,350), y=[30,210).
         # Pixel centers never lie on its four outer boundaries; no masks/tolerance.
-        rows = [b''.join(bytes(color) if color and 50 <= x < 350 and 30 <= y < 210
-                         else BACKGROUND for x in range(width)) for y in range(height)]
+        if name == 'texture':
+            # On the rotated LCD, U increases upward and V increases leftward.
+            border = BACKGROUND * 50
+            upper = border + bytes((0, 255, 0, 255)) * 150 + bytes((255, 255, 0, 255)) * 150 + border
+            lower = border + bytes((255, 0, 0, 255)) * 150 + bytes((0, 0, 255, 255)) * 150 + border
+            blank = [BACKGROUND * width] * 30
+            rows = blank + [upper] * 90 + [lower] * 90 + blank
+        else:
+            rows = [b''.join(bytes(color) if color and 50 <= x < 350 and 30 <= y < 210
+                             else BACKGROUND for x in range(width)) for y in range(height)]
         pngdiff.save(folder / (name + '.png'), width, height, rows)
 
 
@@ -47,7 +55,9 @@ def verify(folder, backend, reference, png_folder):
     if backend == 'productionGX2':
         if counters.get('native_draws') != 6 or counters.get('pass') is not True:
             raise ValueError('fixture did not draw six native batches')
-        for field in ('cpu_batches', 'cpu_draws', 'cpu_vertices', 'cpu_route', 'pixel_misses', 'shader_miss_bytes'):
+        if counters.get('immediate_native_draws') != 1:
+            raise ValueError('fixture did not issue its native immediate batch')
+        for field in ('immediate_cpu_runs', 'cpu_batches', 'cpu_draws', 'cpu_vertices', 'cpu_route', 'pixel_misses', 'shader_miss_bytes'):
             if counters.get(field) != 0:
                 raise ValueError('fallback or incomplete counters: ' + field)
         if counters.get('resolution') not in (240, 480):
@@ -69,7 +79,7 @@ def verify(folder, backend, reference, png_folder):
     return {'match': compared['match'], 'backend': backend, 'counters': counters, 'comparison': compared,
             'raw_sha256': {name: sha(folder / (name + '.rgba')) for name in CASES},
             'result_sha256': sha(folder / 'result.json'), 'tolerance': 0,
-            'reference_kind': 'Independent analytical uniform fill and centered rectangle; no GPU output was promoted to reference.'}
+            'reference_kind': 'Independent analytical fills, centered rectangles, and four texture quadrants.'}
 
 
 if __name__ == '__main__':

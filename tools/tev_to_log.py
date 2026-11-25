@@ -6,7 +6,7 @@ a fixed stride, then the alpha test, buffer colour and buffer update writes. The
 is put into the settings the game's own runs logged around combiners with the same textures and lighting. Writes <game dir>/shader_logs/models_fs.bin, records like fs_log.bin.
 tev_to_log.py <game dir>. NSMB2 on 2026-11-07: both fragment states the console missed that day came out of this, with no run having reached them.
 Files are read as they are, or unpacked first: LZ10/LZ11/Level-5/Yaz0 (dvlb_to_log.py) or the 3DS's backward LZ (Sticker Star's .bcrez).
-M&L's BG4 archives are opened entry by entry, nested ones too.
+BG4 archives are opened entry by entry, nested ones too. The Builder also passes material candidates recovered by the native archive scanner.
 shortcut: Layton's XFSA archives aren't opened yet.
 """
 import glob
@@ -16,7 +16,7 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from dvlb_to_log import romfs_files, unpacked  # noqa: E402
+from dvlb_to_log import MAX_UNPACKED, fragment_keys, framed_records, romfs_files, unpacked  # noqa: E402
 
 TEV_REGS = (0xC0, 0xC8, 0xD0, 0xD8, 0xF0, 0xF8)
 HEADS = [0x804F0000 | r for r in TEV_REGS]  # all bytes, four more words, consecutive
@@ -25,16 +25,25 @@ OUT = 'models_fs.bin'
 
 
 def materials(b):
-    """(where, six stages of (source, operand, combine, colour, scale), {register: value} written after them)"""
-    p = 0
-    while True:
-        p = b.find(FIRST, p)
-        if p < 0:
+    """Six combiner stages, their trailing register writes, and optional CGFX lighting metadata."""
+    compact = b.startswith(b'MTEV')
+    if compact:
+        if len(b) < 12:
             return
-        at, p = p, p + 4
+        p, mtob = struct.unpack_from('<II', b, 4)
+        b = b[12:]
+    else:
+        p = 0
+    while True:
+        found = b.find(FIRST, p)
+        if found < 0 or (compact and found != p):
+            return
+        at, p = found, found + 4
         stride = next((s for s in (0x1C, 0x18, 0x20) if at + 5 * s + 20 <= len(b) and
                        all(struct.unpack_from('<I', b, at + i * s)[0] == HEADS[i] for i in range(6))), None)
         if at % 4 or at < 4 or not stride:
+            if compact:
+                return
             continue
         stages = [(struct.unpack_from('<I', b, at + i * stride - 4)[0],) + struct.unpack_from('<4I', b, at + i * stride + 4) for i in range(6)]
         extra, q = {}, at + 5 * stride + 20
@@ -47,7 +56,14 @@ def materials(b):
                 break
             extra[reg] = v
             q += 8 + 4 * (n + (n & 1))
-        yield at, stages, extra
+        m = mtob if compact else b.rfind(b'MTOB', 0, at)
+        flags = layer = None
+        if 0 <= m and m + 0x18 <= at and at >= 0x20 and b[m:m + 4] == b'MTOB':
+            flags = struct.unpack_from('<I', b, m + 0x14)[0]
+            layer = struct.unpack_from('<I', b, at - 0x20)[0]
+        yield stages, extra, flags, layer
+        if compact:
+            return
 
 
 def blz(b):
@@ -264,27 +280,8 @@ def normal(s):
 
 def records(path):
     """fragment keys in a log, or in a console's miss list (tagged records, as misses_to_log.py reads them)"""
-    d, p, out = open(path, 'rb').read(), 0, []
-    while p + 4 <= len(d):
-        tag = d[p:p + 4]
-        if tag == b'FS  ':
-            n = struct.unpack_from('<I', d, p + 4)[0]
-            out.append(d[p + 8:p + 8 + n])
-            p += 8 + n
-            continue
-        if tag == b'VS  ':
-            _, nc, ns = struct.unpack_from('<III', d, p + 4)
-            p += 16 + (nc + ns) * 4 + 56
-            continue
-        if tag == b'GSX ':  # a vertex shader and a geometry shader: its size after the tag
-            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
-            continue
-        n = struct.unpack_from('<I', d, p)[0]
-        if n > 4096 or n % 4:
-            raise ValueError(f'{path}: not a fragment log at {p}')
-        out.append(d[p + 4:p + 4 + n])
-        p += 4 + n
-    return out
+    with open(path, 'rb') as f:
+        return [key for key in fragment_keys(f.read()) if key and len(key) % 4 == 0]
 
 
 def tex_needed(s):
@@ -460,6 +457,22 @@ def raw_with(stages):
     return st
 
 
+def material_contents(game, archive):
+    for name in ('romfs.bin', 'update_romfs.bin'):
+        path = os.path.join(game, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            for off, size in romfs_files(data):
+                yield from contents(data[off:off + size])
+    if archive:
+        for b in framed_records(archive, MAX_UNPACKED):
+            if b.startswith(b'MTEV'):
+                yield b
+            else:
+                yield from contents(b)
+
+
 def main():
     game = sys.argv[1].rstrip('/\\')
     logs = game + '/shader_logs'
@@ -485,29 +498,23 @@ def main():
         e = encode(c)
         uses[e] = (uses.get(e, (c, 0))[0], uses.get(e, (c, 0))[1] + 1)
     contexts = [c for c, n in sorted(uses.values(), key=lambda u: -u[1])]
-    bases, lyt_blobs = [], []
-    with open(game + '/romfs.bin', 'rb') as f:
-        data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-        for off, size in romfs_files(data):
-            for b in contents(data[off:off + size]):
-                if b[:4] == b'darc':
-                    lyt_blobs.append(bytes(b))  # and its models are read as it is, and again from its files, unpacked
-                for at, stages, extra in materials(b):
-                    st = [stage(i, w, extra.get(0xE0, 0)) for i, w in enumerate(stages)]
-                    m = b.rfind(b'MTOB', 0, at)
-                    # CGFX: the material's flag for fragment lighting (bit 0) and its lighting layer config. Its fog flag (bit 4) is not gone by:
-                    # Super Mario 3D Land draws materials in fog whose flag says none, and with it believed not one of the 64 states a console
-                    # had to compile there was made ahead; without it, 19 (2026-11-12, --holdout).
-                    if m >= 0:
-                        flags = struct.unpack_from('<I', b, m + 0x14)[0]
-                        lit, layer = bool(flags & 1), struct.unpack_from('<I', b, at - 0x20)[0]
-                    else:  # BCH and the rest: lit if a stage reads the lighting, otherwise either way
-                        lit = True if any(x in (1, 2) for t in st for x in t['csrc'] + t['asrc']) else None
-                        layer = None
-                    at_reg = extra.get(0x104, 0)
-                    fogat = ((at_reg & 1) << 2 | ((at_reg >> 4) & 7) << 3) if at_reg & 1 else 0
-                    bases.append((lit, layer, tev_list(st), fogat))
-    bases = list({repr(x): x for x in bases}.values())
+    archive = sys.argv[sys.argv.index('--materials') + 1] if '--materials' in sys.argv[:-1] else None
+    bases, lyt_blobs = {}, []
+    for b in material_contents(game, archive):
+        if b[:4] == b'darc':
+            lyt_blobs.append(bytes(b))  # and its models are read as it is, and again from its files, unpacked
+        for stages, extra, flags, layer in materials(b):
+            st = [stage(i, w, extra.get(0xE0, 0)) for i, w in enumerate(stages)]
+            # A material can draw in a foggy scene even with its own fog flag clear.
+            if flags is not None:
+                lit = bool(flags & 1)
+            else:  # BCH and the rest: lit if a stage reads the lighting, otherwise either way
+                lit = True if any(x in (1, 2) for t in st for x in t['csrc'] + t['asrc']) else None
+            at_reg = extra.get(0x104, 0)
+            fogat = ((at_reg & 1) << 2 | ((at_reg >> 4) & 7) << 3) if at_reg & 1 else 0
+            base = lit, layer, tev_list(st), fogat
+            bases.setdefault(repr(base), base)
+    bases = list(bases.values())
     model_sigs = {sig(normal(dict(head=1, tex=[0, 0, 0], tev=tev, light=0, fogat=0, blend=0, mask=0))['tev']) for _, _, tev, _ in bases}
     tails = [[]] + learned_tails(states, model_sigs)
     made = {}  # state -> which part found it

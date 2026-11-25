@@ -41,7 +41,7 @@ class Image:
         self.extra_entries = []
         self.index()
         self.cros = cro.load(gamedir)
-        if self.cros:
+        if self.cros and self.cros.mods:
             self.add_cros(self.cros)
         for s in self.segments:
             s.data = bytes(s.data)

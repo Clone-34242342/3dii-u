@@ -171,10 +171,10 @@ with tempfile.TemporaryDirectory() as tmp:
         pictures[name] = os.path.join(tmp, name + '.png')
         assert img.save(pictures[name])
 
-    def made(style, pad_art=None, boot_sound=None, icon_art=None):
+    def made(style, pad_art=None, boot_sound=None, icon_art=None, art='red'):
         out = os.path.join(tmp, 'title')
         title.make_title(out, game, os.path.join(tmp, 'g.rpx'), shaders, '0005000010334455', 'A game', 'WUP-N-ABCD', archives,
-                         pictures['red'], icon_art, style, pad_art=pad_art, boot_sound=boot_sound)
+                         pictures.get(art, art), icon_art, style, pad_art=pad_art, boot_sound=boot_sound)
         middle = {}
         for tga, w, h in (('bootTvTex.tga', 1280, 720), ('bootDrcTex.tga', 854, 480)):
             data = open(os.path.join(out, 'meta', tga), 'rb').read()
@@ -204,6 +204,11 @@ with tempfile.TemporaryDirectory() as tmp:
     middle, sound = made('console', pictures['green'], os.path.join(tmp, 'gone.btsnd'))
     assert near(middle['bootTvTex.tga'], (255, 255, 255), 12), ("the TV lost the Virtual Console's layout", middle)  # its white band
     assert near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == every, ('the GamePad picture laid out, or a lost sound kept', middle, sound)
+    for missing in (None, os.path.join(tmp, 'bad.png')):
+        middle, _ = made('console', art=missing)
+        assert all(near(pixel, (255, 255, 255), 12) for pixel in middle.values()), 'missing art removed the VC layout'
+    middle, _ = made('picture', art=None)
+    assert all(near(pixel, (0, 255, 0)) for pixel in middle.values()), 'Picture style lost its icon fallback'
     middle, sound = made('picture', os.path.join(tmp, 'bad.png'), os.path.join(tmp, 'bad.btsnd'))
     assert near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, ("a picture or sound that can't be used wasn't left out", middle, sound)
     sound = made('picture', boot_sound=os.path.join(tmp, 'start.wav'))[1]

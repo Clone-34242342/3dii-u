@@ -86,7 +86,7 @@ class Mod:
 
     def changes_code(self):
         """code, or CRO modules (the code most of some games is in): either way the code finders must look again"""
-        return bool(self.code or self.exheader or any(n.lower().endswith(('.cro', '.crs')) for n in self.romfs))
+        return bool(self.code or self.exheader or any(n.lower().endswith(('.cro', '.crs', '.cro.p')) for n in self.romfs))
 
 
 # ---------------------------------------------------------------- code patches
@@ -104,33 +104,42 @@ def apply_ips(data, patch):
         size = int.from_bytes(patch[at + w:at + w + 2], 'big')
         at += w + 2
         if size:
+            if at + size > len(patch):
+                raise ModError('code.ips ends early.')
             chunk = patch[at:at + size]
             at += size
         else:  # a run of one byte
+            if at + 3 > len(patch):
+                raise ModError('code.ips ends early.')
             n = int.from_bytes(patch[at:at + 2], 'big')
             chunk = patch[at + 2:at + 3] * n
             at += 3
-        if off + len(chunk) > len(out):
-            out.extend(bytes(off + len(chunk) - len(out)))
-        out[off:off + len(chunk)] = chunk
+        end_off = off + len(chunk)
+        if end_off > dumps.CODE_ROOM:
+            raise ModError('code.ips writes beyond the guest code region.')
+        if end_off > len(out):
+            out.extend(bytes(end_off - len(out)))
+        out[off:end_off] = chunk
     return bytes(out)
 
 
 def apply_bps(data, patch):
     """BPS (beat), checked against its source's CRC so a patch for another version of the game says so"""
-    if patch[:4] != b'BPS1':
+    if len(patch) < 19 or patch[:4] != b'BPS1':
         raise ModError('code.bps isn\'t a BPS patch.')
     src_crc, dst_crc, own_crc = struct.unpack('<III', patch[-12:])
     if zlib.crc32(patch[:-4]) != own_crc:
         raise ModError('code.bps is damaged (its checksum is wrong).')
     if zlib.crc32(data) != src_crc:
         raise ModError('code.bps was made for a different version of this game\'s code (an update, or another region).')
-    at = 4
+    at, end = 4, len(patch) - 12
 
     def num():
         nonlocal at
         v, shift = 0, 1
-        while True:
+        for _ in range(5):
+            if at >= end:
+                break
             b = patch[at]
             at += 1
             v += (b & 0x7F) * shift
@@ -138,34 +147,51 @@ def apply_bps(data, patch):
                 return v
             shift <<= 7
             v += shift
+        raise ModError('code.bps has an invalid number.')
 
-    num()
-    out = bytearray(num())
+    if num() != len(data):
+        raise ModError('code.bps declares the wrong source size.')
+    size = num()
+    if size > dumps.CODE_ROOM:
+        raise ModError('code.bps writes beyond the guest code region.')
+    out = bytearray()
     meta = num()  # (not at += num(): that reads at before num() moves it)
     at += meta
-    o = src_rel = dst_rel = 0
-    while at < len(patch) - 12:
+    if at > end:
+        raise ModError('code.bps has truncated metadata.')
+    src_rel = dst_rel = 0
+    while at < end:
         d = num()
         kind, n = d & 3, (d >> 2) + 1
+        o = len(out)
+        if o + n > size:
+            raise ModError('code.bps writes beyond its declared output size.')
         if kind == 0:  # source read
-            out[o:o + n] = data[o:o + n]
+            if o + n > len(data):
+                raise ModError('code.bps reads beyond the source code.')
+            out.extend(data[o:o + n])
         elif kind == 1:  # target read
-            out[o:o + n] = patch[at:at + n]
+            if at + n > end:
+                raise ModError('code.bps has truncated literal data.')
+            out.extend(patch[at:at + n])
             at += n
         else:
             r = num()
             delta = (-1 if r & 1 else 1) * (r >> 1)
             if kind == 2:  # source copy
                 src_rel += delta
-                out[o:o + n] = data[src_rel:src_rel + n]
+                if src_rel < 0 or src_rel + n > len(data):
+                    raise ModError('code.bps reads beyond the source code.')
+                out.extend(data[src_rel:src_rel + n])
                 src_rel += n
             else:  # target copy, which can overlap what it writes
                 dst_rel += delta
+                if not 0 <= dst_rel < o:
+                    raise ModError('code.bps copies from unwritten output.')
                 for i in range(n):
-                    out[o + i] = out[dst_rel + i]
+                    out.append(out[dst_rel + i])
                 dst_rel += n
-        o += n
-    if zlib.crc32(out) != dst_crc:
+    if len(out) != size or zlib.crc32(out) != dst_crc:
         raise ModError('code.bps didn\'t produce the code it should have.')
     return bytes(out)
 
@@ -187,27 +213,59 @@ class Dir:
 
 def read_romfs(f):
     """the tree of a level 3 image, file data left where it is"""
+    f.seek(0, os.SEEK_END)
+    size = f.tell()
     f.seek(0)
-    h = struct.unpack('<10I', f.read(0x28))
+    head = f.read(0x28)
+    if len(head) != 0x28:
+        raise ModError('The game\'s RomFS header is truncated.')
+    h = struct.unpack('<10I', head)
+    # Older empty images may end before the file-data alignment padding.
+    limit = size if h[8] else (size + 15) & ~15
+    if not (h[0] == 0x28 <= h[3] <= h[3] + h[4] <= h[7] <= h[7] + h[8] <= min(size, h[9]) and h[9] <= limit):
+        raise ModError('The game\'s RomFS tables are outside the image.')
     f.seek(h[3])
     dm = f.read(h[4])
     f.seek(h[7])
     fm = f.read(h[8])
     u = lambda b, o: struct.unpack_from('<I', b, o)[0]
-    name = lambda b, o, n: b[o:o + n].decode('utf-16-le')
+    dirs, files = set(), set()
 
-    def walk(off, node):
-        c = u(dm, off + 12)
-        while c != 0xFFFFFFFF:
-            fo, fs = struct.unpack_from('<QQ', fm, c + 8)
-            node.files.append([name(fm, c + 32, u(fm, c + 28)), (h[9] + fo, fs)])
-            c = u(fm, c + 4)
-        c = u(dm, off + 8)
-        while c != 0xFFFFFFFF:
-            node.dirs.append(walk(c, Dir(name(dm, c + 24, u(dm, c + 20)))))
-            c = u(dm, c + 4)
-        return node
-    return walk(0, Dir(''))
+    def name(table, at, fixed, seen):
+        if at in seen or at % 4 or at + fixed > len(table):
+            raise ModError('The game\'s RomFS repeats an entry or points outside its table.')
+        seen.add(at)
+        n = u(table, at + fixed - 4)
+        start = at + fixed
+        if n % 2 or start + n > len(table):
+            raise ModError('The game\'s RomFS has a truncated entry name.')
+        try:
+            return table[start:start + n].decode('utf-16-le')
+        except UnicodeDecodeError:
+            raise ModError('The game\'s RomFS has an invalid UTF-16 entry name.') from None
+
+    name(dm, 0, 24, dirs)
+    root = Dir('')
+    pending = [(0, root)]
+    while pending:
+        off, node = pending.pop()
+        file = u(dm, off + 12)
+        while file != 0xFFFFFFFF:
+            leaf = name(fm, file, 32, files)
+            fo, fs = struct.unpack_from('<QQ', fm, file + 8)
+            if h[9] + fo + fs > size:
+                raise ModError('The game\'s RomFS file lies outside the image.')
+            node.files.append([leaf, (h[9] + fo, fs)])
+            file = u(fm, file + 4)
+        child = u(dm, off + 8)
+        children = []
+        while child != 0xFFFFFFFF:
+            directory = Dir(name(dm, child, 24, dirs))
+            node.dirs.append(directory)
+            children.append((child, directory))
+            child = u(dm, child + 4)
+        pending.extend(reversed(children))
+    return root
 
 
 def find_file(root, path):
@@ -354,10 +412,19 @@ def apply(mods, game_dir, log=print):
             ex[:len(new)] = new
             open(ex_path, 'wb').write(ex)
         if mod.code:
-            code = open(code_path, 'rb').read()
-            patch = mod.read(mod.code)
             kind = mod.code.rsplit('/', 1)[-1].lower()
-            code = patch if kind == 'code.bin' else apply_ips(code, patch) if kind == 'code.ips' else apply_bps(code, patch)
+            if kind == 'code.bin':
+                size = mod.size(mod.code)
+                if size > dumps.CODE_ROOM:
+                    raise ModError('code.bin exceeds the guest code region.')
+                with mod.open(mod.code) as f:
+                    code = f.read(size + 1)
+                if len(code) != size:
+                    raise ModError('code.bin changed while the mod was being read.')
+            else:
+                code = open(code_path, 'rb').read()
+                patch = mod.read(mod.code)
+                code = apply_ips(code, patch) if kind == 'code.ips' else apply_bps(code, patch)
             open(code_path, 'wb').write(code)
             log(f'mod {os.path.basename(mod.path)}: {kind} applied')
         for name, member in mod.romfs.items():

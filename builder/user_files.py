@@ -9,7 +9,7 @@ OTP_SIZE = 1024
 OTP_COMMON_KEY = slice(0xE0, 0xF0)  # where the Wii U common key sits in the OTP (wiiubrew: bank 1), as phase0/tools/make_wup.py reads it
 BOOT9_SIZES = (0x10000, 0x8000)  # the whole boot ROM, or only its protected half
 # What a user's own console gives them, and what must never be shipped or committed.
-NAMES = ('otp.bin', 'seeprom.bin', 'boot9.bin', 'boot11.bin', 'seeddb.bin', 'aes_keys.txt', 'movable.sed', 'keys.txt')
+NAMES = ('otp.bin', 'seeprom.bin', 'boot9.bin', 'boot11.bin', 'seeddb.bin', 'aes_keys.txt', 'movable.sed', 'keys.txt', 'mii_qr.key')
 # Recognizable raw game/system dumps; other .bin files include required shader records.
 DUMP_NAMES = ('code.bin', '.code', 'romfs.bin', 'exefs.bin', 'exheader.bin')
 DUMP_EXTENSIONS = ('.3ds', '.cia', '.cci', '.cxi', '.romfs')

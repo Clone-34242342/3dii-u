@@ -7,6 +7,7 @@ The cache lives in <work>/../objcache, outside what fresh_cache wipes, and is tr
 cache (a file another build trimmed or holds open, a full disk) never fails a build: the object is then just compiled, or not kept.
 An unsafe output path is rejected before a cache miss can send the compiler there."""
 from pathlib import Path
+from contextlib import ExitStack, contextmanager
 import hashlib
 import os
 import re
@@ -20,6 +21,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wup_safety import check_output, NAND_DIRS
 
 MAX_BYTES = 2 << 30  # disk space is tight on the PCs this runs on
+
+
+def workspace_lock(*folders):
+    """Hold the shared build folders until the process finishes or exits."""
+    return file_locks(*(Path(folder) / '.3diiu-build.lock' for folder in folders))
+
+
+@contextmanager
+def file_locks(*lock_paths):
+    """Acquire the named files in canonical order, releasing all if any is busy."""
+    paths = {}
+    for entry in lock_paths:
+        path, _ = _checked(entry)
+        paths[os.path.normcase(path)] = path
+    with ExitStack() as files:
+        for lock in (paths[k] for k in sorted(paths)):
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            _checked(lock)
+            fd = os.open(lock, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            files.callback(os.close, fd)
+            _, present = _checked(lock)
+            if present is None or not os.path.samestat(present, os.fstat(fd)):
+                raise OSError(f'The Builder lock changed while opening {lock}.')
+            try:
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as e:
+                raise OSError(f'Another build is using {lock.parent}. Wait for it to finish and try again.') from e
+        yield
 
 
 def _compiler_id(exe):

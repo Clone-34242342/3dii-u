@@ -44,6 +44,8 @@ class GeneratedObjects(unittest.TestCase):
 
     def test_host_relinks_when_only_obsolete_object_was_removed(self):
         game = self.root / 'game';gen = game / 'gen_abi';gen.mkdir(parents=True)
+        (game / 'code.bin').write_bytes(b'fixture')
+        (game / 'info.json').write_text('{}')
         for name in ('code_000.c', 'table.c', 'guest.h'):
             (gen / name).write_text('')
         rt = self.root / 'runtime'

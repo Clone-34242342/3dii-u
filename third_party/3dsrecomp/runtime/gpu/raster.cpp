@@ -636,11 +636,12 @@ DrawState *draw_state() {
 #endif
     auto ds = std::make_unique<DrawState>();
 #ifdef __WIIU__
-    for (u32 i = 0; i < 0x200; i++)
-        if (g.regs[i] != ds_last_regs[i]) {
-            ds_churn[i]++;
-            ds_last_regs[i] = g.regs[i];
-        }
+    if constexpr (kMeasure)
+        for (u32 i = 0; i < 0x200; i++)
+            if (g.regs[i] != ds_last_regs[i]) {
+                ds_churn[i]++;
+                ds_last_regs[i] = g.regs[i];
+            }
 #endif
     build_draw_state(*ds);  // may flush (render-to-texture); states vector survives as needed
     // the texture setup may have flushed the batch: make sure our RT is still registered
@@ -653,7 +654,7 @@ DrawState *draw_state() {
 #ifdef __WIIU__
     g.ds->tex_sig = tex_regs_sig();
     ds_cache[g.ds_hash] = std::move(ds);
-    ds_built++;
+    if constexpr (kMeasure) ds_built++;
 #else
     batch.states.push_back(std::move(ds));
 #endif

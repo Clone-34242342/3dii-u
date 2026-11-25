@@ -19,12 +19,17 @@ struct FSClient {};
 struct FSCmdBlock {};
 using FSStatus = int;
 using FSErrorFlag = int;
+using FSDirectoryHandle = int;
+struct FSDirectoryEntry { char name[256]; };
 using OSTime = long long;
 using OSDynLoad_Module = void *;
-enum { OS_DYNLOAD_OK=0, OS_DYNLOAD_EXPORT_FUNC=0, FS_ERROR_FLAG_ALL=-1, FS_STATUS_OK=0 };
+enum { OS_DYNLOAD_OK=0, OS_DYNLOAD_EXPORT_FUNC=0, FS_ERROR_FLAG_ALL=-1, FS_STATUS_OK=0, FS_STATUS_END=-2 };
 static void FSInit() {}
 static int FSAddClient(FSClient *,int) { return 0; }
 static void FSInitCmdBlock(FSCmdBlock *) {}
+static FSStatus FSOpenDir(FSClient *, FSCmdBlock *, const char *, FSDirectoryHandle *, FSErrorFlag) { assert(false); return -1; }
+static FSStatus FSReadDir(FSClient *, FSCmdBlock *, FSDirectoryHandle, FSDirectoryEntry *, FSErrorFlag) { assert(false); return -1; }
+static FSStatus FSCloseDir(FSClient *, FSCmdBlock *, FSDirectoryHandle, FSErrorFlag) { assert(false); return -1; }
 static OSTime OSGetSystemTime() { return (OSTime)(kernel::real_ns()/1000000); }
 static OSTime OSTicksToMilliseconds(OSTime value) { return value; }
 static OSTime OSTicksToSeconds(OSTime value) { return value/1000; }
@@ -167,6 +172,7 @@ static void scheduler_open(const fs::path &path) {
     auto a=std::make_shared<Thread>(),b=std::make_shared<Thread>();a->id=1;b->id=2;a->priority=b->priority=0x30;
     threads={a,b};a->status=TStatus::Running;b->status=TStatus::Ready;b->ready_seq=1;running=a.get();tls_thread=a.get();
     test_open=true;open_waiting=checkpoint_waiting=holder_ready=false;std::atomic<bool> checkpoint_done=false;
+    bool guest_parked=false;
     std::thread holder([&]{
         std::lock_guard storage(storage_mutex);std::unique_lock lock(progress_mutex);holder_ready=true;progress_cv.notify_all();
         assert(progress_cv.wait_for(lock,std::chrono::seconds(2),[]{return open_waiting&&checkpoint_waiting;}));
@@ -175,10 +181,14 @@ static void scheduler_open(const fs::path &path) {
     std::thread other([&]{
         tls_thread=b.get();Lock lock(kmutex);b->cv.wait(lock,[&]{return running==b.get();});
         memset(gptr(0x1200),0,256);w32(0x1200,0x080E0080);w32(0x1204,7);IPC close(b.get(),0x1200,&lock);user.handle(close);
-        assert(r32(0x1204)==0&&!archives.count(7));b->status=TStatus::WaitSleep;block_current(lock);
+        assert(r32(0x1204)==0&&!archives.count(7));b->status=TStatus::WaitSleep;
+        {std::lock_guard progress(progress_mutex);guest_parked=true;progress_cv.notify_all();}
+        block_current(lock);
         b->status=TStatus::Dead;resume_thread(a.get());running=nullptr;schedule_async();
     });
     std::thread checkpoint([&]{
+        // The checkpoint runs once both guest threads have yielded the kernel lock.
+        {std::unique_lock progress(progress_mutex);assert(progress_cv.wait_for(progress,std::chrono::seconds(2),[&]{return guest_parked;}));}
         Lock lock(kmutex);assert(!running);save_lock();
         {std::lock_guard progress(progress_mutex);checkpoint_waiting=true;progress_cv.notify_all();}
         wiiu::fs_begin(0xC00B);wiiu::fs_end();save_unlock();checkpoint_done=true;

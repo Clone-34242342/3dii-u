@@ -57,6 +57,7 @@
 #include "save_backup.h"
 #include "shader_compile.h"
 #include "shadergen.h"
+#include "mii_face.h"
 #include "mii_select.h"
 #include "swkbd.h"
 #include "ui_font.h"
@@ -222,8 +223,11 @@ u8 *ring;
 u32 ring_off, ring_end, ring_seg;
 OSTime ring_fence[3];
 u32 dyn_waited;  // ticks waited for the GPU since dyn_res_update last looked
+float *ring_constant;
+float ring_constant_value[4];
 
 void ring_next_segment() {
+    ring_constant = nullptr;
     // What has been submitted by now is the last that can read this segment, or the one before it: a draw whose data filled the end of that
     // one was only submitted from this one, after that one's fence was taken.
     const OSTime submitted = GX2GetLastSubmittedTimeStamp();
@@ -252,6 +256,16 @@ void *ring_alloc(u32 size, u32 align) {
     // all of this gets written, so the cache needn't read it from memory first, which on this CPU takes longer than writing it
     for (u32 p = (at + 31) & ~31u; p + 32 <= at + size; p += 32) asm volatile("dcbz 0,%0" : : "r"(ring + p));
     return ring + at;
+}
+
+const float *constant_vertex(const float *value) {
+    if (!ring_constant || memcmp(ring_constant_value, value, sizeof ring_constant_value)) {
+        ring_constant = (float *)ring_alloc(64, 64);
+        memcpy(ring_constant_value, value, sizeof ring_constant_value);
+        memcpy(ring_constant, value, sizeof ring_constant_value);
+        DCFlushRange(ring_constant, sizeof ring_constant_value);
+    }
+    return ring_constant;
 }
 
 inline u32 swap_float(float f) {
@@ -320,6 +334,7 @@ void miss_put(const void *p, size_t n) {
 }
 volatile u32 gpu_busy_us;  // time the GPU thread spent working, not waiting
 u32 vs_ubo_loc, ps_ubo_loc;
+u64 st_immediate_draws;
 u64 st_draws, st_cpu_draws, st_ps_misses, st_uploads, st_upload_bytes, st_flips;
 double st_upload_ms;
 
@@ -345,6 +360,7 @@ struct GfdShader {
 std::vector<GfdShader> gfd_vs, gfd_ps;
 std::vector<u8> gfd_file_head, gfd_end;  // the file's header and its end block
 FILE *gfd_file;
+u32 st_shipped_vs_reuses, st_shipped_ps_reuses;
 
 static void gfd_scan(const u8 *d, u32 n, const u8 *idx, u32 idx_size) {
     constexpr u32 VS_HEAD = 3, VS_PROG = 5, PS_HEAD = 6, PS_PROG = 7, END = 1;
@@ -414,16 +430,30 @@ static std::vector<u8> gfd_one(const GfdShader &g) {
 GX2VertexShader *load_vs(u32 index) {
     wiiu::last_vs = index;
     if (index >= gfd_vs.size()) FATAL("no vertex shader %u\n", index);
+    // The pack can map many guest keys to this same program. Share its GX2
+    // allocation while keeping the input metadata in each guest key's entry.
+    static std::vector<GX2VertexShader *> programs(gfd_vs.size());
+    GX2VertexShader *&s = programs[index];
+    if (s) {
+        if (kMeasure) st_shipped_vs_reuses++;
+        return s;
+    }
     std::vector<u8> one = gfd_one(gfd_vs[index]);
-    GX2VertexShader *s = WHBGfxLoadGFDVertexShader(0, one.data());
+    s = WHBGfxLoadGFDVertexShader(0, one.data());
     if (!s) FATAL("cannot load vertex shader %u\n", index);
     return s;
 }
 GX2PixelShader *load_ps(u32 index) {
     wiiu::last_ps = index;
     if (index >= gfd_ps.size()) FATAL("no pixel shader %u\n", index);
+    static std::vector<GX2PixelShader *> programs(gfd_ps.size());
+    GX2PixelShader *&s = programs[index];
+    if (s) {
+        if (kMeasure) st_shipped_ps_reuses++;
+        return s;
+    }
     std::vector<u8> one = gfd_one(gfd_ps[index]);
-    GX2PixelShader *s = WHBGfxLoadGFDPixelShader(0, one.data());
+    s = WHBGfxLoadGFDPixelShader(0, one.data());
     if (!s) FATAL("cannot load pixel shader %u\n", index);
     return s;
 }
@@ -637,17 +667,21 @@ struct FetchHash {
 std::unordered_map<FetchKey, std::unique_ptr<GX2FetchShader>, FetchHash> fetch_shaders;
 
 GX2FetchShader *get_fetch(const FetchKey &k) {
+    // Entries live for the session, so their addresses survive insertions and rehashing.
+    static const decltype(fetch_shaders)::value_type *last = nullptr;
+    if (last && last->first == k) return last->second.get();
     auto it = fetch_shaders.find(k);
-    if (it != fetch_shaders.end()) return it->second.get();
-    auto fs = std::make_unique<GX2FetchShader>();
-    memset(fs.get(), 0, sizeof(GX2FetchShader));
-    const u32 size = GX2CalcFetchShaderSizeEx(k.count, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
-    void *mem = memalign(GX2_SHADER_PROGRAM_ALIGNMENT, size);
-    GX2InitFetchShaderEx(fs.get(), (u8 *)mem, k.count, k.s, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, mem, size);
-    GX2FetchShader *r = fs.get();
-    fetch_shaders.emplace(k, std::move(fs));
-    return r;
+    if (it == fetch_shaders.end()) {
+        auto fs = std::make_unique<GX2FetchShader>();
+        memset(fs.get(), 0, sizeof(GX2FetchShader));
+        const u32 size = GX2CalcFetchShaderSizeEx(k.count, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
+        void *mem = memalign(GX2_SHADER_PROGRAM_ALIGNMENT, size);
+        GX2InitFetchShaderEx(fs.get(), (u8 *)mem, k.count, k.s, GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
+        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, mem, size);
+        it = fetch_shaders.emplace(k, std::move(fs)).first;
+    }
+    last = &*it;
+    return last->second.get();
 }
 
 GX2AttribStream float4_stream(u32 location, u32 buffer, u32 offset, bool instance) {
@@ -685,6 +719,7 @@ struct Surface {
     u64 drawn = 0;                                     // when the GPU last wrote it (gpu_writes): of targets sharing memory, the latest holds what's there
     u64 last_use = 0;                                  // use_counter when it was last drawn into, sampled, copied or shown (forget_unused)
     bool linear = false;                               // its memory holds the picture row by row, not in tiles: a display transfer's linear output (gpu_copy_transfer)
+    bool lcd_bottom = false;
     bool shared_depth = false, clear_pending = false;  // see share_depth_block
     // For a target the game's own code may read (cpu_reads): the list being run has drawn to it; a draw to some other kind of target has sampled
     // the picture it holds; and the same of the picture it held before this list drew to it. See gx2_finish_list.
@@ -828,6 +863,9 @@ struct HalfKey {
 };
 std::vector<HalfKey> half_keys;
 
+constexpr bool color_has_alpha(u32 fmt) { return (fmt & 7) != 1 && (fmt & 7) != 3; }  // RGB8 and RGB565 store no alpha.
+constexpr u32 surface_comp_map(u32 fmt) { return 0x00010200 | (color_has_alpha(fmt) ? GX2_SQ_SEL_A : GX2_SQ_SEL_1); }
+
 // scale_as: a copy of that surface's picture (gx2_texture_copy and its mipmaps), made at its scale so what the game draws from it stays as sharp.
 // first: the draw a colour target is made for. with: the colour target a depth buffer is bound with, whose scale it has to have: a game uses one
 // depth buffer's memory with targets this draws at different scales. linear: a display transfer's picture in rows (Surface::linear), which no
@@ -836,6 +874,10 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
                      bool linear = false) {
     for (auto &s : surfaces)
         if (s->addr == addr && s->w == w && s->h == h && s->depth == depth && (!with || (s->base_sx == with->base_sx && s->base_sy == with->base_sy))) {
+            if (!depth && color_has_alpha(s->fmt) != color_has_alpha(fmt)) {
+                s->tex.compMap = surface_comp_map(fmt);
+                GX2InitTextureRegs(&s->tex);
+            }
             s->fmt = fmt;
             used(*s);
             return s.get();
@@ -914,7 +956,7 @@ Surface *get_surface(u32 addr, u32 w, u32 h, u32 fmt, bool depth, const Surface 
         s->tex.surface = f;
         s->tex.viewNumMips = 1;
         s->tex.viewNumSlices = 1;
-        s->tex.compMap = 0x00010203;
+        s->tex.compMap = surface_comp_map(fmt);
         GX2InitTextureRegs(&s->tex);
     }
     s->guest_newer = true;
@@ -940,6 +982,8 @@ int dyn_force = -1;
 inline float dyn_factor(u32 level) { return level ? dyn_low : 1.0f; }
 inline bool dyn_scaled(const Surface &s) { return s.base_sy > 2; }  // not the bottom screen, which is 2x on a screen a quarter of the size, nor a 1:1 target
 
+void flush_surface(Surface &s);
+
 // the surface at base_sx, base_sy times its dyn_f, in the memory it has (which holds its largest size)
 void apply_scale(Surface &s) {
     s.sx = s.base_sx * s.dyn_f;
@@ -949,6 +993,7 @@ void apply_scale(Surface &s) {
     s.row0 = s.sh - (u32)(s.h * s.sy);
     GX2Surface &f = s.depth ? s.db.surface : s.cb.surface;
     void *const image = f.image;
+    if (image) flush_surface(s);  // Pending writes still use the old pitch and extent.
     f.width = s.sw;
     f.height = s.sh;
     f.tileMode = GX2_TILE_MODE_DEFAULT;
@@ -980,6 +1025,19 @@ void set_base_scale(Surface &s, float bsx, float bsy) {
 }
 inline void take_dyn_level(Surface &s) {
     if ((s.dyn_level != dyn_level || s.dyn_f != dyn_factor(dyn_level)) && dyn_scaled(s)) set_surface_scale(s, dyn_level);
+}
+
+GX2Surface depth_storage_layout(const Surface &s) {
+    GX2Surface layout = s.db.surface;
+    if (!s.dyn_level) return layout;
+    // The next full-size pass reuses this allocation.
+    layout.width = (u32)(s.w * s.base_sx);
+    layout.height = (u32)(s.tex_h * s.base_sy);
+    layout.tileMode = GX2_TILE_MODE_DEFAULT;
+    GX2CalcSurfaceSizeAndAlignment(&layout);
+    layout.imageSize = std::max(layout.imageSize, s.db.surface.imageSize);
+    layout.alignment = std::max(layout.alignment, s.db.surface.alignment);
+    return layout;
 }
 
 // Switches for trying a change on a console while it plays ("set <name> 0|1" over the network, gfx_set): each of these on by default
@@ -1075,7 +1133,8 @@ const void *vtx_cached(u32 addr, const u8 *src, u32 src_stride, u32 count, u32 k
         return w;
     }
     fill(buf, src);
-    DCFlushRange(buf, size);
+    // A retired mesh's heap address can still be in the GPU attribute cache.
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, buf, size);
     VtxEntry &e = vtx_cache[key];
     e.addr = addr;
     e.bytes = bytes;
@@ -1152,16 +1211,15 @@ void note_downscaled(Surface &src, const Surface &dst, u32 scaling) {
 
 u64 gpu_writes;  // a count of the GPU's writes into targets, for Surface::drawn
 
-// A surface at addr that match accepts. Targets of different sizes can share an address (get_surface tells them apart by size), so the first
-// one there isn't always the one meant: a stale target used to stand in front of the one a texture read.
+// Targets of different sizes can alias. Use the most recent write among compatible views.
 template <class Match>
 Surface *find_surface(u32 addr, bool depth, Match match) {
+    Surface *latest = nullptr;
     for (auto &s : surfaces)
-        if (s->addr == addr && s->depth == depth && match(*s)) {
-            used(*s);
-            return s.get();
-        }
-    return nullptr;
+        if (s->addr == addr && s->depth == depth && match(*s) && (!latest || s->drawn > latest->drawn))
+            latest = s.get();
+    if (latest) used(*latest);
+    return latest;
 }
 Surface *find_surface(u32 addr, bool depth) {
     return find_surface(addr, depth, [](const Surface &) { return true; });
@@ -1282,6 +1340,27 @@ u32 hash_guest(const u8 *p, u32 n, u32 *slices) {
     for (u32 k = 0; k < SLICES; k++) {
         slices[k] = hash_slice(p, n, k);
         h = h * 31 + slices[k];
+    }
+    return h;
+}
+
+// Expand the upload to cover every byte whose hash is being replaced.
+u32 hash_partial_upload(Tex &e, const u8 *p, u32 *rows) {
+    const u32 words = e.bytes / 4;
+    u32 h = e.bytes;
+    for (u32 k = 0; k < SLICES; k++) {
+        const u32 begin = (u32)((u64)words * k / SLICES), end = (u32)((u64)words * (k + 1) / SLICES);
+        if (begin != end) {
+            const u32 first = begin * 4 / e.row_bytes, last = (end * 4 - 1) / e.row_bytes;
+            bool dirty = false;
+            for (u32 r = first; r <= last; r++)
+                dirty |= (e.dirty_rows[r >> 5] >> (r & 31)) & 1;
+            if (dirty) {
+                e.slice[k] = hash_slice(p, e.bytes, k);
+                for (u32 r = first; r <= last; r++) rows[r >> 5] |= 1u << (r & 31);
+            }
+        }
+        h = h * 31 + e.slice[k];
     }
     return h;
 }
@@ -1609,6 +1688,8 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
             if (logged++ < 400) LOG("STALE tex %08x %ux%u fmt %u levels %u bytes %u, flip %llu\n", addr, w, h, fmt, levels, e.bytes, (unsigned long long)st_flips);
             e.maybe_dirty = true;
         }
+        // A later scene can reuse the same guest allocation without flushing it.
+        if (use_counter - e.last_use >= TURN_FLIPS) e.maybe_dirty = true;
         bool turn = false;
         if (e.unflushed && use_counter - e.changed_at > TURN_QUIET) e.unflushed = false;
         if (e.last_use != use_counter && !e.dirty && !e.maybe_dirty
@@ -1623,9 +1704,9 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
         if (e.heap_flushes != heap_flushes) {
             e.heap_flushes = heap_flushes;
             const OSTime th = prof_now();
-            if (sample_guest(pptr(addr), e.bytes) != e.sample) {
+            if (e.hash_stale || sample_guest(pptr(addr), e.bytes) != e.sample) {
                 e.maybe_dirty = true;
-            } else if (!e.hash_stale) {
+            } else {
                 // The sample reads one word in 32 or fewer, so a few changed tiles can leave it as it was. Every byte gets checked too: all of
                 // them when such flushes are rare (after a file is read), and a run of them per flush when a game flushes every frame, which
                 // finds any change within SLICES flushes at a 32nd of a full hash's cost (4 ms a MB on a console).
@@ -1647,12 +1728,16 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
             // Hashed unless a definite write said so: an upload on a changed sample alone used to leave the hash unknown too, and the next
             // write whose sample happened to match (two characters' textures, transparent at the sampled points) was taken for no change.
             // Dream Team drew Goombas with Luigi's head that way (2026-11-08).
-            const u32 hh = e.dirty ? 0 : hash_guest(pptr(addr), e.bytes, e.slice);
+            const bool part = e.dirty && !e.maybe_dirty && e.levels == 1 && e.h <= 1024 && !((e.w | e.h) & 7);
+            const bool partial_hash = part && !e.hash_stale;
+            u32 rows[4];
+            memcpy(rows, e.dirty_rows, sizeof rows);
+            const u32 hh = partial_hash ? hash_partial_upload(e, pptr(addr), rows)
+                         : e.dirty && !e.maybe_dirty ? 0 : hash_guest(pptr(addr), e.bytes, e.slice);
             e.sample = sample;
             prof_add(P_HASH, th);
-            // A stale hash (the last upload took a definite write's word for it) with the same sample: the image is current, only the hash is
-            // unknown, so it's taken now. Uploading instead redid NSMB2's whole 1 MB atlas after nearly every partial update.
-            if (changed || (!e.hash_stale && hh != e.hash)) {
+            // A sample match cannot prove the contents of a texture with no valid baseline.
+            if (changed || e.hash_stale || hh != e.hash) {
                 if (turn) {
                     e.unflushed = true;
                     e.changed_at = use_counter;
@@ -1662,18 +1747,17 @@ GX2Texture *get_texture(u32 addr, u32 w, u32 h, u32 fmt, u32 levels, Surface **f
                 last_reupload = {addr, w, h, fmt, levels, e.dirty};
                 // definite writes to part of a one-level texture: only the rows they touched, and the rows the other image missed meanwhile.
                 // A GPU-decoded one is written in order with the draws that read it: nothing to wait for and nothing to spare.
-                const bool part = e.dirty && !e.maybe_dirty && e.levels == 1 && e.h <= 1024;
-                u32 rows[4];
-                memcpy(rows, e.dirty_rows, sizeof rows);
                 if (!e.gpu && replace_image(e)) {
+                    u32 uploaded[4];
+                    memcpy(uploaded, rows, sizeof rows);
                     for (u32 k = 0; k < 4; k++) rows[k] |= e.lag_rows[k];
-                    if (part) memcpy(e.lag_rows, e.dirty_rows, sizeof rows);
+                    if (part) memcpy(e.lag_rows, uploaded, sizeof uploaded);
                     else memset(e.lag_rows, 0xff, sizeof rows);
                 }
                 upload_texture(e, part ? rows : nullptr);
             }
             e.hash = hh;
-            e.hash_stale = e.dirty;
+            e.hash_stale = e.dirty && !e.maybe_dirty && !partial_hash;
             e.dirty = e.maybe_dirty = false;
             memset(e.dirty_rows, 0, sizeof e.dirty_rows);
         }
@@ -1988,7 +2072,8 @@ void take_depth_block(const RTConfig &rt) {
     if (d.shared_depth && depth_owner != &d && !d.clear_pending) {
         LOG("[gx2] depth %08x %ux%u came back with no clear: giving it its own memory\n", d.addr, d.w, d.h);
         GX2Surface &f = d.db.surface;
-        f.image = alloc_surface_mem(f.imageSize, f.alignment, d.mem1, false);
+        const GX2Surface storage = depth_storage_layout(d);
+        f.image = alloc_surface_mem(storage.imageSize, storage.alignment, d.mem1, false);
         DCFlushRange(f.image, f.imageSize);
         d.shared_depth = false;
         d.clear_pending = true;
@@ -2027,7 +2112,8 @@ void send_state(const DrawState &ds, Surface &c, bool has_depth, bool stencil) {
     if (m & 0xff) mask |= GX2_CHANNEL_MASK_R;
     if (m & 0xff00) mask |= GX2_CHANNEL_MASK_G;
     if (m & 0xff0000) mask |= GX2_CHANNEL_MASK_B;
-    if (m & 0xff000000u) mask |= GX2_CHANNEL_MASK_A;
+    const bool alpha = color_has_alpha(c.fmt);
+    if (alpha && (m & 0xff000000u)) mask |= GX2_CHANNEL_MASK_A;
     if (!ds.color_write) mask = 0;
     GX2SetTargetChannelMasks((GX2ChannelMask)mask, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
                              (GX2ChannelMask)0, (GX2ChannelMask)0);
@@ -2050,7 +2136,14 @@ void send_state(const DrawState &ds, Surface &c, bool has_depth, bool stencil) {
             if (f == 11) return GX2_BLEND_MODE_INV_CONSTANT_ALPHA;
             return k_factor[f & 15 ? std::min<u32>(f, 14) : 0];
         };
-        GX2SetBlendControl(GX2_RENDER_TARGET_0, k_factor[std::min<u32>(ds.sf_rgb, 14)], k_factor[std::min<u32>(ds.df_rgb, 14)], k_eq[std::min<u32>(ds.eq_rgb, 4)], TRUE,
+        auto rgb_factor = [&](u32 f) {
+            if (!alpha) {
+                if (f == 8) return GX2_BLEND_MODE_ONE;  // destination alpha is one
+                if (f == 9 || f == 14) return GX2_BLEND_MODE_ZERO;
+            }
+            return k_factor[std::min<u32>(f, 14)];
+        };
+        GX2SetBlendControl(GX2_RENDER_TARGET_0, rgb_factor(ds.sf_rgb), rgb_factor(ds.df_rgb), k_eq[std::min<u32>(ds.eq_rgb, 4)], TRUE,
                            alpha_factor(ds.sf_a), alpha_factor(ds.df_a), k_eq[std::min<u32>(ds.eq_a, 4)]);
         const u32 bc = ds.blend_color;
         GX2SetBlendConstantColor((bc & 255) / 255.0f, ((bc >> 8) & 255) / 255.0f, ((bc >> 16) & 255) / 255.0f, (bc >> 24) / 255.0f);
@@ -2075,7 +2168,7 @@ struct StateSent {
     u32 row0, sw, sh, w, h;
     s32 sc[4];
     u32 color_mask, blend_color, st[3];
-    u8 scissor_mode, cull, color_write, blend, logic_op, f[6], depth_test, depth_write, depth_func, stencil, st_ops[4];
+    u8 scissor_mode, cull, color_write, color_fmt, blend, logic_op, f[6], depth_test, depth_write, depth_func, stencil, st_ops[4];
 };
 StateSent state_sent;
 
@@ -2095,6 +2188,7 @@ void set_state(const DrawState &ds) {
     now.cull = (u8)ds.cull;
     now.color_mask = ds.color_mask;
     now.color_write = ds.color_write;
+    now.color_fmt = (u8)c.fmt;
     now.blend = ds.blend;
     now.logic_op = (u8)ds.logic_op;
     if (ds.blend) {
@@ -2543,7 +2637,7 @@ bool gx2_gsx_ready(const Gx2Draw &d) {
     return false;
 }
 
-bool gx2_draw(const Gx2Draw &d) {
+bool gx2_draw(const Gx2Draw &d, const V4 *immediate) {
     const DrawState &ds = *d.ds;
     if (ds.skip || ds.shadow_mode || ds.gas || !ds.rt.color_addr || !pptr(ds.rt.color_addr) || (ds.rt.color_fmt & 0x80)) return true;
     if (gxt_cpu_vs) return false;  // debug aid: tells a wrong vertex shader from anything else
@@ -2766,7 +2860,7 @@ bool gx2_draw(const Gx2Draw &d) {
     VertexArray arrays[16];
     u32 n_arrays = 0;
     u8 reg_array[16] = {};  // the array each input register's attribute went into
-    for (u32 r = 0; r < 16; r++) {
+    if (!immediate) for (u32 r = 0; r < 16; r++) {
         if (!(vs.inputs & (1u << r)) || vs.location[r] < 0 || reg_attr[r] < 0) continue;
         const Gx2Attr &at = d.attr[reg_attr[r]];
         if (!at.is_default && at.elems && at.stride && gpu_fetched(at)) reg_array[r] = (u8)join_vertex_array(arrays, n_arrays, at);
@@ -2776,16 +2870,21 @@ bool gx2_draw(const Gx2Draw &d) {
     for (u32 r = 0; r < 16; r++) {
         if (!(vs.inputs & (1u << r)) || vs.location[r] < 0) continue;
         const s32 a = reg_attr[r];
+        if (immediate) {
+            V4 *values = (V4 *)ring_alloc(d.count * sizeof(V4), 64);
+            for (u32 vertex = 0; vertex < d.count; vertex++) values[vertex] = a >= 0 ? immediate[vertex * 16 + a] : V4{};
+            DCFlushRange(values, d.count * sizeof(V4));
+            GX2SetAttribBuffer(buf, d.count * sizeof(V4), sizeof(V4), values);
+            fk.s[fk.count++] = float4_stream(vs.location[r], buf++, 0, false);
+            continue;
+        }
         const Gx2Attr *at = a >= 0 ? &d.attr[a] : nullptr;
         const bool constant = !at || at->is_default || at->elems == 0 || at->stride == 0;
         if (constant) {
             static const float k_zero[4] = {0, 0, 0, 0}, k_unit[4] = {0, 0, 0, 1};
             const float *v = !at ? (memcmp(g.default_attr[r].v, k_zero, 16) ? g.default_attr[r].v : k_unit)
                                  : at->is_default ? g.default_attr[a].v : k_unit;
-            float *c = (float *)ring_alloc(64, 64);
-            memcpy(c, v, 16);
-            DCFlushRange(c, 16);
-            GX2SetAttribBuffer(buf, 16, 16, c);
+            GX2SetAttribBuffer(buf, 16, 16, constant_vertex(v));
             fk.s[fk.count++] = float4_stream(vs.location[r], buf, 0, true);
             buf++;
             continue;
@@ -2923,8 +3022,11 @@ bool gx2_draw(const Gx2Draw &d) {
         GX2DrawEx(mode, d.count, d.first, 1);
     lap(P_DRAW);
     st_draws++;
+    if (immediate) st_immediate_draws++;
     return true;
 }
+
+bool gx2_draw(const Gx2Draw &d) { return gx2_draw(d, nullptr); }
 
 // ---------------------------------------------------------------- draws shaded on the CPU
 void gx2_flush_cpu_batch() {
@@ -3190,21 +3292,10 @@ void metal_guest_prewrite(u32, u32) {}
 // the last transfer was the top screen's left eye, and a right eye has been seen straight after one (see right_eye_transfer)
 static bool left_done, right_follows_left;
 
-// Some games draw a right eye with 3D off, and that's half of each frame's work. Once a top-screen-sized transfer to the right eye has come straight after a left
-// eye, the next right eye isn't drawn, up to its transfer. Where the right eye went says where its pass starts:
-// - into the right LCD's framebuffer (New Super Mario Bros. 2, Animal Crossing): its pass follows the left eye's transfer at once (right_eye_transfer);
-// - into a framebuffer no screen shows (the Laytons, which clear their targets, draw the scene again, and on the title and save screens read it back and make
-//   mipmaps of it too): it starts with the first clear after the left eye, unless that's the bottom screen's, which those games draw first when there's no right eye.
-static bool right_eye_hidden;
 static bool skip_seen;  // a pass was left undrawn since the last top screen picture (note_top_picture)
 
 // a fill of a whole render target is a clear
 bool gx2_memory_fill(u32 start, u32 end, u32 value, u32 control) {
-    if (left_done && right_follows_left && right_eye_hidden) {
-        const u32 size = end - start;
-        if (size == 240 * 320 * 4 || size == 240 * 320 * 3) left_done = false;  // on to the bottom screen, so no right eye this time
-        else gx2_skip_pass = gx2_skip_copies = skip_seen = true;
-    }
     if (gx2_skip_pass) return true;
     const Fill f{start, end, value, control};
     bool any = false, other = false;
@@ -3474,24 +3565,25 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
     GX2CopyColorBufferToScanBuffer(to.surface.image ? &to : from, target);
 }
 
-// Render targets a game made and stopped using (a course or a scene left behind) are freed. Kept for good, Mario Kart 7 had 88 after three
-// races where it began with 21, each holding its GPU memory (fast memory filled, and later targets went to slow memory), and every walk of the
-// list took longer: games slowed the longer they were played. One unused for kForgetAfter presents goes, what the GPU drew there that memory
-// lacks written back first, so nothing the game may still read is lost. One a present, as a write back waits for the GPU.
+// Check one idle target per present for retirement. Writing pixels back on a timeout can overwrite reused guest memory.
 bool transfer_source(const Surface &s);
+size_t next_surface_retirement;
 
 void forget_unused() {
     constexpr u64 kForgetAfter = 1800;  // presents: half a minute at 60, a minute at 30
-    for (auto it = surfaces.begin(); it != surfaces.end(); ++it) {
+    for (size_t checked = 0; checked < surfaces.size(); ++checked) {
+        if (next_surface_retirement >= surfaces.size()) next_surface_retirement = 0;
+        auto it = surfaces.begin() + next_surface_retirement++;
         Surface &s = **it;
         if (s.last_use + kForgetAfter > use_counter || &s == cur_color || &s == cur_depth || s.in_list || &s == depth_owner || transfer_source(s)) continue;
-        if (!surface_readback::retire(s, surfaces, write_back)) continue;
+        if (!surface_readback::retire(s, surfaces)) return;
         // Shared depth descriptors borrow depth_block; retiring one must not free it.
         if (void *image = s.shared_depth ? nullptr : s.image()) {
             if (!s.mem1) free(image);
             else if (GfxHeapFreeMEM1) GfxHeapFreeMEM1(image);
         }
         surfaces.erase(it);
+        --next_surface_retirement;
         state_sent_valid = false;
         state_lost = true;
         return;
@@ -3587,7 +3679,7 @@ void frame_cap_wait() {
     }
 }
 
-u32 st_pictures[2];  // pictures the game has sent to each screen since the last report: its own frame rate, which flips aren't (a present can show one screen's)
+u32 st_pictures[2];  // screen compositions since the last report, including multiple transfers to the same screen
 // What the TV and the GamePad show (screen_layouts.h): the options menu's TV and GAMEPAD lines change them at once, and settings.ini keeps them.
 // A touch reaches the game where the GamePad shows the bottom screen.
 volatile int tv_layout, pad_layout;  // the menu's (input thread)
@@ -3787,6 +3879,7 @@ void draw_fps() {
     snprintf(text, sizeof text, "%u FPS", fps);
     const float wide = 6 * 3 * strlen(text);
     for (GX2ColorBuffer *cb : {tv_cb, drc_cb}) {
+        if (cb == drc_cb && wiiu::mii_selector_open()) continue;
         GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
         cur_color = nullptr;
         begin_blit();
@@ -3833,7 +3926,7 @@ bool transfer_source(const Surface &s) {
 // read: Pokémon Ultra Sun halves a small picture of its scene into one every frame, and through guest memory that is a read back, which
 // waits for the GPU, and an upload. The texture's bytes aren't in guest memory then: a lookup there of another size or format than the
 // transfer's reads what was there before, and what the game puts there later counts as newer (Surface::copy).
-static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
+static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, Surface **copied = nullptr) {
     gt_mark(GT_TRANSFER, out_paddr);
     const u32 in_w = in_dims & 0xffff, in_h = in_dims >> 16, out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
     const u32 scaling = (flags >> 24) & 3;
@@ -3844,13 +3937,10 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     // tiles in, tiles out (0x20 without 0x02): a texture
     const bool own_size = sy <= 1 && (flags & 0x22) == 0x20 && out_paddr >= mem::VRAM_PADDR && out_paddr < mem::VRAM_PADDR + mem::VRAM_SIZE;
     if ((flip && crop) || in_w < out_w0 || in_h < out_h0) return false;
-    Surface *src = nullptr;
-    for (auto &x : surfaces)
-        if (!x->depth && x->addr == in_paddr && x->w == in_w && x->h == in_h && !x->guest_newer &&
-            (x->sy > 1 || x->gpu_chain || (own_size && x->gpu_newer)))
-            src = x.get();
+    Surface *src = find_surface(in_paddr, false, [&](const Surface &s) {
+        return s.w == in_w && s.h == in_h && !s.guest_newer && (s.sy > 1 || s.gpu_chain || (own_size && s.gpu_newer));
+    });
     if (!src) return false;
-    used(*src);
     const bool own_size_copy = own_size && src->sy <= 1 && !src->gpu_chain;
     if (sy <= 1 && !src->gpu_chain && !own_size_copy) return false;
     // Neither bit 1 (linear in) nor bit 5 (left tiled): the picture lands in memory row by row, for whatever reads its bytes. Paper Mario's goes on to another
@@ -3890,6 +3980,7 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     dst->drawn = ++gpu_writes;
     dst->guest_newer = false;
     dst->written_since_flush = true;
+    if (copied) *copied = dst;
     note_downscaled(*src, *dst, scaling);  // from its next frame on
     return true;
 }
@@ -4061,12 +4152,21 @@ bool gx2_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u
     const u32 bpp = src->bytes() / (src->w * src->h), tile_row = src->w * 8 * bpp;
     const u32 in_w = (in_width_gap & 0xffff) * 16, in_gap = (in_width_gap >> 16) * 16;
     const u32 out_w = (out_width_gap & 0xffff) * 16, out_gap = (out_width_gap >> 16) * 16;
-    const bool whole = !in_gap && !out_gap && !(src->h & (src->h - 1)) && out_paddr >= mem::VRAM_PADDR && out_paddr < mem::VRAM_PADDR + mem::VRAM_SIZE;
+    // A complete tiled framebuffer copy keeps its logical size, including non-power-of-two LCD targets.
+    const bool whole = !in_gap && !out_gap && !src->linear && out_paddr >= mem::VRAM_PADDR &&
+                       (u64)out_paddr + size <= mem::VRAM_PADDR + mem::VRAM_SIZE;
+    if (whole) {
+        const auto source = surface_readback::bounds(in_paddr, size);
+        for (const auto &alias : surfaces)
+            if (!alias->depth && alias->drawn > src->drawn &&
+                surface_readback::overlaps(source, surface_readback::bounds(alias->addr, alias->bytes())))
+                return false;
+    }
     if (!whole && ((in_gap && in_w != tile_row) || out_w != tile_row || !out_gap || (out_w + out_gap) % (8 * bpp))) return false;
     const u32 w = whole ? src->w : (out_w + out_gap) / (8 * bpp);
     u32 h = src->h;
-    while (h & (h - 1)) h += h & -h;
-    if ((w & (w - 1)) || w > 1024 || h > 1024) return false;
+    while (!whole && (h & (h - 1))) h += h & -h;
+    if ((!whole && (w & (w - 1))) || w > 1024 || h > 1024) return false;
     Surface *dst = get_surface(out_paddr, w, h, src->fmt, false, src);
     if (dst == src) return false;
     take_dyn_level(*dst);
@@ -4081,7 +4181,10 @@ bool gx2_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u
         restore_context();
     }
     dst->gpu_chain = true;
-    if (whole) dst->copy = true;
+    if (whole) {
+        dst->copy = true;
+        dst->linear = dst->lcd_bottom = false;
+    }
     flush_surface(*src);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, src->tex.surface.image, src->tex.surface.imageSize);
     GX2SetColorBuffer(&dst->cb, GX2_RENDER_TARGET_0);
@@ -4153,13 +4256,21 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
     };
     static Seen seen[3][4];
     static u32 next[3], clock;
+    if (!rows || size < rows || size % rows) return -1;
+    const u32 row_bytes = size / rows;
+    const auto covers = [&](u32 pa, u32 visible_rows) {
+        return rows >= visible_rows && pa >= paddr && (pa - paddr) % row_bytes == 0 &&
+               (pa - paddr) / row_bytes <= rows - visible_rows;
+    };
     clock++;
+    u32 current_bottom = 0;
     const u32 swaps[3] = {kernel::gsp_swaps(0), kernel::gsp_swaps(1), kernel::gsp_swaps(0)};
     for (int s = 0; s < 3; s++) {
         const kernel::FramebufferInfo f = kernel::gsp_framebuffer(s == 2 ? 0 : s);
         const u32 addr = s == 2 && f.addr_right != f.addr_left ? f.addr_right : s == 2 ? 0 : f.addr_left;
         const u32 pa = f.valid && addr ? mem::vaddr_to_paddr(addr) : 0;
         if (!pa) continue;
+        if (s == 1) current_bottom = pa;
         Seen *e = nullptr;
         for (Seen &x : seen[s])
             if (x.pa == pa) e = &x;
@@ -4172,16 +4283,27 @@ static int screen_of(u32 paddr, u32 size, u32 rows, u32 &skip) {
     for (int s = 0; s < 3; s++) {
         if ((s == 1) != bottom_rows) continue;  // only the screens of the picture's height
         for (const Seen &x : seen[s])
-            if (x.pa && swaps[s] - x.swaps <= 8 && x.pa >= paddr && x.pa - paddr < size && x.when >= best) {  // a tie goes to the later screen
+            if (x.pa && swaps[s] - x.swaps <= 8 && covers(x.pa, s == 1 ? 320 : 400) && x.when >= best) {  // a tie goes to the later screen
                 found = s;
                 best = x.when;
                 skip = x.pa - paddr;
             }
     }
+    // Some games, including Extreme Butoden, give both LCDs a padded 400-row buffer.
+    // With no ordinary match, the current bottom address can identify its 320 visible rows.
+    if (found < 0 && !bottom_rows && rows <= 400 && current_bottom && covers(current_bottom, 320)) {
+        skip = current_bottom - paddr;
+        return 1;
+    }
     return found;
 }
 
-bool gx2_skip_pass, gx2_skip_copies;
+bool gx2_skip_pass;
+static u64 shown_bottom_draw;
+
+static bool packed_bottom(const kernel::FramebufferInfo &f, u32 fmt) {
+    return f.valid && fmt == (f.format & 7) && (!f.stride || f.stride == 240 * pixel_bytes(fmt));
+}
 
 // New Super Mario Bros. 2 draws a right eye every frame though the slider says 3D is off, and the Wii U couldn't show it: half its draws.
 // The pass between a left eye's transfer and the right eye's after it isn't drawn once 30 frames in a row have drawn both eyes, each with
@@ -4195,7 +4317,7 @@ static bool right_eye_transfer(int screen) {
     static u32 stereo;             // frames in a row that drew both eyes in full
     static bool right_seen;        // a right eye straight after the last left one
     const bool was_skipping = gx2_skip_pass;
-    gx2_skip_pass = gx2_skip_copies = false;
+    gx2_skip_pass = false;
     if (screen == 2) {
         if (left_done && !was_skipping) right_draws = (u32)(st_draws - at_left);
         right_seen = left_done;
@@ -4215,46 +4337,10 @@ static bool right_eye_transfer(int screen) {
         at_left = st_draws;
     }
     left_done = screen == 0;
-    gx2_skip_pass = left_done && right_follows_left && stereo >= 30 && !right_eye_hidden;
+    gx2_skip_pass = left_done && right_follows_left && stereo >= 30;
     skip_seen |= gx2_skip_pass;
     return false;
 }
-
-// A right eye drawn where no screen shows (the Laytons) is the first screen-sized picture after a left eye, transferred the way the left eye was. Copies in
-// between don't count (Azran's mipmaps); it may go to either of two buffers (both Laytons), and Miracle Mask sends every other one to the right LCD. Other
-// pictures come that way now and then: a top screen's next buffer before its LCD first shows it (Metroid: Samus Returns at start-up, which lost that picture
-// and the copies after it, its objects vanishing for a moment on a console, 2026-11-09). So it takes 60 of them, no more than two left eyes apart, and a
-// buffer an LCD shows ends it.
-struct HiddenRightEye {
-    enum Kind { OTHER, CANDIDATE, RIGHT_EYE, ON_A_SCREEN };
-    bool after_left = false;  // a left eye has gone, and no screen-sized picture since
-    u32 left_flags = 0, lefts_since = 0, runs = 0, dst[4] = {}, next = 0;
-
-    bool remembered(u32 pa) const { return std::find(std::begin(dst), std::end(dst), pa) != std::end(dst); }
-
-    // What a transfer is: a right eye to leave undrawn (the 60th of a run, or one whose pass was skipped already, as that drew nothing to show), one
-    // more of a run, or a remembered buffer an LCD shows after all, which ends the run
-    Kind see(int screen, bool top_sized, bool screen_sized, u32 flags, u32 pa, bool pass_skipped) {
-        Kind kind = OTHER;
-        if (after_left && top_sized && screen < 0 && flags == left_flags) {
-            runs = lefts_since <= 2 ? runs + 1 : 1;  // frames without a right eye in between start the count again
-            lefts_since = 0;
-            if (!remembered(pa)) dst[next++ % 4] = pa;
-            kind = runs >= 60 || pass_skipped ? RIGHT_EYE : CANDIDATE;
-        } else if (screen >= 0 && remembered(pa)) {
-            runs = 0;
-            std::fill(std::begin(dst), std::end(dst), 0u);
-            kind = ON_A_SCREEN;
-        }
-        if (screen == 0) {
-            lefts_since++;
-            left_flags = flags;
-        }
-        if (screen_sized) after_left = screen == 0;
-        return kind;
-    }
-};
-static HiddenRightEye hidden_right_eye;
 
 // whether a destination no LCD has shown has come before, when its screen's count of pictures stood elsewhere
 static bool passed_over(u32 pa, u32 count) {
@@ -4282,8 +4368,8 @@ static void note_top_picture(u32 src, u32 out_paddr, int known_screen) {
     last_src = src;
     if (again) return;
     if (usual > 20 && n < usual / 4 && told++ < 300)
-        LOG("[gx2] thin picture at frame %u: %u draws (usually %.0f), %08x to %08x screen %d, pass skipped %d, right eye %d %d %d\n", (u32)g_frame, n,
-            usual, src, out_paddr, known_screen, skip_seen, right_follows_left, right_eye_hidden, left_done);
+        LOG("[gx2] thin picture at frame %u: %u draws (usually %.0f), %08x to %08x screen %d, pass skipped %d, right eye %d %d\n", (u32)g_frame, n,
+            usual, src, out_paddr, known_screen, skip_seen, right_follows_left, left_done);
     usual = usual ? usual * 0.9f + n * 0.1f : (float)n;
     skip_seen = false;
 }
@@ -4291,8 +4377,10 @@ static void note_top_picture(u32 src, u32 out_paddr, int known_screen) {
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
     const u32 in_w = in_dims & 0xffff, in_h = in_dims >> 16, out_w = out_dims & 0xffff, out_h = out_dims >> 16;
     // the output size is given before the transfer's downscale (the flags' bits 24-25), so a 2x wide target has out_w 480 too
-    const bool crop = flags & 4;
-    const u32 rows = out_h >> ((flags >> 24 & 3) == 2);  // the picture's height, after a 2x2 downscale
+    const bool crop = flags & 4, flip = flags & 1;
+    const u32 scaling = (flags >> 24) & 3, hs = scaling != 0, vs = scaling == 2;
+    const u32 rows = out_h >> vs;
+    if (!rows || out_size < rows) return false;
     u32 skip_bytes = 0;
     const int known_screen = screen_of(out_paddr, out_size, rows, skip_bytes);
     if (gxt()) {
@@ -4300,36 +4388,23 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         LOG("[gxt] transfer %08x -> %08x in %ux%u out %ux%u flags %08x screen %d (LCDs %08x %08x)\n", in_paddr, out_paddr, in_w, in_h, out_w, out_h, flags, known_screen,
             t.valid ? mem::vaddr_to_paddr(t.addr_left) : 0, b.valid ? mem::vaddr_to_paddr(b.addr_left) : 0);
     }
-    const bool top_sized = in_w == 240 && in_h == 400 && out_w == 240 && out_h == 400;
-    if (gx2_skip_copies && !top_sized && known_screen < 0) return true;  // the mipmaps of a right eye that wasn't drawn
-    const bool screen_sized = top_sized || known_screen >= 0 || rows == 320;
-    switch (hidden_right_eye.see(known_screen, top_sized, screen_sized, flags, out_paddr, gx2_skip_pass)) {
-    case HiddenRightEye::RIGHT_EYE:  // nothing to draw or copy from its next clear to this transfer (gx2_memory_fill)
-        if (!right_eye_hidden) {
-            static u32 logged;
-            if (logged++ < 20) LOG("[gx2] right eye goes where no screen shows: transfer %08x -> %08x\n", in_paddr, out_paddr);
-        }
-        right_eye_hidden = right_follows_left = true;
-        gx2_skip_pass = gx2_skip_copies = left_done = false;
-        return true;
-    case HiddenRightEye::ON_A_SCREEN:
-        if (right_eye_hidden) {
-            static u32 logged;
-            if (logged++ < 20) LOG("[gx2] right eye: %08x is a screen's buffer after all\n", out_paddr);
-            right_eye_hidden = right_follows_left = false;
-        }
-        break;
-    default:
-        break;
-    }
-    if (known_screen == 2 && right_eye_hidden) {
-        static u32 logged;
-        if (logged++ < 20) LOG("[gx2] right eye goes to the right LCD: transfer %08x -> %08x\n", in_paddr, out_paddr);
-        right_eye_hidden = false;
-    }
+    // An unregistered LCD-sized destination can be a future framebuffer or a texture the game still needs.
     if (right_eye_transfer(known_screen)) return true;
+    // Preserve both GamePad framebuffer images when a game writes more than one between LCD refreshes.
+    if (known_screen == 1 && !skip_bytes && !scaling && !(flags & 0x22) && in_dims == out_dims && out_w == 240 && rows == 320 &&
+        packed_bottom(kernel::gsp_framebuffer(1), (flags >> 12) & 7)) {
+        Surface *dst = nullptr;
+        if (gpu_copy_transfer(in_paddr, out_paddr, in_dims, out_dims, flags, &dst)) {
+            // A deferred CPU read must not restore an older image over this new destination.
+            for (LastTransfer &t : last_transfer)
+                if (t.out_paddr == out_paddr && t.out_size <= out_size) t.src = nullptr;
+            dst->lcd_bottom = true;
+            return true;
+        }
+    }
     // New Super Mario Bros. 2's framebuffers are 256 wide, and the LCD shows 240 columns of them
-    const u32 shown_w = out_w == 256 && (crop || known_screen >= 0) ? 240 : out_w;
+    const u32 output_w = out_w >> hs;
+    const u32 shown_w = output_w == 256 && (crop || known_screen >= 0) ? 240 << hs : out_w;
     const u32 shown_h = known_screen == 0 ? 400 : known_screen == 1 ? 320 : out_h;
     const u32 skip_rows = skip_bytes / (out_size / rows);
     if ((crop ? in_w < out_w : in_w != out_w) || (shown_w != 240 && shown_w != 480) || (shown_h != 400 && shown_h != 320) || (in_h != out_h && !crop)) {
@@ -4345,7 +4420,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     for (auto &x : surfaces) {
         if (x->depth || x->w != in_w || in_paddr < x->addr || in_paddr >= x->addr + x->bytes()) continue;
         const u32 row_bytes = x->bytes() / x->h, off = in_paddr - x->addr;
-        if (off % row_bytes || off / row_bytes + out_h > x->h) continue;
+        if (off % row_bytes || off / row_bytes + out_h > x->h || (s && x->drawn <= s->drawn)) continue;
         s = x.get();
         first_row = off / row_bytes;
     }
@@ -4362,7 +4437,22 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     static u32 shown[2];  // pictures sent to each screen's own buffers
     const bool spare = known_screen < 0 && passed_over(out_paddr, shown[which]);
     if (known_screen >= 0) shown[which]++;
-    if (!spare) show_screen(which, &s->tex, flags & 1, (h - first_row - skip_rows - shown_h) / h, (h - first_row - skip_rows) / h, (float)shown_w / in_w);
+    const u32 source_rows = known_screen >= 0 ? shown_h << vs : shown_h;
+    const u32 source_skip = flip && known_screen >= 0 ? ((rows - skip_rows - shown_h) << vs) : skip_rows << vs;
+    const u32 start_row = first_row + source_skip;
+    if (gxt()) LOG("[gxt] transfer source %08x %ux%u fmt %u draw %llu rows %u+%u, %s%s\n", s->addr, s->w, s->h, s->fmt,
+                   (unsigned long long)s->drawn, start_row, source_rows, spare ? "off-screen" : which == 0 ? "TV" : "GamePad",
+                   s->guest_newer ? " guest-written" : "");
+    if (!spare) {
+        if (which == 1) {
+            shown_bottom_draw = 0;
+            const auto written = surface_readback::bounds(out_paddr, out_size);
+            for (auto &surface : surfaces)
+                if (surface->lcd_bottom && surface_readback::overlaps(written, surface_readback::bounds(surface->addr, surface->bytes())))
+                    surface->lcd_bottom = false;
+        }
+        show_screen(which, &s->tex, flip, (h - start_row - source_rows) / h, (h - start_row) / h, (float)shown_w / in_w);
+    }
     if (kMeasure && !spare && which == 0) note_top_picture(in_paddr, out_paddr, known_screen);
     last_transfer[spare ? 2 : which] = {s, in_paddr, out_paddr, in_dims, out_dims, flags, out_size};
     return true;
@@ -4510,8 +4600,10 @@ static void relieve_mem1() {
         // only screens' targets have fast memory; none means its memory is being made (gfx_reacquire), so it goes where that puts it
         if (!s->depth || !s->mem1 || s->shared_depth || !f.image) continue;
         GfxHeapFreeMEM1(f.image);
-        if (share_depth_block(f)) s->shared_depth = s->clear_pending = true;
-        else f.image = alloc_surface_mem(f.imageSize, f.alignment, s->mem1, false);
+        GX2Surface storage = depth_storage_layout(*s);
+        s->shared_depth = share_depth_block(storage);
+        f.image = s->shared_depth ? storage.image : alloc_surface_mem(storage.imageSize, storage.alignment, s->mem1, false);
+        s->clear_pending = true;
         if (cur_depth == s.get()) GX2SetDepthBuffer(&s->db);
     }
 }
@@ -4530,6 +4622,7 @@ void gfx_thread_init() {
     if (!ring) FATAL("out of memory for the GPU ring\n");
     junk(ring, RING_SIZE, 4);
     ring_off = 0;
+    ring_constant = nullptr;
     ring_end = RING_SIZE / 3;
     tv_cb = WHBGfxGetTVColourBuffer();
     drc_cb = WHBGfxGetDRCColourBuffer();
@@ -4921,213 +5014,487 @@ static const char *const k_kb_rows[2][4] = {
 };
 static constexpr int KB_COLS = 10, KB_ROWS = 5;  // row 4: shift, space, delete, cancel, OK
 static constexpr float KB_X = 107, KB_Y = 150, KB_W = 64, KB_H = 62;
-static volatile bool kb_active;
-static volatile int kb_row = 1, kb_col = 0, kb_shift;
-static char kb_text[64];
-static volatile int kb_len;
+static constexpr float KB_NUMPAD_OFFSET = 90;
+static std::mutex kb_m;
+static std::atomic<bool> kb_active;
+static int kb_row = 1, kb_col = 0;
+static bool kb_shift;
+static std::string kb_text;
 static swkbd::Request kb_req;
+static constexpr int kb_columns[] = {0, 2, 6, 7, 8, KB_COLS};
+static constexpr int kb_numeric_columns[] = {0, 3, 6, KB_COLS};
 
 // row 4's keys, by column
 static int kb_special(int col) { return col < 2 ? 0 : col < 6 ? 1 : col < 7 ? 2 : col < 8 ? 3 : 4; }
 
-static void kb_press(int row, int col) {
-    const bool numpad = kb_req.numpad;
-    const int maxlen = kb_req.max_len > 0 ? std::min<int>(kb_req.max_len, sizeof kb_text - 1) : (int)sizeof kb_text - 1;
+static int kb_units(const std::string &text) {
+    int units = 0;
+    for (unsigned char c : text)
+        if ((c & 0xc0) != 0x80) units += c >= 0xf0 ? 2 : 1;
+    return units;
+}
+
+static bool kb_confirmable(const swkbd::Request &request, const std::string &text) {
+    switch (request.valid) {
+    case 1: return !text.empty();
+    case 2:
+    case 3: return text.find_first_not_of(' ') != std::string::npos;
+    case 4: return kb_units(text) == request.max_len;
+    default: return true;
+    }
+}
+
+static bool kb_accepts(const swkbd::Request &request, const std::string &text, char c) {
+    if (text.size() >= 63 || (request.max_len > 0 && kb_units(text) >= request.max_len)) return false;
+    if (c >= '0' && c <= '9') {
+        const auto digits = std::count_if(text.begin(), text.end(), [](char d) { return d >= '0' && d <= '9'; });
+        return !request.digits_limited || digits < request.max_digits;
+    }
+    return !request.numpad && !(c == '%' && request.no_percent);
+}
+
+static int kb_press(int row, int col) {
     if (row < 4) {
         const char c = k_kb_rows[kb_shift][row][col];
-        if (numpad && !(c >= '0' && c <= '9')) return;
-        if (kb_len < maxlen) {
-            kb_text[kb_len] = c;
-            kb_len = kb_len + 1;
-            kb_text[kb_len] = 0;
+        if (kb_accepts(kb_req, kb_text, c)) {
+            kb_text += c;
+            if (row > 0) kb_shift = false;
         }
-        if (kb_shift && row > 0) kb_shift = 0;
-        return;
+        return 0;
     }
     switch (kb_special(col)) {
-    case 0: kb_shift = !kb_shift; break;
-    case 1:
-        if (kb_len < maxlen && !numpad) {
-            kb_text[kb_len] = ' ';
-            kb_len = kb_len + 1;
-            kb_text[kb_len] = 0;
-        }
-        break;
+    case 0: if (!kb_req.numpad) kb_shift = !kb_shift; break;
+    case 1: if (kb_accepts(kb_req, kb_text, ' ')) kb_text += ' '; break;
     case 2:
-        if (kb_len > 0) {
-            kb_len = kb_len - 1;
-            kb_text[kb_len] = 0;
+        if (!kb_text.empty()) {
+            size_t end = kb_text.size() - 1;
+            while (end && ((unsigned char)kb_text[end] & 0xc0) == 0x80) --end;
+            kb_text.resize(end);
         }
         break;
-    case 3:
-        if (kb_req.can_cancel) {
-            kb_active = false;
-            swkbd::finish("", false);
-        }
-        break;
-    default: {
-        // the game's own rules for what it accepts: don't offer to confirm what it would reject
-        bool blank = true;
-        for (int i = 0; i < kb_len; i++) blank &= kb_text[i] == ' ';
-        if ((kb_req.valid == 1 && kb_len == 0) || ((kb_req.valid == 2 || kb_req.valid == 3) && blank)) break;
-        if (kb_req.valid == 4 && kb_len != kb_req.max_len) break;
-        kb_active = false;
-        swkbd::finish(kb_text, true);
-        break;
+    case 3: return kb_req.can_cancel ? -1 : 0;
+    default: return kb_confirmable(kb_req, kb_text) ? 1 : 0;
     }
-    }
+    return 0;
 }
 
 bool keyboard_open() { return kb_active; }
 
 void keyboard_input(u32 pressed, bool touch_began, u16 x, u16 y) {
-    if (!kb_active) {
-        if (swkbd::pending(&kb_req)) {
-            size_t n = std::min(kb_req.initial.size(), sizeof kb_text - 1);
-            memcpy(kb_text, kb_req.initial.data(), n);
-            kb_text[n] = 0;
-            kb_len = (int)n;
-            kb_row = 1;
-            kb_col = 0;
-            kb_shift = 1;
-            kb_active = true;
+    int choice = 0;
+    std::string result;
+    {
+        std::lock_guard<std::mutex> lock(kb_m);
+        if (!kb_active) {
+            if (swkbd::pending(&kb_req)) {
+                size_t n = std::min<size_t>(kb_req.initial.size(), 63);
+                while (n && ((unsigned char)kb_req.initial[n] & 0xc0) == 0x80) --n;
+                kb_text.assign(kb_req.initial, 0, n);
+                kb_row = kb_req.numpad ? 0 : 1;
+                kb_col = 0;
+                kb_shift = !kb_req.numpad;
+                kb_active = true;
+            }
+            return;
         }
-        return;
+        if (touch_began) {
+            const float top = KB_Y + (kb_req.numpad ? KB_NUMPAD_OFFSET : 0);
+            if (x >= KB_X && x < KB_X + KB_COLS * KB_W && y >= top) {
+                const int c = (int)((x - KB_X) / KB_W), r = (int)((y - top) / KB_H);
+                if (kb_req.numpad && r == 1) {
+                    kb_row = 4;
+                    kb_col = kb_columns[2 + std::min(c / 3, 2)];
+                    choice = kb_press(kb_row, kb_col);
+                } else if (r < (kb_req.numpad ? 1 : KB_ROWS)) {
+                    kb_row = r;
+                    kb_col = c;
+                    choice = kb_press(r, c);
+                }
+            }
+        } else {
+            const int dy = !!(pressed & VPAD_BUTTON_DOWN) - !!(pressed & VPAD_BUTTON_UP);
+            const int dx = !!(pressed & VPAD_BUTTON_RIGHT) - !!(pressed & VPAD_BUTTON_LEFT);
+            if (dy) {
+                kb_row = kb_req.numpad ? (kb_row == 0 ? 4 : 0) : (kb_row + KB_ROWS + dy) % KB_ROWS;
+                if (kb_req.numpad && kb_row == 4) kb_col = std::max(kb_col, kb_columns[2]);
+            }
+            if (dx) {
+                if (kb_row != 4) kb_col = (kb_col + KB_COLS + dx) % KB_COLS;
+                else if (kb_req.numpad) kb_col = kb_columns[2 + (kb_special(kb_col) + 1 + dx) % 3];
+                else kb_col = kb_columns[(kb_special(kb_col) + 5 + dx) % 5];
+            }
+            if (pressed & VPAD_BUTTON_A) choice = kb_press(kb_row, kb_col);
+            else if (pressed & VPAD_BUTTON_B) choice = kb_press(4, 6);    // delete
+            else if (pressed & VPAD_BUTTON_Y) choice = kb_press(4, 0);    // shift
+            else if (pressed & VPAD_BUTTON_X) choice = kb_press(4, 2);    // space
+            else if (pressed & VPAD_BUTTON_PLUS) choice = kb_press(4, 8); // OK
+        }
+        if (choice) {
+            if (choice > 0) result = std::move(kb_text);
+            else kb_text.clear();
+            kb_active = false;
+        }
     }
-    if (touch_began) {
-        const int c = (int)((x - KB_X) / KB_W), r = (int)((y - KB_Y) / KB_H);
-        if (x >= KB_X && c < KB_COLS && y >= KB_Y && r < KB_ROWS) kb_press(r, c);
-    }
-    if (pressed & VPAD_BUTTON_UP) kb_row = (kb_row + KB_ROWS - 1) % KB_ROWS;
-    if (pressed & VPAD_BUTTON_DOWN) kb_row = (kb_row + 1) % KB_ROWS;
-    if (pressed & VPAD_BUTTON_LEFT) kb_col = (kb_col + KB_COLS - 1) % KB_COLS;
-    if (pressed & VPAD_BUTTON_RIGHT) kb_col = (kb_col + 1) % KB_COLS;
-    if (pressed & VPAD_BUTTON_A) kb_press(kb_row, kb_col);
-    if (pressed & VPAD_BUTTON_B) kb_press(4, 6);       // delete
-    if (pressed & VPAD_BUTTON_Y) kb_press(4, 0);       // shift
-    if (pressed & VPAD_BUTTON_X) kb_press(4, 2);       // space
-    if (pressed & VPAD_BUTTON_PLUS) kb_press(4, 8);    // OK
+    if (choice) swkbd::finish(result, choice > 0);
 }
 
-static void draw_keyboard() {
+static bool draw_keyboard() {
+    if (!kb_active) return false;
+    swkbd::Request request;
+    std::string value;
+    int row, col;
+    bool shifted, confirm;
+    {
+        std::lock_guard<std::mutex> lock(kb_m);
+        if (!kb_active) return false;
+        request = kb_req;
+        value = request.password ? std::string(kb_units(kb_text), '*') : kb_text;
+        row = kb_row;
+        col = kb_col;
+        shifted = kb_shift;
+        confirm = kb_confirmable(request, kb_text);
+    }
     const u32 w = drc_cb->surface.width, h = drc_cb->surface.height;
     GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
     cur_color = nullptr;
     begin_blit();
     GX2SetViewport(0, 0, (float)w, (float)h, 0, 1);
     GX2SetScissor(0, 0, w, h);
-    GX2SetPixelTexture(&black_tex, 0);
-    GX2SetPixelSampler(&blit_sampler, 0);
-    set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
-    draw_rect(w, h, KB_X, 0, KB_X + 640, 480, 0, 0, 1, 1);
-    set_blit_colors(0, 0, 0, 1, 1, 1);
-    draw_rect(w, h, KB_X + 16, 56, KB_X + 624, 136, 0, 0, 1, 1);
-    const auto key_rect = [&](float x0, float y0, float x1, float y1, bool selected) {
-        set_blit_colors(0, 0, 0, 0.35f, 0.2f, 0.05f);
-        draw_rect(w, h, x0 + 2, y0 + 2, x1 - 2, y1 - 2, 0, 0, 1, 1);
-        if (selected) set_blit_colors(0, 0, 0, 1.0f, 0.75f, 0.2f);
-        else set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
-        draw_rect(w, h, x0 + 5, y0 + 5, x1 - 5, y1 - 5, 0, 0, 1, 1);
-    };
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < KB_COLS; c++) key_rect(KB_X + c * KB_W, KB_Y + r * KB_H, KB_X + (c + 1) * KB_W, KB_Y + (r + 1) * KB_H, r == kb_row && c == kb_col);
-    const int sel = kb_row == 4 ? kb_special(kb_col) : -1;
-    const float y4 = KB_Y + 4 * KB_H;
-    key_rect(KB_X, y4, KB_X + 2 * KB_W, y4 + KB_H, sel == 0);
-    key_rect(KB_X + 2 * KB_W, y4, KB_X + 6 * KB_W, y4 + KB_H, sel == 1);
-    key_rect(KB_X + 6 * KB_W, y4, KB_X + 7 * KB_W, y4 + KB_H, sel == 2);
-    key_rect(KB_X + 7 * KB_W, y4, KB_X + 8 * KB_W, y4 + KB_H, sel == 3);
-    key_rect(KB_X + 8 * KB_W, y4, KB_X + 10 * KB_W, y4 + KB_H, sel == 4);
-    GX2SetPixelTexture(&font_tex, 0);
-    GX2SetPixelSampler(&lut_sampler, 0);
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
-    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
-    set_blit_colors(0.1f, 0.05f, 0.0f, 0, 0, 0);
-    draw_text(w, h, kb_req.hint.empty() ? "Type here:" : kb_req.hint.c_str(), KB_X + 20, 22, 3);
-    draw_text(w, h, kb_text, KB_X + 30, 76, 6);
-    for (int r = 0; r < 4; r++)
-        for (int c = 0; c < KB_COLS; c++) {
-            const char t[2] = {k_kb_rows[kb_shift][r][c], 0};
-            draw_text(w, h, t, KB_X + c * KB_W + 20, KB_Y + r * KB_H + 12, 5);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE,
+                       GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+
+    GX2SetPixelTexture(&disk_tex, 0);
+    GX2SetPixelSampler(&blit_sampler, 0);
+    const float right = KB_X + KB_COLS * KB_W;
+    const float offset = request.numpad ? KB_NUMPAD_OFFSET : 0;
+    const float bottom = request.numpad ? 289 + offset : 476;
+    const auto paint = [&](float r, float g, float b) { set_blit_colors(r, g, b, 0, 0, 0); };
+    const auto fill = [&](float x0, float y0, float x1, float y1) {
+        draw_rect(w, h, x0, y0, x1, y1, 0.5f, 0.5f, 0.5f, 0.5f);
+    };
+    for (int band = 0; band < 16; ++band) {
+        const float f = band / 15.0f;
+        paint(0.45f - 0.18f * f, 0.59f - 0.20f * f, 0.86f - 0.16f * f);
+        fill(0, 30.0f * band, (float)w, 30.0f * (band + 1));
+    }
+    paint(0.47f, 0.58f, 0.84f);
+    draw_round_rect(w, h, KB_X - 16, 20 + offset, right + 16, bottom, 16);
+    paint(0.11f, 0.17f, 0.35f);
+    draw_round_rect(w, h, KB_X - 13, 23 + offset, right + 13, bottom - 3, 13);
+    paint(0.96f, 0.97f, 1.0f);
+    draw_round_rect(w, h, KB_X + 6, 64 + offset, right - 6, 134 + offset, 10);
+
+    const auto key = [&](float x0, float y0, float x1, bool selected, bool enabled) {
+        if (selected) {
+            paint(0.18f, 0.76f, 1.0f);
+            draw_round_rect(w, h, x0 + 2, y0 + 3, x1 - 2, y0 + KB_H - 3, 9);
         }
-    draw_text(w, h, kb_shift ? "ABC" : "abc", KB_X + 28, y4 + 16, 4);
-    draw_text(w, h, "Space", KB_X + 2 * KB_W + 68, y4 + 16, 4);
-    draw_text(w, h, "<", KB_X + 6 * KB_W + 18, y4 + 12, 5);
-    if (kb_req.can_cancel) draw_text(w, h, "X", KB_X + 7 * KB_W + 18, y4 + 12, 5);
-    draw_text(w, h, kb_req.ok.empty() ? "OK" : "OK", KB_X + 8 * KB_W + 42, y4 + 16, 4);
+        if (enabled) paint(0.93f, 0.94f, 0.97f);
+        else paint(0.26f, 0.32f, 0.48f);
+        fill(x0 + 6, y0 + 7, x1 - 6, y0 + KB_H - 7);
+    };
+    const int rows = request.numpad ? 1 : 4;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < KB_COLS; ++c)
+            key(KB_X + c * KB_W, KB_Y + offset + r * KB_H, KB_X + (c + 1) * KB_W, r == row && c == col, true);
+    const float y4 = KB_Y + offset + (request.numpad ? 1 : 4) * KB_H;
+    const auto action_x = [&](int i) { return KB_X + (request.numpad ? kb_numeric_columns[i - 2] : kb_columns[i]) * KB_W; };
+    const int first_action = request.numpad ? 2 : 0;
+    const bool enabled[5] = {!request.numpad, !request.numpad, !value.empty(), request.can_cancel, confirm};
+    for (int i = first_action; i < 5; ++i)
+        key(action_x(i), y4, action_x(i + 1), row == 4 && kb_special(col) == i, enabled[i]);
+
+    const bool font = ui_font::load();
+    GX2SetPixelTexture(font ? &ui_font::texture() : &font_tex, 0);
+    GX2SetPixelSampler(font ? &blit_sampler : &lut_sampler, 0);
+    const auto pixel_scale = [](float size) { return std::max(1.0f, std::floor(size / 8)); };
+    const auto width = [&](const char *s, float size) { return font ? ui_font::width(s, size) : strlen(s) * 6 * pixel_scale(size); };
+    const auto text = [&](const char *s, float x, float y, float size) {
+        if (!font) {
+            draw_text(w, h, s, x, y + (size - 7 * pixel_scale(size)) / 2, pixel_scale(size));
+            return;
+        }
+        ui_font::Quad glyphs[64];
+        const int count = ui_font::quads(s, size, x, y, glyphs, 64);
+        for (int i = 0; i < count; ++i) {
+            const auto &q = glyphs[i];
+            draw_rect(w, h, q.x0, q.y0, q.x1, q.y1, q.u0, q.v0, q.u1, q.v1);
+        }
+    };
+    paint(1, 1, 1);
+    GX2SetScissor((u32)(KB_X + 10), (u32)(30 + offset), (u32)(right - KB_X - 20), 30);
+    const char *hint = request.hint.empty() ? (request.numpad ? "Enter a number" : "Enter text") : request.hint.c_str();
+    text(hint, KB_X + 10, 35 + offset, 23);
+    GX2SetScissor((u32)(KB_X + 18), (u32)(69 + offset), (u32)(right - KB_X - 36), 60);
+    paint(0.08f, 0.12f, 0.25f);
+    text(value.c_str(), std::min(KB_X + 18, right - 22 - width(value.c_str(), 32)), 83 + offset, 32);
+    GX2SetScissor(0, 0, w, h);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < KB_COLS; ++c) {
+            const char label[2] = {k_kb_rows[shifted][r][c], 0};
+            text(label, KB_X + (c + 0.5f) * KB_W - width(label, 29) / 2, KB_Y + offset + r * KB_H + 16, 29);
+        }
+    const char *actions[5] = {shifted ? "ABC" : "abc", "Space", "Delete", request.cancel.empty() ? "Cancel" : request.cancel.c_str(),
+                              request.ok.empty() ? "OK" : request.ok.c_str()};
+    for (int i = first_action; i < 5; ++i) {
+        const float x0 = action_x(i), x1 = action_x(i + 1);
+        const float size = !request.numpad && (i == 2 || i == 3) ? 16.0f : 21.0f;
+        const float label_width = width(actions[i], size);
+        if (enabled[i]) paint(0.08f, 0.12f, 0.25f);
+        else paint(0.78f, 0.83f, 0.94f);
+        GX2SetScissor((u32)(x0 + 7), (u32)y4, (u32)(x1 - x0 - 14), (u32)KB_H);
+        text(actions[i], std::max(x0 + 7, (x0 + x1 - label_width) / 2), y4 + (KB_H - size) / 2, size);
+    }
+    GX2SetScissor(0, 0, w, h);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     state_lost = true;
+    return true;
 }
 
-// ---- the Mii selector the game asks for (mii_select.h), on the GamePad: the console's Miis by name; up, down and A, a touch, or B where the game
-// lets the player cancel. Names keep only the letters the menu's font has.
-static constexpr float MS_X = 107, MS_Y = 92, MS_W = 640, MS_ROW = 42;
-static constexpr int MS_ROWS = 8;
-static volatile bool ms_active;
-static volatile int ms_sel, ms_top;  // the Mii picked, the first row shown
-static mii_select::Request ms_req;
+// ---- the Mii selector the game asks for (mii_select.h), on the GamePad
+static constexpr float MS_X = 28, MS_Y = 66, MS_W = 152, MS_H = 172, MS_GAP = 10;
+static constexpr float MS_FOOTER = 442, MS_L = 28, MS_R = 199, MS_SORT = 512, MS_BACK = 641, MS_CHOOSE = 741;
+static constexpr int MS_COLS = 5, MS_ROWS = 2, MS_PAGE = MS_COLS * MS_ROWS;
+static std::mutex ms_m;
+static u32 ms_next_layout;
+static std::atomic<u32> ms_presented_layout;
+static struct {
+    std::shared_ptr<const mii_select::Request> request;
+    std::shared_ptr<const std::vector<int>> by_name;
+    u32 layout = 0;
+    int sel = 0;
+    int row(int pos) const { return by_name ? (*by_name)[pos] : pos; }
+    int top() const { return sel / MS_PAGE * MS_PAGE; }
+} ms;
 
-static void ms_choose(int index) {
-    ms_active = false;
-    mii_select::finish(index);
+bool mii_selector_open() {
+    std::lock_guard<std::mutex> lock(ms_m);
+    return !!ms.request;
 }
-
-bool mii_selector_open() { return ms_active; }
 
 void mii_selector_input(u32 pressed, bool touch_began, u16 x, u16 y) {
-    if (!ms_active) {
-        if (mii_select::pending(&ms_req) && !ms_req.names.empty()) {
-            ms_sel = std::clamp(ms_req.initial, 0, (int)ms_req.names.size() - 1);
-            ms_top = std::max(0, ms_sel - MS_ROWS + 1);
-            ms_active = true;
+    const auto request = mii_select::pending();
+    int pick = -2;
+    {
+        std::lock_guard<std::mutex> lock(ms_m);
+        if (request != ms.request) {
+            ms = {};
+            if (request && !request->entries.empty()) {
+                ms.request = request;
+                ms.layout = ++ms_next_layout;
+                ms.sel = std::clamp(request->initial, 0, (int)request->entries.size() - 1);
+            }
+            return;
         }
-        return;
+        if (!request) return;
+        const int n = (int)request->entries.size();
+        const bool layout_visible = ms.layout == ms_presented_layout.load();
+        if (touch_began && layout_visible && x >= MS_X && y >= MS_Y && y < MS_FOOTER) {
+            const float dx = x - MS_X, dy = y - MS_Y;
+            const int col = (int)(dx / (MS_W + MS_GAP)), row = (int)(dy / (MS_H + MS_GAP));
+            const int pos = ms.top() + row * MS_COLS + col;
+            if (col < MS_COLS && row < MS_ROWS && pos < n &&
+                dx - col * (MS_W + MS_GAP) < MS_W && dy - row * (MS_H + MS_GAP) < MS_H)
+                pick = ms.row(pos);
+        }
+        if (touch_began && y >= MS_FOOTER && y < 480) {
+            if (x >= MS_L && x < MS_L + 36) pressed |= VPAD_BUTTON_L;
+            if (x >= MS_R && x < MS_R + 36) pressed |= VPAD_BUTTON_R;
+            if (x >= MS_SORT && x < MS_BACK) pressed |= VPAD_BUTTON_Y;
+            if (x >= MS_BACK && x < MS_CHOOSE) pressed |= VPAD_BUTTON_B;
+            if (layout_visible && x >= MS_CHOOSE && x < 828) pressed |= VPAD_BUTTON_A;
+        }
+        if (pick == -2) {
+            const auto old_order = ms.by_name;
+            const int top = ms.top();
+            if ((pressed & VPAD_BUTTON_Y) && n > 1) {
+                const int row = ms.row(ms.sel);
+                if (ms.by_name) {
+                    ms.by_name.reset();
+                    ms.sel = row;
+                } else {
+                    auto sorted = std::make_shared<std::vector<int>>(n);
+                    for (int i = 0; i < n; ++i) (*sorted)[i] = i;
+                    std::stable_sort(sorted->begin(), sorted->end(), [&](int a, int b) {
+                        return request->entries[a].name < request->entries[b].name;
+                    });
+                    ms.sel = (int)(std::find(sorted->begin(), sorted->end(), row) - sorted->begin());
+                    ms.by_name = std::move(sorted);
+                }
+            }
+            const int dx = !!(pressed & VPAD_BUTTON_RIGHT) - !!(pressed & VPAD_BUTTON_LEFT);
+            const int dy = !!(pressed & VPAD_BUTTON_DOWN) - !!(pressed & VPAD_BUTTON_UP);
+            const int pos = ms.sel % MS_PAGE;
+            const int rows = (std::min(MS_PAGE, n - ms.top()) - 1) / MS_COLS + 1;
+            const int row = std::clamp(pos / MS_COLS + dy, 0, rows - 1);
+            const int col = std::clamp(pos % MS_COLS + dx, 0, MS_COLS - 1);
+            ms.sel = std::min(ms.top() + row * MS_COLS + col, n - 1);
+            const int page = !!(pressed & VPAD_BUTTON_R) - !!(pressed & VPAD_BUTTON_L);
+            const int next_page = std::clamp(ms.sel / MS_PAGE + page, 0, (n - 1) / MS_PAGE);
+            ms.sel = std::min(next_page * MS_PAGE + ms.sel % MS_PAGE, n - 1);
+            if (top != ms.top() || old_order != ms.by_name) ms.layout = ++ms_next_layout;
+            if (pressed & VPAD_BUTTON_A) pick = ms.row(ms.sel);
+            else if ((pressed & VPAD_BUTTON_B) && request->can_cancel) pick = -1;
+        }
+        if (pick != -2) ms = {};
     }
-    const int n = (int)ms_req.names.size();
-    if (touch_began && x >= MS_X && x < MS_X + MS_W && y >= MS_Y) {
-        const int row = (int)((y - MS_Y) / MS_ROW);
-        if (row < MS_ROWS && ms_top + row < n) return ms_choose(ms_top + row);
-    }
-    if (pressed & VPAD_BUTTON_UP) ms_sel = (ms_sel + n - 1) % n;
-    if (pressed & VPAD_BUTTON_DOWN) ms_sel = (ms_sel + 1) % n;
-    if (ms_sel < ms_top) ms_top = ms_sel;
-    if (ms_sel >= ms_top + MS_ROWS) ms_top = ms_sel - MS_ROWS + 1;
-    if (pressed & VPAD_BUTTON_A) ms_choose(ms_sel);
-    else if ((pressed & VPAD_BUTTON_B) && ms_req.can_cancel) ms_choose(-1);
+    if (pick != -2) mii_select::finish(*request, pick);
 }
 
-static void draw_mii_selector() {
+static bool draw_mii_selector(u32 &layout) {
+    const auto view = [] {
+        std::lock_guard<std::mutex> lock(ms_m);
+        return ms;
+    }();
+    if (!view.request) return false;
+    layout = view.layout;
+    const auto &request = *view.request;
     const u32 w = drc_cb->surface.width, h = drc_cb->surface.height;
+    const int n = (int)request.entries.size(), top = view.top(), count = std::min(MS_PAGE, n - top);
+    std::array<const char *, MS_PAGE + 1> labels{};
+    labels[0] = request.title.empty() ? "Choose a Mii" : request.title.c_str();
+    for (int i = 0; i < count; ++i) {
+        const auto &name = request.entries[view.row(top + i)].name;
+        labels[1 + i] = name.empty() ? "Unnamed Mii" : name.c_str();
+    }
+#ifdef RECOMP_FFL_TRIAL
+    std::array<const mii_select::Request::Entry *, MS_PAGE> entries;
+    for (int i = 0; i < count; ++i) entries[i] = &request.entries[view.row(top + i)];
+    if (mii_face::prepare(view.layout, entries.data(), count)) restore_context();
+#endif
+    const bool font = ui_font::load();
+    if (font) ui_font::prepare(labels.data(), count + 1);
     GX2SetColorBuffer(drc_cb, GX2_RENDER_TARGET_0);
     cur_color = nullptr;
     begin_blit();
     GX2SetViewport(0, 0, (float)w, (float)h, 0, 1);
     GX2SetScissor(0, 0, w, h);
-    GX2SetPixelTexture(&black_tex, 0);
-    GX2SetPixelSampler(&blit_sampler, 0);
-    set_blit_colors(0, 0, 0, 0.98f, 0.9f, 0.62f);
-    draw_rect(w, h, MS_X, 0, MS_X + MS_W, 480, 0, 0, 1, 1);
-    const int n = (int)ms_req.names.size();
-    for (int r = 0; r < MS_ROWS && ms_top + r < n; r++) {
-        const float y = MS_Y + r * MS_ROW;
-        set_blit_colors(0, 0, 0, 0.35f, 0.2f, 0.05f);
-        draw_rect(w, h, MS_X + 16, y + 2, MS_X + MS_W - 16, y + MS_ROW - 2, 0, 0, 1, 1);
-        if (ms_top + r == ms_sel) set_blit_colors(0, 0, 0, 1.0f, 0.75f, 0.2f);
-        else set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
-        draw_rect(w, h, MS_X + 19, y + 5, MS_X + MS_W - 19, y + MS_ROW - 5, 0, 0, 1, 1);
-    }
-    GX2SetPixelTexture(&font_tex, 0);
-    GX2SetPixelSampler(&lut_sampler, 0);
     GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
-    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
-    set_blit_colors(0.1f, 0.05f, 0.0f, 0, 0, 0);
-    draw_text(w, h, ms_req.title.empty() ? "Choose a Mii" : ms_req.title.c_str(), MS_X + 20, 22, 3);
-    for (int r = 0; r < MS_ROWS && ms_top + r < n; r++) draw_text(w, h, ms_req.names[ms_top + r].c_str(), MS_X + 32, MS_Y + r * MS_ROW + 11, 3);
-    draw_text(w, h, ms_req.can_cancel ? "A: CHOOSE   B: CANCEL" : "A: CHOOSE", MS_X + 20, 446, 2);
-    if (ms_top > 0) draw_text(w, h, "-", MS_X + MS_W - 40, 60, 3);
-    if (ms_top + MS_ROWS < n) draw_text(w, h, "+", MS_X + MS_W - 40, 424, 3);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE,
+                       GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    GX2SetPixelTexture(&disk_tex, 0);
+    GX2SetPixelSampler(&blit_sampler, 0);
+    const auto paint = [](float r, float g, float b) { set_blit_colors(r, g, b, 0, 0, 0); };
+    const auto fill = [&](float x0, float y0, float x1, float y1) {
+        draw_rect(w, h, x0, y0, x1, y1, 0.5f, 0.5f, 0.5f, 0.5f);
+    };
+    const auto rounded = [&](float x, float y, float wide, float tall, float radius) {
+        draw_round_rect(w, h, x, y, x + wide, y + tall, radius);
+    };
+    paint(0.79f, 0.91f, 0.97f);
+    fill(0, 0, (float)w, (float)h);
+    paint(0.48f, 0.66f, 0.78f);
+    fill(MS_X, 49, w - MS_X, 51);
+    fill(MS_X, MS_FOOTER - 6, w - MS_X, MS_FOOTER - 4);
+    for (int i = 0; i < count; ++i) {
+        const float x = MS_X + i % MS_COLS * (MS_W + MS_GAP), y = MS_Y + i / MS_COLS * (MS_H + MS_GAP);
+        const bool focused = top + i == view.sel;
+        if (focused) {
+            paint(0.0f, 0.49f, 0.47f);
+            rounded(x - 3, y - 3, MS_W + 6, MS_H + 6, 16);
+            paint(0.82f, 0.98f, 0.96f);
+        } else {
+            paint(0.95f, 0.98f, 1.0f);
+        }
+        rounded(x + 2, y + 2, MS_W - 4, MS_H - 4, 12);
+        const float middle = x + MS_W / 2;
+#ifdef RECOMP_FFL_TRIAL
+        if (const auto *face = mii_face::texture(i)) {
+            paint(1, 1, 1);
+            GX2SetPixelTexture(face, 0);
+            draw_rect(w, h, middle - 63, y + 2, middle + 63, y + 128, 0, 0, 1, 1);
+            GX2SetPixelTexture(&disk_tex, 0);
+            continue;
+        }
+#endif
+        paint(0.84f, 0.91f, 0.96f);
+        draw_rect(w, h, middle - 48, y + 21, middle + 48, y + 117, 0, 0, 1, 1);
+        paint(0.34f, 0.49f, 0.62f);
+        draw_rect(w, h, middle - 21, y + 39, middle + 21, y + 81, 0, 0, 1, 1);
+        rounded(middle - 29, y + 87, 58, 20, 10);
+    }
+    paint(0.24f, 0.34f, 0.48f);
+    if (n > MS_PAGE) {
+        rounded(MS_L, MS_FOOTER + 5, 30, 25, 7);
+        rounded(MS_R, MS_FOOTER + 5, 30, 25, 7);
+    }
+    if (n > 1) rounded(MS_SORT, MS_FOOTER + 5, 25, 25, 12);
+    if (request.can_cancel) rounded(MS_BACK, MS_FOOTER + 5, 25, 25, 12);
+    rounded(MS_CHOOSE, MS_FOOTER + 5, 25, 25, 12);
+    GX2SetPixelTexture(font ? &ui_font::texture() : &font_tex, 0);
+    GX2SetPixelSampler(font ? &blit_sampler : &lut_sampler, 0);
+    const auto pixel_scale = [](float size) { return std::max(1.0f, size / 12); };
+    const auto width = [&](const char *s, float size) {
+        if (font) return ui_font::width(s, size);
+        int glyphs = 0;
+        for (; *s; ++s) glyphs += ((u8)*s & 0xC0) != 0x80;
+        return glyphs * 6 * pixel_scale(size);
+    };
+    const auto text = [&](const char *s, float x, float y, float size) {
+        if (!font) {
+            std::string ascii;
+            for (; *s; ++s) {
+                const u8 c = (u8)*s;
+                if (c < 0x80) ascii += *s;
+                else if (c >= 0xC0) ascii += '?';
+            }
+            const float scale = pixel_scale(size);
+            draw_text(w, h, ascii.c_str(), x, y + (size - 7 * scale) / 2, scale);
+            return;
+        }
+        ui_font::Quad q[64];
+        const int count = ui_font::quads(s, size, x, y, q, 64);
+        for (int i = 0; i < count; ++i)
+            draw_rect(w, h, q[i].x0, q[i].y0, q[i].x1, q[i].y1, q[i].u0, q[i].v0, q[i].u1, q[i].v1);
+    };
+    const auto centered = [&](const char *s, float x, float y, float size) { text(s, x - width(s, size) / 2, y, size); };
+    char number[32];
+    if (n >= 1000) snprintf(number, sizeof number, "%d,%03d Miis", n / 1000, n % 1000);
+    else snprintf(number, sizeof number, n == 1 ? "%d Mii" : "%d Miis", n);
+    const float xnumber = w - MS_X - width(number, 24);
+    paint(0.09f, 0.17f, 0.32f);
+    text(number, xnumber, 15, 24);
+    GX2SetScissor((u32)MS_X, 0, (u32)(xnumber - MS_X - 16), 49);
+    text(labels[0], MS_X, 11, 30);
+    for (int i = 0; i < count; ++i) {
+        const char *name = labels[1 + i];
+        const float x = MS_X + i % MS_COLS * (MS_W + MS_GAP), y = MS_Y + i / MS_COLS * (MS_H + MS_GAP);
+        const float size = std::clamp(24 * (MS_W - 16) / std::max(1.0f, width(name, 24)), 14.0f, 24.0f);
+        GX2SetScissor((u32)(x + 8), (u32)(y + 120), (u32)(MS_W - 16), (u32)(MS_H - 120));
+        centered(name, x + MS_W / 2, y + 131 + (24 - size) / 2, size);
+    }
+    GX2SetScissor(0, 0, w, h);
+    snprintf(number, sizeof number, "Page %d / %d", top / MS_PAGE + 1, (n - 1) / MS_PAGE + 1);
+    centered(number, (MS_L + 30 + MS_R) / 2, MS_FOOTER + 7, 19);
+    if (n > 1) text(view.by_name ? "Reset" : "Sort", MS_SORT + 31, MS_FOOTER + 7, 19);
+    if (request.can_cancel) text("Back", MS_BACK + 31, MS_FOOTER + 7, 19);
+    text("Choose", MS_CHOOSE + 31, MS_FOOTER + 7, 19);
+    paint(1, 1, 1);
+    if (n > MS_PAGE) {
+        centered("L", MS_L + 15, MS_FOOTER + 7, 19);
+        centered("R", MS_R + 15, MS_FOOTER + 7, 19);
+    }
+    if (n > 1) centered("Y", MS_SORT + 12.5f, MS_FOOTER + 7, 19);
+    if (request.can_cancel) centered("B", MS_BACK + 12.5f, MS_FOOTER + 7, 19);
+    centered("A", MS_CHOOSE + 12.5f, MS_FOOTER + 7, 19);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, drc_cb->surface.image, drc_cb->surface.imageSize);
     state_lost = true;
+    return true;
+}
+
+static void mii_selector_scanout(u32 submitted_layout) {
+    static u32 layout, layout_swap;
+    if (submitted_layout == layout && layout == ms_presented_layout.load()) return;
+    u32 swaps = 0, flips = 0;
+    OSTime last_flip = 0, last_vsync = 0;
+    GX2GetSwapStatus(&swaps, &flips, &last_flip, &last_vsync);
+    if (submitted_layout != layout || (s32)(swaps - layout_swap) < 0) {
+        layout = submitted_layout;
+        layout_swap = swaps;
+    }
+    // Touch must use the page and sort order already on screen.
+    if ((s32)(flips - layout_swap) >= 0) ms_presented_layout.store(layout);
 }
 
 // The report is asked for by the frontend's thread and written by this one, between frames: the counters it prints and starts over are this
@@ -5243,11 +5610,27 @@ static void show_lcd_from_memory() {
     top_shown = false;
 }
 
+static void show_bottom_lcd() {
+    const kernel::FramebufferInfo f = kernel::gsp_framebuffer(1);
+    const u32 pa = f.valid && f.addr_left ? mem::vaddr_to_paddr(f.addr_left) : 0;
+    if (!pa || !packed_bottom(f, f.format & 7)) return;
+    const u32 fmt = cbuf_to_pixfmt(f.format & 7);
+    Surface *shown = find_surface(pa, false, [&](const Surface &s) {
+        return s.lcd_bottom && s.linear && s.w == 240 && s.h == 320 && s.fmt == fmt && !s.guest_newer;
+    });
+    if (!shown || shown->drawn == shown_bottom_draw) return;
+    shown_bottom_draw = shown->drawn;
+    flush_surface(*shown);
+    const float height = (float)shown->tex_h;
+    if (gxt()) LOG("[gxt] GamePad from selected LCD %08x draw %llu\n", pa, (unsigned long long)shown_bottom_draw);
+    show_screen(1, &shown->tex, false, (height - 320) / height, 1);
+}
+
 // (the GPU thread, after each look at its queue) quiet: it had nothing to do for its whole wait. present_rule.h says when a frame is shown.
 void gfx_pump(bool quiet) {
     if (!vblank_pending) {
         // the menu, the keyboard and the Mii list are drawn at a VBlank's look only, so while one is up nothing is shown in between
-        if (!menu_is_open && !kb_active && !ms_active && present_rule.between(quiet)) {
+        if (!menu_is_open && !kb_active && !mii_selector_open() && present_rule.between(quiet)) {
             screen_fresh = false;
             present();
         }
@@ -5255,17 +5638,15 @@ void gfx_pump(bool quiet) {
     }
     vblank_pending = false;
     show_lcd_from_memory();
+    show_bottom_lcd();
     install_compiled();
     if (report_due.exchange(false)) write_report();
     shader_compile_watch();
+    u32 mii_layout = 0;
     if (menu_is_open) {
         draw_menu();
         screen_fresh = true;
-    } else if (kb_active) {
-        draw_keyboard();
-        screen_fresh = true;
-    } else if (ms_active) {
-        draw_mii_selector();
+    } else if (draw_keyboard() || draw_mii_selector(mii_layout)) {
         screen_fresh = true;
     }
     static u32 swaps_seen[2];  // each screen's swaps (services/gsp.cpp) up to the last VBlank's look
@@ -5275,13 +5656,28 @@ void gfx_pump(bool quiet) {
         if (swaps != swaps_seen[s]) swapped |= 1u << s;
         swaps_seen[s] = swaps;
     }
-    if (present_rule.vblank(screen_fresh, swapped, menu_is_open || kb_active || ms_active)) {
+    if (present_rule.vblank(screen_fresh, swapped, menu_is_open || kb_active || mii_selector_open())) {
         screen_fresh = false;
         present();
+        if (mii_layout) mii_selector_scanout(mii_layout);
     }
 }
 
-void gfx_shutdown() { GX2DrawDone(); }
+void gfx_shutdown() {
+    gpu::vtx_flush_immediate();
+    gpu::vtx_finish_jobs();
+    gpu::gx2_flush_cpu_batch();
+    GX2DrawDone();
+#ifdef RECOMP_FFL_TRIAL
+    mii_face::release();
+#endif
+}
+
+void gfx_report_final() {
+    LOG("[gx2 final] native draws %llu, CPU batches %llu, fragment misses %llu, immediate native draws %llu, immediate CPU runs %llu\n",
+        (unsigned long long)gpu::st_draws, (unsigned long long)gpu::st_cpu_draws, (unsigned long long)gpu::st_ps_misses,
+        (unsigned long long)gpu::st_immediate_draws, (unsigned long long)gpu::vtx_immediate_cpu_runs);
+}
 
 // Back from the HOME Menu: the system took MEM1 and WHB has made its own buffers again, so the screens' render targets need
 // new memory too, in the order they first got it. What was in them is gone; the game draws them again every frame.
@@ -5375,6 +5771,7 @@ static void write_report() {
     static OSTime last_t;
     static u64 last_flips, last_draws, last_cpu_draws;
     static u32 last_busy;
+    static u32 last_lcd_swaps[2];
     const OSTime now = OSGetSystemTime();
     const float secs = last_t ? OSTicksToMicroseconds(now - last_t) / 1e6f : 1;
     const float fps = (st_flips - last_flips) / secs;
@@ -5382,6 +5779,10 @@ static void write_report() {
     LOG("[gx2] %.1f fps, gpu thread %.0f%% busy, %.0f draws/s, %llu on CPU, %llu fragment misses, %llu textures uploaded (%llu KB, %.1f ms, %llu decoded on the GPU), %u KB textures, %u surfaces\n",
         fps, busy, (st_draws - last_draws) / secs, (unsigned long long)(st_cpu_draws - last_cpu_draws), (unsigned long long)st_ps_misses, (unsigned long long)st_uploads,
         (unsigned long long)(st_upload_bytes >> 10), st_upload_ms, (unsigned long long)st_gpu_decodes, (u32)(tex_memory >> 10), (u32)surfaces.size());
+    LOG("[gx2 immediate] native draws %llu, CPU shader runs %llu\n", (unsigned long long)st_immediate_draws, (unsigned long long)vtx_immediate_cpu_runs);
+    if (st_shipped_vs_reuses || st_shipped_ps_reuses)
+        LOG("[prof] duplicate shipped shader loads avoided: %u vertex, %u pixel\n", st_shipped_vs_reuses, st_shipped_ps_reuses);
+    st_shipped_vs_reuses = st_shipped_ps_reuses = 0;
     const float draws = std::max<float>((float)(st_draws - last_draws), 1.0f);
     auto us = [&](int k) { return (float)OSTicksToMicroseconds((u64)prof[k]) / draws; };
     const float flips = std::max<float>((float)(st_flips - last_flips), 1.0f);
@@ -5392,7 +5793,11 @@ static void write_report() {
         us(P_KEY), us(P_BIND), us(P_PS), us(P_STATE), us(P_UNI), us(P_TEX), us(P_HASH), us(P_TEXUP), us(P_TEXFL), us(P_VSUNI), us(P_RANGE), us(P_ATTR), us(P_DRAW),
         (list_ns - last_list_ns) / 1e6 / flips, ms(P_PRESENT), ms(P_WAIT), ms(P_SYNC), st_syncs / flips, st_luts / flips, draws / flips, ds_built / flips, st_flushes / flips, st_rehashes / flips, (u32)textures.size());
     last_list_ns = list_ns;
-    LOG("[prof] the game's pictures a second: top screen %.1f, bottom screen %.1f\n", st_pictures[0] / secs, st_pictures[1] / secs);
+    const u32 top_swaps = kernel::gsp_swaps(0), bottom_swaps = kernel::gsp_swaps(1);
+    LOG("[prof] compositions/s: top %.1f, bottom %.1f | guest LCD swaps/s: top %.1f, bottom %.1f\n",
+        st_pictures[0] / secs, st_pictures[1] / secs, (top_swaps - last_lcd_swaps[0]) / secs, (bottom_swaps - last_lcd_swaps[1]) / secs);
+    last_lcd_swaps[0] = top_swaps;
+    last_lcd_swaps[1] = bottom_swaps;
     st_pictures[0] = st_pictures[1] = 0;
     LOG("[prof] VBlanks a top screen picture stayed up: 0 (never shown) %u, 1 %u, 2 %u, 3 %u, 4+ %u\n", st_pace[0], st_pace[1], st_pace[2], st_pace[3], st_pace[4]);
     memset(st_pace, 0, sizeof st_pace);
@@ -5476,7 +5881,7 @@ void input_override(u32 &buttons, bool &touch, u16 &tx, u16 &ty) {
     (void)tx;
     (void)ty;
     static bool held_back;
-    if (menu_is_open || kb_active || ms_active) held_back = true;
+    if (menu_is_open || kb_active || mii_selector_open()) held_back = true;
     else if (!buttons && !touch) held_back = false;
     if (held_back) {
         buttons = 0;

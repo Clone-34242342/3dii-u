@@ -6,21 +6,26 @@
 #include <mic/mic.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
+#include "mic_stream.h"
 #include "services.h"
 #include "wiiu.h"
 
 namespace {
 constexpr u32 SAMPLES = 0x2800;
-// shortcut: assumed, mic.rpl doesn't report its rate; only pitch depends on it, so measure it if a game ever needs that
-constexpr u32 HOST_RATE = 32000;
+constexpr u32 DEFAULT_HOST_RATE = 32000;
 MICWorkMemory work;
 MICHandle handle = -1;
-volatile bool blowing;
+bool opened;
+std::atomic<bool> blowing;
+MicStream stream;
+u32 host_rate = DEFAULT_HOST_RATE;
 u32 noise = 12345;
 decltype(&MICInit) mic_init;
 decltype(&MICOpen) mic_open;
+decltype(&MICGetState) mic_get_state;
 decltype(&MICGetStatus) mic_get_status;
 decltype(&MICSetDataConsumed) mic_set_data_consumed;
 decltype(&MICClose) mic_close;
@@ -38,6 +43,7 @@ bool load_mic() {
                   {"MICClose", (void **)&mic_close}};
     for (const auto &w : wanted)
         if (OSDynLoad_FindExport(m, OS_DYNLOAD_EXPORT_FUNC, w.name, w.where) != OS_DYNLOAD_OK || !*w.where) return false;
+    OSDynLoad_FindExport(m, OS_DYNLOAD_EXPORT_FUNC, "MICGetState", (void **)&mic_get_state);
     return true;
 }
 }  // namespace
@@ -57,39 +63,66 @@ void mic_host_start() {
         if (work.sampleBuffer) handle = mic_init(MIC_INSTANCE_0, 0, &work, &err);
         if (err != MIC_ERROR_OK) {
             LOG("[mic] no GamePad microphone (error %d)\n", (int)err);
+            free(work.sampleBuffer);
+            work.sampleBuffer = nullptr;
             handle = -1;
             return;
         }
     }
     const MICError err = mic_open(handle);
-    if (err != MIC_ERROR_OK) LOG("[mic] could not open the GamePad microphone (error %d)\n", (int)err);
+    opened = err == MIC_ERROR_OK;
+    stream = {};
+    host_rate = DEFAULT_HOST_RATE;
+    if (opened) {
+        u32 rate = 0;
+        if (mic_get_state && mic_get_state(handle, 0, &rate) == MIC_ERROR_OK && rate >= 8000 && rate <= 96000)
+            host_rate = rate;
+        // The driver can retain samples from the previous recording across close/open.
+        MICStatus st{};
+        if (mic_get_status(handle, &st) == MIC_ERROR_OK && st.availableData > 0)
+            mic_set_data_consumed(handle, std::min(st.availableData, (int)SAMPLES));
+        LOG("[mic] GamePad capture: %u Hz\n", host_rate);
+    } else LOG("[mic] could not open the GamePad microphone (error %d)\n", (int)err);
     wiiu::note("microphone started: %d", (int)err);
 }
 
 void mic_host_stop() {
-    if (handle >= 0) mic_close(handle);
+    if (opened) mic_close(handle);
+    opened = false;
 }
 
-void mic_host_read(s16 *out, u32 n, u32 rate) {
-    memset(out, 0, n * 2);
-    MICStatus st;
-    if (handle >= 0 && mic_get_status(handle, &st) == MIC_ERROR_OK && st.availableData > 0) {
-        const u32 have = (u32)st.availableData, need = (u64)n * HOST_RATE / rate;
-        // the newest samples only: a game that fell behind wants to hear now, not a backlog
-        const u32 from = (u32)st.bufferPos + (have > need ? have - need : 0), got = std::min(have, need);
+u32 mic_host_read_available(s16 *out, u32 n, u32 rate) {
+    u32 produced = 0;
+    MICStatus st{};
+    bool failed = !opened || mic_get_status(handle, &st) != MIC_ERROR_OK ||
+                  st.availableData < 0 || (st.availableData > 0 && (u32)st.bufferPos >= SAMPLES);
+    if (!failed && st.availableData > 0) {
+        const u32 available = std::min((u32)st.availableData, SAMPLES);
+        // After a stall, bound the delay to the guest sampling timer's catch-up window.
+        const u32 overlap = std::min(available, host_rate * 11 / 100);
+        const u32 skip = available - overlap;
         DCInvalidateRange(work.sampleBuffer, SAMPLES * 2);
-        const s16 *in = (const s16 *)work.sampleBuffer;
-        for (u32 i = 0; i < n; i++) {
-            const u32 at = (u64)i * HOST_RATE / rate;
-            if (at >= got) break;
-            out[i] = in[(from + at) % SAMPLES];
+        MicStream next = skip ? MicStream{} : stream;
+        const auto result = next.read((const s16 *)work.sampleBuffer, SAMPLES, (st.bufferPos + skip) % SAMPLES,
+                                      overlap, host_rate, out, n, rate);
+        const u32 consumed = skip + result.consumed;
+        failed = consumed && mic_set_data_consumed(handle, (int)consumed) != MIC_ERROR_OK;
+        if (!failed) {
+            stream = next;
+            produced = result.produced;
         }
-        mic_set_data_consumed(handle, (int)have);
+    }
+    if (failed) {
+        stream = {};
+        memset(out, 0, n * sizeof(*out));
+        produced = n;
     }
     if (blowing) {
         for (u32 i = 0; i < n; i++) {
             noise = noise * 1664525u + 1013904223u;
             out[i] = (s16)(noise >> 16);
         }
+        return n;
     }
+    return produced;
 }

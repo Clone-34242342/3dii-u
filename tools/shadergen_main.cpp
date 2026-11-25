@@ -54,20 +54,33 @@ std::vector<std::string> fs_keys;
 std::vector<VsRecord> vs_records;
 std::vector<GsxRecord> gsx_records;
 
-// a log holds "VS  " records, or (fragment logs) length-prefixed keys, or "FS  " records among shader misses, or "GSX " records (their size
-// after the tag first)
+constexpr u32 kShaderWords = 4096;
+
+bool read_fs_key(const std::vector<u8> &data, size_t &p) {
+    if (data.size() - p < 4) return false;
+    u32 n;
+    memcpy(&n, data.data() + p, 4);
+    if (!n || n % 4 || n > 4 * FS_KEY_WORDS || n > data.size() - p - 4) return false;
+    fs_keys.emplace_back((const char *)data.data() + p + 4, n);
+    p += 4 + n;
+    return true;
+}
+
+// A shader miss log can also contain standalone "GS  " records for the CPU compiler.
 void read_log(const std::string &path) {
     const std::vector<u8> d = read_file(path);
     size_t p = 0;
     auto u32at = [&](size_t o) { u32 v; memcpy(&v, &d[o], 4); return v; };
-    while (p + 8 <= d.size()) {
+    while (d.size() - p >= 4) {
         if (!memcmp(&d[p], "GSX ", 4)) {
-            const size_t end = p + 8 + u32at(p + 4);
-            if (end > d.size()) break;
+            if (d.size() - p < 8) break;
+            const u32 size = u32at(p + 4);
+            if (size < 44 + 88 || size > d.size() - p - 8) break;
+            const size_t end = p + 8 + size;
             size_t q = p + 8;
             GsxRecord r;
             const u32 vnc = u32at(q + 4), vns = u32at(q + 8), gnc = u32at(q + 16), gns = u32at(q + 20);
-            if (44 + ((size_t)vnc + vns + gnc + gns) * 4 + 88 != end - q) break;
+            if (std::max({vnc, vns, gnc, gns}) > kShaderWords || 44 + (vnc + vns + gnc + gns) * 4 + 88 != size) break;
             r.vs.entry = u32at(q);
             r.gs.entry = u32at(q + 12);
             r.vs_outmask = u32at(q + 24);
@@ -89,28 +102,30 @@ void read_log(const std::string &path) {
             gsx_records.push_back(std::move(r));
             p = end;
         } else if (!memcmp(&d[p], "VS  ", 4)) {
+            if (d.size() - p < 16 + 56) break;
             VsRecord r;
             r.entry = u32at(p + 4);
             const u32 nc = u32at(p + 8), ns = u32at(p + 12);
+            if (std::max(nc, ns) > kShaderWords || (nc + ns) * 4 > d.size() - p - 16 - 56) break;
             p += 16;
-            r.code.resize(4096);
-            r.swz.resize(4096);
-            memcpy(r.code.data(), &d[p], nc * 4);
-            memcpy(r.swz.data(), &d[p + nc * 4], ns * 4);
             r.code.resize(nc);
             r.swz.resize(ns);
+            if (nc) memcpy(r.code.data(), &d[p], nc * 4);
+            if (ns) memcpy(r.swz.data(), &d[p + nc * 4], ns * 4);
             p += (nc + ns) * 4;
             memcpy(r.b, &d[p], 16);
             memcpy(r.iu, &d[p + 16], 16);
             memcpy(r.slots, &d[p + 32], 24);
             p += 56;
             vs_records.push_back(std::move(r));
+        } else if (!memcmp(&d[p], "GS  ", 4)) {
+            if (d.size() - p < 16) break;
+            const u32 nc = u32at(p + 8), ns = u32at(p + 12);
+            if (std::max(nc, ns) > kShaderWords || (nc + ns) * 4 > d.size() - p - 16) break;
+            p += 16 + (nc + ns) * 4;
         } else {
-            size_t q = p;
-            if (!memcmp(&d[p], "FS  ", 4)) q += 4;
-            const u32 n = u32at(q);
-            fs_keys.emplace_back((const char *)&d[q + 4], n);
-            p = q + 4 + n;
+            if (!memcmp(&d[p], "FS  ", 4)) p += 4;
+            if (!read_fs_key(d, p)) break;
         }
     }
 }
@@ -135,13 +150,7 @@ int main(int argc, char **argv) {
     fsys::create_directories(glsl);
 
     const std::vector<u8> pl = read_file(pipelines);
-    if (pl.size() >= 8)
-        for (size_t p = 8; p + 4 <= pl.size();) {
-            u32 n;
-            memcpy(&n, &pl[p], 4);
-            fs_keys.emplace_back((const char *)&pl[p + 4], n);
-            p += 4 + n;
-        }
+    for (size_t p = 8; p < pl.size() && read_fs_key(pl, p);) {}
     const size_t shipped = fs_keys.size();
     // a finished game's list first (builder/shaderlogs.py, confirm): its shaders keep their numbers, and what the logs add since comes after
     if (fsys::exists(fsys::path(logs) / "confirmed.bin")) read_log((fsys::path(logs) / "confirmed.bin").string());
@@ -209,8 +218,8 @@ int main(int argc, char **argv) {
     for (const VsRecord &r : vs_records) {
         std::vector<u32> code = r.code, swz = r.swz;
         const u32 nc = (u32)code.size(), ns = (u32)swz.size();
-        code.resize(4096);
-        swz.resize(4096);
+        code.resize(kShaderWords);
+        swz.resize(kShaderWords);
         ShaderProgram *p = shader_decode(code.data(), nc, swz.data());
         (void)ns;
         u64 identity;
@@ -264,8 +273,8 @@ int main(int argc, char **argv) {
         auto decode = [](const VsRecord &v) {
             std::vector<u32> code = v.code, swz = v.swz;
             const u32 nc = (u32)code.size();
-            code.resize(4096);
-            swz.resize(4096);
+            code.resize(kShaderWords);
+            swz.resize(kShaderWords);
             return shader_decode(code.data(), nc, swz.data());
         };
         ShaderProgram *vs = decode(r.vs), *gs = decode(r.gs);

@@ -3,9 +3,10 @@
 
     python tools/test_gpu_render_target.py --out build_win/gpu_replay_probe
 
-The output directory must be new. Review build_proof.json, then use an isolated
-Cemu/MLC and the existing cemu_run.ps1. Run tools/gpu_replay_verify.py on the
-guest's common-save output with --backend productionGX2 and --reference <out>/analytical.
+The output directory must be new. Review build_proof.json, create an isolated
+Cemu profile with check_ports.cemu_profile(), and launch with cemu_run.ps1.
+Run tools/gpu_replay_verify.py on the guest's common-save output with
+--backend productionGX2 and --reference <out>/analytical.
 An empty common directory selects diagnostic240; a default480 marker selects
 the production480 setting. Both must report six native draws and zero fallback.
 """
@@ -186,7 +187,7 @@ def main():
             '-Shots', '1', '-Out', '<new capture directory>'],
         'verify_argv': [sys.executable, str(ROOT / 'tools/gpu_replay_verify.py'), '<common-save-output>',
             '--backend', 'productionGX2', '--reference', str(analytical), '--png-output', '<new PNG directory>'],
-        'limits': 'Native240 is diagnostic1x; default480 uses production scaling/readback. Cemu is not console hardware. Uniform texture does not validate UV variation/swizzle.'}
+        'limits': 'Native240 is diagnostic1x; default480 uses production scaling/readback. Cemu is not console hardware. Texture coverage uses one nearest-filtered 8x8 Morton tile.'}
     (output / 'commands.json').write_text(json.dumps(commands, indent=2) + '\n')
     (output / 'build_proof.json').write_text(json.dumps(proof, indent=2) + '\n')
     print(json.dumps({'rpx': str(rpx), 'rpx_sha256': sha(rpx), 'target_execution': 'NOT RUN'}), flush=True)

@@ -11,7 +11,7 @@ Lines starting with @ are for the app: @stage <name>, @progress <0-100>, @done <
 
 It builds with tools/win/build3ds.py, in folders of its own (builder_work/, build_win_builder/), so it never touches the nine ports' builds."""
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import errno
 import filecmp
 import io
@@ -37,6 +37,7 @@ import dumps  # noqa: E402
 import mods  # noqa: E402
 import shaderlogs  # noqa: E402
 import user_files  # noqa: E402
+from objcache import _checked, workspace_lock  # noqa: E402
 
 WORK = os.environ.get('THREEDII_WORK') or ROOT  # the standalone app's engine may be read-only: then it builds in a folder of the user's
 # Where games are built: each game's work while it builds and the compiled code kept between builds, gigabytes of files the build makes
@@ -111,10 +112,38 @@ def profile_for(dump):
 
 def derived(dump):
     """title id, product code, slug and folder for a game the list doesn't have: kept clear of real Wii U titles (high byte 0x3D), and the 3DS id stays readable"""
-    code = (dump.product or 'CTR-X-XXXX').split('-')[-1][:4].upper().ljust(4, 'X')
-    folder = re.sub(r'[^A-Za-z0-9]+', '_', dump.name or code).strip('_') or code
-    return {'slug': 'g_' + code.lower(), 'title_id': '00050000%08X' % (0x3D000000 | (dump.unique >> 8)), 'name': dump.name or code, 'product': 'WUP-N-' + code,
+    product = (dump.product or '').split('-')[-1]
+    if re.fullmatch(r'[A-Za-z0-9]{1,4}', product):
+        code = product.upper().ljust(4, 'X')
+        slug = 'g_' + code.lower()
+        fallback_folder = code
+    else:
+        code = f'{(dump.unique >> 8) & 0xffff:04X}'
+        slug = f'g_{dump.title_id:016x}'
+        fallback_folder = f'Game_{dump.title_id:016X}'
+    folder = re.sub(r'[^A-Za-z0-9]+', '_', dump.name or '').strip('_') or fallback_folder
+    if not safe_component(folder):
+        folder = f'Game_{dump.title_id:016X}'
+    return {'slug': slug, 'title_id': '00050000%08X' % (0x3D000000 | (dump.unique >> 8)), 'name': dump.name or code, 'product': 'WUP-N-' + code,
             'folder': folder, 'status': 'Untested', 'note': 'Not tested on a console yet: it may not start, or stop partway.'}
+
+
+def safe_component(name):
+    return (isinstance(name, str) and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_-]*', name) is not None
+            and re.fullmatch(r'CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9]', name, re.IGNORECASE) is None)
+
+
+def workspace_child(parent, name):
+    if not safe_component(name):
+        fail(f'Invalid Builder folder name: {name!r}')
+    try:
+        root, _ = _checked(parent, directory=True)
+        path, _ = _checked(root / name, directory=True)
+        if path.resolve().parent != root.resolve():
+            fail(f'The build folder must be directly inside {root}: {path}')
+    except (OSError, ValueError) as e:
+        fail(str(e))
+    return str(path)
 
 
 def console_learned(slug):
@@ -148,32 +177,8 @@ def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', re
 
 @contextmanager
 def staged_output(target):
-    """Build beside the destination; retain its last good contents until the replacement is in place."""
-    wup_safety.check_output(target, replace=True)
-    target = os.path.abspath(target)
-    parent = os.path.dirname(target)
-    os.makedirs(parent, exist_ok=True)
-    work = tempfile.mkdtemp(prefix='.3diiu-', dir=parent)
-    new, previous = os.path.join(work, 'new'), os.path.join(work, 'previous')
-    try:
+    with wup_safety.staged_outputs(target) as (new,):
         yield new
-        if os.path.lexists(target):
-            print(f'Keeping the previous build at {previous} until replacement finishes.', flush=True)
-            os.rename(target, previous)
-        try:
-            os.rename(new, target)
-        except BaseException:
-            if os.path.lexists(previous):
-                try:
-                    os.rename(previous, target)
-                except OSError as e:
-                    raise OSError(f'The previous build could not be restored to {target}; it is safe at {previous}.') from e
-            raise
-        shutil.rmtree(previous, ignore_errors=True)
-    finally:
-        # A failed rollback (or interrupted swap) must never clean up the only remaining good copy.
-        if not os.path.lexists(previous):
-            shutil.rmtree(work, ignore_errors=True)
 
 
 def copy_to(source, target_dir):
@@ -182,20 +187,22 @@ def copy_to(source, target_dir):
     target = os.path.join(target_dir, name)
     try:
         wup_safety.check_output(target, source, replace=True)
+        wup_safety.check_output(source, replace=True)
+        with staged_output(target) as new:
+            wup_safety.check_title_replacement(target, wup_safety.wup_title_id(source))
+            os.makedirs(new)
+            names = sorted(os.listdir(source))
+            total, done = sum(os.path.getsize(os.path.join(source, n)) for n in names), 0
+            for n in names:
+                with open(os.path.join(source, n), 'rb') as i, open(os.path.join(new, n), 'wb') as o:
+                    while chunk := i.read(8 << 20):
+                        o.write(chunk)
+                        done += len(chunk)
+                        PROGRESS.at(done / total * 0.8)
+            if any(filecmp.cmpfiles(source, new, names, shallow=False)[1:]):
+                fail('The copy came out different from the original: the card may be failing. Nothing was replaced.')
     except ValueError as e:
         fail(str(e))
-    with staged_output(target) as new:
-        os.makedirs(new)
-        names = sorted(os.listdir(source))
-        total, done = sum(os.path.getsize(os.path.join(source, n)) for n in names), 0
-        for n in names:
-            with open(os.path.join(source, n), 'rb') as i, open(os.path.join(new, n), 'wb') as o:
-                while chunk := i.read(8 << 20):
-                    o.write(chunk)
-                    done += len(chunk)
-                    PROGRESS.at(done / total * 0.8)
-        if any(filecmp.cmpfiles(source, new, names, shallow=False)[1:]):
-            fail('The copy came out different from the original: the card may be failing. Nothing was replaced.')
     return target
 
 
@@ -221,13 +228,12 @@ def card_error(e):
 
 def check_card(card):
     """a build that ends on the SD card finds out it can't write there first, not after minutes of building"""
-    probe = os.path.join(card.rstrip('\\/') + os.sep, 'install', '.3diiu_check')
+    install = os.path.join(card.rstrip('\\/') + os.sep, 'install')
     try:
-        wup_safety.check_output(probe)
-        os.makedirs(os.path.dirname(probe), exist_ok=True)
-        with open(probe, 'wb') as f:
+        wup_safety.check_output(install)
+        os.makedirs(install, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=install, prefix='.3diiu-check-') as f:
             f.write(b'3Dii U')
-        os.remove(probe)
     except ValueError as e:
         fail(str(e))
     except OSError as e:
@@ -255,6 +261,8 @@ def main():
     ap.add_argument('--game', required=True)
     ap.add_argument('--update')
     ap.add_argument('--dlc')
+    ap.add_argument('--download-play-child', type=int, metavar='INDEX',
+                    help='build the selected embedded child in the Builder work folder for Cemu (THREEDII_MEASURE=1)')
     ap.add_argument('--mod', action='append', default=[], help="a mod in Luma's layout (luma/titles/<title id>/: romfs, code.ips/.bps/.bin); several go on in order")
     ap.add_argument('--keys', help='boot9.bin and seeddb.bin from your own 3DS (default ~/.3ds)')
     ap.add_argument('--emulator', help='a 3DS emulator\'s user folder (Azahar, Citra) or the 0004009b folder GodMode9 copies off your 3DS '
@@ -284,8 +292,67 @@ def main():
             s.reconfigure(errors='backslashreplace')
     if sys.platform != 'win32':
         fail('Building on Linux isn\'t ready yet: this version builds on Windows.')
-    if not (a.card or a.out):
+    if not (a.card or a.out) and a.download_play_child is None:
         fail('Choose an SD card or a folder for the WUP.')
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(workspace_lock(BUILD, WORK))
+            from app import fresh_cache
+            fresh_cache(ROOT, BUILD)
+        except (OSError, ValueError) as e:
+            fail(str(e))
+        build(a)
+
+
+def required_disk(game, extras, encrypted, cemu_only):
+    reserve = 3 << 30
+    if cemu_only:
+        # The unpacked title hardlinks its assets and the Cemu build skips WUP packing.
+        dumps = [game, *extras]
+        temporary = sum(d.size for d in dumps if d.kind == 'dlc' or d in encrypted)
+        return reserve + sum(d.size for d in dumps) + temporary
+    return reserve + game.size * 4 + sum(d.size * 3 for d in extras)
+
+
+def extract_dlp_child(parent, title_id, game_dir, tmp, keys):
+    if not dumps.copy_dlp(parent, tmp):
+        raise dumps.DumpError('This game dump has no Download Play archive.')
+    path = os.path.join(tmp, 'child.cia')
+    name = f'{title_id:016x}.cia'
+    with open(os.path.join(tmp, 'dlp_child.romfs'), 'rb') as archive:
+        matches = [source for filename, source in mods.read_romfs(archive).files if filename.lower() == name]
+        if len(matches) != 1:
+            raise dumps.DumpError(f'Expected one Download Play child named {name}.')
+        offset, size = matches[0]
+        archive.seek(offset)
+        with open(path, 'wb') as output:
+            for done in range(0, size, 4 << 20):
+                length = min(size - done, 4 << 20)
+                data = archive.read(length)
+                if len(data) != length:
+                    raise dumps.DumpError('The Download Play child was cut short.')
+                output.write(data)
+
+    with ExitStack() as files:
+        child = dumps.Dump(path)
+        files.enter_context(child.f)
+        if not child.cia or child.title_id != title_id:
+            raise dumps.DumpError('The Download Play CIA has the wrong title ID.')
+        if child.encrypted():
+            problem = user_files.check_key_folder(keys or decrypt.KEYS_DEFAULT)
+            if problem:
+                raise decrypt.DecryptError(problem)
+            plain = decrypt.to_plain(path, os.path.join(tmp, 'plain_child'), 'child')
+            child = dumps.Dump(plain)
+            files.enter_context(child.f)
+        if int.from_bytes(child.program().pread(0x118, 8), 'little') != title_id:
+            raise dumps.DumpError('The Download Play program has the wrong title ID.')
+        info = dumps.extract_program(child, game_dir)
+        if int(info['program_id'], 16) != title_id:
+            raise dumps.DumpError('The Download Play extended header has the wrong program ID.')
+
+
+def build(a):
     try:
         for path in (WORK_GAMES, ARCHIVES, a.out):
             if path:
@@ -293,7 +360,14 @@ def main():
     except ValueError as e:
         fail(str(e))
     # a measuring build for Cemu is never packed (THREEDII_MEASURE, build3ds.py), so it needs no common key
-    problem = None if os.environ.get('THREEDII_MEASURE', '') not in ('', 'console') else user_files.check_otp(a.otp)
+    cemu_only = os.environ.get('THREEDII_MEASURE', '') not in ('', 'console')
+    child_index = a.download_play_child
+    if child_index is not None:
+        if not 0 <= child_index <= 255:
+            fail('A Download Play child index must be between 0 and 255.')
+        if os.environ.get('THREEDII_MEASURE') != '1' or a.card or a.update or a.dlc or a.mod or a.save:
+            fail('Download Play child checks require a base game and THREEDII_MEASURE=1.')
+    problem = None if cemu_only else user_files.check_otp(a.otp)
     if problem:
         fail(problem)
     if a.card:
@@ -324,20 +398,27 @@ def main():
         fail(str(e))
     update = next((d for d in extras if d.kind == 'update'), None)
     dlc = next((d for d in extras if d.kind == 'dlc'), None)
-    profile = profile_for(game)
+    profile = profile_for(game) if child_index is None else None
     known = None if a.cold else profile
     code_mods = any(m.changes_code() for m in mod_list)
     info = dict(known or derived(game))
+    child_id = None
+    if child_index is not None:
+        child_id = 0x0004000100000000 | (game.unique & ~0xFF) | child_index
+        info.update(slug=f'dlp_{child_id:016x}', title_id=f'000500003E{child_id & 0xFFFFFF:06X}',
+                    name=info['name'] + ' (Download Play)')
     if update:
         info['slug'] += f'_v{update.version}'
     if a.cold:
         info['slug'] += '_cold'  # work folders of its own, and no list of entries under that name
+    if not safe_component(info['folder']):
+        fail(f'Invalid WUP folder name: {info["folder"]!r}')
     print(f'{info["name"]} ({game.title_id:016X}): {info["status"]}' + (f', update v{update.version}' if update else '') + (', with DLC' if dlc else '')
           + (f', {len(mod_list)} mod{"s" * (len(mod_list) > 1)}' if mod_list else ''), flush=True)
 
-    game_dir = os.path.join(WORK_GAMES, info['slug'])
-    tmp = game_dir + '_decrypting'  # plain copies of what came encrypted, gone once unpacked
-    need = sum(d.size * (4 if d is game else 3) for d in [game] + extras) + (3 << 30)
+    game_dir = workspace_child(WORK_GAMES, info['slug'])
+    tmp = workspace_child(WORK_GAMES, info['slug'] + '_decrypting')  # plain copies of what came encrypted
+    need = required_disk(game, extras, encrypted, cemu_only)
     os.makedirs(WORK_GAMES, exist_ok=True)
     if shutil.disk_usage(WORK_GAMES).free < need:
         fail(f'Not enough free space: building this takes about {need >> 30} GB on the drive with {WORK}.')
@@ -354,8 +435,14 @@ def main():
             sources = decrypt.dlc_contents(dlc.path, tmp) if dlc.encrypted() else dumps.plain_dlc_sources(dlc, tmp)
 
         PROGRESS.stage('Unpacking')
-        dumps.extract_program(plain[game], game_dir, lambda d, t: PROGRESS.at(d / t * (0.6 if extras else 1)))
-        dumps.copy_dlp(plain[game], game_dir)
+        if child_id is not None:
+            extract_dlp_child(plain[game], child_id, game_dir, tmp, a.keys)
+        else:
+            dumps.extract_program(plain[game], game_dir, lambda d, t: PROGRESS.at(d / t * (0.6 if extras else 1)))
+            try:
+                dumps.copy_dlp(plain[game], game_dir)
+            except (dumps.DumpError, decrypt.DecryptError) as e:
+                print(f'Warning: skipping unreadable optional Download Play data. {e}', flush=True)
         if update:
             info_u = dumps.add_update(update, plain[update], game_dir, lambda d, t: PROGRESS.at(0.6 + d / t * 0.2))
             print(f'update v{update.version}: its code runs as {info_u["program_id"]}', flush=True)
@@ -364,7 +451,10 @@ def main():
         archives = ARCHIVES
         os.makedirs(archives, exist_ok=True)  # the title takes whatever is in it, even if that's nothing
         if a.emulator:
-            got = dumps.import_system_archives(a.emulator, archives, tmp)
+            try:
+                got = dumps.import_system_archives(a.emulator, archives, tmp)
+            except decrypt.DecryptError as e:
+                fail(f'Could not decrypt the selected 3DS system files. {e}')
             print(f'system archives from your emulator\'s files: {len(got)}', flush=True)
         # mods go on before anything's recompiled, so their code is recompiled with the game's
         mods.apply(mod_list, game_dir, lambda s: print(s, flush=True))
@@ -379,21 +469,22 @@ def main():
         fail('The 3DS system files are missing: the Mii data, without which Mii games stop, and the shared font. Give --emulator Azahar\'s '
              'user folder (after its File > Set Up System Files) or the 0004009b folder GodMode9 copies off your 3DS (title, in CTRNAND).')
     with open(os.path.join(game_dir, 'code.bin'), 'rb') as f:  # and what this game's own code names of them (dumps.archives_named)
-        lacking = [t for t in dumps.archives_named(f.read()) if not os.path.isfile(os.path.join(archives, t + '.romfs'))]
+        lacking = [t for t in dumps.archives_named(f.read()) if not dumps.have_system_archives(archives, (t,))]
     if lacking:
         t = lacking[0]
-        fail(f'This game reads {dumps.ARCHIVE_NAMES.get(t, "a font")} from the 3DS itself, and your 3DS system files don\'t have it: the game would '
-             f'stop as it starts. It is in the {t[:8]} folder: with GodMode9, copy that folder off your 3DS too ([1:] SYSNAND CTRNAND > title), '
+        fail(f'This game needs {dumps.ARCHIVE_NAMES.get(t, "a font")} to start. Your 3DS system files are missing a readable copy. '
+             f'With GodMode9, copy the {t[:8]} folder off your 3DS ([1:] SYSNAND CTRNAND > title), '
              f'next to the 0004009b one, and choose the folder again under "3DS system files". Azahar\'s File > Set Up System Files brings it too.')
     # what earlier runs of a game learned (render states it uses; code only static analysis misses) goes with it, if the code is the same.
     # An untested game's live under its own slug (games/g_<code>/shader_logs): a run's shader_misses.bin put there is compiled ahead next time.
-    logs = os.path.join(ROOT, 'games', (known or derived(game))['slug'], 'shader_logs')
+    log_slug = info['slug'] if child_id is not None else (known or derived(game))['slug']
+    logs = os.path.join(ROOT, 'games', log_slug, 'shader_logs')
     if os.path.isdir(logs) and not a.cold:
         os.makedirs(os.path.join(game_dir, 'shader_logs'), exist_ok=True)
         for f in os.listdir(logs):
             if not f.startswith('other_') and os.path.isfile(os.path.join(logs, f)):
                 shutil.copyfile(os.path.join(logs, f), os.path.join(game_dir, 'shader_logs', f))
-    for f in [] if a.cold else console_learned((known or derived(game))['slug']):
+    for f in [] if a.cold else console_learned(log_slug):
         os.makedirs(os.path.join(game_dir, 'shader_logs'), exist_ok=True)
         shutil.copyfile(f, os.path.join(game_dir, 'shader_logs', os.path.basename(f)))
 
@@ -449,7 +540,8 @@ def main():
                 fail(f'{tool} failed')
 
     args = types.SimpleNamespace(jobs=a.jobs, force=False, extra_flags=None, only=None, opt=None)
-    sys.stdout = held = Held(Watch(sys.__stdout__, PROGRESS), b3.context)
+    original_stdout = sys.stdout
+    sys.stdout = held = Held(Watch(original_stdout, PROGRESS), b3.context)
     shader_stop = []
 
     def shaders():  # they need none of the code, so they're made while it compiles (Zelda's took 21 of its 254 s)
@@ -462,7 +554,7 @@ def main():
                 traceback.print_exc(file=held.held)
             shader_stop.append(e)
 
-    alongside = threading.Thread(target=shaders, daemon=True)
+    alongside = threading.Thread(target=shaders)
     try:
         PROGRESS.stage('Recompiling')
         # Before the code: build_game_code makes native code of the geometry shaders in the logs' GSX records, which the app's logs hold as
@@ -475,17 +567,19 @@ def main():
             raise SystemExit(f'shader logs: {e!r}') from e
         b3.prepare_vertex_logs = lambda g, shadergen: None
         alongside.start()
-        b3.build_code(g, args)
-        PROGRESS.stage('Shaders')
-        alongside.join()
+        try:
+            b3.build_code(g, args)
+            PROGRESS.stage('Shaders')
+        finally:
+            alongside.join()
         print(held.held.getvalue(), end='', flush=True)
         if shader_stop:
             raise shader_stop[0] if isinstance(shader_stop[0], SystemExit) else SystemExit(f'shaders: {shader_stop[0]!r}')
     except SystemExit as e:
-        sys.stdout = sys.__stdout__
         fail(f'The build stopped: {e}')
-    sys.stdout = sys.__stdout__
-    learned, dvlb = os.path.join(ROOT, 'games', derived(game)['slug'], 'shader_logs'), os.path.join(game_dir, 'shader_logs', 'dvlb.bin')
+    finally:
+        sys.stdout = original_stdout
+    learned, dvlb = os.path.join(ROOT, 'games', log_slug, 'shader_logs'), os.path.join(game_dir, 'shader_logs', 'dvlb.bin')
     if not known and not a.cold and WORK == ROOT and os.path.isfile(dvlb):  # its vertex programs, where its runs' logs go: make_app.py fingerprints the
         os.makedirs(learned, exist_ok=True)  # shipped logs' vertex records by them (shaderlogs.py), and ships no dvlb.bin
         shutil.copyfile(dvlb, os.path.join(learned, 'dvlb.bin'))
@@ -519,7 +613,11 @@ def main():
 
     PROGRESS.stage('Packing the WUP')
     # A failed card copy leaves this completed output outside the extraction folder that the next attempt clears.
-    wup = os.path.join(a.out or os.path.join(WORK_GAMES, '_wup', info['slug']), info['folder'])
+    if a.out:
+        wup = os.path.join(a.out, info['folder'])
+    else:
+        folder = workspace_child(workspace_child(WORK_GAMES, '_wup'), info['slug'])
+        wup = workspace_child(folder, info['folder'])
     pack_wup(a.otp, os.path.join(out, 'title'), wup)
 
     where = wup
@@ -534,10 +632,11 @@ def main():
             where = copy_to(wup, install)
         except OSError as e:  # the WUP stays in the work folder, as with a folder build
             fail(card_error(e) + f' The game is built: it is in {wup}.')  # one line: the window reads @error lines
-        shutil.rmtree(wup, ignore_errors=True)
+        if not a.out:
+            shutil.rmtree(workspace_child(folder, info['folder']), ignore_errors=True)
     if not a.keep:  # the runtime's objects stay: every game shares them
-        shutil.rmtree(game_dir, ignore_errors=True)
-        shutil.rmtree(os.path.join(b3.WORK, f'ppc_{info["slug"]}'), ignore_errors=True)
+        shutil.rmtree(workspace_child(WORK_GAMES, info['slug']), ignore_errors=True)
+        shutil.rmtree(workspace_child(b3.WORK, f'ppc_{info["slug"]}'), ignore_errors=True)
     PROGRESS.done, PROGRESS.share = 100, 0
     PROGRESS.at(1)
     print(f'@done {where}', flush=True)

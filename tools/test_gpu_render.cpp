@@ -25,6 +25,10 @@ constexpr u32 W = 240, H = 400;
 struct Pixel { u8 r, g, b, a; };
 static_assert(sizeof(Pixel) == 4);
 constexpr Pixel background{16, 32, 48, 255};
+constexpr Pixel texture_quadrants[] = {
+    {255, 0, 0, 255}, {0, 255, 0, 255},
+    {0, 0, 255, 255}, {255, 255, 0, 255},
+};
 
 void need(bool condition, const char *why) {
     if (!condition) FATAL("REPLAY FAIL: %s\n", why);
@@ -132,6 +136,23 @@ void quad(Commands &c, std::vector<u8> &vertices, float z, const std::array<floa
     c.reg(R::DRAW, 1);
 }
 
+void immediate_quad(Commands &c, float z, const std::array<float, 4> &color) {
+    c.reg(R::RESTART_PRIM, 1);
+    c.reg(R::FIXATTR_INDEX, 15);
+    constexpr float xy[4][2] = {{-0.75f, -0.75f}, {0.75f, -0.75f}, {-0.75f, 0.75f}, {0.75f, 0.75f}};
+    const auto attribute = [&](const std::array<float, 4> &v) {
+        const u32 x = f24_bits(v[0]), y = f24_bits(v[1]), z = f24_bits(v[2]), w = f24_bits(v[3]);
+        c.reg(R::FIXATTR_DATA, w << 8 | z >> 16);
+        c.reg(R::FIXATTR_DATA + 1, z << 16 | y >> 8);
+        c.reg(R::FIXATTR_DATA + 2, y << 24 | x);
+    };
+    for (int k : {0, 1, 2, 2, 1, 3}) {
+        attribute({xy[k][0], xy[k][1], z, 1});
+        attribute(color);
+        attribute({(xy[k][0] + 0.75f) / 1.5f, (xy[k][1] + 0.75f) / 1.5f, 0, 1});
+    }
+}
+
 u64 checksum(const void *data, size_t size) {
     u64 hash = 14695981039346656037ull;
     const auto *bytes = (const u8 *)data;
@@ -139,7 +160,8 @@ u64 checksum(const void *data, size_t size) {
     return hash;
 }
 
-bool output(const std::string &folder, const char *name, u32 input, u32 height, Pixel inside, bool has_quad, FILE *report) {
+bool output(const std::string &folder, const char *name, u32 input, u32 height, Pixel inside,
+            bool has_quad, bool textured, FILE *report) {
     gpu::display_transfer(input, OUT, W | height << 16, W | height << 16, 0);
 #ifdef __WIIU__
     gpu::gx2_cpu_will_read(OUT, W * height * 4);
@@ -160,7 +182,11 @@ bool output(const std::string &folder, const char *name, u32 input, u32 height, 
             // lie between pixel centers. The shared diagonal has no effect on the union.
             const u32 y = height - 1 - line;
             const bool covered = has_quad && p >= 30 && p < 210 && y >= 50 && y < 350;
-            const Pixel expected = covered ? inside : background;
+            Pixel expected = background;
+            if (covered) {
+                // The upper half of PICA V addresses the first rows in texture memory.
+                expected = textured ? texture_quadrants[(p >= 120) + 2 * (y < 200)] : inside;
+            }
             if (memcmp(&actual, &expected, 4)) {
                 if (wrong < 4) LOG("%s pixel(%u,%u): got %u,%u,%u,%u expected %u,%u,%u,%u\n", name, p, y,
                     actual.r, actual.g, actual.b, actual.a, expected.r, expected.g, expected.b, expected.a);
@@ -197,7 +223,7 @@ int main(int argc, char **argv) {
         setup(c);
         Pixel inside = background;
         if (scene == 1) {
-            quad(c, vertices, -0.5f, {1, 0, 0, 1});
+            immediate_quad(c, -0.5f, {1, 0, 0, 1});
             inside = {255, 0, 0, 255};
         } else if (scene == 2) {
             c.reg(R::DEPTH_WRITE, 3);
@@ -216,14 +242,17 @@ int main(int argc, char **argv) {
             c.reg(R::TEX0_TYPE, 0);
             std::array<u8, 256> texture;
             for (u32 i = 0; i < 64; i++) {
-                texture[i * 4] = 255; texture[i * 4 + 1] = 0;
-                texture[i * 4 + 2] = 255; texture[i * 4 + 3] = 255;
+                // The two high Morton bits select a 4x4 quadrant. PICA stores ABGR bytes.
+                const Pixel color = texture_quadrants[i / 16];
+                texture[i * 4] = color.a;
+                texture[i * 4 + 1] = color.b;
+                texture[i * 4 + 2] = color.g;
+                texture[i * 4 + 3] = color.r;
             }
             memcpy(mem::paddr_ptr(TEX), texture.data(), texture.size());
             gpu::dma_written(TEX, (u32)texture.size());
             write_file(folder + "/texture.bin", texture.data(), texture.size());
             quad(c, vertices, -0.5f, {1, 1, 1, 1});
-            inside = {255, 255, 0, 255};
         } else if (scene == 4) {
             c.reg(R::OM_MODE, 0x100);
             quad(c, vertices, -0.5f, {0.25f, 0.125f, 0.0625f, 1});
@@ -242,11 +271,11 @@ int main(int argc, char **argv) {
         gpu::gx2_finish_list();
 #endif
         if (scene) fprintf(report, ",");
-        okay &= output(folder, name, CB, H, inside, scene != 0, report);
+        okay &= output(folder, name, CB, H, inside, scene != 0, scene == 3, report);
     }
     gpu::memory_fill(BOTTOM, BOTTOM + W * 320 * 4, 0x102030ff, 0x201);
     fprintf(report, ",");
-    okay &= output(folder, "bottom_clear", BOTTOM, 320, background, false, report);
+    okay &= output(folder, "bottom_clear", BOTTOM, 320, background, false, false, report);
     fprintf(report, "],\"counters\":");
 #ifdef __WIIU__
     okay &= replay_target_counters(report);

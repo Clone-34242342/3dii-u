@@ -20,8 +20,11 @@ void save_flush(bool now);
 long save_write(int fd, const void *data, u32 len, u64 at);
 void save_resize(int fd, u64 size);
 const std::string &save_account_dir();  // the player's storage, /vol/save/<persistent id>, or empty without one
+bool save_dir_lacks(const std::string &path, const char *first, const char *second);  // confirmed by a complete listing
 bool save_pending();                     // saved by the game and not flushed yet
 bool save_copy_tree(const std::string &from, const std::string &to);
+bool save_migrate_common(const std::string &from, const std::string &to);
+void save_finish_migration(const std::string &to);  // confirm a published account save if its previous tree still exists
 extern volatile u32 files_copied;  // by save_copy_tree: the watchdog counts them as work while a game starts
 // a 3DS save packed into the game by the builder, taken in once before it starts (save_storage.cpp)
 void save_from_content(const std::string &packed, const std::string &save, const std::string &done);
@@ -56,6 +59,7 @@ bool gfx_ready();
 // (GPU thread) present the screens if a new VBlank arrived, service in-game overlay
 void gfx_pump(bool quiet);  // quiet: the GPU thread had nothing to do for its whole wait
 void gfx_shutdown();
+void gfx_report_final();  // GPU thread completion, after the final drain; logging only
 void gfx_reacquire();  // (GPU thread) back from the HOME Menu
 void gfx_note_busy(u32 us);
 // (main thread) a VBlank passed: present what is ready

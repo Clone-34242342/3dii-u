@@ -10,6 +10,7 @@ struct Quad {
     float x0, y0, x1, y1, u0, v0, u1, v1;
 };
 bool load();                                 // (GPU thread) bakes it on the first call; false: the console gave no font
+void prepare(const char *const *texts, size_t count);  // cache the additional glyphs needed by the visible text
 const GX2Texture &texture();                 // white, with the glyphs' coverage as alpha
 float width(const char *utf8, float size);   // 0 without the font
 int quads(const char *utf8, float size, float x, float y, Quad *out, int max);  // one a glyph it has, left to right

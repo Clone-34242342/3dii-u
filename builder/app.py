@@ -32,18 +32,19 @@ def short_path(engine, work):
     directory junction in the work folder, which needs no administrator and moves with the app. Without one, the app's own path."""
     if os.name != 'nt' or 'THREEDII_ROOT' in os.environ:  # a build the app started inherits the window's choice
         return engine
-    link = os.path.join(work, 'engine')
+    import hashlib
+    name = 'e' + hashlib.sha256(os.fsencode(os.path.normcase(os.path.realpath(engine)))).hexdigest()[:6]
+    link = os.path.join(work, name)
     try:
-        if os.path.lexists(link):
-            if os.path.isdir(link) and os.path.normcase(os.path.realpath(link)) == os.path.normcase(os.path.realpath(engine)):
-                return link
-            os.rmdir(link)  # a junction to where the app was before, or to nothing now: rmdir takes the link, never what it pointed to
-        os.makedirs(work, exist_ok=True)
-        import _winapi
-        _winapi.CreateJunction(engine, link)  # not cmd's mklink: a hidden cmd.exe is one of the things antivirus guesses weigh
-        return link
+        if not os.path.lexists(link):
+            os.makedirs(work, exist_ok=True)
+            import _winapi
+            _winapi.CreateJunction(engine, link)
+        if os.path.isdir(link) and os.path.samefile(engine, link):
+            return link
     except OSError:
-        return engine
+        pass
+    return engine
 
 
 def fresh_cache(engine, work):
@@ -109,9 +110,7 @@ def use_engine(root):
     if root and os.path.basename(root) == 'engine':
         base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), '.local', 'share')
         work = os.environ.setdefault('THREEDII_WORK', os.path.join(base, '3Dii U Builder'))
-        build = os.environ.setdefault('THREEDII_BUILD', chosen_build() or work)  # the big build files, pipeline.BUILD
-        if 'THREEDII_ROOT' not in os.environ or '--pipeline' in sys.argv[1:]:  # a build rechecks its selected folder; compiler children don't
-            fresh_cache(root, build)
+        os.environ.setdefault('THREEDII_BUILD', chosen_build() or work)  # the big build files, pipeline.BUILD
         root = short_path(root, work)
         os.environ.setdefault('THREEDII_DEVKITPRO', os.path.join(root, 'devkitpro').replace('\\', '/'))
         os.environ.setdefault('THREEDII_SHADERGEN', os.path.join(root, 'bin', 'shadergen.exe'))
@@ -123,8 +122,7 @@ PYTHON_FLAGS = ('-B', '-E', '-I', '-O', '-OO', '-P', '-S', '-s', '-u')  # python
 
 def hand_over():
     """An app with a downloaded update opens that version's window instead (updater.py), so the folder the person unzipped is never changed.
-    Holding Shift while it starts opens this one. Done before use_engine(), which would otherwise start the work folder's compiled cache
-    over for this engine at every start, and the newer version's again after it."""
+    Holding Shift while it starts opens this one."""
     if not FROZEN:
         return
     try:
@@ -140,17 +138,6 @@ def hand_over():
         updater.hold_version()  # a downloaded version, in any mode: its folder mustn't be cleared away while it runs
     except Exception:  # an update must never stop the app starting as itself
         pass
-
-
-hand_over()
-try:
-    use_engine(find_root())
-except (OSError, ValueError) as e:
-    why = f'The compiled cache could not be refreshed.\n\n{e}'
-    if FROZEN and os.name == 'nt' and len(sys.argv) == 1:
-        import ctypes
-        ctypes.windll.user32.MessageBoxW(None, why, '3Dii U Builder cannot start', 0x10)
-    raise SystemExit(why) from e
 
 
 def quiet_children():
@@ -243,6 +230,8 @@ def cannot_start(why=MISSING):
 
 
 def main():
+    hand_over()
+    use_engine(find_root())
     while len(sys.argv) > 1 and sys.argv[1] in PYTHON_FLAGS:
         del sys.argv[1]
     if len(sys.argv) > 1 and sys.argv[1] == '--pipeline':

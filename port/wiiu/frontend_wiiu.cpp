@@ -15,9 +15,11 @@
 #include <gx2/event.h>
 #include <proc_ui/procui.h>
 #include <sysapp/launch.h>
+#include <sysapp/title.h>
 #include <sys/stat.h>
 #include <malloc.h>
 #include <nn/act.h>
+#include <nn/save/save.h>
 #include <padscore/kpad.h>
 #include <padscore/wpad.h>
 #include <unistd.h>
@@ -25,6 +27,7 @@
 #include <whb/gfx.h>
 #include <whb/proc.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <csetjmp>
@@ -106,9 +109,15 @@ static volatile u32 file_op;
 static volatile OSTime file_since;
 
 void wiiu::fs_begin(u32 op) {
+    const OSTime wait_started = kMeasure ? OSGetSystemTime() : 0;
     OSLockMutex(&file_m);
-    file_since = OSGetSystemTime();
+    const OSTime acquired = OSGetSystemTime();
+    file_since = acquired;
     file_op = op;
+    if (kMeasure) {
+        const u32 waited = (u32)OSTicksToMilliseconds(acquired - wait_started);
+        if (waited >= 16) LOG("[fs] operation %04x waited %u ms for storage\n", op, waited);
+    }
 }
 
 void wiiu::fs_end() {
@@ -221,16 +230,18 @@ static int gpu_thread(int, void *) {
     wiiu::gfx_thread_init();
     stage("gpu thread ready");
     setjmp(gpu_restart);
+    bool drained = false;
     while (!quitting) {
         if (gpu_pause) {
             if (gpu_tripped) LOG("[home] the GPU thread was still drawing when GX2 went away\n");
-            else wiiu::gfx_shutdown();
+            else { wiiu::gfx_shutdown(); drained = true; }
             gpu_tripped = false;
             gpu_parked = true;
             while (gpu_pause && !quitting) OSSleepTicks(OSMillisecondsToTicks(2));
             if (quitting) break;
             wiiu::gfx_reacquire();
             gpu_parked = false;
+            drained = false;
             continue;
         }
         // quiet: two milliseconds went by with nothing asked of the GPU, and nothing came in at the last moment either, which is when a
@@ -242,7 +253,8 @@ static int gpu_thread(int, void *) {
         if (!gpu_pause) wiiu::gfx_pump(waited && done == kernel::gx_stats.cmdlists + kernel::gx_stats.transfers);
         if (kMeasure) wiiu::gfx_note_busy((u32)OSTicksToMicroseconds(OSGetSystemTime() - t0));
     }
-    if (!gpu_parked) wiiu::gfx_shutdown();
+    if (!gpu_parked) { wiiu::gfx_shutdown(); drained = true; }
+    if (kMeasure && drained) wiiu::gfx_report_final();
     gpu_parked = true;
     // GX2 has to close on the core it started on, once the system has taken the foreground back
     while (!gfx_may_close) OSSleepTicks(OSMillisecondsToTicks(2));
@@ -276,6 +288,8 @@ static u32 pro_as_gamepad(u32 t) {
     if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
     if (t & WPAD_PRO_TRIGGER_ZL) v |= VPAD_BUTTON_ZL;
     if (t & WPAD_PRO_TRIGGER_ZR) v |= VPAD_BUTTON_ZR;
+    if (t & WPAD_PRO_TRIGGER_L) v |= VPAD_BUTTON_L;
+    if (t & WPAD_PRO_TRIGGER_R) v |= VPAD_BUTTON_R;
     if (t & WPAD_PRO_BUTTON_A) v |= VPAD_BUTTON_A;
     if (t & WPAD_PRO_BUTTON_B) v |= VPAD_BUTTON_B;
     if (t & WPAD_PRO_BUTTON_X) v |= VPAD_BUTTON_X;
@@ -307,7 +321,7 @@ static u32 map_buttons(u32 h, bool z_too) {
 }
 
 // whether the last read found a GamePad, which the keyboard and the Mii list are drawn on
-static volatile bool gamepad_there = true;
+static std::atomic<bool> gamepad_there{true};
 
 // Without a GamePad the game gets the player's Mii at once, as it does from ports without a list (services/apt.cpp)
 bool mii_select_shown() { return gamepad_there; }
@@ -326,6 +340,7 @@ static int hid_thread(int, void *) {
         fclose(f);
         kernel::g_live_path = live_path.c_str();
     }
+    const bool hold_mii_picker = wiiu::debug_flag("hold_mii_picker");  // scripted capture of the picker itself
     // Pro Controllers beside the GamePad: what either holds counts, and the stick pushed further is the circle pad
     KPADInit();
     WPADEnableURCC(TRUE);
@@ -426,10 +441,10 @@ static int hid_thread(int, void *) {
         if (autoplay || kernel::g_live_path || wiiu::test_run()) {
             tick++;
             if (tick % 500 == 0 && wiiu::keyboard_open()) {
-                wiiu::keyboard_input(0, true, 107 + 64 * 8 + 10, 150 + 62 * 4 + 10);  // OK, with what's typed
-                if (wiiu::keyboard_open()) wiiu::keyboard_input(0, true, 107 + 10, 150 + 62 * 2 + 10);  // or type something first
+                wiiu::keyboard_input(VPAD_BUTTON_PLUS, false, 0, 0);
+                if (wiiu::keyboard_open()) wiiu::keyboard_input(0, true, 117, 250);  // a letter or the first digit
             }
-            if (wiiu::mii_selector_open()) wiiu::mii_selector_input(VPAD_BUTTON_A, false, 0, 0);  // the Mii offered first, at once: a route's timing stays
+            if (!hold_mii_picker && wiiu::mii_selector_open()) wiiu::mii_selector_input(VPAD_BUTTON_A, false, 0, 0);
         }
         if (autoplay) {
             const u32 phase = tick % 468;
@@ -737,36 +752,77 @@ static void let_card_catch_up() {
 }
 
 // Whether what a database slot held, as a 3DS game would read it, is a Mii: a name of printable characters, an author's name of them, the
-// padding empty, a birthday and a favourite colour that exist, a height and a build within their 127
+// padding empty, a birthday and a favourite colour that exist, a height and a build within their 128
 static bool looks_like_mii(const std::array<u8, 0x60> &m) {
     const u32 about = m[0x18] | m[0x19] << 8;
-    if (m[0x16] || m[0x17] || (about >> 1 & 15) > 12 || (about >> 10 & 15) > 11 || m[0x2E] > 127 || m[0x2F] > 127) return false;
+    if (m[0x16] || m[0x17] || (about >> 1 & 15) > 12 || (about >> 10 & 15) > 11 || m[0x2E] > 128 || m[0x2F] > 128) return false;
     for (u32 name : {0x1Au, 0x48u})
         for (u32 at = name; at < name + 20; at += 2) {
             const u32 c = m[at] | m[at + 1] << 8;
             if (!c) break;
-            if (c < 0x20 || (c >= 0xD800 && c < 0xE000) || c >= 0xFFFE) return false;
+            if (c < 0x20 || (c >= 0xDC00 && c < 0xE000) || c >= 0xFFFE) return false;
+            if (c >= 0xD800 && c < 0xDC00) {
+                if (at + 2 == name + 20) return false;
+                at += 2;
+                const u32 low = m[at] | m[at + 1] << 8;
+                if (low < 0xDC00 || low >= 0xE000) return false;
+            }
         }
     return m[0x1A] || m[0x1B];
 }
 
-// Mii Maker's Miis out of its database (FFL_ODB.dat: "FFOC", a version, then 3000 slots of 0x5C bytes, an unused one with no Mii id), each
-// with the checksum a Mii carries everywhere else. services/misc.cpp turns them into what a 3DS game reads, whichever way round the
-// console keeps their fields, and fs.cpp puts as many as fit into the game's own Mii Maker. That layout is what the 3DS's own database
-// suggests and no console's file has been read yet: so a slot is only taken if what it holds looks like a Mii, as the checksum, made
-// here, vouches for nothing.
-static void read_mii_maker(FILE *f) {
-    u8 head[8];
-    if (fread(head, 1, sizeof head, f) != sizeof head || memcmp(head, "FFOC", 4)) return;
-    std::array<u8, 0x60> m{}, as_3ds;
-    for (u32 slot = 0; slot < 3000 && fread(m.data(), 1, 0x5C, f) == 0x5C; slot++) {
-        if (!(m[0x0C] | m[0x0D] | m[0x0E] | m[0x0F])) continue;
-        m[0x5C] = m[0x5D] = 0;
+// FFLiDatabaseFileOfficial: big-endian FFOC, 3000 Official records, a regular-Mii list and a checksum at EOF.
+// https://github.com/aboood40091/ffl/blob/master/include/nn/ffl/FFLiDatabaseFileOfficial.h
+static bool read_mii_maker(FILE *f) {
+    constexpr long size = 0x43840;
+    if (fseek(f, 0, SEEK_END) != 0 || ftell(f) != size || fseek(f, 0, SEEK_SET) != 0) return false;
+    std::vector<u8> db(size);
+    if (fread(db.data(), 1, db.size(), f) != db.size() ||
+        memcmp(db.data(), "FFOC", 4) || kernel::mii_crc16(db.data(), db.size()) != 0)
+        return false;
+    for (u32 slot = 0; slot < 3000; slot++) {
+        std::array<u8, 0x60> m{};
+        memcpy(m.data(), db.data() + 8 + slot * 0x5C, 0x5C);
+        if (kernel::mii_id_empty(m.data() + 0x0C) || (m[0x0C] & 0x20)) continue;
+        // Camera-created Wii U Miis can carry version 0. The 3DS expects version 3.
+        if (m[3] != 3 && !(m[3] == 0 && (m[0] & 0x70) == 0x40)) continue;
+        std::reverse(m.begin(), m.begin() + 4);
+        m[0] = 3;
+        for (size_t at = 0x18; at < 0x5C; at += 2)
+            if (at != 0x2E) std::swap(m[at], m[at + 1]);  // height and build are bytes
+        if (!looks_like_mii(m)) continue;
         const u16 crc = kernel::mii_crc16(m.data(), 0x5E);
         m[0x5E] = (u8)(crc >> 8);
         m[0x5F] = (u8)crc;
-        if (kernel::mii_3ds(m, as_3ds) && looks_like_mii(as_3ds)) kernel::g_host_miis.push_back(m);
+        kernel::g_host_miis.push_back(m);
     }
+    return true;
+}
+
+static void read_console_mii_maker() {
+    // Resolve the shared path as FFL does. save_mount() has already initialized nn_save.
+    const u64 maker = _SYSGetSystemApplicationTitleId(SYSTEM_APP_ID_MII_MAKER);
+    OSDynLoad_Module save;
+    if (!maker || OSDynLoad_Acquire("nn_save.rpl", &save) != OS_DYNLOAD_OK) return;
+    decltype(&SAVEGetSharedSaveDataPath) shared_path = nullptr;
+    OSDynLoad_FindExport(save, OS_DYNLOAD_EXPORT_FUNC, "SAVEGetSharedSaveDataPath", (void **)&shared_path);
+    if (shared_path) {
+        for (const char *name : {"db/FFL_ODB.dat", "db/FFL_ODB_OLD.dat"}) {
+            char path[256] = "fs:";
+            if (shared_path(maker, name, path + 3, sizeof path - 3) != SAVE_STATUS_OK || path[3] != '/') continue;
+            if (FILE *f = fopen(path, "rb")) {
+                const size_t before = kernel::g_host_miis.size();
+                const bool valid = read_mii_maker(f);
+                fclose(f);
+                if (valid) {
+                    LOG("[wiiu] %s: %zu Mii(s) read\n", name, kernel::g_host_miis.size() - before);
+                    break;
+                }
+                LOG("[wiiu] %s: invalid Mii database\n", name);
+            }
+        }
+    }
+    OSDynLoad_Release(save);
 }
 
 void frontend_run() {
@@ -1028,18 +1084,12 @@ int main(int argc, char **argv) {
         }
         fclose(f);
     }
-    // The rest of the console's Miis, after the accounts': Mii Maker's own database, in its save, whichever region's Mii Maker the console
-    // has (Japan's, America's, Europe's). The same test aid first: a "test_mii_maker.bin" in the data folder is read as that database.
+    // The rest of the console's Miis are in Mii Maker's shared save. Cemu checks can supply a fixture using the same file format.
     if (FILE *f = wiiu::debug_flag("cemu") ? fopen((wiiu::data_dir() + "/test_mii_maker.bin").c_str(), "rb") : nullptr) {
         read_mii_maker(f);
         fclose(f);
     }
-    if (!wiiu::debug_flag("nowiimiis"))
-        for (const char *maker : {"1004a000", "1004a100", "1004a200"})
-            if (FILE *f = fopen((std::string("fs:/vol/storage_mlc01/usr/save/00050010/") + maker + "/user/common/db/FFL_ODB.dat").c_str(), "rb")) {
-                read_mii_maker(f);
-                fclose(f);
-            }
+    if (!wiiu::debug_flag("nowiimiis")) read_console_mii_maker();
     kernel::init_services();
     stage("services up");
     frontend_init();
@@ -1049,6 +1099,7 @@ int main(int argc, char **argv) {
     stage("game started");
     frontend_run();
     WHBProcShutdown();
+    if (route_quit) OSExitThread(0);  // Cemu 2.6 spins in process exit, which prevents the runner from closing it.
     _exit(0);
     return 0;
 }

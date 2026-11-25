@@ -544,6 +544,9 @@ void handle_special(u32 id, u32 value) {
 
 inline void write_reg(u32 id, u32 value, u32 mask) {
     if (id >= 0x300) return;
+#ifdef __WIIU__
+    if (id < R::FIXATTR_DATA || id >= R::FIXATTR_DATA + 3 || g.regs[R::FIXATTR_INDEX] != 15) vtx_flush_immediate();
+#endif
     const u32 m = expand_mask[mask];
     const u32 was = g.regs[id];
     g.regs[id] = (was & ~m) | (value & m);
@@ -574,6 +577,9 @@ inline void write_reg(u32 id, u32 value, u32 mask) {
 // at a time each went through write_reg and into handle_special to do one small thing. Here the register is looked at once for the
 // whole run. What write_reg does for each word is done for all of them at the end: none of these words reads the register it is written to.
 void write_run(u32 kind, u32 id, u32 first, const u32 *extra, u32 count) {
+#ifdef __WIIU__
+    vtx_flush_immediate();
+#endif
     const auto each = [&](auto word) {
         word(first);
         for (u32 i = 0; i < count; i++) word(le32(extra[i]));
@@ -702,6 +708,9 @@ void process_command_list(u32 paddr, u32 size_bytes) {
     static const double hitch_ms = getenv("GPU_HITCH_MS") ? atof(getenv("GPU_HITCH_MS")) : 0;
     const double t0 = g_stats || hitch_ms ? now_ms() : 0;
     cmd_run(paddr, size_bytes);
+#ifdef __WIIU__
+    vtx_flush_immediate();
+#endif
     raster_flush();
     if (hitch_ms) {
         // command lists that took long enough to delay a frame (GPU_HITCH_MS=<threshold>)

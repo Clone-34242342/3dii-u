@@ -61,6 +61,12 @@ def mii_selection():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}', '-static', ROOT + '/tools/test_mii_selection.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def apt_mii_qr():
+    exe = build3ds.WORK + '/selftest/test_apt_mii_qr.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', f'-I{build3ds.RT}', '-static', ROOT + '/tools/test_apt_mii_qr.cpp', '-lbcrypt', '-o', exe], [exe]]
+
+
 def memory_fills():
     """port/wiiu/memory_fills.h against made-up fills and writes of a made-up memory, built for this PC"""
     exe = build3ds.WORK + '/selftest/test_memory_fills.exe'
@@ -79,6 +85,11 @@ def audio_dsp():
     """Production DSP coverage plus serialized Wii U queue/lifetime checks."""
     return [[sys.executable, ROOT + '/tools/test_audio_stability.py']]
 
+def microphone():
+    exe = build3ds.WORK + '/selftest/test_mic_stream.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-static', ROOT + '/tools/test_mic_stream.cpp', '-o', exe], [exe]]
+
 
 def ro_tree():
     """third_party/3dsrecomp/runtime/services/ro_tree.h against an export tree made up for three names, built for this PC"""
@@ -92,6 +103,12 @@ def languages():
     exe = build3ds.WORK + '/selftest/test_languages.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{build3ds.RT}', '-static', ROOT + '/tools/test_languages.cpp', '-o', exe], [exe]]
+
+
+def cpu_parallel():
+    exe = build3ds.WORK + '/selftest/test_cpu_parallel.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-static', ROOT + '/tools/test_cpu_parallel.cpp', '-o', exe], [exe]]
 
 
 def latte_program():
@@ -233,7 +250,8 @@ def main():
         'PC autoplay': [[py, ROOT + '/tools/test_pc_autoplay.py']],
         'mapped output': mapped_output(),
         'unanswered service replies': unanswered(),
-        'module memory ownership': [[py, '-B', ROOT + '/tools/test_module_memory.py']],
+        'module memory ownership': [[py, '-B', ROOT + '/tools/test_module_memory.py'],
+                                    [py, '-B', ROOT + '/tools/test_cro_modules.py']],
         'offline UDS IPC': uds_room(),
         'relative callbacks': [[py, ROOT + '/tools/test_relative_callbacks.py']],
         'multiply wrap': [[py, ROOT + '/tools/test_multiply_wrap.py']],
@@ -241,12 +259,14 @@ def main():
         'generated object cache': [[py, ROOT + '/tools/test_generated_objects.py']],
         'camera': camera(),
         'vertex arrays': vertex_arrays(),
-        'vertex cache': [[py, ROOT + '/tools/test_vertex_cache.py']],
+        'vertex cache': [[py, ROOT + '/tools/test_vertex_cache.py'], [py, ROOT + '/tools/test_native_immediate.py']],
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
         'depth viewport': depth_viewport(),
         'surface readback': surface_readback(),
         'Mii selection': mii_selection(),
+        'APT Mii QR': apt_mii_qr(),
+        'Wii U Mii database and picker': [[py, ROOT + '/tools/test_wiiu_miis.py']],
         'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py'],
                                                        [py, ROOT + '/tools/test_shader_install.py']],
         'shader learning': [[py, ROOT + '/tools/test_shader_learning.py']],
@@ -254,9 +274,11 @@ def main():
         'memory fills': memory_fills(),
         'motion input': motion_input(),
         'audio DSP': audio_dsp(),
+        'GamePad microphone': microphone(),
         'module exports': ro_tree(),
         'legacy extra data': [[py, ROOT + '/tools/test_fs_extdata.py']],
         'game languages': languages(),
+        'CPU byte operations': cpu_parallel(),
         'compiled programs': latte_program(),
         'open bools': open_bools(),
         'geometry shaders': gsx() + [[py, ROOT + '/tools/gsx_to_gsl.py', '--self-check']],
@@ -290,8 +312,11 @@ def main():
         'shader logs': [[py, ROOT + '/builder/test_shaderlogs.py'], [py, ROOT + '/tools/test_dvlb_to_log.py']],
         'user files': [[py, ROOT + '/builder/test_user_files.py']],
         '3DS saves in a build': [[py, ROOT + '/builder/test_saves.py'], *save_from_content()],
+        'save migration failures': [[py, ROOT + '/tools/test_save_migration.py']],
         'system archives': [[py, ROOT + '/builder/test_system_archives.py']],
         'builder app': [[py, ROOT + '/builder/test_app.py'], [py, ROOT + '/builder/test_pipeline_outputs.py']],
+        'builder input validation': [[py, ROOT + '/builder/test_input_validation.py']],
+        'builder lifecycle': [[py, ROOT + '/tools/test_builder_lifecycle.py']],
         'builder window': [[py, ROOT + '/builder/test_window.py'], [py, ROOT + '/builder/test_cards.py']],
         'builder updater': [[py, ROOT + '/builder/test_updater.py']],
         'DLC reader': [[py, ROOT + '/builder/selftest.py']],

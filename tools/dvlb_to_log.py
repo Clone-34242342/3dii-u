@@ -4,11 +4,12 @@
 Walks code.bin and the whole romfs, inside LZ10, LZ11 and Yaz0 streams and whatever they hold, for shader binaries (DVLB), and writes them as shader log records, which the shader
 generator reads like any other log: one for each vertex program and each one that can draw an outline. Which output each register feeds comes from the program's own table, as a game
 sets it up. With --lists and the shader generator's path, the programs a game loads with GPU command lists kept in its files go in too (Game Freak's model files: the generator
-finds them, tools/shadergen_lists.cpp). dvlb_to_log.py <game dir> [--check] [--lists <shadergen>]. Output: <game dir>/shader_logs/dvlb.bin, and dvlb.gsl
-with each geometry program whole (gs_record). --check only compares with what runs have logged, and writes nothing.
+finds them, tools/shadergen_lists.cpp). dvlb_to_log.py <game dir> [--check] [--lists <shadergen> [--materials <stream>]]. Output: <game dir>/shader_logs/dvlb.bin,
+dvlb.gsl with each geometry program whole (gs_record), and optional material records for tev_to_log.py. --check only compares with what runs have logged.
 """
 import bisect
 import glob
+from itertools import chain
 import mmap
 import os
 import re
@@ -233,25 +234,51 @@ def record(entry, code, swz, b, slots):
     return out
 
 
-def vertex_records(d):
-    """(entry, code, swizzles, output map) of each vertex record among a log's records"""
+def log_spans(d):
+    """Record boundaries in a mixed shader log, through the last complete record."""
     p = 0
-    while p + 8 <= len(d):
-        if d[p:p + 4] == b'VS  ':
-            entry, nc, ns = struct.unpack_from('<III', d, p + 4)
-            p += 16
-            code = struct.unpack_from(f'<{nc}I', d, p)
-            swz = struct.unpack_from(f'<{ns}I', d, p + nc * 4)
-            p += (nc + ns) * 4
-            yield entry, code, swz, [x - 256 if x >= 128 else x for x in d[p + 32:p + 56]]
-            p += 56
-        elif d[p:p + 4] == b'GSX ':  # a vertex shader and a geometry shader (shadergen_main.cpp): its size after the tag
-            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
+    while p + 4 <= len(d):
+        tag = d[p:p + 4]
+        if tag in (b'VS  ', b'GS  '):
+            if p + 16 > len(d):
+                break
+            nc, ns = struct.unpack_from('<II', d, p + 8)
+            if max(nc, ns) > 4096:
+                break
+            end = p + 16 + (nc + ns) * 4 + (56 if tag == b'VS  ' else 0)
         else:
-            q = p + 4 if d[p:p + 4] == b'FS  ' else p
+            q = p + 4 if tag in (b'FS  ', b'GSX ') else p
             if q + 4 > len(d):
                 break
-            p = q + 4 + struct.unpack_from('<I', d, q)[0]
+            end = q + 4 + struct.unpack_from('<I', d, q)[0]
+            if tag != b'GSX ':
+                tag = b'FS  '
+        if end > len(d):
+            break
+        if tag == b'GSX ':
+            if end - p < 8 + 44 + 88:
+                break
+            nc, ns, _, gc, gs = struct.unpack_from('<5I', d, p + 12)
+            if max(nc, ns, gc, gs) > 4096 or end - p != 8 + 44 + (nc + ns + gc + gs) * 4 + 88:
+                break
+        yield tag, p, end
+        p = end
+
+
+def fragment_keys(d):
+    for tag, p, end in log_spans(d):
+        if tag == b'FS  ':
+            yield d[p + (8 if d[p:p + 4] == b'FS  ' else 4):end]
+
+
+def vertex_records(d):
+    """(entry, code, swizzles, output map) of each vertex record among a log's records"""
+    for tag, p, end in log_spans(d):
+        if tag == b'VS  ':
+            entry, nc, ns = struct.unpack_from('<III', d, p + 4)
+            code = struct.unpack_from(f'<{nc}I', d, p + 16)
+            swz = struct.unpack_from(f'<{ns}I', d, p + 16 + nc * 4)
+            yield entry, code, swz, [x - 256 if x >= 128 else x for x in d[end - 24:end]]
 
 
 def logged(game):
@@ -262,17 +289,33 @@ def logged(game):
         yield from vertex_records(open(path, 'rb').read())
 
 
-def listed(game, shadergen):
-    """The records of the vertex programs the game's files, and its update's, load with GPU command lists, as the shader generator finds them: b'' if it can't.
+def listed(game, shadergen, archive_binaries=None, archive_materials=None):
+    """The records of the vertex programs the game's files and its update load with GPU command lists, as the shader generator finds them.
     (A file the update replaces is looked through all the same: a program no draw uses costs a build a little time.)"""
     images = [p for p in (f'{game}/romfs.bin', f'{game}/update_romfs.bin') if os.path.exists(p)]
+    if not images:
+        return b''
     with tempfile.TemporaryDirectory() as tmp:
-        r = subprocess.run([os.path.abspath(shadergen), '--lists', tmp + '/lists.bin', *images], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+        archive_args = ['--dvlb', archive_binaries] if archive_binaries else []
+        if archive_materials:
+            archive_args += ['--materials', archive_materials]
+        r = subprocess.run([os.path.abspath(shadergen), '--lists', tmp + '/lists.bin', *archive_args, *images],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
         if r.returncode:
-            print(f'command lists not looked through: {r.stdout[-200:].strip()}')
-            return b''
+            sys.exit(f'Shader command-list discovery failed: {r.stdout[-200:].strip()}')
         with open(tmp + '/lists.bin', 'rb') as f:
             return f.read()
+
+def framed_records(path, limit):
+    with open(path, 'rb') as f:
+        while header := f.read(4):
+            size = int.from_bytes(header, 'little')
+            if len(header) != 4 or not 4 <= size <= limit:
+                raise ValueError('Invalid shader discovery record size')
+            data = f.read(size)
+            if len(data) != size:
+                raise ValueError('Truncated shader discovery record')
+            yield data
 
 
 def start_of(entry, code):
@@ -285,15 +328,12 @@ def start_of(entry, code):
     return entry, tuple(words)
 
 
-def main():
-    game = sys.argv[1]
-    check = '--check' in sys.argv
-    lists = listed(game, sys.argv[sys.argv.index('--lists') + 1]) if '--lists' in sys.argv[:-1] else b''
+def write_records(game, check, lists=b'', archived=()):
     out = gs_out = b''
     table = {}
     done = set()
     binaries = kept = geometry = 0
-    for blob in programs(game):
+    for blob in chain(programs(game), archived):
         try:
             code, swz, entries = parse(blob)
         except (ValueError, struct.error, IndexError):
@@ -343,6 +383,19 @@ def main():
         with open(f'{game}/shader_logs/dvlb.gsl', 'wb') as f:  # even empty: it says this dvlb.bin was made since (make_app.py)
             f.write(gs_out)
         print(f'{len(out) >> 10} KB written, and {geometry} geometry programs')
+
+
+def main():
+    game = sys.argv[1]
+    check = '--check' in sys.argv
+    if '--lists' not in sys.argv[:-1]:
+        write_records(game, check)
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        archived = os.path.join(tmp, 'compressed-dvlb.bin')
+        materials = sys.argv[sys.argv.index('--materials') + 1] if not check and '--materials' in sys.argv[:-1] else None
+        lists = listed(game, sys.argv[sys.argv.index('--lists') + 1], archived, materials)
+        write_records(game, check, lists, framed_records(archived, MAX_BINARY))
 
 
 if __name__ == '__main__':

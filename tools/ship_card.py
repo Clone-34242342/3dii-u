@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-from wup_safety import check_output
+from wup_safety import check_output, check_title_replacement, publication_lock, stage_locked_outputs, staged_outputs, wup_title_id
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 FOLDERS = {'sticker_star': 'Paper_Mario_Sticker_Star', 'nsmb2': 'New_Super_Mario_Bros_2', 'dream_team': 'Mario_Luigi_Dream_Team', 'paper_jam': 'Mario_Luigi_Paper_Jam',
@@ -22,39 +22,51 @@ PREVIOUS = ROOT + '/dist/previous'  # the build each title had on the card befor
 def pack(otp, game):
     target = f'{ROOT}/dist/{FOLDERS[game]}'
     title = f'{ROOT}/{OUT.get(game, "build_mario/" + game)}/title'
-    check_output(target, title, replace=True)
-    shutil.rmtree(target, ignore_errors=True)
-    r = subprocess.run([sys.executable, ROOT + '/tools/pack_game_wup.py', otp, title, target], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
-    if r.returncode == 0:
-        return target
-    print(f'{game}: packing failed: {r.stdout[-200:]}', flush=True)
-    shutil.rmtree(target, ignore_errors=True)
-    return None
+    try:
+        check_output(target, title, replace=True)
+        with staged_outputs(target) as (new,):
+            r = subprocess.run([sys.executable, ROOT + '/tools/pack_game_wup.py', otp, title, new], cwd=ROOT,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+            if r.returncode:
+                raise OSError(r.stdout[-200:])
+    except (OSError, ValueError) as e:
+        print(f'{game}: packing failed: {e}', flush=True)
+        return None
+    return target
+
+
+def verified_copy(source, target):
+    shutil.copytree(source, target)
+    mismatches = filecmp.cmpfiles(source, target, os.listdir(source), shallow=False)[1:]
+    if any(mismatches):
+        raise OSError(f'The copy from {source} differs: {mismatches}')
 
 
 def copy(source, card):
     name = os.path.basename(source)
     target = f'{card}/install/{name}'
-    check_output(source, replace=True)
-    check_output(target, source, replace=True)
-    # what was there is kept on this PC, compared, and leaves the card, so the card only ever holds one build of each (the user's rule, 2026-11-07): a build that
-    # disappoints can go back without a rebuild
-    if os.path.isdir(target):
-        kept = f'{PREVIOUS}/{name}'
-        check_output(kept, replace=True)
-        shutil.rmtree(kept, ignore_errors=True)
-        shutil.copytree(target, kept)
-        if any(filecmp.cmpfiles(target, kept, os.listdir(target), shallow=False)[1:]):
-            return f'{name}: SAVING THE PREVIOUS BUILD DIFFERS, the card is as it was'
-        shutil.rmtree(target)
-    os.makedirs(target)
-    names = os.listdir(source)
-    for n in names:
-        shutil.copyfile(f'{source}/{n}', f'{target}/{n}')
-    mismatch = filecmp.cmpfiles(source, target, names, shallow=False)[1:]
-    if any(mismatch):
-        return f'{name}: COPY DIFFERS {mismatch}'
-    shutil.rmtree(source)
+    kept = f'{PREVIOUS}/{name}'
+    check_output(target, source)
+    check_output(kept, source)
+    check_output(kept, target)
+    try:
+        with publication_lock(source, target, kept):
+            check_output(source, replace=True)
+            title_id = wup_title_id(source)
+            check_title_replacement(target, title_id)
+            # Keep the card's old build on the PC so it can be restored without a rebuild.
+            have_previous = os.path.isdir(target) and bool(os.listdir(target))
+            targets = [kept, target] if have_previous else [target]
+            if have_previous:
+                check_title_replacement(kept, title_id)
+            names = os.listdir(source)
+            with stage_locked_outputs(*targets) as staged:
+                verified_copy(source, staged[-1])
+                if have_previous:
+                    verified_copy(target, staged[0])
+            shutil.rmtree(source)
+    except (OSError, ValueError) as e:
+        return f'{name}: COPY FAILED: {e}'
     return f'{name}: on the card, compared, {len(names)} files'
 
 

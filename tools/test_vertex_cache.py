@@ -35,6 +35,10 @@ def main():
     cache = source[source.index('struct VtxEntry {'):source.index('// A target the game draws at twice')]
     hash_source = (root / 'third_party/3dsrecomp/runtime/gpu/gpu.cpp').read_text()
     production = function(hash_source, 'u64 hash_bytes(').replace('u64 hash_bytes(', 'u64 production_hash_bytes(', 1)
+    if not args.backend or 'const float *constant_vertex(' in source:
+        production += '\n#define CONSTANT_VERTEX_REUSE\n'
+        production += source[source.index('float *ring_constant;'):source.index('void ring_next_segment()')]
+        production += function(source, 'const float *constant_vertex(')
     production += '\n' + cache + '\n' + function(source, 'void gx2_finish_list()')
     if 'u32 vtx_list;' in cache:
         production = '#define VTX_LIST_GENERATION\n' + production

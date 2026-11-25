@@ -599,7 +599,8 @@ def hand_over(exe, argv):
     try:
         with record_lock() as held:
             record = held and read_record()
-            if record and record.get('state') == 'trying':  # current() set it for this exe a moment ago; anything else came after
+            current_exe = record and record_exe(record)
+            if current_exe and record.get('state') == 'trying' and same_path(current_exe, exe):
                 write_record(record, 'failed')
     except Exception:
         pass

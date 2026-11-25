@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Runs an RPX through the checks the Wii U's loader makes, as far as they can be made off the console (decaf-emu's reimplementation is the
-reference). Cemu accepts files the console refuses. rpx_check.py <file.rpx> <cos.xml>"""
+"""Runs the Wii U loader checks that can be made off the console, using decaf-emu as the reference."""
+import argparse
 import re
 import struct
 import sys
 import zlib
 
-data = open(sys.argv[1], 'rb').read()
-cos = open(sys.argv[2]).read()
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('rpx')
+parser.add_argument('cos_xml')
+parser.add_argument('--verbose', action='store_true', help='print each branch relocation')
+args = parser.parse_args()
+with open(args.rpx, 'rb') as f:
+    data = f.read()
+with open(args.cos_xml, encoding='utf-8') as f:
+    cos = f.read()
 problems = []
 
 
@@ -134,8 +141,8 @@ for s in secs[1:]:
     r = body(s)
     if len(r) % 12:
         bad('%s size is not a multiple of 12' % s['n'])
-    for o in range(0, len(r), 12):
-        off, inf, add = struct.unpack('>IIi', r[o:o + 12])
+        continue
+    for off, inf, _ in struct.iter_unpack('>IIi', r):
         t = inf & 255
         kinds[t] = kinds.get(t, 0) + 1
         if t not in GOOD:
@@ -145,9 +152,10 @@ for s in secs[1:]:
         if si >= len(syms) // 16:
             bad('symbol index out of range in %s' % s['n'])
             break
-        if t in (10, 11):
+        if args.verbose and t in (10, 11):
             nm, val, size, inf2, other, shndx = struct.unpack('>IIIBBH', syms[si * 16:si * 16 + 16])
             print('    branch reloc type %d at %#x, symbol section %d value %#x bind %d' % (t, off, shndx, val, inf2 >> 4))
 print('  relocation types:', dict(sorted(kinds.items())))
 print('  entry %#x' % struct.unpack('>I', data[0x18:0x1C])[0])
 print('RESULT:', 'no problems found' if not problems else '%d problems' % len(problems))
+sys.exit(bool(problems))

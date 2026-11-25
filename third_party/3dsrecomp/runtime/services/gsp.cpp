@@ -14,6 +14,7 @@ namespace kernel {
 enum Irq { PSC0 = 0, PSC1 = 1, PDC0 = 2, PDC1 = 3, PPF = 4, P3D = 5, DMA = 6 };
 
 namespace {
+constexpr u32 CPU_WRITE = 0xFD, CPU_INVALIDATE = 0xFE, CPU_FLUSH = 0xFF;
 struct GspState {
     std::shared_ptr<SharedMem> shm;
     std::shared_ptr<Event> irq_event[4];
@@ -109,7 +110,7 @@ static void update_framebuffer(int screen) {
 
 // A service wrote guest memory the GPU may read: tell the GPU thread, in order with the GX commands.
 void gsp_cpu_wrote(u32 vaddr, u32 size) {
-    std::array<u32, 8> c{0xFFu, vaddr, size};
+    std::array<u32, 8> c{CPU_WRITE, vaddr, size};
     std::lock_guard<std::mutex> lk(gsp.qm);
     gsp.queue.push_back(c);
     gsp.busy++;
@@ -120,7 +121,7 @@ void gsp_cpu_wrote(u32 vaddr, u32 size) {
 void gsp_cache_op(u32 vaddr, u32 size, bool cpu_will_read) {
     VLOG("[gsp] cache %s %08x %x\n", cpu_will_read ? "invalidate" : "flush", vaddr, size);
     if (!size) return;
-    std::array<u32, 8> c{cpu_will_read ? 0xFEu : 0xFFu, vaddr, size};
+    std::array<u32, 8> c{cpu_will_read ? CPU_INVALIDATE : CPU_FLUSH, vaddr, size};
     std::lock_guard<std::mutex> lk(gsp.qm);
     gsp.queue.push_back(c);
     gsp.busy++;
@@ -291,10 +292,13 @@ void gsp_process_gx() {
             for (u32 i = 1; i + 1 < 8; i += 2)
                 if (u32 pa = c[i + 1] ? va2pa(c[i]) : 0) gpu::invalidate_memory(pa, c[i + 1]);
             break;
-        case 0xFF:  // (ours) the CPU wrote this range
+        case CPU_WRITE:  // A service wrote bytes, rather than just flushing a CPU cache.
+            if (u32 pa = va2pa(c[1])) gpu::service_written(pa, c[2]);
+            break;
+        case CPU_FLUSH:
             if (u32 pa = va2pa(c[1])) gpu::invalidate_memory(pa, c[2]);
             break;
-        case 0xFE:  // (ours) the CPU is about to read this range
+        case CPU_INVALIDATE:
             if (u32 pa = va2pa(c[1])) {
                 gpu::invalidate_memory(pa, c[2]);
 #ifdef __WIIU__
@@ -455,6 +459,7 @@ struct GspGpu : Service {
             n--;
             index = (index + 1) % 0xF;
             w32(cb, (hdr & 0xFFFF0000) | (n << 8) | index);
+            if ((c[0] & 0xFF) >= CPU_WRITE) continue;  // Internal notifications do not come from guest command memory.
             {
                 std::lock_guard<std::mutex> lk(gsp.qm);
                 gsp.queue.push_back(c);

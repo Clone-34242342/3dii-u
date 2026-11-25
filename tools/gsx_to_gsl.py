@@ -11,31 +11,16 @@ import pathlib
 import struct
 import sys
 
+from dvlb_to_log import log_spans
+
 
 def gs_programs(d):
     """the geometry shader of each GSX record of a shader log: (entry, code word count, swizzle word count, code and swizzle words as bytes)"""
-    p = 0
-    while p + 8 <= len(d):
-        tag = d[p:p + 4]
+    for tag, p, _ in log_spans(d):
         if tag == b'GSX ':
-            end = p + 8 + struct.unpack_from('<I', d, p + 4)[0]
-            if end > len(d):
-                return
             _vs_entry, vnc, vns, entry, nc, ns = struct.unpack_from('<6I', d, p + 8)
-            if 44 + (vnc + vns + nc + ns) * 4 + 88 != end - p - 8:
-                return
             at = p + 8 + 44 + (vnc + vns) * 4
             yield entry, nc, ns, d[at:at + (nc + ns) * 4]
-            p = end
-        elif tag == b'VS  ':
-            if p + 16 > len(d):
-                return
-            nc, ns = struct.unpack_from('<II', d, p + 8)
-            p += 16 + (nc + ns) * 4 + 56
-        else:  # a fragment state, tagged or not
-            if tag == b'FS  ':
-                p += 4
-            p += 4 + struct.unpack_from('<I', d, p)[0]
 
 
 def gs_records(logs):

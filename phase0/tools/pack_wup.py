@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools'))
-from wup_safety import check_output, check_title_id
+from wup_safety import check_output, check_title_id, check_title_replacement, publication_lock
 
 PAD_UNIT = 0x8000     # non-hashed contents are padded to this
 BLOCK_DATA = 0xFC00   # hashed contents: data per block...
@@ -404,6 +404,11 @@ def field(xml, tag):
 def main():
     title, out_dir = sys.argv[1:3]
     check_output(out_dir, title, replace=True)
+    with publication_lock(out_dir):
+        pack(title, out_dir)
+
+
+def pack(title, out_dir):
     key_hex = sys.stdin.read().strip()
     assert re.fullmatch(r'[0-9a-fA-F]{32}', key_hex), 'expected a 32-digit hex key on stdin'
     common_key = bytes.fromhex(key_hex)
@@ -418,6 +423,7 @@ def main():
     with open(os.path.join(title, 'meta', 'meta.xml'), encoding='utf8') as f:
         if field(f.read(), 'title_id') != title_id:
             raise ValueError('app.xml and meta.xml must name the same 3Dii U title.')
+    check_title_replacement(out_dir, title_id)
     # The file table names the title that holds each content: this one. For an update that is the 0005000E title itself; naming the base
     # instead (versions 1-3, 2026-11-06) made the console look for the update's files in the base's data: "cannot open fs:/vol/content/exheader.bin".
     parent_id = title_id

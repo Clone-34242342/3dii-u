@@ -68,16 +68,11 @@ void read(Surfaces &surfaces, uint32_t addr, uint32_t size, WriteBack write_back
     }
 }
 
-template<class Surface, class Surfaces, class WriteBack>
-bool retire(Surface &s, Surfaces &surfaces, WriteBack write_back) {
+template<class Surface, class Surfaces>
+bool retire(const Surface &s, Surfaces &surfaces) {
     if (s.depth) return true;
-    if (s.gpu_newer) {
-        const Spans spans = owned(s, surfaces);
-        if (!spans.empty()) {
-            write_back(s, spans);
-            if (s.gpu_newer) return false;  // allocation/readback failed: keep the only copy
-        }
-    }
+    // An idle timeout cannot establish that the guest still uses this address for pixels.
+    if (s.gpu_newer && !owned(s, surfaces).empty()) return false;
     // Removing an alias must not give its bytes back to older GPU pictures.
     // Their exclusions survive eviction, until a fresh draw reclaims them.
     for (auto &older : surfaces)

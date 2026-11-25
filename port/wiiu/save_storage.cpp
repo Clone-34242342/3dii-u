@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,6 +43,7 @@ constexpr u8 COMMON = 0xFF;  // as an account number, this means /vol/save/commo
 FSStatus (*flush_quota)(FSClient *, FSCmdBlock *, u8, FSErrorFlag);
 alignas(64) FSClient client;
 alignas(64) FSCmdBlock block;
+bool save_client_ready;
 volatile bool dirty;
 volatile OSTime first_change, last_change;
 u8 account_slot = COMMON;
@@ -53,12 +56,33 @@ std::map<std::string, DirectUsers> direct_users;  // keep a path direct until ev
 u64 cached_bytes;
 constexpr u64 CACHE_FILE_MAX = 16 << 20, CACHE_MAX = 48 << 20;  // bigger files go to storage as the game writes them
 
+bool under(const std::string &path, const std::string &prefix) { return !path.compare(0, prefix.size(), prefix); }
+
+int flush_save_quota(const char *path, u8 slot) {
+    if (wiiu::fsa_direct_flush_quota(path)) return 0;
+    return flush_quota ? flush_quota(&client, &block, slot, FS_ERROR_FLAG_ALL) : -1;
+}
+
+int flush_save_quotas(bool now) {
+    const bool mine = !account_dir.empty() && under(g_save_base, account_dir);
+    wiiu::fs_begin(0xC007);
+    int result = 0;
+    if (!account_dir.empty() && (mine || now)) result = flush_save_quota(account_dir.c_str(), account_slot);
+    if (!mine || now) {
+        const int common = flush_save_quota("/vol/save/common", COMMON);
+        if (!result) result = common;
+    }
+    wiiu::fs_end();
+    return result;
+}
+
 // Until it's flushed the journal holds what was written, and refuses more once it's full. wut says so with -1, or with a short count if it got partway.
 long write_retrying(int fd, const void *data, size_t len, u64 at) {
     const long n = pwrite(fd, data, len, (off_t)at);
     if (n == (long)len) return n;
     LOG("[save] wrote %ld of %x bytes at %llx: error %d, flushing\n", n, (u32)len, (unsigned long long)at, errno);
-    wiiu::save_flush(true);
+    // A cache writeback can reach this retry while it is already draining the cache.
+    if (flush_quota && flush_save_quotas(true) < 0) wiiu::save_dirty();
     const long done = std::max(n, 0L), more = pwrite(fd, (const u8 *)data + done, len - done, (off_t)(at + done));
     if (more < 0) LOG("[save] still failing: error %d\n", errno);
     return more < 0 ? n : done + more;
@@ -132,7 +156,6 @@ bool write_out_all() {
     }
 }
 
-bool under(const std::string &path, const std::string &prefix) { return !path.compare(0, prefix.size(), prefix); }
 }  // namespace
 
 namespace wiiu {
@@ -155,7 +178,8 @@ void save_mount() {
     FSInit();
     const int added = FSAddClient(&client, FS_ERROR_FLAG_ALL);
     FSInitCmdBlock(&block);
-    if (added != FS_STATUS_OK) flush_quota = nullptr;
+    save_client_ready = added == FS_STATUS_OK;
+    if (!save_client_ready) flush_quota = nullptr;
     const int inited = init();
     int folder = init_dir(COMMON);
     if (folder && init_common) folder = init_common();
@@ -189,6 +213,20 @@ void save_mount() {
 
 const std::string &save_account_dir() { return account_dir; }
 
+bool save_dir_lacks(const std::string &path, const char *first, const char *second) {
+    if (!save_client_ready) return false;
+    const char *native = path.c_str() + (path.starts_with("fs:") ? 3 : 0);
+    FSDirectoryHandle handle;
+    if (FSOpenDir(&client, &block, native, &handle, FS_ERROR_FLAG_ALL) != FS_STATUS_OK) return false;
+    FSDirectoryEntry entry;
+    FSStatus status;
+    while ((status = FSReadDir(&client, &block, handle, &entry, FS_ERROR_FLAG_ALL)) == FS_STATUS_OK) {
+        if (!std::strncmp(entry.name, first, sizeof entry.name) || !std::strncmp(entry.name, second, sizeof entry.name)) break;
+    }
+    const FSStatus closed = FSCloseDir(&client, &block, handle, FS_ERROR_FLAG_ALL);
+    return status == FS_STATUS_END && closed == FS_STATUS_OK;
+}
+
 void save_dirty() {
     const OSTime now = OSGetSystemTime();
     if (!dirty) first_change = now;
@@ -213,15 +251,7 @@ void save_flush(bool now) {
     if (!now && (!dirty || (OSTicksToMilliseconds(t - last_change) < 1000 && OSTicksToSeconds(t - first_change) < 5))) return;
     dirty = false;
     const bool written = write_out_all();
-    const bool mine = !account_dir.empty() && under(g_save_base, account_dir);
-    fs_begin(0xC007);
-    int r = 0;
-    if (!account_dir.empty() && (mine || now)) r = fsa_direct_flush_quota(account_dir.c_str()) ? 0 : flush_quota(&client, &block, account_slot, FS_ERROR_FLAG_ALL);
-    if (!mine || now) {
-        const int c = fsa_direct_flush_quota("/vol/save/common") ? 0 : flush_quota(&client, &block, COMMON, FS_ERROR_FLAG_ALL);
-        if (!r) r = c;
-    }
-    fs_end();
+    const int r = flush_save_quotas(now);
     LOG("[save] flushed: %d, %u ms\n", r, (u32)OSTicksToMilliseconds(OSGetSystemTime() - t));
     if (r < 0 || !written) save_dirty();
 }
@@ -243,26 +273,29 @@ volatile u32 files_copied;
 // A folder and all in it, each file read and written whole from an aligned buffer (write_out says why): the C library's copy goes a little at a time. false: something
 // didn't copy.
 bool save_copy_tree(const std::string &from, const std::string &to) {
+    namespace fs = std::filesystem;
     std::error_code ec;
-    std::filesystem::create_directories(to, ec);
+    fs::create_directories(to, ec);
     if (ec) return false;
-    for (const auto &e : std::filesystem::directory_iterator(from, ec)) {
-        const std::string name = e.path().filename().string(), src = from + "/" + name, dst = to + "/" + name;
-        if (e.is_directory(ec)) {
+    for (fs::directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string(), src = from + "/" + name, dst = to + "/" + name;
+        const bool directory = it->is_directory(ec);
+        if (ec) return false;
+        if (directory) {
             if (!save_copy_tree(src, dst)) return false;
             continue;
         }
         const int in = open(src.c_str(), O_RDONLY);
         if (in < 0) return false;
         struct stat st;
-        bool ok = !fstat(in, &st);
+        bool ok = !fstat(in, &st) && st.st_size >= 0 && (u64)st.st_size <= std::numeric_limits<u32>::max();
         const u32 n = ok ? (u32)st.st_size : 0;
         u8 *buf = ok ? (u8 *)memalign(64, std::max(n, 64u)) : nullptr;
         ok = buf && (!n || pread(in, buf, n, 0) == (long)n);
-        close(in);
-        const int out = ok ? open(dst.c_str(), O_RDWR | O_CREAT, 0644) : -1;
+        if (close(in)) ok = false;
+        const int out = ok ? open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644) : -1;
         ok = out >= 0 && (!n || save_write(out, buf, n, 0) == (long)n);
-        if (out >= 0) close(out);
+        if (out >= 0 && close(out)) ok = false;
         free(buf);
         if (!ok) return false;
         files_copied = files_copied + 1;
@@ -270,27 +303,76 @@ bool save_copy_tree(const std::string &from, const std::string &to) {
     return !ec;
 }
 
+static bool flush_migrated_account() {
+    if (account_dir.empty()) return false;
+    fs_begin(0xC007);
+    const bool flushed = flush_save_quota(account_dir.c_str(), account_slot) >= 0;
+    fs_end();
+    return flushed;
+}
+
+void save_finish_migration(const std::string &to) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string old = to + "_old";
+    const bool pending = fs::exists(old, ec);
+    if (ec) FATAL("[save] Cannot read migration state at %s.\n", old.c_str());
+    if (!pending) return;
+    if (!flush_migrated_account())
+        FATAL("[save] Cannot confirm the account save at %s. The previous save is still at %s.\n", to.c_str(), old.c_str());
+    fs::remove_all(old, ec);
+}
+
 // A copy made whole beside where it goes, then put in its place, what was there set aside until it is: a copy cut short, or a flush
 // partway through one (a full journal, write_retrying), never stands for a save
-static bool copy_into_place(const std::string &from, const std::string &to) {
+static bool copy_into_place(const std::string &from, const std::string &to, bool preserve_existing = false) {
     namespace fs = std::filesystem;
     std::error_code ec, aside;
     const std::string fresh = to + "_new", old = to + "_old";
+    const bool had_old = fs::exists(old, ec);
+    if (ec) return false;
+    bool had_to = fs::exists(to, ec);
+    if (ec) return false;
+    if (had_old && !had_to) {
+        fs::rename(old, to, ec);  // a previous swap stopped before its rollback
+        if (ec) return false;
+        had_to = true;
+    }
     fs::remove_all(fresh, ec);
-    if (!save_copy_tree(from, fresh)) {
+    if (ec) return false;
+    if (!save_copy_tree(from, fresh) || (preserve_existing && had_to && !save_copy_tree(to, fresh))) {
         fs::remove_all(fresh, ec);
         return false;
     }
     fs::remove_all(old, ec);
-    fs::rename(to, old, aside);  // nothing there yet is fine
+    if (ec) return false;
+    if (had_to) fs::rename(to, old, aside);
+    else if (preserve_existing) fs::create_directory(old, aside);  // mark a pending commit even for a new account save
+    if (aside) {
+        fs::remove_all(fresh, ec);
+        return false;
+    }
     fs::rename(fresh, to, ec);
     if (ec) {
-        if (!aside) fs::rename(old, to, aside);
-        fs::remove_all(fresh, aside);
+        if (had_to) fs::rename(old, to, aside);
+        else if (preserve_existing) fs::remove_all(old, aside);
+        if (!aside) fs::remove_all(fresh, ec);  // a failed rollback keeps both recoverable trees
+        return false;
+    }
+    if (preserve_existing && !flush_migrated_account()) {
+        fs::rename(to, fresh, ec);
+        if (ec) FATAL("[save] Cannot roll back the unconfirmed account save at %s. The previous save is still at %s.\n", to.c_str(), old.c_str());
+        if (had_to) fs::rename(old, to, ec);
+        else fs::remove_all(old, ec);
+        if (!ec) fs::remove_all(fresh, ec);
         return false;
     }
     fs::remove_all(old, ec);
     return true;
+}
+
+bool save_migrate_common(const std::string &from, const std::string &to) {
+    return copy_into_place(from, to, true);  // the account's newer extdata wins collisions
 }
 
 // A 3DS save the builder packed into the game (builder/saves.py, the title's save_import), taken in once, before the game starts: its

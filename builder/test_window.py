@@ -9,6 +9,8 @@ import shutil
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -29,6 +31,7 @@ base = tempfile.mkdtemp()
 settings = os.path.join(base, 'settings.json')
 gui.settings_file = lambda: settings  # the user's settings are never read or written, on any platform
 gui.updater.home = lambda: os.path.join(base, 'app')  # nor the downloaded versions' folder
+gui.pipeline.WORK = os.path.join(base, 'work')  # use the test's own workspace lock
 os.makedirs(os.path.join(base, 'keys'))
 json.dump({'keys': os.path.join(base, 'keys')}, open(settings, 'w'))  # an empty key folder: the user's keys are never looked at
 try:
@@ -89,8 +92,7 @@ try:
     icon = gui.icon_url([[(90, 120, 150)] * 48] * 48)
     state.set(hasGame=True, gameName='A game', badge='Untested', icon=icon, hasArt=True, artUrl=QUrl.fromLocalFile(art).toString(),
               library=[dict(path='C:/a.3ds', name='One', icon=icon, cover='', current=True), dict(path='C:/b.3ds', name='Two', icon=icon, cover='', current=False)],
-              cards=[dict(path='E:\\', label='E:\\    set up for a Wii U'), dict(path='F:\\', label='F:\\    removable drive')],
-              games=[dict(name='Finished', status='Complete', note='A note.')] + state.games)
+              cards=[dict(path='E:\\', label='E:\\    set up for a Wii U'), dict(path='F:\\', label='F:\\    removable drive')])
     for page in ('games', 'help', 'build'):
         win.setProperty('page', page)
         settle(f'page {page}')
@@ -100,11 +102,30 @@ try:
     games_page.setProperty('viewMode', 'compat')
     settle('compat list view')
     assert named_pills('compat list view')
+    catalog = {g['program_id']: g for g in state.compatList}
+    usa, eur = (catalog[i] for i in ('0004000000033500', '0004000000033600'))
+    assert usa['name'] != eur['name'] and usa['wiiu_status'] == 'Plays' and eur['wiiu_status'] == 'Untested'
+    assert usa['cemu_status'] == eur['cemu_status'] == 'Plays'
+    miku, persona = (catalog[i] for i in ('0004000000148900', '0004000000123400'))
+    assert (miku['wiiu_status'], miku['cemu_status']) == ('Plays', 'Limited')
+    assert (persona['wiiu_status'], persona['cemu_status']) == ('Untested', 'Plays')
     for f in ('all', 'wiiu', 'cemu'):
         games_page.setProperty('platformFilter', f)
         settle(f'compat filter {f}')
+        rows = [p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'compatibilityRow']
+        texts = [p.property('text') for row in rows for p in items(row) if p.isVisible()]
+        assert (miku['name'] in texts) == (f != 'cemu')
+        assert (persona['name'] in texts) == (f != 'wiiu')
+        assert ('Wii U · ' + usa['wiiu_note'] in texts) == (f != 'cemu')
+        assert ('Cemu · ' + usa['cemu_note'] in texts) == (f != 'wiiu')
     games_page.setProperty('viewMode', 'library')
     settle('library view restored')
+    for result, badge in ((miku, 'Plays on Wii U'), (persona, 'Plays in Cemu')):
+        state.game = SimpleNamespace(title_id=int(result['program_id'], 16))
+        assert gui.pipeline.profile_for(state.game) is None
+        state.refresh_note()
+        assert state.badge == badge, state.note
+    state.game = None
     win.setProperty('openFaq', 0)
     settle('an open answer')
     menu = win.findChild(QObject, 'cardMenu')
@@ -533,6 +554,161 @@ try:
         os.environ.pop('BOOT9_PATH', None)
     else:
         os.environ['BOOT9_PATH'] = kept_env
+
+    # A complete essential cache must not hide newly added files in the selected source.
+    import struct
+    source, cached = os.path.join(base, 'system source with spaces'), os.path.join(base, 'system cache')
+    os.makedirs(source)
+    def archive(folder, tid, body):
+        with open(os.path.join(folder, tid + '.romfs'), 'wb') as file:
+            file.write(struct.pack('<I', 0x28) + body)
+    for tid in gui.dumps.ESSENTIAL_ARCHIVES:
+        archive(source, tid, tid.encode() * 4)
+    real_import(source, cached, base)
+    archive(cached, '0004009b00010402', b'offline cached region data' * 4)
+    cached_before = {name: open(os.path.join(cached, name), 'rb').read() for name in os.listdir(cached)}
+    badword = '000400db00010302'
+    assert real_have(cached) and not os.path.exists(os.path.join(cached, badword + '.romfs'))
+    archive(source, badword, b'new bad-word fixture' * 4)
+    dest = os.path.join(base, 'build destination')
+    os.makedirs(dest)
+    kept_st, kept_game = dict(state.st), state.game
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'building', 'view', 'updateState')}
+    captured = []
+    class BuildCaptured(Exception):
+        pass
+    def capture(argv, **kwargs):
+        captured.append(argv)
+        raise BuildCaptured  # stop before a process/thread/timer can be started
+    try:
+        state.game = SimpleNamespace(path=os.path.join(base, 'test.3ds'), encrypted=lambda: False)
+        state.st.update(system=source, folder=dest, otp='unused test otp')
+        with mock.patch.object(gui.pipeline, 'ARCHIVES', cached), mock.patch.object(gui, 'otp_ok', return_value=True), \
+             mock.patch.object(gui.subprocess, 'Popen', side_effect=capture):
+            state.set(rootOk=True, target='folder', building=False, view='form', updateState='')
+            try:
+                state.build()
+            except BuildCaptured:
+                pass
+            assert captured and '--emulator' in captured[-1], 'GUI build dropped its selected system source once essentials were cached'
+            selected = captured[-1][captured[-1].index('--emulator') + 1]
+            assert selected == source and state.st['system'] == source
+            assert badword in real_import(selected, cached, base)
+            assert open(os.path.join(cached, badword + '.romfs'), 'rb').read() == open(os.path.join(source, badword + '.romfs'), 'rb').read()
+            assert all(open(os.path.join(cached, name), 'rb').read() == body for name, body in cached_before.items())
+            assert json.load(open(settings))['system'] == source
+            # An unplugged source leaves cached/offline files and the selection intact.
+            missing = os.path.join(base, 'unplugged source')
+            state.st['system'] = missing
+            state.set(building=False)
+            try:
+                state.build()
+            except BuildCaptured:
+                pass
+            assert captured[-1][captured[-1].index('--emulator') + 1] == missing
+            assert not real_import(missing, cached, base) and real_have(cached)
+            assert state.st['system'] == missing and json.load(open(settings))['system'] == missing
+            assert all(open(os.path.join(cached, name), 'rb').read() == body for name, body in cached_before.items())
+            messages = []
+            while not state.lines.empty():
+                messages.append(state.lines.get_nowait())
+            assert any(message and 'system folder is unavailable' in message for message in messages)
+    finally:
+        state.st, state.game = kept_st, kept_game
+        state.set(**kept_flags)
+        gui.save_settings(state.st)
+
+    # Queue selection is a snapshot. Only a completed worker, including a failed launch, can advance it.
+    kept_st = dict(state.st)
+    kept_game, kept_update, kept_save = state.game, state.update, state.save_in
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'building', 'view', 'updateState')}
+    card = os.path.join(base, 'test card')
+    os.makedirs(card)
+
+    def enqueue(name, target='folder'):
+        state.game = SimpleNamespace(path=os.path.join(base, name + '.3ds'), name=name, encrypted=lambda: False)
+        state.set(gameName=name, target=target)
+        state.enqueueBuild()
+
+    def complete(result=None):
+        if result:
+            state.lines.put(result)
+            state.poll()
+            assert state.building, 'a result alone advanced the queue before the worker exited'
+        state.lines.put(None)
+        state.poll()
+
+    def queue_status():
+        return [item['status'] for item in state.queueItems]
+
+    worker = mock.Mock()
+    worker.poll.return_value = None
+    try:
+        state.st.update(system='', folder=dest, card=card, otp='first otp')
+        state.set(rootOk=True, building=False, view='form', updateState='')
+        with mock.patch.object(gui, 'otp_ok', return_value=True), mock.patch.object(state, 'find_system'), \
+             mock.patch.object(gui.dumps, 'have_system_archives', return_value=True), \
+             mock.patch.object(gui.pipeline, 'profile_for', side_effect=lambda game: {'folder': game.name}), \
+             mock.patch.dict(os.environ, THREEDII_BUILD='first work folder', BOOT9_PATH='first keys'), \
+             mock.patch.object(gui.threading, 'Thread'), \
+             mock.patch.object(gui.subprocess, 'Popen', side_effect=[worker, OSError('launch failed'), worker, worker]) as launch:
+            state.update = SimpleNamespace(path='queued update.cia')
+            state.save_in = 'queued save folder'
+            enqueue('First')
+            enqueue('First')
+            assert state.queuePending == 1 and state.dialog['title'] == 'That output is already queued'
+            state.answer(True)
+            state.update = state.save_in = None
+            state.st['otp'] = 'second otp'
+            os.environ['THREEDII_BUILD'] = 'second work folder'
+            os.environ['BOOT9_PATH'] = 'second keys'
+            enqueue('Second')
+            enqueue('Third', 'card')
+            enqueue('Remove me')
+            state.removeQueued(3)
+            enqueue('Fourth')
+            state.set(gameName='Still editing', target='folder')
+            state.startQueue()
+            settle('queue started')
+            assert state.buildName == 'First' and queue_status() == ['Building', 'Queued', 'Queued', 'Queued']
+            first_args, first_env = launch.call_args.args[0], launch.call_args.kwargs['env']
+            assert first_args[first_args.index('--game') + 1].endswith('First.3ds')
+            assert first_args[first_args.index('--out') + 1] == dest
+            assert first_args[first_args.index('--otp') + 1] == 'first otp'
+            assert first_args[first_args.index('--update') + 1] == 'queued update.cia'
+            assert first_args[first_args.index('--save') + 1] == 'queued save folder'
+            assert first_env['THREEDII_BUILD'] == 'first work folder' and first_env['BOOT9_PATH'] == 'first keys'
+            state.build()
+            state.clearQueue()
+            state.removeQueued(1)
+            assert launch.call_count == 1 and state.queuePending == 3
+            complete('@done first output')
+            assert launch.call_count == 2 and state.buildName == 'Second'
+            state.poll()
+            assert launch.call_count == 3 and state.buildName == 'Third' and 'Copying' in state.stages
+            assert queue_status() == ['Done', 'Failed', 'Building', 'Queued']
+            assert state.queueItems[1]['detail'] == 'launch failed'
+            third_args = launch.call_args.args[0]
+            assert third_args[third_args.index('--card') + 1] == card and '--save' not in third_args
+            with mock.patch.object(gui, 'WIN', True), mock.patch.object(gui.subprocess, 'run'):
+                gui.App.stop_for_close(state)
+            complete()
+            assert launch.call_count == 3 and not state.busy() and state.queuePending == 1, (
+                launch.call_count, state.building, state.queueRunning, queue_status())
+            assert queue_status() == ['Done', 'Failed', 'Cancelled', 'Queued']
+            state.startQueue()
+            assert launch.call_count == 4 and state.buildName == 'Fourth'
+            complete('@error build failed')
+            settle('queue finished')
+            assert not state.busy() and state.queuePending == 0 and state.queueItems[-1]['detail'] == 'build failed'
+            assert state.gameName == 'Still editing'
+            state.clearQueue()
+            assert state.queueItems == []
+    finally:
+        state.timer.stop()
+        state.st, state.game, state.update, state.save_in = kept_st, kept_game, kept_update, kept_save
+        state.set(**kept_flags)
+        gui.save_settings(state.st)
 
     # the in-game menu (click the left stick), on or left out of the games it builds, kept in the settings
     state.setGameMenu(False)

@@ -187,9 +187,9 @@ A game that takes Miis gets the Wii U's own. That is a rule for every game: the 
 - `mii_3ds()` in `services/misc.cpp` turns each one into what a 3DS game reads:
   - A Mii comes either the way a 3DS keeps one or the way the Wii U's processor reads it, with its fields the other way round. The second kind is turned round, all of it.
   - A Mii made on a console newer than the 3DS is said to be a 3DS's. Super Mario 3D Land, of 2011, takes no other: it said "You don't have any Mii characters", and a save file lost its face at the next start.
-- They go into the game's own Mii Maker database, 100 at most (`sync_mii_db()` in `services/fs.cpp`), where a game that lists Miis finds them.
-  - A Mii stays at the place it had at an earlier start, a new one takes the first free place, and each names the place it lies at. A 3DS keeps a Mii at the place it names, and games find it again by that: 3D Land showed no face on a save file whose Mii named a place where another Mii lay.
-- The current account's Mii is the player's. The friends service and the Mii selector applet hand it out, naming the same place as its copy in the database, where it is placed first and always has a place. The selector answers at once and shows no choice.
+- Each game has a Mii Maker database with 100 official slots (`sync_mii_db()` in `services/fs.cpp`). Automatic import stops with ten free slots for the game to fill. Existing entries keep their slots, including in databases already full.
+  - A 3DS keeps a Mii at the place it names, and games find it again by that. 3D Land showed no face on a save file whose Mii named a place where another Mii lay.
+- The current account's Mii is imported first when there is room. The friends service and the Mii selector applet use its database slot if it has one. An unrestricted picker offers the full Wii U library.
 - `tools/check_ports.py` gives every run an account Mii and a small Mii Maker database, made up, with Miis in both layouts and a slot that holds none. A run fails if the game's Mii Maker ends up with more or fewer Miis than those. Cemu's own account Mii is a placeholder, so without them a run tested a console with no Mii at all.
 
 ## The PC build: `port/pc/`

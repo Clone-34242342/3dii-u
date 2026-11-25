@@ -73,6 +73,36 @@ static const std::string id1 = "0000000000000863", id2 = "0000000000001234";
 static const std::string binary("\0\x1a\r\n\xff", 5);
 
 int main() {
+    const std::string account = "/vol/save/80000001";
+    const Path save = Path(account) / "save/0004000000086300";
+    const Path common = "fs:/vol/save/common/save/0004000000086300";
+    auto fsa_status = [](const Path &p, std::error_code &ec) {
+        if (p == "fs:" || p == "fs:/vol/save" || p == "/vol/save") {
+            ec = std::make_error_code(p == "fs:" ? std::errc::not_enough_memory : std::errc::permission_denied);
+            return fs::file_status(fs::file_type::none);
+        }
+        if (p.filename() == ".checkpoint-restore") {
+            ec = std::make_error_code(std::errc::no_such_file_or_directory);
+            return fs::file_status(fs::file_type::not_found);
+        }
+        return fs::file_status(fs::file_type::directory);
+    };
+    for (const Path &p : {save, common, save / ".checkpoint-restore", common / ".checkpoint-restore", Path(card_mount)}) {
+        assert(!checked_path(p, nullptr, fsa_status));
+        assert(checked_path(p, &account, fsa_status));
+    }
+    assert(!checked_path("/vol/save/80000002/save", &account, fsa_status));
+    assert(!checked_path(save / "../savedata", &account, fsa_status));
+    auto bad_child = [&](fs::file_type type, std::errc error) {
+        return checked_path(save / ".checkpoint-restore", &account, [&](const Path &p, std::error_code &ec) {
+            if (p.filename() != ".checkpoint-restore") return fsa_status(p, ec);
+            ec = std::make_error_code(error);
+            return fs::file_status(type);
+        });
+    };
+    assert(!bad_child(fs::file_type::symlink, {}));
+    assert(!bad_child(fs::file_type::none, std::errc::permission_denied));
+
     const fs::path temp = fs::canonical(fs::temp_directory_path());
     const fs::path root = temp / ("3dii-u-backup-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     assert(fs::create_directory(root));  // never remove/reuse someone else's test folder
@@ -88,6 +118,13 @@ int main() {
         return c;
     };
     std::string message;
+    {
+        const auto c = context();
+        const auto files = snapshot(c.save);
+        reset_faults();
+        assert(take(c, message) == Restore::None && message.empty());
+        assert(operation == 0 && snapshot(c.save) == files);
+    }
     const time_t now = 1700000000;
     auto exported = [&](const Context &c) {
         assert(export_backup(c, now, message));

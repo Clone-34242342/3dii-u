@@ -17,6 +17,10 @@ int mii_maker_place(u32 n);            // where the nth of console_miis() lies i
 std::array<u8, 0x60> console_mii(u32 n);  // the nth of console_miis(), as a game reads it: where its Mii Maker has it, and its checksum
 std::array<u8, 0x60> player_mii();     // the current account's Mii, or a stand-in "Mario" when it has no usable one
 u16 mii_crc16(const u8 *p, size_t n);  // CRC-16/XMODEM, as Mii data and Mii Maker's database use
+inline bool mii_id_empty(const u8 *id) {
+    for (unsigned i = 0; i < 10; i++) if (id[i]) return false;
+    return true;
+}
 void register_apt();
 void register_fs();
 void register_cfg();
@@ -25,7 +29,7 @@ void register_hid();
 void register_dsp();
 void register_misc();
 void register_ro();
-bool ro_has_modules();  // whether the game came with CRO modules, which ldr:ro maps where the game says
+bool ro_has_modules();  // whether ldr:ro maps a static or dynamic module where the game says
 
 std::shared_ptr<SharedMem> load_shared_font();
 // a file of a system archive (system_archives/<title id>.romfs), empty if missing
@@ -69,7 +73,8 @@ void dsp_tick();  // (host thread, lock not held) one audio frame, played whethe
 // The host's microphone, for mic:u (lock held). misc.cpp has weak defaults that give silence.
 void mic_host_start();
 void mic_host_stop();
-void mic_host_read(s16 *out, u32 n, u32 rate);  // the latest n samples, at this rate
+void mic_host_read(s16 *out, u32 n, u32 rate);
+u32 mic_host_read_available(s16 *out, u32 n, u32 rate);  // up to n consecutive samples at this rate
 // The host's camera (lock held). A fresh immutable 640x480 NV12 snapshot, pitch 768; false means unavailable/no new frame.
 bool cam_host_start();
 void cam_host_stop();

@@ -17,6 +17,8 @@ import tempfile
 import decrypt
 
 MU = 0x200
+CODE_ROOM = 0x08000000 - 0x00100000  # mem::HEAP_BASE - mem::CODE_BASE (runtime/rt.h)
+DEVICE_NAMES = {'con', 'prn', 'aux', 'nul', 'conin$', 'conout$'} | {f'{p}{n}' for p in ('com', 'lpt') for n in range(1, 10)}
 KINDS = {0x00040000: 'game', 0x00040002: 'demo', 0x0004000E: 'update', 0x0004008C: 'dlc'}
 OWNED, DOWNLOADED = 2, 1  # a DLC content's ownership bits, as am:app reports them
 SIG_SIZES = {0x10000: 0x240, 0x10001: 0x140, 0x10002: 0x80, 0x10003: 0x240, 0x10004: 0x140, 0x10005: 0x80}  # signature type -> bytes, type included
@@ -42,31 +44,47 @@ class FileSlice:
 
 def blz_decompress(data):
     """Nintendo's backward LZ, used for the ExeFS .code section (tools/extract_game.py)"""
+    if len(data) < 8:
+        raise DumpError('The compressed code has no BLZ footer.')
     top_bottom, extra = struct.unpack('<II', data[-8:])
-    out = bytearray(data) + bytearray(extra)
-    index = len(data) - (top_bottom >> 24)
-    stop = len(data) - (top_bottom & 0xFFFFFF)
+    size = len(data) + extra
+    if size > CODE_ROOM:
+        raise DumpError('The compressed code expands beyond the guest code region.')
+    header, packed = top_bottom >> 24, top_bottom & 0xFFFFFF
+    if not 8 <= header <= packed <= len(data):
+        if not extra:  # MakeROM stores incompressible code followed by a zero word.
+            return bytes(data)
+        raise DumpError('The compressed code has invalid BLZ bounds.')
+    index, stop = len(data) - header, len(data) - packed
+    out = bytearray(size)
+    out[:len(data)] = data
     at = len(out)
     while index > stop:
         index -= 1
         control = data[index]
         for _ in range(8):
-            if index <= stop or at <= 0:
+            if index <= stop:
                 break
             if control & 0x80:
+                if index - 2 < stop:
+                    raise DumpError('The compressed code has a truncated BLZ back-reference.')
                 index -= 2
                 pair = data[index] | (data[index + 1] << 8)
                 count = ((pair >> 12) & 15) + 3
                 back = (pair & 0x0FFF) + 3  # distance from the byte about to be written, after at -= 1
+                if at - count < stop or at - 1 + back >= size:
+                    raise DumpError('The compressed code has an invalid BLZ back-reference.')
                 for _ in range(count):
                     at -= 1
                     out[at] = out[at + back]
             else:
+                if at <= stop:
+                    raise DumpError('The compressed code exceeds its BLZ bounds.')
                 index -= 1
                 at -= 1
                 out[at] = data[index]
             control = (control << 1) & 0xFF
-    if at > stop:
+    if at != stop:
         raise DumpError('The code didn\'t decompress: a damaged dump.')
     return bytes(out)
 
@@ -231,15 +249,33 @@ def exefs_files(p, nh, only=None):
     off, size, hashed = u32(nh, 0x1A0) * MU, u32(nh, 0x1A4) * MU, u32(nh, 0x1A8) * MU
     if not size:
         return {}
+    if not MU <= hashed <= size or off < MU or off + size > p.size:
+        raise DumpError('The ExeFS section lies outside its NCCH.')
     head = p.pread(off, 0x200)
     if hashlib.sha256(p.pread(off, hashed)).digest() != nh[0x1C0:0x1E0]:
         raise DumpError('The ExeFS fails its hash: a bad decryption or a damaged dump.')
-    files = {}
+    files, names = {}, set()
     for i in range(10):
-        name = head[i * 16:i * 16 + 8].rstrip(b'\0').decode('ascii', 'replace')
-        if not name or (only and name not in only):
+        raw = head[i * 16:i * 16 + 8].rstrip(b'\0')
+        if not raw:
+            continue
+        if any(b < 32 or b >= 127 or b in b'<>:"/\\|?*' for b in raw):
+            raise DumpError('The ExeFS contains an invalid file name.')
+        name = raw.decode('ascii')
+        flat = name.lstrip('.').lower()
+        stem = flat.partition('.')[0].rstrip()
+        if not flat or stem in DEVICE_NAMES:
+            raise DumpError(f'The ExeFS contains an invalid file name: {name!r}.')
+        if flat in names:
+            raise DumpError(f'The ExeFS contains a duplicate file name: {name!r}.')
+        names.add(flat)
+        if only and name not in only:
             continue
         foff, fsize = struct.unpack_from('<II', head, i * 16 + 8)
+        if foff + fsize > size - MU:
+            raise DumpError(f'ExeFS {name} lies outside its section.')
+        if name == '.code' and fsize > CODE_ROOM:
+            raise DumpError('The ExeFS code exceeds the guest code region.')
         data = p.pread(off + 0x200 + foff, fsize)
         if hashlib.sha256(data).digest() != head[0x200 - 32 * (i + 1):0x200 - 32 * i]:
             raise DumpError(f'ExeFS {name} fails its hash: a bad decryption or a damaged dump.')
@@ -361,9 +397,6 @@ def title_info(dump):
 def add_update(update, plain_update, game_dir, progress=None):
     """The update's code, exheader and ExeFS in place of the base's, and its RomFS beside the base's. update is the dump as given (for its
     version), plain_update a plain copy of it (the same dump if it was plain already)."""
-    for f in ('code.bin', 'exheader.bin', 'info.json'):
-        if os.path.exists(os.path.join(game_dir, f)):
-            os.remove(os.path.join(game_dir, f))
     info = extract_program(plain_update, game_dir, progress, romfs_name='update_romfs.bin')
     with open(os.path.join(game_dir, 'update_title.bin'), 'wb') as o:
         o.write(title_info(update))
@@ -426,8 +459,8 @@ def archives_named(code):
             if any(struct.pack('<II', *pair) in code for pair in ((int(t[8:], 16), int(t[:8], 16)), (int(t[:8], 16), int(t[8:], 16))))]
 
 
-def have_system_archives(folder):
-    return all(os.path.isfile(p) and is_romfs(p) for p in (os.path.join(folder, t + '.romfs') for t in ESSENTIAL_ARCHIVES))
+def have_system_archives(folder, required=ESSENTIAL_ARCHIVES):
+    return all(os.path.isfile(p) and is_romfs(p) for p in (os.path.join(folder, t + '.romfs') for t in required))
 
 
 def nand_titles(folder):

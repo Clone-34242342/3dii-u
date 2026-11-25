@@ -63,6 +63,7 @@ PORT = ROOT + '/port'
 DKP = short_sdk_root(os.environ.get('THREEDII_DEVKITPRO') or 'C:/devkitPro/opt/devkitpro')  # the standalone builder brings its own copy
 BIN = DKP + '/devkitPPC/bin/powerpc-eabi-'
 WUT = DKP + '/wut'
+FFL_TRIAL = os.environ.get('THREEDII_FFL_TEST', '').replace('\\', '/')
 LLVM = 'C:/Program Files/LLVM/bin/'
 MINGW = 'C:/msys64/mingw64'
 GLSLC = ROOT + '/third_party/cafeglsl/glslcompiler.exe'  # v0.2.0: every shader a build ships comes from it, so its programs are the ones consoles have drawn with (tools/win/build_cafeglsl.ps1)
@@ -356,13 +357,16 @@ def functions_list(g):
     return merged
 
 
-def need_gen(g):
-    """the C is made again whenever the recompiler or the game's entries are newer than it, for every game"""
-    table = f'{g.gen_dir}/table.c'
+def need_gen(g, gen_dir=None):
+    """Regenerate when the recompiler, code or CRO inputs change."""
+    table = f'{gen_dir or g.gen_dir}/table.c'
     if not os.path.exists(table):
         return True
     t = os.path.getmtime(table)
-    return any(os.path.getmtime(f) > t for f in recompiler_sources() + [functions_list(g)])
+    # The directory mtime also catches a removed optional RomFS.
+    inputs = [functions_list(g), __file__, ROOT + '/tools/win/gen_lf.py', g.dir, f'{g.dir}/code.bin', f'{g.dir}/info.json']
+    inputs += [f for name in ('romfs.bin', 'update_romfs.bin') if os.path.isfile(f := f'{g.dir}/{name}')]
+    return any(os.path.getmtime(f) > t for f in recompiler_sources() + inputs)
 
 
 def game_env(g):
@@ -423,16 +427,40 @@ def runtime_sources(host=False):
 def build_runtime(g, args):
     """the runtime every game links: one build of it serves them all"""
     obj_dir = f'{WORK}/rt_measure' if MEASURE else f'{WORK}/rt_std'
+    if FFL_TRIAL:
+        obj_dir += '_ffl'
     check_cache_dir(obj_dir)
     os.makedirs(obj_dir, exist_ok=True)
     sources = runtime_sources()
     items = []
     extra = shlex.split(args.extra_flags or '')
     only = set((args.only or '').replace(' ', '').split(',')) - {''}
+    if FFL_TRIAL:
+        program = f'{obj_dir}/mii_face_program.inc'
+        vert, frag = (f'{PORT}/wiiu/mii_face.{stage}' for stage in ('vert', 'frag'))
+        if not os.path.isfile(program) or any(os.path.getmtime(src) > os.path.getmtime(program) for src in (vert, frag, GLSLC)):
+            gsh = f'{obj_dir}/mii_face.gsh'
+            r = run([GLSLC, '-vs', vert, '-ps', frag, '-o', gsh], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode:
+                sys.exit('Mii face shader failed: ' + r.stdout[-1000:])
+            check_registers(gsh)
+            with open(gsh, 'rb') as compiled, open(program, 'w', encoding='ascii', newline='\n') as f:
+                f.write('alignas(64) constexpr unsigned char mii_face_program[] = {\n')
+                code = compiled.read()
+                for i in range(0, len(code), 24):
+                    f.write('    ' + ', '.join(map(str, code[i:i+24])) + ',\n')
+                f.write('};\n')
     for s in sources:
         base = os.path.basename(s)
         name = base
         flags = runtime_flags(extra)
+        if base == 'apt_mii_qr.cpp':
+            flags += [f'-I{ROOT}/toolchain/aac_ppc/include']
+        if FFL_TRIAL and base in ('gx2_backend.cpp', 'mii_face.cpp'):
+            flags += ['-DRECOMP_FFL_TRIAL']
+            if base == 'mii_face.cpp':
+                flags += ['-DRIO_DEBUG', '-DFFL_NO_FS', '-DFFL_NO_DATABASE_FILE', '-fshort-wchar',
+                          f'-I{FFL_TRIAL}/testing/ffl/include', f'-I{FFL_TRIAL}/testing/rio/include', f'-I{obj_dir}']
         real = s  # (mic_wiiu.cpp loads mic.rpl when a game first asks for the mic, so no game imports it: importing it hung a big build before main)
         obj = f'{obj_dir}/{obj_name(s)}'
         if only and base not in only and os.path.exists(obj):
@@ -555,7 +583,10 @@ def link_game(g, rt, code, link_flags=None):
     wraps = ['-Wl,--wrap=' + f for f in ('FSAOpenFileEx', 'FSACloseFile', 'FSAReadFile', 'FSAWriteFile', 'FSASetPosFile', 'FSAGetStatFile', 'FSAGetStat', 'FSAFlushFile', 'FSATruncateFile',
                                          'FSARemove', 'FSAMakeDir', 'FSARename', 'FSAOpenDir', 'FSAReadDir', 'FSARewindDir', 'FSACloseDir')]
     argv = [BIN + 'g++.exe', '-mcpu=750', '-meabi', '-mhard-float', '-specs=rpx/rpx.specs', '-Wl,--relax', '-Wl,--no-warn-rwx-segments', f'@link/{g.name}.rsp'] + wraps + aac + extra
-    argv += ['-Wl,--start-group', f'-L{WUT}/lib', f'-L{CAFEGLSL_PPC}/lib', '-lcafeglsl', '-lwut', '-lstdc++', '-lm', '-lc', '-lsysbase', '-lgcc', '-Wl,--end-group', f'@link/{g.name}_code.rsp', '-o', elf]
+    argv += ['-Wl,--start-group']
+    if FFL_TRIAL:
+        argv += [rel(f'{FFL_TRIAL}/lib3dii_ffl_narrow.a'), rel(f'{DKP}/portlibs/ppc/lib/libz.a')]
+    argv += [f'-L{WUT}/lib', f'-L{CAFEGLSL_PPC}/lib', '-lcafeglsl', '-lwut', '-lstdc++', '-lm', '-lc', '-lsysbase', '-lgcc', '-Wl,--end-group', f'@link/{g.name}_code.rsp', '-o', elf]
     r = run(argv, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     errors = sorted({re.sub(r'^.*ld(\.exe)?: ', '', x) for x in r.stdout.splitlines() if re.search(r'undefined reference|error|multiple definition|truncated', x)})
     for e in errors[:30]:
@@ -728,8 +759,11 @@ def prepare_vertex_logs(g, shadergen):
     for f in ('vs_log.bin', 'fs_log.bin'):
         if os.path.exists(f'{run_dir}/{f}'):
             shutil.copyfile(f'{run_dir}/{f}', f'{logs}/{f}')
-    r = run([sys.executable, ROOT + '/tools/dvlb_to_log.py', g.dir, '--lists', shadergen], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+    r = run([sys.executable, ROOT + '/tools/dvlb_to_log.py', g.dir, '--lists', shadergen, '--materials', logs + '/materials.raw'],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-300:].strip())
+    if r.returncode:
+        sys.exit('dvlb_to_log failed')
 
 
 def prepare_logs(g, shadergen):
@@ -737,7 +771,13 @@ def prepare_logs(g, shadergen):
     The vertex part first (prepare_vertex_logs)."""
     prepare_vertex_logs(g, shadergen)
     logs = g.dir + '/shader_logs'
-    r = run([sys.executable, ROOT + '/tools/tev_to_log.py', g.dir], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+    materials = logs + '/materials.raw'
+    try:
+        r = run([sys.executable, ROOT + '/tools/tev_to_log.py', g.dir, '--materials', materials],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+    finally:
+        if os.path.isfile(materials):
+            os.remove(materials)
     print(r.stdout[-300:].strip())
     if r.returncode:
         sys.exit('tev_to_log failed')
@@ -771,6 +811,8 @@ def prepare_logs(g, shadergen):
     r = run([sys.executable, ROOT + '/tools/fs_variants.py', logs + '/variants.bin', '--max', str(FRAGMENT_VARIANTS)] + own_logs + near,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-300:].strip())
+    if r.returncode:
+        sys.exit('fs_variants failed')
 
 
 def build_shaders(g, args):
@@ -846,8 +888,7 @@ def prune_generated_objects(obj_dir, items):
 def host_build(g, args):
     gen_dir = f'{g.dir}/{args.gen or "gen_safe"}'
     abi = gen_dir.endswith('gen_abi')
-    table = f'{gen_dir}/table.c'
-    if not os.path.exists(table) or any(os.path.getmtime(f) > os.path.getmtime(table) for f in recompiler_sources() + [functions_list(g)]):
+    if need_gen(g, gen_dir):
         print('recompiling the game to C')
         do_gen(g, args, gen_dir, abi)
     rt = host_runtime(args)
@@ -928,6 +969,7 @@ def trial(g, args):
     for item in args.env or []:
         k, v = item.split('=', 1)
         env[k] = v
+    env['THREEDII_TRIAL_WORK'] = WORK
     with open(run_dir + '/lazy.cmd', 'w', newline='\r\n') as f:
         f.write(f'@"{sys.executable}" "{ROOT}/tools/win/build3ds.py" lazy {g.name} %1 --gen "{os.path.basename(gen_dir)}"' + (f' --run {args.run}' if args.run else '') + '\n')
     print(f'running {frames} frames, autoplay {args.autoplay}', flush=True)
@@ -1021,6 +1063,17 @@ def main():
     ap.add_argument('--opt')
     ap.add_argument('--out', help='put the RPX, game.nm and shaders here instead, to keep a test build apart')
     args = ap.parse_args()
+    if args.command == 'lazy' and os.environ.get('THREEDII_TRIAL_WORK') == WORK:
+        # The running trial holds the workspace lock for its lazy callback.
+        return dispatch(args)
+    try:
+        with objcache.workspace_lock(ROOT, WORK):
+            return dispatch(args)
+    except (OSError, ValueError) as e:
+        sys.exit(str(e))
+
+
+def dispatch(args):
     if not os.path.isdir(f'{ROOT}/games/{args.game}'):
         sys.exit(f'no games/{args.game}')
     if not os.path.exists(BIN + 'gcc.exe'):

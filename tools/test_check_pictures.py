@@ -3,6 +3,8 @@
 import os
 import sys
 import tempfile
+from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +12,13 @@ from PySide6.QtGui import QColor, QImage
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_ports as c  # noqa: E402
+
+
+def cemu_template():
+    portable = Path(c.CEMU) / 'portable'
+    portable.mkdir(parents=True)
+    (portable.parent / 'CemuMario.exe').touch()
+    (portable / 'settings.xml').write_text('<settings><mlc_path>original</mlc_path></settings>')
 
 
 def leg(t, colours, minimum_pairs=1):
@@ -21,6 +30,74 @@ def leg(t, colours, minimum_pairs=1):
         for screen in ('tv', 'pad'):
             img.save(f'{t.data}/shots/cemu/{screen}_{i:02d}.png')
     return c.pictures(t, 'blank_save', minimum_pairs=minimum_pairs)
+
+
+def test_judge_quit_routes():
+    """Strict evidence needs a complete, gracefully closed log from every leg."""
+    with tempfile.TemporaryDirectory() as folder, mock.patch.object(c, 'CEMU', folder + '/cemu'):
+        cemu_template()
+        seed = folder + '/seed'
+        os.makedirs(seed)
+        with open(seed + '/test.bin', 'w') as file:
+            file.write('private test seed')
+        route = ['A 6', 'WAIT 100000', 'B 6']
+        cases = [(True, False, False), (True, True, False), (True, False, True),
+                 (False, False, False), (False, True, False), (False, False, True)]
+        for index, (strict, kept, environment) in enumerate(cases):
+            target = c.Target('closure_' + str(index), 'ff', folder + '/out' + str(index), folder + '/data' + str(index),
+                              save=seed if kept else '', env={'TEST_SCENE': '1'} if environment else {})
+            routes = []
+            for storage in (target.common, target.player):
+                marker = Path(storage) / 'manual-save.bin'
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_bytes(b'manual save')
+
+            def renderer(current, seconds, interp, shots, captures):
+                assert current.cemu_dir != c.CEMU
+                assert not (Path(current.common) / 'manual-save.bin').exists()
+                assert not (Path(current.player) / 'manual-save.bin').exists()
+                assert (Path(current.player) / 'save/test.bin').is_file() == kept
+                (Path(current.cemu_dir) / 'portable/log.txt').write_text('mock Cemu run')
+                with open(current.common + '/live.txt') as file:
+                    lines = file.read().splitlines()
+                routes.append(lines)
+                with open(current.common + '/log.txt', 'w') as file:
+                    file.write('[fs] every file call goes straight\n[glsl] compiler thread ready\n')
+                    file.write('[gx2] 60 fps, 0 on CPU, 0 fragment misses\n')
+                    file.write(''.join(f'[test] {key} is {value}\n' for key, value in current.env.items()))
+                    if lines[-1] == 'KEY quit':
+                        file.write('[gx2 final] native draws 6, CPU batches 0, fragment misses 0, immediate native draws 1, immediate CPU runs 0\n')
+                        file.write('[quit] sound system shut down\n')
+                return 'closed'
+
+            with mock.patch.object(c, 'STRICT', strict), mock.patch.dict(c.ROUTES, {target.name: route}), \
+                 mock.patch.object(c, 'cemu', side_effect=renderer), mock.patch.object(c, 'pictures', return_value=(None, None)):
+                faults, notes = c.judge(target, 80, [], measured=strict)
+            assert len(routes) == (1 if kept or environment else 2), (strict, kept, environment, routes)
+            for leg_index, lines in enumerate(routes):
+                if strict or leg_index:
+                    assert lines == ['A 6', 'KEY quit'], ('quit route is not bounded/complete', strict, kept, environment, lines)
+                else:
+                    assert lines == route, ('ordinary first-leg route changed', kept, environment, lines)
+            assert not faults, (strict, kept, environment, faults, notes)
+            for storage in (target.common, target.player):
+                assert (Path(storage) / 'manual-save.bin').read_bytes() == b'manual save'
+        settings = Path(c.CEMU) / 'portable/settings.xml'
+        assert settings.read_text() == '<settings><mlc_path>original</mlc_path></settings>'
+        original = '<settings><Graphic><AsyncCompile>true</AsyncCompile></Graphic></settings>'
+        settings.write_text(original)
+        with tempfile.TemporaryDirectory() as scratch:
+            profile = Path(c.cemu_profile(scratch))
+            made = c.ET.parse(profile / 'portable/settings.xml')
+            assert made.findtext('Graphic/AsyncCompile') == 'false'
+        assert settings.read_text() == original
+        settings.unlink()
+        with tempfile.TemporaryDirectory() as scratch:
+            profile = Path(c.cemu_profile(scratch))
+            made = c.ET.parse(profile / 'portable/settings.xml')
+            assert Path(made.findtext('mlc_path')) == profile / 'portable/mlc01'
+            assert made.findtext('Graphic/AsyncCompile') == 'false'
+        assert not settings.exists()
 
 
 def main():
@@ -69,6 +146,25 @@ def main():
                     img.setPixelColor(31, 47, QColor('white'))
                 img.save(f'{visible.data}/shots/cemu/{screen}_{n:02d}.png')
         assert not c.pictures(visible, 'blank_save', minimum_pairs=2)[0]
+        design = c.Target('design', '0', d, d.replace('\\', '/') + '/design', route='acnl_design')
+        incoming = design.data + '/shots/cemu'
+        os.makedirs(incoming)
+        editor = QImage(320, 240, QImage.Format_RGB888)
+        editor.fill(QColor('white'))
+        for screen in ('tv', 'pad'):
+            editor.save(f'{incoming}/{screen}_00.png')
+        assert 'design strokes missing' in c.pictures(design, 'kept_save')[0]
+        editor.save(f'{incoming}/tv_00.png')
+        for x, y in ((125, 71), (145, 71), (185, 71), (135, 111), (185, 111), (125, 155), (195, 155)):
+            editor.setPixelColor(x, y, QColor('#ffaa88'))
+        editor.save(f'{incoming}/pad_00.png')
+        assert not c.pictures(design, 'kept_save')[0]
+        for screen in ('tv', 'pad'):
+            editor.save(f'{incoming}/{screen}_00.png')
+        editor.setPixelColor(125, 155, QColor('white'))
+        for screen in ('tv', 'pad'):
+            editor.save(f'{incoming}/{screen}_01.png')
+        assert 'design strokes missing' in c.pictures(design, 'kept_save')[0]
         corrupt = c.Target('corrupt', '0', d, d.replace('\\', '/') + '/corrupt')
         incoming = corrupt.data + '/shots/cemu'
         os.makedirs(incoming)
@@ -92,30 +188,35 @@ def main():
         t = c.Target('cadence', 'ff', d + '/out', d + '/game')
         os.makedirs(t.out + '/title/code')
         open(t.out + '/title/code/game.rpx', 'wb').close()
-        os.makedirs(c.CEMU + '/portable', exist_ok=True)
-        open(c.CEMU + '/portable/log.txt', 'w').close()
+        cemu_template()
         calls = []
+        sequence = count(1)
 
         def runner(*argv):
             seconds = int(argv[argv.index('-Seconds') + 1])
             shots = int(argv[argv.index('-Shots') + 1])
             interp = '-Interpreter' in argv
             calls.append((seconds, shots, interp))
-            log = t.common + '/log.txt'
+            profile = argv[argv.index('-CemuDir') + 1]
+            assert profile != c.CEMU
+            with open(profile + '/portable/log.txt', 'w') as f:
+                f.write('attempt ' + 'x' * next(sequence))
+            log = profile + '/portable/mlc01/usr/save/00050000/ff/user/common/log.txt'
             if len(calls) > 1 and not interp:
-                open(log, 'w').close()
-                return SimpleNamespace(stdout='exited by itself')
+                if os.path.exists(log):
+                    os.remove(log)
+                return SimpleNamespace(stdout='exited by itself', returncode=0)
             with open(log, 'w') as f:
                 f.write('[fs] every file call goes straight\n[glsl] compiler thread ready\n[quit] sound system shut down\n')
             count = int((35 if interp else seconds) / (seconds / shots))
-            folder = t.data + '/shots/cemu'
+            folder = argv[argv.index('-Out') + 1]
             os.makedirs(folder, exist_ok=True)
             img = QImage(128, 72, QImage.Format_RGB888)
             img.fill(QColor('green'))
             for i in range(count):
                 for screen in ('tv', 'pad'):
                     img.save(f'{folder}/{screen}_{i:02d}.png')
-            return SimpleNamespace(stdout='closed')
+            return SimpleNamespace(stdout='closed', returncode=0)
 
         with mock.patch.object(c, 'run', side_effect=runner):
             faults, notes = c.judge(t, 200, [])
@@ -128,6 +229,7 @@ def main():
             faults, notes = c.judge(t, 200, [], measured=True)
         assert any('unverified rendering' in fault for fault in faults), faults
         assert any('lacks complete execution counters' in fault for fault in faults), faults
+    test_judge_quit_routes()
     print('ok')
 
 

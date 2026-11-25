@@ -1,15 +1,18 @@
-// shadergen --lists <out.bin> <romfs.bin>...: the vertex programs a game sets up from GPU command lists it keeps in its files.
+// shadergen --lists <out.bin> [--dvlb <dvlb-stream>] [--materials <material-stream>] <romfs.bin>...
 //
 // Game Freak's model files (Pokémon Sun and Moon on) hold a shader not as a shader binary (DVLB) but as the register writes that load it:
 // the code, the swizzles, the uniforms, the entry point and the output map, ending in the jump back out of the list. The files lie packed
 // (LZ11) in GARC archives, 7 GB unpacked for Ultra Sun, so the search is native code here; tools/dvlb_to_log.py, which finds the shader
 // binaries, runs it and keeps what it finds with them. Each list is read the way runtime/gpu/gpu.cpp runs one, and what a draw after it
 // would log (port/pc/vs_log.cpp) is written as a "VS  " record, each different one once.
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "gpu/pica.h"
@@ -19,6 +22,10 @@ using namespace gpu;
 namespace {
 constexpr size_t kMostUnpacked = 64 << 20;  // of one file in an archive, packed or unpacked (tools/dvlb_to_log.py's MAX_UNPACKED)
 constexpr size_t kMostTable = 64 << 20;     // of a romfs's file table, or an archive's
+constexpr size_t kMostDvlb = 1 << 18;      // tools/dvlb_to_log.py's MAX_BINARY
+constexpr char kCriMagic[] = "CRILAYLA";
+constexpr size_t kCriMagicSize = sizeof kCriMagic - 1;
+constexpr size_t kCriPrefix = 256;
 
 u32 le16at(const u8 *p) { return p[0] | p[1] << 8; }
 u32 le32at(const u8 *p) { return p[0] | p[1] << 8 | p[2] << 16 | (u32)p[3] << 24; }
@@ -175,6 +182,7 @@ std::string list_record(const u8 *d, size_t n, size_t at) {
 struct Found {
     std::set<std::string> seen;
     std::string records;  // each different one, in the order met
+    std::ofstream dvlb, materials;
     u64 archives = 0, entries = 0, bytes = 0, lists = 0;
 };
 
@@ -187,6 +195,166 @@ void scan(const u8 *d, size_t n, Found &found) {
         if (rec.empty()) continue;
         found.lists++;
         if (found.seen.insert(rec).second) found.records += rec;
+    }
+}
+
+// CRILAYLA stores the first 256 decoded bytes after its bitstream. The remaining bytes decode backwards.
+bool uncrilayla(const std::vector<u8> &packed, size_t body, std::vector<u8> &out) {
+    size_t disk = packed.size() - kCriPrefix;
+    out.resize(kCriPrefix + body);
+    memcpy(out.data(), packed.data() + disk, kCriPrefix);
+    size_t remaining = body;
+    u32 value = 0, bits = 0;
+    const auto read_bits = [&](u32 n) -> int {
+        while (bits < n) {
+            if (!disk) return -1;
+            value = (value << 8) | packed[--disk];
+            bits += 8;
+        }
+        bits -= n;
+        return (value >> bits) & ((1u << n) - 1);
+    };
+    while (remaining) {
+        const int token = read_bits(1);
+        if (token < 0) return false;
+        const size_t pos = kCriPrefix + remaining - 1;
+        if (!token) {
+            const int byte = read_bits(8);
+            if (byte < 0) return false;
+            out[pos] = (u8)byte;
+            --remaining;
+            continue;
+        }
+        const int offset = read_bits(13);
+        if (offset < 0 || (size_t)offset + 3 > body - remaining) return false;
+        const size_t back = (size_t)offset + 3;
+        size_t count = 3;
+        for (u32 width = 2;; width = width == 2 ? 3 : width == 3 ? 5 : 8) {
+            const int step = read_bits(width);
+            if (step < 0) return false;
+            count += step;
+            if (count > remaining) return false;
+            if ((u32)step != (1u << width) - 1) break;
+        }
+        for (; count; --count, --remaining) {
+            const size_t dst = kCriPrefix + remaining - 1;
+            out[dst] = out[dst + back];
+        }
+    }
+    return true;
+}
+
+void put_le32(u8 *dest, u32 value) {
+    for (unsigned i = 0; i < 4; ++i) dest[i] = (u8)(value >> (i * 8));
+}
+
+std::ostream &write_frame(std::ostream &out, const u8 *data, size_t size) {
+    u8 length[4];
+    put_le32(length, (u32)size);
+    return out.write((const char *)length, sizeof length).write((const char *)data, size);
+}
+
+void write_materials(const std::vector<u8> &body, std::ofstream &out) {
+    if (!out.is_open() || !out || body.size() < 4) return;
+    const std::string_view data((const char *)body.data(), body.size());
+    if (data.compare(0, 4, "darc") == 0 || data.compare(0, 4, "BG4\0", 4) == 0) {
+        write_frame(out, body.data(), body.size());
+        return;
+    }
+
+    // Match the complete six-stage list and bound its trailing register writes as tev_to_log.py does.
+    constexpr std::string_view first("\xc0\x00\x4f\x80", 4);
+    constexpr u32 headers[] = {0x804f00c0, 0x804f00c8, 0x804f00d0, 0x804f00d8, 0x804f00f0, 0x804f00f8};
+    size_t mtob = data.npos, next_mtob = data.npos;
+    std::vector<u8> record;
+    for (size_t at = data.find(first); at != data.npos; at = data.find(first, at + 4)) {
+        if (at < 4 || at % 4) continue;
+        size_t end = 0;
+        for (size_t stride : {0x1c, 0x18, 0x20}) {
+            if (at + 5 * stride + 20 > data.size()) continue;
+            size_t i = 1;
+            while (i < std::size(headers) && le32at(body.data() + at + i * stride) == headers[i]) ++i;
+            if (i < std::size(headers)) continue;
+            end = at + 5 * stride + 20;
+            break;
+        }
+        if (!end) continue;
+        for (size_t q = end, i = 0; i < 12 && q + 8 <= data.size(); ++i) {
+            const u32 header = le32at(body.data() + q + 4);
+            if ((header & 0xffff) > 0x2ff || !(header & 0xf0000)) break;
+            end = q + 8;
+            const u32 n = (header >> 20) & 255;
+            q = end + 4 * (n + (n & 1));
+        }
+
+        if (record.empty()) next_mtob = data.find("MTOB");
+        while (next_mtob != data.npos && next_mtob + 4 <= at) {
+            mtob = next_mtob;
+            next_mtob = data.find("MTOB", mtob + 4);
+        }
+        const size_t start = at >= 0x20 ? at - 0x20 : 0;
+        const bool copy_mtob = mtob != data.npos && mtob < start;
+        constexpr size_t mtob_size = 24;
+        const u32 material_offset = (u32)(at - start + (copy_mtob ? mtob_size : 0));
+        const u32 mtob_offset = mtob == data.npos ? 0xffffffff : copy_mtob ? 0 : (u32)(mtob - start);
+        record.resize(12);
+        memcpy(record.data(), "MTEV", 4);
+        put_le32(record.data() + 4, material_offset);
+        put_le32(record.data() + 8, mtob_offset);
+        if (copy_mtob) record.insert(record.end(), body.data() + mtob, body.data() + mtob + mtob_size);
+        record.insert(record.end(), body.data() + start, body.data() + end);
+        if (!write_frame(out, record.data(), record.size())) return;
+    }
+}
+
+void write_dvlbs(const std::vector<u8> &body, std::ofstream &out) {
+    if (!out.is_open() || !out) return;
+    for (size_t at = 0; at + 16 <= body.size(); ++at) {
+        const u8 *d = body.data() + at;
+        if (memcmp(d, "DVLB", 4)) continue;
+        const u32 count = le32at(d + 4);
+        if (!count || count > 256) continue;
+        const size_t size = std::min(body.size() - at, kMostDvlb), dvlp = 8 + 4 * count;
+        if (dvlp + 4 > size || memcmp(d + dvlp, "DVLP", 4)) continue;
+        if (!write_frame(out, d, size)) return;
+    }
+}
+
+size_t scan_crilayla(Image &img, u64 at, u64 available, std::vector<u8> &packed, std::vector<u8> &body, Found &found) {
+    u8 head[16];
+    if (available < sizeof head + kCriPrefix || !img.read(at, head, sizeof head) || memcmp(head, kCriMagic, kCriMagicSize)) return 0;
+    const size_t unpacked = le32at(head + 8), stored = le32at(head + 12);
+    if (unpacked > kMostUnpacked - kCriPrefix || stored > kMostUnpacked - sizeof head - kCriPrefix) return 0;
+    const size_t frame_size = sizeof head + stored + kCriPrefix;
+    if (frame_size > available || !img.read(at + sizeof head, packed, frame_size - sizeof head) || !uncrilayla(packed, unpacked, body)) return 0;
+    ++found.entries;
+    found.bytes += body.size();
+    write_dvlbs(body, found.dvlb);
+    write_materials(body, found.materials);
+    return frame_size;
+}
+
+void scan_cpk(Image &img, u64 at, u64 size, std::vector<u8> &packed, std::vector<u8> &body, Found &found) {
+    constexpr size_t kChunk = 1 << 20;
+    std::vector<u8> chunk;
+    ++found.archives;
+    for (u64 pos = 0; size - pos >= kCriMagicSize;) {
+        const size_t read_size = (size_t)std::min<u64>(size - pos, kChunk + kCriMagicSize - 1);
+        if (!img.read(at + pos, chunk, read_size)) return;
+        size_t i = 0;
+        while (i + kCriMagicSize <= read_size) {
+            const auto *first = (const u8 *)memchr(chunk.data() + i, kCriMagic[0], read_size - i - kCriMagicSize + 1);
+            if (!first) {
+                i = read_size - kCriMagicSize + 1;
+                break;
+            }
+            i = first - chunk.data();
+            size_t frame_size = 0;
+            if (!memcmp(first, kCriMagic, kCriMagicSize))
+                frame_size = scan_crilayla(img, at + pos + i, size - pos - i, packed, body, found);
+            i += frame_size ? frame_size : 1;
+        }
+        pos += i;
     }
 }
 
@@ -217,8 +385,11 @@ void scan_archive(Image &img, u64 at, u64 size, Found &found) {
             p += 12;
             if (end <= start || data + end > size || end - start > kMostUnpacked || !img.read(at + data + start, packed, end - start)) continue;
             found.entries++;
-            if (unlz11(packed.data(), packed.size(), body)) scan(body.data(), body.size(), found);
-            else scan(packed.data(), packed.size(), found);
+            const bool expanded = unlz11(packed.data(), packed.size(), body);
+            const auto &payload = expanded ? body : packed;
+            scan(payload.data(), payload.size(), found);
+            if (expanded) write_dvlbs(payload, found.dvlb);
+            write_materials(payload, found.materials);
         }
     }
 }
@@ -230,26 +401,66 @@ bool scan_romfs(const char *path, Found &found) {
     u8 head[40];
     if (!img.open(path) || !img.read(0, head, sizeof head) || le32at(head) != sizeof head) return false;
     const u64 files = le32at(head + 28), files_size = le32at(head + 32), base = le32at(head + 36);
-    std::vector<u8> table;
+    std::vector<u8> table, packed, body;
     if (files_size > kMostTable || !img.read(files, table, files_size)) return false;
+    const bool scan_cri = found.dvlb.is_open() || found.materials.is_open();
     for (u64 p = 0; p + 32 <= table.size();) {
-        const u64 at = base + le64at(&table[p + 8]), size = le64at(&table[p + 16]);
-        p += 32 + ((le32at(&table[p + 28]) + 3) & ~3u);
+        const u64 off = le64at(&table[p + 8]), size = le64at(&table[p + 16]);
+        p += 32 + (((u64)le32at(&table[p + 28]) + 3) & ~3ull);
+        if (base > img.size || off > img.size - base || size > img.size - base - off) continue;
+        const u64 at = base + off;
         u8 magic[4];
-        if (size >= 4 && img.read(at, magic, 4) && !memcmp(magic, "CRAG", 4) && size <= img.size - at) scan_archive(img, at, size, found);
+        if (size < sizeof magic || !img.read(at, magic, sizeof magic)) continue;
+        if (!memcmp(magic, "CRAG", 4)) scan_archive(img, at, size, found);
+        else if (scan_cri && !memcmp(magic, "CPK ", 4)) scan_cpk(img, at, size, packed, body, found);
+        else if (scan_cri && !memcmp(magic, kCriMagic, sizeof magic)) scan_crilayla(img, at, size, packed, body, found);
     }
     return true;
 }
 }  // namespace
 
 int lists_main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: shadergen --lists <out.bin> <romfs.bin>...\n");
+    Found found;
+    struct Output {
+        const char *flag;
+        std::ofstream &stream;
+        const char *path = nullptr;
+    } outputs[] = {{"--dvlb", found.dvlb}, {"--materials", found.materials}};
+    int first_romfs = 3;
+    while (first_romfs < argc) {
+        auto *output = std::find_if(std::begin(outputs), std::end(outputs), [&](const Output &candidate) {
+            return !strcmp(argv[first_romfs], candidate.flag);
+        });
+        if (output == std::end(outputs)) break;
+        if (output->path || first_romfs + 1 >= argc) {
+            first_romfs = argc;
+            break;
+        }
+        output->path = argv[first_romfs + 1];
+        first_romfs += 2;
+    }
+    if (argc <= first_romfs) {
+        fprintf(stderr, "usage: shadergen --lists <out.bin> [--dvlb <dvlb-stream>] [--materials <material-stream>] <romfs.bin>...\n");
         return 2;
     }
-    Found found;
-    for (int i = 3; i < argc; i++)
+    for (auto &output : outputs) {
+        if (!output.path) continue;
+        output.stream.open(output.path, std::ios::binary);
+        if (!output.stream) {
+            fprintf(stderr, "could not write %s\n", output.path);
+            return 1;
+        }
+    }
+    for (int i = first_romfs; i < argc; i++)
         if (!scan_romfs(argv[i], found)) fprintf(stderr, "%s: not a romfs, nothing to look through\n", argv[i]);
+    for (auto &output : outputs) {
+        if (!output.path) continue;
+        output.stream.close();
+        if (!output.stream) {
+            fprintf(stderr, "could not write %s\n", output.path);
+            return 1;
+        }
+    }
     FILE *f = fopen(argv[2], "wb");
     if (!f || fwrite(found.records.data(), 1, found.records.size(), f) != found.records.size() || fclose(f)) {
         fprintf(stderr, "could not write %s\n", argv[2]);

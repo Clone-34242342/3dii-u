@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT/'builder'))
 import pipeline
 import ship_card
 import wup_safety as safety
+from test_pipeline_outputs import fake_tmd
 
 KEY = '000102030405060708090a0b0c0d0e0f'
 
@@ -87,10 +88,16 @@ class TicketSafety(unittest.TestCase):
                     self.fail('NAND parent was staged for replacement')
             self.assertEqual(nested_ticket.read_bytes(), b'existing emulator NAND ticket')
             # This is an ordinary generated update: its own ticket is expected and round-trip verified.
+            (out/'title.tmd').write_bytes(fake_tmd(b'previous update', 0x0005000e3d008630))
             result = pack('0005000e3d008630', app_type='0800001b')
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn('round trip verified', result.stdout)
             self.assertEqual(int.from_bytes(old.read_bytes()[0x1dc:0x1e4], 'big'), 0x0005000e3d008630)
+            saved = {f.name: f.read_bytes() for f in out.iterdir()}
+            result = pack('000500003d008631')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('A different Wii U title', result.stderr)
+            self.assertEqual({f.name: f.read_bytes() for f in out.iterdir()}, saved)
 
     def test_builder_rejects_before_staging(self):
         with tempfile.TemporaryDirectory(prefix='3dii-ticket-') as directory:

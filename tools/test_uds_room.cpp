@@ -2,6 +2,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <vector>
+#include "../third_party/3dsrecomp/runtime/services/apt_wireless_reboot.h"
 #include "../third_party/3dsrecomp/runtime/services/misc.cpp"
 
 static std::vector<u8> memory(0x10000, 0xcc);
@@ -31,10 +32,12 @@ int IPC::handles(int pos, std::initializer_list<ObjPtr> objects, bool move) {
     return pos;
 }
 void Event::signal() { signaled = true; }
-u32 IPC::static_buffer(int index, u32 *size) const { assert(index == 0); if (size) *size = 64; return 0x4500; }
+static u32 static_address = 0x4500, static_size = 64;
+u32 IPC::static_buffer(int index, u32 *size) const { assert(index == 0); if (size) *size = static_size; return static_address; }
 void IPC::static_desc(int pos, int index, u32 size) { set(pos, size << 14 | index << 10 | 2); set(pos + 1, static_buffer(index)); }
-void add_timeout(u64, std::function<void()>) { assert(false); }
-u64 now_ns() { assert(false); return 0; }
+static u64 fake_time, scheduled;
+void add_timeout(u64 deadline, std::function<void()>) { assert(fake_time); scheduled = deadline; }
+u64 now_ns() { assert(fake_time); return fake_time; }
 u32 alloc_linear(u32) { assert(false); return 0; }
 ObjPtr get_object(Handle) { assert(false); return {}; }
 void register_service(std::shared_ptr<Service>) { assert(false); }
@@ -53,13 +56,13 @@ std::vector<u8> system_archive_file(u64, const std::string &) { assert(false); r
 
 
 static constexpr u32 cb = 0x1000;
-static void call(kernel::Uds &uds, u32 cmd, std::initializer_list<u32> args = {}) {
+static void call(kernel::Service &service, u32 cmd, std::initializer_list<u32> args = {}) {
     memset(gptr(cb), 0xa5, 0x100);
     w32(cb, cmd << 16 | (u32)args.size() << 6);
     unsigned at = 1;
     for (u32 arg : args) w32(cb + 4 * at++, arg);
     kernel::IPC ipc(nullptr, cb, nullptr);
-    uds.handle(ipc);
+    service.handle(ipc);
 }
 static void reply(u32 cmd, u32 normal, u32 result, u32 translate = 0) {
     assert(r32(cb) == (cmd << 16 | normal << 6 | translate));
@@ -101,7 +104,60 @@ static void scan(kernel::Uds &uds) {
         for (unsigned at = 0x400d; at < 0x4100; ++at) assert(memory[at] == 0xcc);
     }
 }
+static void microphone_clock() {
+    constexpr u64 ms = 1000000;
+    kernel::Mic mic("mic");
+    mic.mem = std::make_shared<kernel::SharedMem>();
+    mic.mem->backing = 0x2000;
+    mic.mem->size = 0x1000;
+    mic.rate = 8182;
+    mic.end = 163;
+    mic.sampling = true;
+    mic.next_tick = 10 * ms;
+    kernel::fake_time = 35 * ms;
+    mic.tick(mic.generation);
+    assert(kernel::scheduled == 20 * ms && mic.pos == 81 && mic.sampling);
+    mic.tick(mic.generation);
+    assert(mic.pos == 163 && r32(0x2ffc) == 163 && mic.buf_full->signaled && !mic.sampling);
+
+    mic.loop = mic.sampling = true;
+    mic.next_tick = 30 * ms;
+    kernel::fake_time = 200 * ms;
+    mic.tick(mic.generation);
+    assert(kernel::scheduled == 110 * ms && mic.pos == 82);
+    kernel::fake_time = 0;
+}
+
 int main() {
+    microphone_clock();
+    auto wireless = [](u32 size, u32 capacity, u32 address, u32 error) {
+        kernel::static_size = capacity;
+        kernel::static_address = address;
+        std::fill(memory.begin(), memory.end(), 0xcc);
+        w32(cb, 0x00450040);
+        w32(cb + 4, size);
+        kernel::IPC ipc(nullptr, cb, nullptr);
+        kernel::get_wireless_reboot_info(ipc);
+        reply(0x45, 1, error, error ? 0 : 2);
+        if (!error) {
+            assert(r32(cb + 8) == (size << 14 | 2));
+            assert(r32(cb + 12) == address);
+        }
+        for (u32 at = 0x4000; at < 0x5000; ++at)
+            assert(memory[at] == (!error && at >= address && at - address < size ? 0 : 0xcc));
+    };
+    wireless(16, 15, 0x4500, kernel::RES_INVALID_COMBINATION);
+    wireless(17, 64, 0x4500, kernel::RES_INVALID_COMBINATION);
+    wireless(16, 64, 0x4ff8, kernel::RES_INVALID_ADDRESS);
+    wireless(16, 64, 0xfffffff8, kernel::RES_INVALID_ADDRESS);
+    wireless(16, 64, 0x4500, 0);
+    kernel::DlpSrvr dlp("dlp:SRVR");
+    for (u64 id : {0ull, 0x0004000000030800ull, 0x0004000100030801ull}) {
+        g_game.program_id = id;
+        call(dlp, 0xe, {0});
+        reply(0xe, 2, 0);
+        assert(r32(cb + 8) == (id == 0x0004000100030801ull));
+    }
     kernel::Uds uds("nwm::UDS");
     call(uds, 6); // EjectSpectators must never become ConnectNetwork.
     offline(uds); // red on the old production scaffold

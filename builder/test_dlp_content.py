@@ -1,14 +1,16 @@
 """Synthetic DLP archive preservation, not inner-CIA validation or multiplayer support."""
 import hashlib
+from io import BytesIO
 from pathlib import Path
 import struct
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 import dumps
-import pipeline
 from selftest import ncch
+import pipeline
 
 
 TITLE = 0x0004000000012300
@@ -114,6 +116,36 @@ class DlpContentTest(unittest.TestCase):
         with mock.patch.object(pipeline, 'tool', return_value=mock.Mock()):
             pipeline.make_title(str(self.root), str(out), info)
         self.assertEqual((out / 'title/content/dlp_child.romfs').read_bytes(), self.body)
+
+    def test_child_staging_requires_matching_cia_and_program_ids(self):
+        child_id = 0x0004000100012302
+        archive = self.root / 'outer.romfs'
+        tree = pipeline.mods.Dir('')
+        tree.files.append([f'{child_id:016x}.cia', (0, len(self.body))])
+        pipeline.mods.write_romfs(tree, BytesIO(self.body), str(archive))
+        self.image.write_bytes(card(ncch(archive.read_bytes())))
+        parent = dumps.Dump(str(self.image))
+        self.addCleanup(parent.f.close)
+
+        for cia_id, ncch_id, program_id in ((child_id, child_id, child_id), (TITLE, child_id, child_id),
+                                           (child_id, TITLE, child_id), (child_id, child_id, TITLE)):
+            with self.subTest(cia_id=cia_id, ncch_id=ncch_id, program_id=program_id):
+                def open_child(path):
+                    self.assertEqual(Path(path).read_bytes(), self.body)
+                    program = mock.Mock()
+                    program.pread.return_value = ncch_id.to_bytes(8, 'little')
+                    return SimpleNamespace(f=open(path, 'rb'), cia=True, title_id=cia_id, encrypted=lambda: False,
+                                           program=lambda: program)
+
+                with mock.patch.object(dumps, 'Dump', side_effect=open_child), \
+                     mock.patch.object(dumps, 'extract_program', return_value={'program_id': f'{program_id:016x}'}) as extract:
+                    if cia_id == ncch_id == program_id == child_id:
+                        pipeline.extract_dlp_child(parent, child_id, str(self.root), str(self.root), None)
+                        extract.assert_called_once()
+                    else:
+                        with self.assertRaisesRegex(dumps.DumpError, 'wrong (title|program) ID'):
+                            pipeline.extract_dlp_child(parent, child_id, str(self.root), str(self.root), None)
+                        self.assertEqual(extract.call_count, int(cia_id == ncch_id == child_id))
 
 
 if __name__ == '__main__':

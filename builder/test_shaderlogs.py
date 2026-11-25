@@ -9,10 +9,12 @@ import shutil
 import struct
 import sys
 import tempfile
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shaderlogs  # noqa: E402
+from make_app import bundle_logs  # noqa: E402
 
 
 def vs(entry, code, swz, tail):
@@ -24,6 +26,9 @@ other = ([0x33, 0x44], [0xC])  # one the DVLB scan never found
 tail = bytes(range(56))
 frag = struct.pack('<I', 3) + b'key' + b'FS  ' + struct.pack('<I', 2) + b'xy'
 log = vs(1, prog[0] + [0x99, 0x99], prog[1] + [0x77], tail) + frag + vs(0, *other, tail)  # memory: the program, then another's leftovers
+
+for pending in (b'VS  ' + bytes(7), vs(0, *other, tail)[:-1], frag[:6], b'FS  '):
+    assert list(shaderlogs.records(log + pending)) == list(shaderlogs.records(log)), 'keep only complete records'
 
 base = tempfile.mkdtemp()
 try:
@@ -73,6 +78,27 @@ try:
     assert shaderlogs.restore(base) == (2, 0)
     with open(os.path.join(base, 'run_vsf.bin'), 'rb') as f:
         assert f.read() == vs(1, *prog, tail) + gsx(prog, gprog, gtail), 'both records back as they were logged'
+
+    src, dst = Path(base) / 'source', Path(base) / 'bundled'
+    logs = src / 'shader_logs'
+    logs.mkdir(parents=True)
+    for name in ('dvlb.bin', 'dvlb.gsl'):
+        shutil.copyfile(Path(base) / name, logs / name)
+    extra = gsx(prog, gprog, b'\x01' + gtail[1:])
+    captured = shaderlogs.split(extra, progs)[1]
+    (logs / 'run.bin').write_bytes(log)
+    (logs / 'run.vsf').write_bytes(vsf + captured + b'GSF ')
+    (logs / 'standalone.vsf').write_bytes(captured)
+    assert bundle_logs(src, dst) == (0, 0)
+    bundled = dst / 'shader_logs'
+    assert (bundled / 'run.vsf').read_bytes() == vsf + captured
+    assert (bundled / 'standalone.vsf').read_bytes() == captured
+    assert not (bundled / 'dvlb.bin').exists()
+    for name in ('dvlb.bin', 'dvlb.gsl'):
+        shutil.copyfile(logs / name, bundled / name)
+    assert shaderlogs.restore(bundled) == (4, 0)
+    assert (bundled / 'run_vsf.bin').read_bytes() == vs(1, *prog, tail) + gsx(prog, gprog, gtail) + extra
+    assert (bundled / 'standalone_vsf.bin').read_bytes() == extra
 finally:
     shutil.rmtree(base)
 
@@ -81,6 +107,34 @@ rnd = random.Random(9)
 
 def words(n):
     return b''.join(struct.pack('<I', rnd.getrandbits(32)) for _ in range(n))
+
+
+with tempfile.TemporaryDirectory() as root:
+    src, dst = Path(root) / 'local', Path(root) / 'bundle'
+    logs = src / 'shader_logs'
+    logs.mkdir(parents=True)
+    first, second = (words(8), words(4)), (words(8), words(4))
+    code, swz = first[0] + second[0][-16:], first[1] + second[1][-8:]
+    captured = shaderlogs.vs_record(1, code, swz, tail)
+    choices = {first, second}
+    found = b''.join(shaderlogs.vs_record(0, *p, tail) for p in (first, second))
+    (src / 'code.bin').write_bytes(words(8))
+    (logs / 'dvlb.bin').write_bytes(found)
+    (logs / 'capture.bin').write_bytes(captured)
+    made, missed = shaderlogs.program_recipes(captured, choices)
+    assert len(list(shaderlogs.recipes(made))) == 1 and missed == 0
+    assert shaderlogs.program_recipes(captured, {first}) == (b'', 1)
+    assert shaderlogs.write_recipes(src, logs) == (1, 0)
+    assert (logs / 'recipes.vsr').read_bytes() == made
+    assert bundle_logs(src, dst) == (1, 0)
+    bundled = dst / 'shader_logs'
+    assert not (bundled / 'capture.vsf').exists(), 'a shorter prefix would discard live instructions'
+    (bundled / 'dvlb.bin').write_bytes(found)
+    assert shaderlogs.restore(bundled) == (1, 0)
+    assert (bundled / 'recipes_vsr.bin').read_bytes() == captured
+    (bundled / 'recipes.vsr').write_bytes(made)
+    (bundled / 'dvlb.bin').write_bytes(shaderlogs.vs_record(0, *first, tail))
+    assert shaderlogs.restore(bundled) == (0, 1)
 
 
 tmp = tempfile.mkdtemp(prefix='shaderlogs_test_')
@@ -109,7 +163,7 @@ try:
     frag, vsf, vsr, left = shaderlogs.split(log, set(), srcs)
     shaderlogs.close(srcs)
     got = list(shaderlogs.recipes(vsr))
-    assert left == [(stranger[:240], stranger[240:])] and len(got) == 1 and not vsf and frag.startswith(b'FS  '), (len(left), len(got))
+    assert left == [(0, stranger[:240], stranger[240:], tail)] and len(got) == 1 and not vsf and frag.startswith(b'FS  '), (len(left), len(got))
     entry, fp, t, pc, ps = got[0]
     assert entry == 3 and t == tail and fp == shaderlogs.fingerprint(code, swz)
     assert len(pc) <= 4 and len(ps) <= 4, (pc, ps)  # a few runs, not a word at a time
@@ -166,7 +220,7 @@ try:
     oracle._raw_runs = None  # original algorithm searched rather than memoizing raw runs
     try:
         missed = shaderlogs.split(harvest_log, set(), oracle)[3]
-        unpacked = oracle.holding([p for c, _ in missed for p in shaderlogs._probes(c)])
+        unpacked = oracle.holding([p for _, c, _, _ in missed for p in shaderlogs._probes(c)])
         expected = shaderlogs.split(harvest_log, set(), oracle, unpacked=unpacked)
         assert len(list(shaderlogs.recipes(expected[2]))) == 3 and len(expected[3]) == 1
     finally:

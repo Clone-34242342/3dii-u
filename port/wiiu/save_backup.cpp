@@ -26,6 +26,8 @@ namespace fs = std::filesystem;
 using Path = fs::path;
 struct Context { Path save, card; uint64_t id; std::string title; };
 constexpr const char *parts[] = {"savedata", "extdata"};
+constexpr const char *card_mount = "fs:/vol/external01";
+constexpr const char *restore_request = "save_restore", *restore_journal = ".checkpoint-restore";
 #ifdef O_BINARY
 constexpr int create_file = O_WRONLY | O_CREAT | O_EXCL | O_BINARY;
 #else
@@ -84,30 +86,46 @@ bool ext_id(const std::string &s) {
     return s.size() == 16 && s.find_first_not_of("0123456789abcdef") == std::string::npos;
 }
 Path game(const Context &c, const char *kind) { return c.card / "3ds" / "Checkpoint" / kind / folder_name(c); }
-Path transaction(const Context &c) { return c.save / ".checkpoint-restore"; }
+Path transaction(const Context &c) { return c.save / restore_journal; }
 
-// Inspect lexical ancestors before following anything; FAT has no links, PC tests do.
-bool checked(const Path &p) {
+// FSA grants access to a save quota or the SD mount, not their virtual parents.
+template<class Stat>
+bool checked_path(const Path &p, const std::string *account_mount, Stat status) {
     for (const auto &part : p) if (part == ".." || part == ".") return false;
     for (Path at = p; !at.empty(); ) {
         std::error_code ec;
-        const auto st = fs::symlink_status(at, ec);
+        const auto st = status(at, ec);
         if (ec && ec != std::errc::no_such_file_or_directory) return false;
         if (!ec && fs::exists(st)) {
             if (!fs::is_directory(st) && !fs::is_regular_file(st)) return false;
             if (at != p && !fs::is_directory(st)) return false;
-#ifdef _WIN32
-            if (GetFileAttributesW(at.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT) return false;
-#endif
             if (fs::is_regular_file(st)) {
                 if (fs::hard_link_count(at, ec) > 1 || ec) return false;
             }
         }
+        if (account_mount && (at == "fs:/vol/save/common" || at == card_mount ||
+                              (!account_mount->empty() && at == *account_mount)))
+            return !ec && fs::is_directory(st);
         const Path parent = at.parent_path();
         if (parent == at) break;
         at = parent;
     }
-    return true;
+    return account_mount == nullptr;
+}
+bool checked(const Path &p) {
+#ifdef SAVE_BACKUP_TEST
+    const std::string *account_mount = nullptr;
+#else
+    const auto *account_mount = &wiiu::save_account_dir();
+#endif
+    return checked_path(p, account_mount, [](const Path &at, std::error_code &ec) {
+        auto st = fs::symlink_status(at, ec);
+#ifdef _WIN32
+        if (!ec && fs::exists(st) && (GetFileAttributesW(at.c_str()) & FILE_ATTRIBUTE_REPARSE_POINT))
+            st.type(fs::file_type::symlink);
+#endif
+        return st;
+    });
 }
 bool present(const Path &p) {
     std::error_code ec;
@@ -335,9 +353,11 @@ bool finish(const Context &c) {
 
 Restore take(const Context &c, std::string &message) {
     message.clear();
-    const Path tx = transaction(c), request = c.save / "save_restore";
-    if (!checked(c.save) || !checked(tx)) {
-        message = "Unsafe restore storage path; no files changed.";
+    const Path tx = transaction(c), request = c.save / restore_request;
+    const bool safe_root = checked(c.save);
+    if (!safe_root || !checked(tx)) {
+        message = safe_root ? "Cannot verify the restore journal; no restore files changed."
+                            : "Cannot verify the game's restore folder; no restore files changed.";
         return Restore::Unsafe;
     }
     Plan prior;
@@ -449,9 +469,17 @@ Restore take(const Context &c, std::string &message) {
 }  // namespace
 
 #ifndef SAVE_BACKUP_TEST
-static Context current() { return {kernel::save_root(), "fs:/vol/external01", g_game.program_id, g_game.name}; }
+static Context current() { return {kernel::save_root(), card_mount, g_game.program_id, g_game.name}; }
 bool export_to_card(std::string &message) { return snapshot([&] { return export_backup(current(), time(nullptr), message); }); }
 bool stage_restore(std::string &message) { return snapshot([&] { return stage(current(), message); }); }
-Restore take_staged_restore(std::string &message) { return take(current(), message); }
+Restore take_staged_restore(std::string &message) {
+    const auto c = current();
+    // Listing the game's mounted folder can confirm an ordinary boot without statting the restore journal.
+    if (save_dir_lacks(c.save.string(), restore_request, restore_journal)) {
+        message.clear();
+        return Restore::None;
+    }
+    return take(c, message);
+}
 #endif
 }  // namespace wiiu::save_backup

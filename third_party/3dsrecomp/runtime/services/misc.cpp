@@ -14,7 +14,8 @@
 // The host's microphone: silence, unless a port provides one
 __attribute__((weak)) void mic_host_start() {}
 __attribute__((weak)) void mic_host_stop() {}
-__attribute__((weak)) void mic_host_read(s16 *out, u32 n, u32 rate) { memset(out, 0, n * 2); }
+__attribute__((weak)) void mic_host_read(s16 *out, u32 n, u32 rate) { memset(out, 0, n * sizeof(*out)); }
+__attribute__((weak)) u32 mic_host_read_available(s16 *out, u32 n, u32 rate) { mic_host_read(out, n, rate); return n; }
 
 namespace kernel {
 
@@ -44,7 +45,7 @@ bool mii_3ds(const std::array<u8, 0x60> &h, std::array<u8, 0x60> &m) {
         for (size_t at = 0x18; at < 0x5C; at += 2)
             if (at != 0x2E) std::swap(m[at], m[at + 1]);  // height and build are a byte each
     }
-    if (m[0] != 3 || !(m[0x0C] | m[0x0D] | m[0x0E] | m[0x0F])) return false;  // not version 3, or no Mii id (an empty slot)
+    if (m[0] != 3 || mii_id_empty(m.data() + 0x0C)) return false;  // not version 3, or no Mii id (an empty slot)
     m[0x01] |= 1;
     // Born on a console that came after the 3DS (4: a Wii U, as its accounts' Miis are), it is said to be a 3DS's: Super Mario 3D Land's Mii
     // library, of 2011, counts no such Mii in Mii Maker ("You don't have any Mii characters") and drops its face from a save file at the
@@ -69,8 +70,11 @@ struct ConsoleMiis {
             if (!mii_3ds(g_host_miis[i], m)) continue;
             size_t at = 0;
             while (at < list.size() && memcmp(&list[at][0x0C], &m[0x0C], 10)) at++;  // the same Mii: its id and the console that made it
-            if ((int)i == g_host_my_mii) mine = (int)at;
             if (at == list.size()) list.push_back(m);
+            if ((int)i == g_host_my_mii) {
+                mine = (int)at;
+                list[at] = m;
+            }
         }
     }
 };
@@ -390,9 +394,11 @@ struct Boss : Service {
 // they have got (3dbrew: MIC Shared Memory).
 struct Mic : Service {
     using Service::Service;
+    static constexpr u64 tick_period = 10000000;
     std::shared_ptr<Event> buf_full = make_event(ONESHOT, "mic");
     std::shared_ptr<SharedMem> mem;
-    u32 start = 0, end = 0, pos = 0, rate = 32730, generation = 0;
+    u64 next_tick = 0;
+    u32 start = 0, end = 0, pos = 0, rate = 32728, generation = 0, sample_remainder = 0;
     u8 encoding = 0, gain = 0, power = 0, clamp = 0;
     bool loop = false, sampling = false;
 
@@ -412,25 +418,28 @@ struct Mic : Service {
     void tick(u32 g) {
         if (g != generation || !sampling) return;
         s16 in[512];
-        const u32 n = rate / 100, step = encoding & 1 ? 2 : 1;
-        mic_host_read(in, n, rate);
+        const u32 budget = rate + sample_remainder, step = encoding & 1 ? 2 : 1;
+        sample_remainder = budget % 100;
+        const u32 n = mic_host_read_available(in, budget / 100, rate);
         for (u32 i = 0; i < n && sampling; i++) {
-            if (pos + step > end) {
-                buf_full->signal();
-                if (!loop) {
-                    stop();
-                    break;
-                }
-                pos = start;
-            }
+            if (end - pos < step) pos = start;
             store(mem->backing + pos, in[i]);
             pos += step;
+            if (end - pos < step) {
+                buf_full->signal();
+                if (!loop) stop();
+            }
         }
         w32(mem->backing + mem->size - 4, pos);
-        if (sampling) add_timeout(now_ns() + 10000000, [this, g] { tick(g); });
+        if (sampling) {
+            // Keep the sampling clock across a late callback, with bounded catch-up after a long pause.
+            const u64 now = now_ns(), catch_up = 9 * tick_period;
+            next_tick = std::max(next_tick + tick_period, now > catch_up ? now - catch_up : 0);
+            add_timeout(next_tick, [this, g] { tick(g); });
+        }
     }
     void handle(IPC &ipc) override {
-        static const u32 rates[4] = {32730, 16360, 10910, 8180};
+        static const u32 rates[4] = {32728, 16364, 10909, 8182};
         switch (ipc.cmd()) {
         case 0x0001:  // MapSharedMemory(size, handle)
             mem = get<SharedMem>(ipc[3]);
@@ -443,17 +452,23 @@ struct Mic : Service {
             break;
         case 0x0003:  // StartSampling(encoding, rate, offset, size, loop)
             stop();
-            if (mem) {
+            if (mem && mem->size > 4 && ipc[3] < mem->size - 4) {
                 encoding = (u8)ipc[1] & 3;
                 rate = rates[ipc[2] & 3];
                 start = pos = ipc[3];
-                end = std::min(start + ipc[4], mem->size - 4);
+                end = start + std::min(ipc[4], mem->size - 4 - start);
+                if (end - start < (encoding & 1 ? 2u : 1u)) {
+                    ipc.ok();
+                    break;
+                }
                 loop = ipc[5] & 1;
                 sampling = true;
+                sample_remainder = 0;
                 LOG("[mic] sampling at %u Hz, encoding %u, %u bytes%s\n", rate, encoding, end - start, loop ? ", looped" : "");
                 mic_host_start();
                 const u32 g = generation;
-                add_timeout(now_ns() + 10000000, [this, g] { tick(g); });
+                next_tick = now_ns() + tick_period;
+                add_timeout(next_tick, [this, g] { tick(g); });
             }
             ipc.ok();
             break;
@@ -902,16 +917,15 @@ struct Ssl : Service {
     }
 };
 
-// dlp:SRVR: Download Play's server side. A game asks it whether it was itself started as a Download Play child; the answer word left out
-// (as an unimplemented command returns) read as "yes" from what the last request left there: Luigi's Mansion: Dark Moon then started in
-// its Thrill Tower multiplayer, as a child looking for its host ("Connection error", "Waiting for player"), not at its title screen.
+// Download Play children are a separate 3DS title category. Use the current guest
+// program ID so retail games take their normal startup path.
 struct DlpSrvr : Service {
     using Service::Service;
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
         case 0x000E:  // IsChild(process id)
             ipc.ok(2);
-            ipc.set(2, 0);
+            ipc.set(2, (g_game.program_id >> 32) == 0x00040001);
             break;
         default:
             unimplemented(ipc);

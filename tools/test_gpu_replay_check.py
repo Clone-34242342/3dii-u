@@ -164,7 +164,7 @@ class ReplayGate(unittest.TestCase):
         raw.mkdir()
         for name in raw_gate.CASES:
             (raw / (name + '.rgba')).write_bytes(b'')
-        counters = {'backend': 'productionGX2', 'native_draws': 6, 'cpu_batches': 0, 'cpu_draws': 0,
+        counters = {'backend': 'productionGX2', 'native_draws': 6, 'immediate_native_draws': 1, 'immediate_cpu_runs': 0, 'cpu_batches': 0, 'cpu_draws': 0,
                     'cpu_vertices': 0, 'cpu_route': 0, 'pixel_misses': 0, 'shader_miss_bytes': 0,
                     'resolution': 480, 'diagnostic_1x': False, 'pass': True}
         def rejected(message):
@@ -172,13 +172,35 @@ class ReplayGate(unittest.TestCase):
                 'frames': [dict(name=name) for name in raw_gate.CASES], 'counters': counters}))
             with self.assertRaisesRegex(ValueError, message):
                 raw_gate.verify(raw, 'productionGX2', self.ref, self.root / 'png')
+        counters['immediate_native_draws'] = 0
+        rejected('native immediate batch')
+        counters['immediate_native_draws'] = 1
         counters['diagnostic_1x'] = True
         rejected('inconsistent diagnostic resolution')
         counters['diagnostic_1x'] = False
-        for field in ('cpu_batches', 'cpu_draws', 'cpu_vertices', 'cpu_route', 'pixel_misses', 'shader_miss_bytes'):
+        for field in ('immediate_cpu_runs', 'cpu_batches', 'cpu_draws', 'cpu_vertices', 'cpu_route', 'pixel_misses', 'shader_miss_bytes'):
             counters[field] = 1
             rejected('fallback or incomplete counters')
             counters[field] = 0
+
+    def test_raw_adapter_rejects_reversed_texture_v(self):
+        reference = self.root / 'analytical'
+        raw_gate.make_analytical(reference)
+        raw = self.root / 'raw'
+        raw.mkdir()
+        frames = []
+        for name in raw_gate.CASES:
+            width, height, rows = pngdiff.load(reference / (name + '.png'))
+            if name == 'texture':
+                # The LCD rotation maps PICA V to the displayed horizontal axis.
+                rows = [row[:200] + row[800:1400] + row[200:800] + row[1400:] for row in rows]
+            (raw / (name + '.rgba')).write_bytes(b''.join(rows))
+            frames.append(dict(name=name, width=width, height=height, wrong_pixels=0))
+        (raw / 'result.json').write_text(json.dumps({'version': 1, 'pass': True,
+            'frames': frames, 'counters': {'backend': 'software'}}))
+        proof = raw_gate.verify(raw, 'software', reference, self.root / 'png')
+        self.assertFalse(proof['match'])
+        self.assertEqual(proof['comparison']['frames']['texture.png']['differing_pixels'], 54000)
 
 
 if __name__ == '__main__':

@@ -2,7 +2,8 @@
 # sent only to Cemu's own windows: the TV's picture and the GamePad's, $Shots times, as tv_NN.png and pad_NN.png in $Out.
 # Nothing else on the screen can end up in the result. Waits for another run to finish instead of closing it.
 # Cemu runs on a Windows desktop of its own, never shown, so it can't cover the user's screen or take their keyboard (the user's rule, 2026-11-07).
-param([string]$Rpx, [string]$Low, [int]$Seconds = 120, [int]$Shots = 6, [string]$Out, [switch]$Interpreter)
+param([string]$Rpx, [string]$Low, [int]$Seconds = 120, [int]$Shots = 6, [string]$Out, [switch]$Interpreter,
+      [string]$CemuDir = (Join-Path $PSScriptRoot '..\..\build_win\cemu'))
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices; using System.Collections.Generic;
 public class W3 {
@@ -37,7 +38,7 @@ public class W3 {
   }
 }
 "@
-$cemuDir = (Resolve-Path (Join-Path $PSScriptRoot '..\..\build_win\cemu')).Path
+$cemuDir = (Resolve-Path -LiteralPath $CemuDir -ErrorAction Stop).Path
 $data = "$cemuDir\portable"
 $sd = "$data\mlc01\usr\save\00050000\$Low\user\common"
 $waited = 0
@@ -63,15 +64,25 @@ Get-ChildItem -LiteralPath $Out -File -ErrorAction SilentlyContinue | Remove-Ite
 $exe = "$cemuDir\CemuMario.exe"
 $cmd = "`"$exe`" -g `"$Rpx`"" + $(if ($Interpreter) { ' --force-interpreter' } else { '' })
 $p = Get-Process -Id ([W3]::Start($exe, $cmd, $cemuDir))
+$null = $p.Handle  # keep the exit status readable after Windows removes the process
 function Post([uint32]$msg, [int]$key, [int64]$l) {  # a key message, to Cemu's own windows only
   foreach ($h in [W3]::Windows([uint32]$p.Id, $true)) { [W3]::PostMessage($h, $msg, [IntPtr]$key, [IntPtr]$l) | Out-Null }
 }
 function Guest-Exited {
+  param([switch]$IncludeFatal)
   if (-not $logFresh) { return $false }
   try {
-    return [IO.File]::GetLastWriteTimeUtc("$sd\log.txt") -ge $p.StartTime.ToUniversalTime() -and
-      [IO.File]::ReadAllText("$sd\log.txt") -cmatch '(?m)^[ \t]*[0-9]+ \[quit\] sound system shut down\r?\n'
+    if ([IO.File]::GetLastWriteTimeUtc("$sd\log.txt") -lt $p.StartTime.ToUniversalTime()) { return $false }
+    $text = [IO.File]::ReadAllText("$sd\log.txt")
+    return $text -cmatch '(?m)^[ \t]*[0-9]+ \[quit\] sound system shut down\r?\n' -or
+      ($IncludeFatal -and $text -cmatch '(?m)^[ \t]*[0-9]+ FATAL: [^\r\n]+\r?\n')
   } catch { return $false }
+}
+function Report-CemuExit {
+  param([switch]$CloseRequested)
+  if ($p.ExitCode -eq 0 -and ($CloseRequested -or (Guest-Exited))) { return }
+  "Cemu exited by itself, code $($p.ExitCode)"
+  Drop-Caches
 }
 function Shot([string]$name) {  # Cemu's screenshot (F12) of what its window shows, moved to $Out under that name once Cemu has written it
   if (Guest-Exited) { return }
@@ -86,12 +97,12 @@ function Shot([string]$name) {  # Cemu's screenshot (F12) of what its window sho
 }
 # Both screens, each time: Cemu's window shows the GamePad's picture while Tab is held. (With its separate GamePad window open Cemu saves
 # that picture too, but the one run tried that way crashed in Cemu at the start of NSMB2, 2026-11-11.)
-$per = [int]($Seconds / [Math]::Max($Shots, 1))
-$captureBudget = [Math]::Max($Seconds, $per * $Shots) + 10  # enough for the final TV/Pad pair, even when neither screenshot arrives
+$per = $Seconds / [double][Math]::Max($Shots, 1)
+$captureBudget = $Seconds + 10  # enough for the final TV/Pad pair, even when neither screenshot arrives
 $captureClock = [Diagnostics.Stopwatch]::StartNew()
 for ($n = 0; $n -lt $Shots -and -not $p.HasExited -and $captureClock.Elapsed.TotalSeconds -lt $captureBudget; $n++) {
   $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
-  while ($wait -gt 0 -and -not $p.HasExited -and -not (Guest-Exited)) {
+  while ($wait -gt 0 -and -not $p.HasExited -and -not (Guest-Exited -IncludeFatal)) {
     Start-Sleep -Milliseconds ([Math]::Min($wait, 1000))
     $wait = [int](($per * ($n + 1) - $captureClock.Elapsed.TotalSeconds) * 1000)
   }
@@ -103,20 +114,27 @@ for ($n = 0; $n -lt $Shots -and -not $p.HasExited -and $captureClock.Elapsed.Tot
     Start-Sleep -Milliseconds 400
     Shot ("pad_{0:d2}.png" -f $n)
   } finally { Post 0x101 0x09 0xC00F0001 }
+  if (Guest-Exited -IncludeFatal) { break }
 }
 Start-Sleep -Seconds 3
 if ($p.HasExited) {
-  "Cemu exited by itself, code $($p.ExitCode)"
-  Drop-Caches
+  Report-CemuExit
 } else {
   $wins = [W3]::Windows([uint32]$p.Id, $false)
   "windows: $($wins.Count)"
   foreach ($h in $wins) { [W3]::PostMessage($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }  # WM_CLOSE
-  if (-not $p.WaitForExit(15000)) {
+  if ($p.WaitForExit(15000)) {
+    Report-CemuExit -CloseRequested
+  } else {
+    $guestQuit = Guest-Exited
     Stop-Process -Id $p.Id -Force -Confirm:$false -ErrorAction SilentlyContinue
     $p.WaitForExit(5000) | Out-Null
     Drop-Caches
-    "Cemu didn't close when asked within 15 s: stopped, and this title's caches deleted"
+    if ($guestQuit) {
+      "Guest shutdown completed. Cemu didn't close within 15 s: stopped, and this title's caches deleted"
+    } else {
+      "Cemu didn't close when asked within 15 s: stopped, and this title's caches deleted"
+    }
   }
 }
 Remove-Item -LiteralPath $mark -Force -Confirm:$false

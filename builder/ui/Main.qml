@@ -25,7 +25,7 @@ ApplicationWindow {
     readonly property bool blocked: dialogLayer.visible || cardMenu.visible || artMenu.visible  // the shortcuts wait while a dialog or a menu is open
     property string page: "build"
     readonly property bool restarting: app.updateState === "restarting"
-    readonly property bool busy: app.building || restarting  // the game controls wait while a build runs or the new version starts
+    readonly property bool busy: app.building || app.queueRunning || restarting  // the game controls wait while a build runs or the new version starts
     property bool showLog: false
     property int openFaq: -1
     property Item lastFocus: null
@@ -614,7 +614,7 @@ ApplicationWindow {
                     anchors.bottom: parent.bottom; anchors.bottomMargin: 26
                     spacing: 8
                     visible: app.hasGame && !app.building
-                    enabled: !win.restarting
+                    enabled: !win.busy
                     Pill { text: "Change game"; onClicked: app.chooseGame() }
                     Pill { id: artPill; text: "Art"; accessibleName: "Art and icon"; tip: app.artText; onClicked: artMenu.openAt(artPill) }
                 }
@@ -671,14 +671,32 @@ ApplicationWindow {
                 }
             }
 
-            Pill {
-                x: 224; y: 630; width: 418; height: 78
-                text: "Build It!"
-                fontSize: 44
-                letterSpacing: 1.5
-                ink: pal.buildText
-                enabled: app.view === "form" && !win.restarting  // build() says what is missing; after a build its own card has the buttons
-                onClicked: app.hasGame ? app.build() : app.chooseGame()
+            Row {
+                x: 224; y: 630
+                spacing: 8
+                readonly property bool canBuild: app.view === "form" && !win.busy
+                Pill {
+                    width: enqueuePill.visible ? 246 : 418; height: 78
+                    text: "Build It!"
+                    fontSize: 44
+                    letterSpacing: 1.5
+                    ink: pal.buildText
+                    enabled: parent.canBuild
+                    onClicked: app.hasGame ? app.build() : app.chooseGame()
+                }
+                Pill {
+                    id: enqueuePill
+                    width: 164; height: 78
+                    text: "Add to queue"
+                    visible: app.hasGame && app.view === "form"
+                    enabled: parent.canBuild
+                    onClicked: {
+                        const count = app.queueItems.length
+                        app.enqueueBuild()
+                        if (app.queueItems.length > count)
+                            column.contentY = 0
+                    }
+                }
             }
 
             // the right column: the choices, or the build
@@ -699,6 +717,51 @@ ApplicationWindow {
                     id: rightCol
                     x: 20; y: 12
                     spacing: 34
+
+                    Card {
+                        visible: app.queueItems.length > 0
+                        title: "Build queue"
+                        Item {
+                            width: 560; height: 50
+                            Row {
+                                anchors.right: parent.right; anchors.rightMargin: 21
+                                spacing: 8
+                                Pill { text: "Clear queue"; enabled: !win.busy; onClicked: app.clearQueue() }
+                                Pill {
+                                    text: app.queueRunning ? "Stop queue" : "Run queue"
+                                    tone: app.queueRunning ? "red" : "cyan"
+                                    enabled: app.queueRunning || (!win.busy && app.queuePending > 0)
+                                    onClicked: app.queueRunning ? app.cancel() : app.startQueue()
+                                }
+                            }
+                        }
+                        ListView {
+                            id: buildQueue
+                            width: 550
+                            height: Math.min(150, count * 50)
+                            clip: true
+                            boundsBehavior: Flickable.StopAtBounds
+                            model: app.queueItems
+                            ScrollBar.vertical: Thumb { policy: ScrollBar.AlwaysOn }
+                            delegate: CardRow {
+                                required property var modelData
+                                required property int index
+                                width: buildQueue.width
+                                label: modelData.name
+                                sub: modelData.status + (modelData.detail ? " · " + modelData.detail : "")
+                                light: modelData.status === "Building" ? "cyan"
+                                     : modelData.status === "Done" ? "green"
+                                     : modelData.status === "Failed" ? "red" : "grey"
+                                Pill {
+                                    text: "Remove"
+                                    accessibleName: "Remove " + modelData.name + " from the queue"
+                                    visible: modelData.status === "Queued"
+                                    enabled: !win.busy
+                                    onClicked: app.removeQueued(index)
+                                }
+                            }
+                        }
+                    }
 
                     // a newer release, from its offer to its being ready (gui.py's updater part)
                     Card {
@@ -743,7 +806,7 @@ ApplicationWindow {
 
                     Card {
                         visible: app.view === "form"
-                        enabled: !win.restarting
+                        enabled: !win.busy
                         title: "Extras"
                         subtitle: "Optional updates, DLC, mods and 3DS saves.\nChoose a game to add its files."
                         CardRow {
@@ -771,7 +834,7 @@ ApplicationWindow {
 
                     Card {
                         visible: app.view === "form"
-                        enabled: !win.restarting
+                        enabled: !win.busy
                         title: "Your Files"
                         subtitle: "These will be staying in your PC.\nThe Builder won't ever show or keep keys."
                         CardRow {
@@ -794,7 +857,7 @@ ApplicationWindow {
                     Card {
                         id: destCard
                         visible: app.view === "form"
-                        enabled: !win.restarting
+                        enabled: !win.busy
                         title: "Put it on"
                         subtitle: "Where the finished game goes: straight onto\nyour Wii U's SD card, or into a folder on this PC."
                         CardRow {
@@ -815,7 +878,7 @@ ApplicationWindow {
                     Card {
                         visible: app.view === "building" || app.view === "failed"
                         title: app.view === "failed" ? "The build stopped" : "Building"
-                        subtitle: app.view === "failed" ? app.resultText : app.gameName
+                        subtitle: app.view === "failed" ? app.resultText : app.buildName
                         titleColor: app.view === "failed" ? pal.redText : pal.title
                         Repeater {
                             model: app.stages
@@ -834,8 +897,8 @@ ApplicationWindow {
                                 anchors.right: parent.right; anchors.rightMargin: 21; y: 8
                                 spacing: 8
                                 Pill { text: win.showLog ? "Hide details" : "Details"; onClicked: win.showLog = !win.showLog }
-                                Pill { text: "Cancel"; tone: "red"; visible: app.view === "building"; enabled: app.building; onClicked: app.cancel() }
-                                Pill { text: "Back"; tone: "cyan"; visible: app.view === "failed"; onClicked: app.back() }
+                                Pill { text: "Cancel"; tone: "red"; visible: app.view === "building" && !app.queueRunning; enabled: app.building; onClicked: app.cancel() }
+                                Pill { text: "Back"; tone: "cyan"; visible: app.view === "failed"; enabled: !win.busy; onClicked: app.back() }
                             }
                         }
                         LogPanel { visible: win.showLog }
@@ -850,8 +913,8 @@ ApplicationWindow {
                             Row {
                                 anchors.right: parent.right; anchors.rightMargin: 21; y: 8
                                 spacing: 8
-                                Pill { text: "Open folder"; tone: "cyan"; onClicked: app.openFolder() }
-                                Pill { text: "Build another"; onClicked: app.back() }
+                                Pill { text: "Open folder"; tone: "cyan"; enabled: !win.busy; onClicked: app.openFolder() }
+                                Pill { text: "Build another"; enabled: !win.busy; onClicked: app.back() }
                             }
                         }
                     }
@@ -865,6 +928,8 @@ ApplicationWindow {
             Item { id: gamesStart }
             property string viewMode: "library"
             property string platformFilter: "all"
+            onViewModeChanged: contentY = 0
+            onPlatformFilterChanged: contentY = 0
             x: 190; y: 100; width: 1090; height: 620
             visible: win.page === "games"
             contentHeight: gamesCol.height + 40
@@ -946,21 +1011,21 @@ ApplicationWindow {
                 }
                 Repeater {
                     model: gamesPage.viewMode === "library" ? [
-                        { title: "Complete", sub: "Confirmed finished on a real Wii U.", list: app.games.filter(g => g.status === "Complete"), light: "cyan" },
-                        { title: "Plays", sub: "Tested on a real Wii U.", list: app.games.filter(g => g.status === "Plays"), light: "grey" },
-                        { title: "Runs in Cemu", sub: "Built with this builder and played in the Cemu emulator, not yet on a real Wii U.", list: app.others, light: "grey" }
+                        { title: "Complete on Wii U", platform: "wiiu", status: "Complete", light: "cyan" },
+                        { title: "Plays on Wii U", platform: "wiiu", status: "Plays", light: "grey" },
+                        { title: "Plays in Cemu", platform: "cemu", status: "Plays", light: "grey" }
                     ] : []
                     Card {
                         id: tier
-                        readonly property string tierLight: modelData.light
+                        readonly property var section: modelData
                         width: 1030
-                        visible: modelData.list.length > 0
-                        title: modelData.title
-                        titleColor: modelData.light === "cyan" ? pal.cyanText : pal.title
-                        subtitle: modelData.sub
+                        visible: tierRows.count > 0
+                        title: section.title
+                        titleColor: section.light === "cyan" ? pal.cyanText : pal.title
                         Repeater {
-                            model: modelData.list
-                            NoteRow { label: modelData.name; sub: modelData.note; light: tier.tierLight }
+                            id: tierRows
+                            model: app.compatList.filter(g => g[tier.section.platform + "_status"] === tier.section.status)
+                            NoteRow { label: modelData.name; sub: modelData[tier.section.platform + "_note"]; light: tier.section.light }
                         }
                     }
                 }
@@ -968,7 +1033,7 @@ ApplicationWindow {
                     width: 1030
                     visible: gamesPage.viewMode === "compat"
                     title: "Compatibility List"
-                    subtitle: "Tested compatibility on real Wii U hardware and Cemu. Ratings reflect console results."
+                    subtitle: "Gameplay results are tracked separately for Wii U and Cemu. Limited checks cover startup or setup scenes."
                     Row {
                         x: 24
                         spacing: 10
@@ -982,16 +1047,16 @@ ApplicationWindow {
                             onClicked: gamesPage.platformFilter = "all"
                         }
                         Pill {
-                            text: "Wii U Verified"
-                            accessibleName: "Show Wii U verified games"
+                            text: "Plays on Wii U"
+                            accessibleName: "Show games playtested on Wii U"
                             tone: gamesPage.platformFilter === "wiiu" ? "cyan" : "grey"
                             fontSize: 15
                             implicitHeight: 32
                             onClicked: gamesPage.platformFilter = "wiiu"
                         }
                         Pill {
-                            text: "Cemu Verified"
-                            accessibleName: "Show Cemu verified games"
+                            text: "Plays in Cemu"
+                            accessibleName: "Show games playtested in Cemu"
                             tone: gamesPage.platformFilter === "cemu" ? "cyan" : "grey"
                             fontSize: 15
                             implicitHeight: 32
@@ -999,13 +1064,14 @@ ApplicationWindow {
                         }
                     }
                     Repeater {
-                        model: (app.compatList || []).filter(g => {
+                        model: app.compatList.filter(g => {
                             if (gamesPage.platformFilter === "wiiu") return g.wiiu_status === "Complete" || g.wiiu_status === "Plays";
-                            if (gamesPage.platformFilter === "cemu") return g.cemu_status === "Plays" || g.status === "Cemu";
+                            if (gamesPage.platformFilter === "cemu") return g.cemu_status === "Plays";
                             return true;
                         })
                         Item {
                             id: cRow
+                            objectName: "compatibilityRow"
                             width: 1030
                             height: Math.max(54, colDetails.implicitHeight + 14)
                             Light {
@@ -1023,13 +1089,19 @@ ApplicationWindow {
                                     font.pixelSize: 18
                                     wrapMode: Text.WordWrap
                                 }
-                                Label {
-                                    width: parent.width
-                                    text: modelData.note
-                                    color: pal.subLabel
-                                    font.pixelSize: 15
-                                    wrapMode: Text.WordWrap
-                                    visible: text.length > 0
+                                Repeater {
+                                    model: [
+                                        { platform: "Wii U", filter: "wiiu", note: modelData.wiiu_note },
+                                        { platform: "Cemu", filter: "cemu", note: modelData.cemu_note }
+                                    ]
+                                    Label {
+                                        width: colDetails.width
+                                        text: modelData.platform + " · " + modelData.note
+                                        color: pal.subLabel
+                                        font.pixelSize: 15
+                                        wrapMode: Text.WordWrap
+                                        visible: modelData.note.length > 0 && (gamesPage.platformFilter === "all" || gamesPage.platformFilter === modelData.filter)
+                                    }
                                 }
                             }
                             Row {
@@ -1294,7 +1366,7 @@ ApplicationWindow {
         }
     }
 
-    Shortcut { sequences: [StandardKey.Open]; enabled: !win.blocked; onActivated: { win.page = "build"; app.chooseGame() } }
+    Shortcut { sequences: [StandardKey.Open]; enabled: !win.blocked && !win.busy; onActivated: { win.page = "build"; app.chooseGame() } }
     Shortcut { sequence: "F1"; enabled: !win.blocked; onActivated: win.page = "help" }
     Shortcut { sequences: ["Return", "Enter"]; enabled: dialogLayer.visible && !noPill.hasFocus; onActivated: app.answer(true) }
     Shortcut { sequence: "Escape"; enabled: win.blocked; onActivated: dialogLayer.visible ? app.answer(false) : cardMenu.visible = artMenu.visible = false }
