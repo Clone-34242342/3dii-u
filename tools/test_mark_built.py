@@ -5,6 +5,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import check_ports as cp  # noqa: E402
@@ -40,5 +41,34 @@ romfs.unlink()
 assert cp.built_from_dump('one') is None, 'a deleted payload cannot pass as a playable cached title'
 romfs.write_bytes(b'fixture')
 assert cp.built_from_dump('one') is not None
+
+cold = Path(d) / 'builder_work/g_one_v1_cold'
+shutil.copytree(title, cold / 'out/title')
+shutil.copyfile(title.parent.parent / 'info.json', cold / 'info.json')
+cp.mark_built('one_cold', 2000, 'Game One (0004000000111100): Not tested\n')
+assert name('g_one_v1') == 'one', 'marking a cold build must never overwrite the warm build marker'
+assert cp.built_from_dump('one_cold').out == (cold / 'out').as_posix()
+(cold / 'check_name.txt').write_text('one')
+assert cp.built_from_dump('one').out == title.parent.as_posix(), 'a warm check cannot use a stale cold marker'
+
+def check_cold_route(extra, expected):
+    entry = {'game': 'synthetic.3ds', **extra}
+    t = cp.Target('nsmb2_cold', '3d0007ae', cold.as_posix(), d)
+    with (patch.object(sys, 'argv', ['check_ports.py', 'nsmb2', '--cold']),
+          patch.object(cp, 'sources', return_value={'games': {'nsmb2': entry}, 'otp': 'unused'}),
+          patch.object(cp, 'build_port') as warm,
+          patch.object(cp, 'build_from_dump', return_value=t) as build,
+          patch.object(cp, 'built_from_dump', return_value=None),
+          patch.object(cp, 'judge', return_value=([], [])) as judge):
+        try:
+            cp.main()
+        except SystemExit as e:
+            assert e.code == 0
+        warm.assert_not_called()
+        build.assert_called_once_with('nsmb2_cold', entry, 'unused')
+        assert judge.call_args.args[0].route == expected
+
+check_cold_route({}, 'nsmb2')
+check_cold_route({'route': 'nsmb2_run'}, 'nsmb2_run')
 shutil.rmtree(d)
 print('mark_built: ok')

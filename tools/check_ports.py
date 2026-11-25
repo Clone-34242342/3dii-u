@@ -127,7 +127,7 @@ def categorize_fault(fault: str) -> str:
     if ('unimplemented service command' in m or 'unimplemented command' in m or 'unimplemented svc' in m or
             '[srv] unhandled' in m or 'unknown service' in m):
         return 'missing service command'
-    if ('vertex shaders the pack lacks' in m or 'shader fallback' in m or
+    if ('vertex shaders the pack lacks' in m or 'unresolved vertex shader' in m or 'shader fallback' in m or
             'console compiler' in m or
             '[glsl]' in m or
             'fragment misses' in m):
@@ -211,6 +211,8 @@ def title_files(out):
 def built_from_dump(name, since=0):
     """the builder's work folder for a game of sources.json, if it's there (and newer than since)"""
     for out in sorted(glob.glob(ROOT + '/builder_work/*/' + ('out_measure' if MEASURE else 'out')), key=os.path.getmtime, reverse=True):
+        if Path(out).parent.name.endswith('_cold') != name.endswith('_cold'):
+            continue
         mark = os.path.dirname(out) + '/check_name.txt'
         if os.path.exists(mark) and open(mark).read() == name and os.path.getmtime(out) >= since and os.path.exists(out + '/title/code/app.xml'):
             manifest = Path(out) / 'check_title_files.json'
@@ -231,7 +233,9 @@ def mark_built(name, started, said):
     of the game the pipeline said it built (its first line has the title ID): another game's build may be going beside this one, and each
     marked the other's folder as its own (Ultra Sun and Ultra Moon, 2026-11-13)."""
     built = re.search(r'\(([0-9A-F]{16})\)', said)
-    for out in glob.glob(ROOT + '/builder_work/*/out*'):
+    for out in glob.glob(ROOT + '/builder_work/*/' + ('out_measure' if MEASURE else 'out')):
+        if Path(out).parent.name.endswith('_cold') != name.endswith('_cold'):
+            continue
         info = os.path.dirname(out) + '/info.json'
         if built and os.path.getmtime(out) >= started and os.path.exists(info) and json.load(open(info))['program_id'][8:] == built.group(1)[8:]:
             if os.path.isdir(out + '/title'):
@@ -491,6 +495,12 @@ def shader_faults(text):
     return faults
 
 
+def vertex_misses(text):
+    missing = set(re.findall(r'\[gx2\] no compiled vertex shader ([0-9a-f]{16}),', text))
+    ready = set(re.findall(r'\[glsl\] vertex ([0-9a-f]{16}) (?:compiled in|restored from native cache)', text))
+    return missing - ready, missing & ready
+
+
 def render_stall_seconds(text):
     """Time spent busy with no GPU progress at the end of a route that drew earlier."""
     samples = re.findall(r'\[wiiu\] frame (\d+): gx lists (\d+), transfers (\d+), guest threads idle (\d+)%', text)
@@ -635,11 +645,11 @@ def judge_runs(t, seconds, flags, measured, scratch):
         if 'every file call goes straight' not in text:
             faults.append(f'{name}: files not direct: ' + ' / '.join(l[:90] for l in text.split('\n') if '[fs] ' in l)[:200])
         # A vertex shader the pack lacks is compiled by the console, and its draws are the CPU's until it's there: a fault only if it never came
-        lacked, came = len(re.findall(r'no compiled vertex shader', text)), len(re.findall(r'\[glsl\] vertex [0-9a-f]+ compiled', text))
-        if lacked > came:
-            faults.append(f'{name}: {lacked - came} vertex shaders the pack lacks and the console did not compile')
-        elif lacked:
-            notes.append(f'{name}: {lacked} vertex shaders the pack lacked, compiled by the console')
+        missing, recovered = vertex_misses(text)
+        if missing:
+            faults.append(f'{name}: {len(missing)} unresolved vertex shader miss(es): {", ".join(sorted(missing))}')
+        if recovered:
+            notes.append(f'{name}: {len(recovered)} vertex shader miss(es) recovered at runtime')
         # A vertex attribute in a layout Cemu has no decoder for is left out, with nothing on the game's log, and the pictures then show what no
         # console draws: NSMB2's world map without its ground, Superstar Saga's backgrounds as stripes (2026-11-11). Cemu's own log says so.
         with open(t.cemu_dir + '/portable/log.txt', encoding='utf-8', errors='replace') as f:
@@ -740,11 +750,11 @@ def main():
     game_gaps = {}
     for game in games:
         started = time.time()
-        if game in SCENES and not args.measure:
+        if not COLD and game in SCENES and not args.measure:
             t = 'a scene needs --measure: its switches reach the game through the measuring build alone'
         elif COLD and game not in src['games']:
             t = f'--cold builds a game from its dump: only the games in {SOURCES}'
-        elif game in GAMES or game in SCENES:
+        elif not COLD and (game in GAMES or game in SCENES):
             of, env = SCENES.get(game, (game, {}))
             t = port(of) if built or of in ports_built else build_port(of)  # a scene's port as this run has built it already
             if not isinstance(t, str):
@@ -774,7 +784,7 @@ def main():
         else:
             t = f'no such game: not one of the ports and not in {SOURCES}'
         if not isinstance(t, str) and game in src['games']:
-            t.route = src['games'][game].get('route', '')
+            t.route = src['games'][game].get('route') or t.route or game
         if args.route and not isinstance(t, str):
             t.route = args.route
         if args.bless and not isinstance(t, str):
