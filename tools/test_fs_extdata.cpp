@@ -16,6 +16,7 @@ void cloud_save_written() {}
 namespace stacks { void save_written(const std::string &) {} }
 namespace kernel {
 u64 g_missing_system_archive;
+void gsp_cpu_wrote(u32, u32) { assert(false); }
 const std::vector<std::array<u8, 0x60>> &console_miis(int *) { assert(false); static const std::vector<std::array<u8, 0x60>> empty; return empty; }
 u16 mii_crc16(const u8 *, size_t) { assert(false); return 0; }
 void run_blocked(Lock &, const std::function<void()> &) { assert(false); }
