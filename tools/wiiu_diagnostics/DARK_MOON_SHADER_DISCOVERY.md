@@ -27,7 +27,7 @@ Both slow shaders reconstruct from the same program in
 boolean-specialized structural analysis reaches 89 and 108 instruction sites,
 respectively. Static sites are not dynamic instruction counts or CPU timings.
 
-The ordinary DVLB scan found two vertex entries. All 34 captured vertex records
+The ordinary DVLB scan found one vertex entry (two output-map records). All 34 captured vertex records
 translate successfully, producing 50 distinct GPU vertex sources and 76 lookup
 keys in the tested generator run. Thus these observations demonstrate a
 discovery/first-use compilation gap, not missing GPU CALL support. The separate
@@ -35,11 +35,29 @@ native geometry translator rejects the captured vertex programs' calls/jumps;
 it is not currently a native vertex backend, and its rejection must not be
 presented as a GPU feature failure.
 
-The material asset has a structured descriptor table and 294 pass descriptors.
-The existing NW4C material scanner finds no materials in that asset. Decoding
-the pass fields into correct uniforms, outputs and fragment states remains an
-investigation. Debug labels include helper functions and cannot safely be
-treated as drawable states by themselves.
+The material asset has 2,905 typed descriptors, 31 material headers and 294
+pass descriptors. The existing NW4C material scanner finds no materials in it.
+The new tagged-material parser follows the descriptor references and the
+primitive/blob arenas, reads the shared DVLB and its boolean/int constants,
+and selects the entry addresses actually named by material/pass headers. It
+finds 38 vertex entries without a gameplay trace. They cover all 23 distinct
+entries in the captured opening data; all 34 captured records agree on code,
+used swizzles, integer defaults, fixed b14 and output mapping. Runtime boolean
+variants remain the shader generator's responsibility.
+
+The 38 selections generate 80 distinct vertex sources and 120 lookup keys;
+Windows CafeGLSL under Steam Proton compiled them in the tested run with at
+most 28 vertex registers (48 available). Synthetic fixtures cover selection,
+helper exclusion, arena alignment, constants, default-pass tokens and malformed
+input rejection. The parser is in the shared PC shader-discovery path and uses
+format tags, not a title ID or captured shader list. Its fresh-cache hardware
+comparison is pending. It currently handles the recognized uncompressed tagged
+assets in RomFS; other containers/layouts may need additional support.
+
+Fragment-state decoding from these material fields remains an investigation.
+Debug labels alone still cannot safely become drawable states. Rejected or
+unrecognized material layouts retain the existing discovery/runtime fallback
+paths, with a diagnostic rather than invented shaders.
 
 The optional asset analyzer associates captured programs with recipe locations
 and DVLE names. Raw programs and private reports stay in the local build area.

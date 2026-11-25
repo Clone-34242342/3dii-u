@@ -183,6 +183,23 @@ def programs(game):
             yield from plain(inner)
 
 
+def material_records(game):
+    """Shader selections in recognized tagged materials, independent of runs."""
+    import tagged_materials
+    with open(os.path.join(game, 'romfs.bin'), 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            for at, size in romfs_files(data):
+                if data[at:at + 4] != tagged_materials.MAGIC:
+                    continue
+                if size > 64 << 20 or at > len(data) or size > len(data) - at:
+                    print('tagged material discovery skipped an oversized/truncated asset', file=sys.stderr)
+                    continue
+                try:
+                    yield from tagged_materials.shader_records(data[at:at + size], sys.modules[__name__])
+                except (ValueError, struct.error, IndexError) as e:
+                    print(f'tagged material discovery incomplete: {e}', file=sys.stderr)
+
+
 def parse(blob):
     n = struct.unpack_from('<I', blob, 4)[0]
     if not 1 <= n <= 256:
@@ -246,10 +263,10 @@ def slots_for(outs):
     return s
 
 
-def record(entry, code, swz, b, slots):
+def record(entry, code, swz, b, slots, integers=bytes(16)):
     out = b'VS  ' + struct.pack('<III', entry, len(code), len(swz))
     out += struct.pack(f'<{len(code)}I', *code) + struct.pack(f'<{len(swz)}I', *swz)
-    out += bytes(b) + bytes(16) + bytes(x & 255 for x in slots)
+    out += bytes(b) + bytes(integers) + bytes(x & 255 for x in slots)
     return out
 
 
@@ -338,6 +355,12 @@ def main():
         loaded += 1
         table.setdefault(start_of(entry, code), slots)
     out += lists
+    discovered = 0
+    for material in material_records(game):
+        for entry, code, _swz, slots in vertex_records(material):
+            table.setdefault(start_of(entry, code), slots)
+        out += material
+        discovered += 1
     agree = differ = unknown = 0
     missing = set()
     for entry, code, _swz, got in logged(game):
@@ -351,7 +374,7 @@ def main():
             agree += 1
         else:
             differ += 1
-    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} from command lists; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
+    print(f'{os.path.basename(game.rstrip("/"))}: {binaries} shader binaries, {kept} vertex programs, {loaded} command-list and {discovered} material selections; logged records: {agree} agree, {differ} other output map, {unknown} not found ({len(missing)} programs)')
     if not check:
         with open(f'{game}/shader_logs/dvlb.bin', 'wb') as f:
             f.write(out)

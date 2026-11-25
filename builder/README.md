@@ -221,3 +221,9 @@ DVLE symbol names. Its static counts are structural estimates, not timings.
 Symbol tables include helper functions, so a label alone must not be made into
 a draw variant without the material's uniforms and output mapping. The separate
 geometry-native translator probe does not describe GPU translator support.
+
+The asset scan also recognizes the tagged 0x1b3/0x1b4 material layout. It follows
+material/pass shader selections and shared DVLB constants/output declarations
+before compiling vertex variants. This does not infer arbitrary fragment states
+or promise complete coverage; recognized-but-invalid assets print a discovery
+diagnostic and leave the existing fallback available.
