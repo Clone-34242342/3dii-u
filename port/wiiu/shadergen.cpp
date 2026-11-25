@@ -138,6 +138,13 @@ void gen_lighting(Gen &g, const LightingState &l) {
                 "        int idx = int(clamp(fl, 0.0, 255.0)); vec2 e = lut_entry(texelFetch(uLut, ivec2(idx, %u), 0));\n"
                 "        dist = e.x + e.y * (loc * 256.0 - float(idx)); }\n",
                 li, li, 16 + lt.num);
+        // Distance attenuation multiplies every RGB contribution, including
+        // ambient. A zero light can skip the remaining LUTs and vector work.
+        // The final light's Fresnel alpha is independent of attenuation.
+        const bool guard_zero_distance = lt.dist_atten &&
+            !(li == l.num_lights - 1 && l.fr.enabled && (l.primary_alpha || l.secondary_alpha));
+        if (guard_zero_distance)
+            g.f("      if (uLscale1.w == 0.0 || dist != 0.0) {\n");
         g.f("      float hl = length(hv); vec3 nh = hl > 0.0 ? hv * (1.0 / hl) : hv;\n"
             "      float lin0 = dot(normal, nh), lin1 = dot(nv, nh), lin2 = dot(normal, nv), lin3 = dot(lv, normal), lin4 = dot(lv, uLights[%u].spot.xyz);\n",
             li);
@@ -153,7 +160,13 @@ void gen_lighting(Gen &g, const LightingState &l) {
                      lt.two_sided ? "true" : "false");
             return std::string(b);
         };
-        g.f("      float spot = %s;\n", lt.spot_atten && l.sp.enabled ? lv(2, 8 + lt.num).c_str() : "1.0");
+        // Spotlight enables change independently during a scene. Keep the
+        // LUT identity specialized, but read the enable from the draw uniform
+        // instead of multiplying shader variants by every light's on/off bit.
+        if (l.sp.enabled)
+            g.f("      float spot = uLights[%u].att.z != 0.0 ? %s : 1.0;\n", li, lv(2, 8 + lt.num).c_str());
+        else
+            g.f("      float spot = 1.0;\n");
         g.f("      float d0 = %s;\n", l.d0.enabled ? lv(0, 0).c_str() : "1.0");
         g.f("      vec3 refl; refl.x = %s;\n", l.rr.enabled ? lv(6, 6).c_str() : "1.0");
         g.f("      refl.y = %s;\n", l.rg.enabled ? lv(5, 5).c_str() : "refl.x");
@@ -174,9 +187,10 @@ void gen_lighting(Gen &g, const LightingState &l) {
             "      vec3 s0 = d0 * uLights[%u].spec0.rgb * g0;\n"
             "      vec3 s1 = d1 * refl * uLights[%u].spec1.rgb * g1;\n"
             "      dsum.rgb += (uLights[%u].diffuse.rgb * dp%s + uLights[%u].ambient.rgb) * att;\n"
-            "      ssum.rgb += (s0 + s1) * clamp_h * att%s;\n"
-            "    }\n",
+            "      ssum.rgb += (s0 + s1) * clamp_h * att%s;\n",
             li, li, li, shp ? " * shadow.rgb" : "", li, shs ? " * shadow.rgb" : "");
+        if (guard_zero_distance) g.f("      }\n");
+        g.f("    }\n");
     }
     if (l.shadow_alpha) {
         if (l.primary_alpha) g.f("    dsum.a *= shadow.a;\n");
@@ -381,8 +395,11 @@ std::string gen_fs_glsl(const DrawState &ds) {
 
 // For combiner settings no run has logged: reads them from uniforms and does what gen_fs_glsl() would have compiled in, far more slowly, but with the right colours. A miss draws
 // with this until a build has its own shader. The plain fallbacks have no combiners, lighting or alpha test, so cut-outs draw solid and lit things go black. Leaves out cube maps,
-// shadow maps and the procedural texture, and the lit one stops at 4 lights, which no logged state passes.
-std::string gen_uber_fs(bool lit) {
+// cube shadow-map variants and procedural textures. Lit families support up to eight lights; specialized programs remain preferred.
+std::string uber_family_key(bool lit, u32 texture_mask) {
+    return std::string(lit ? "uber lit textures " : "uber textures ") + std::to_string(texture_mask & 7);
+}
+std::string gen_uber_fs(bool lit, u32 texture_mask) {
     std::string s = R"(#version 450
 layout(location = 0) in vec4 vColor;
 layout(location = 1) in vec4 vTc01;
@@ -422,8 +439,8 @@ layout(binding = 0, std140) uniform Uni {
     ivec4 uLit3;        // primary alpha, secondary alpha, clamp highlights
     ivec4 uLit4;        // shadow on primary, on secondary
     ivec4 uSel[7];      // d0 d1 sp fr rb rg rr: on, abs, input
-    ivec4 uLight[4];    // LUT number, directional, two sided, shadow
-    ivec4 uLight2[4];   // geometry factor 0, 1, distance attenuation, spot attenuation
+    ivec4 uLight[8];    // LUT number, directional, two sided, shadow
+    ivec4 uLight2[8];   // geometry factor 0, 1, distance attenuation, spot attenuation
 )";
     s += R"(};
 layout(binding = 0) uniform sampler2D t0;
@@ -432,6 +449,16 @@ layout(binding = 2) uniform sampler2D t2;
 layout(binding = 9) uniform sampler2D uFog;
 vec4 prim, fpc, fsc, tx0, tx1, tx2, outc, buf, nxt, K;
 vec2 lut_entry(vec4 t) { return vec2(t.r * 0.99609375 + t.g * 0.00389105, (t.b * 0.99609375 + t.a * 0.00389105) * 2.0 - 1.0); }
+// Explicit scalar operations avoid CafeGLSL's DOT4 channel-scheduling failure
+// in the eight-light fallback. Keep the additions ordered and uncontracted.
+float scalar_dot3(vec3 a, vec3 b) {
+    precise float x = a.x * b.x;
+    precise float y = a.y * b.y;
+    precise float z = a.z * b.z;
+    precise float xy = x + y;
+    precise float xyz = xy + z;
+    return xyz;
+}
 vec4 source(int s) {
     if (s == 0) return prim;
     if (s == 1) return fpc;
@@ -469,7 +496,7 @@ vec3 combine_colour(int op, vec3 a, vec3 b, vec3 c) {
     if (op == 3) return clamp(a + b - 0.50196, 0.0, 1.0);
     if (op == 4) return a * c + b * (1.0 - c);
     if (op == 5) return max(a - b, vec3(0.0));
-    if (op == 6 || op == 7) return vec3(clamp(4.0 * dot(a - 0.50196, b - 0.50196), 0.0, 1.0));
+    if (op == 6 || op == 7) return vec3(clamp(4.0 * scalar_dot3(a - 0.50196, b - 0.50196), 0.0, 1.0));
     if (op == 8) return min(a * b + c, vec3(1.0));
     if (op == 9) return min(a + b, vec3(1.0)) * c;
     return a;
@@ -547,8 +574,8 @@ void light(int i) {
     }
     float hl = length(hv);
     vec3 nh = hl > 0.0 ? hv * (1.0 / hl) : hv;
-    lin0 = dot(normal, nh); lin1 = dot(nv, nh); lin2 = dot(normal, nv); lin3 = dot(lv, normal); lin4 = dot(lv, uLights[i].spot.xyz);
-    lin5 = uLit2.x != 0 ? dot(nh - normal * lin0, tangent) : 0.0;
+    lin0 = scalar_dot3(normal, nh); lin1 = scalar_dot3(nv, nh); lin2 = scalar_dot3(normal, nv); lin3 = scalar_dot3(lv, normal); lin4 = scalar_dot3(lv, uLights[i].spot.xyz);
+    lin5 = uLit2.x != 0 ? scalar_dot3(nh - normal * lin0, tangent) : 0.0;
     bool two = f.z != 0;
     float spot = 1.0, d0 = 1.0, d1 = 1.0;
     if (h.w != 0 && uSel[2].x != 0) spot = uLscale0.z * lut(2, 8 + f.x, two);
@@ -568,7 +595,7 @@ void light(int i) {
     float clamp_h = uLit3.z != 0 && dp == 0.0 ? 0.0 : 1.0;
     float g0 = 1.0, g1 = 1.0;
     if (h.x != 0 || h.y != 0) {
-        float h2 = dot(hv, hv), geo = h2 == 0.0 ? 0.0 : min(dp / h2, 1.0);
+        float h2 = scalar_dot3(hv, hv), geo = h2 == 0.0 ? 0.0 : min(dp / h2, 1.0);
         if (h.x != 0) g0 = geo;
         if (h.y != 0) g1 = geo;
     }
@@ -618,6 +645,10 @@ void lighting() {
     if (uLit.x > 1) light(1);
     if (uLit.x > 2) light(2);
     if (uLit.x > 3) light(3);
+    if (uLit.x > 4) light(4);
+    if (uLit.x > 5) light(5);
+    if (uLit.x > 6) light(6);
+    if (uLit.x > 7) light(7);
     if (uLit2.w != 0) {
         if (uLit3.x != 0) dsum.a *= shadow.a;
         if (uLit3.y != 0) ssum.a *= shadow.a;
@@ -635,10 +666,16 @@ void lighting() {
     if (uUber.w != 0) u0 = u0 * (1.0 / vTc2w.z);
     vec2 u1 = c0 * uTexCoord[1].x + c1 * uTexCoord[1].y + c2 * uTexCoord[1].z;
     vec2 u2 = c0 * uTexCoord[2].x + c1 * uTexCoord[2].y + c2 * uTexCoord[2].z;
-    tx0 = sampled(0, u0, texture(t0, u0));
-    tx1 = sampled(1, u1, texture(t1, u1));
-    tx2 = sampled(2, u2, texture(t2, u2));
-)";
+ )";
+    // Null/unused units need no texture fetch or border test. Lighting retains
+    // its own bump/shadow texture path; this mask specializes TEV inputs only.
+    for (u32 i = 0; i < 3; i++) {
+        const std::string n = std::to_string(i);
+        s += "    tx" + n + " = ";
+        if (texture_mask & (1u << i)) s += "sampled(" + n + ", u" + n + ", texture(t" + n + ", u" + n + "))";
+        else s += "uTexAdd[" + n + "]";
+        s += ";\n";
+    }
     if (lit) s += "    lighting();\n";
     s += R"(    outc = uTevInit[0]; buf = uTevInit[1]; nxt = uTevInit[2];
     if (uUber.x > 0) stage(0);

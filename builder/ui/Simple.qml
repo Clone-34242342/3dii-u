@@ -101,6 +101,36 @@ ApplicationWindow {
             }
         }
 
+        RowLayout {
+            Layout.fillWidth: true
+            Label { text: "Output:" }
+            ComboBox {
+                Layout.preferredWidth: 220
+                Accessible.name: "Output package type"
+                model: ["WUP install", "Homebrew (.wuhb)"]
+                currentIndex: app.outputFormat === "homebrew" ? 1 : 0
+                enabled: !win.busy
+                onActivated: function(index) { app.setOutputFormat(index === 1 ? "homebrew" : "wup") }
+            }
+            Button { text: "Homebrew import guide"; visible: app.outputFormat === "homebrew"; onClicked: app.homebrewGuide() }
+            Item { Layout.fillWidth: true }
+        }
+        RowLayout {
+            visible: app.outputFormat === "homebrew"
+            Layout.fillWidth: true
+            Label { text: "Homebrew build:" }
+            ComboBox {
+                Layout.preferredWidth: 260
+                Accessible.name: "Homebrew build contents"
+                readonly property var keys: ["full", "binary", "shaders", "both"]
+                model: ["Full game (.wuhb)", "Binary only (.rpx)", "Shaders only", "Binary + shaders"]
+                currentIndex: keys.indexOf(app.homebrewParts)
+                enabled: !win.busy
+                onActivated: function(index) { app.setHomebrewParts(keys[index]) }
+            }
+            Item { Layout.fillWidth: true }
+        }
+
         TabBar {
             id: tabs
             objectName: "tabs"
@@ -119,9 +149,9 @@ ApplicationWindow {
             ColumnLayout {  // what every build needs
                 spacing: 8
                 PathRow { label: "Game..."; text: app.hasGame ? app.gameName + "   " + app.meta : "Choose one of your 3DS games"; onChoose: app.chooseGame() }
-                PathRow { label: "Wii U otp.bin..."; text: app.otpText; onChoose: app.chooseOtp() }
+                PathRow { visible: app.outputFormat === "wup"; label: "Wii U otp.bin..."; text: app.otpText; onChoose: app.chooseOtp() }
                 PathRow { label: "3DS keys..."; text: app.keysText; onChoose: app.chooseKeys() }
-                PathRow { label: "3DS system files..."; text: app.sysText; onChoose: app.chooseSystem() }
+                PathRow { visible: app.outputFormat !== "homebrew" || app.homebrewParts === "full"; label: "3DS system files..."; text: app.sysText; onChoose: app.chooseSystem() }
                 GridLayout {
                     columns: 2
                     columnSpacing: 12

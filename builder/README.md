@@ -1,10 +1,10 @@
 # 3Dii U Builder
 
-Turns your own 3DS game dumps into games for your Wii U. Pick a game, say whether to add its update, DLC and a mod, press **Build It!**, and the game lands on your SD card ready for WUP Installer GX2.
+Turns your own 3DS game dumps into games for your Wii U. Pick a game, say whether to add its update, DLC and a mod, choose WUP install or Aroma Homebrew output, and press **Build It!**.
 
 UI and art design by syntcity.
 
-No game data and no keys come with the builder. Everything it builds from is yours: your dumps, your 3DS's keys if the dumps are encrypted, and your Wii U's `otp.bin`.
+No game data and no keys come with the builder. Everything it builds from is yours: your dumps, your 3DS's keys if the dumps are encrypted, and your Wii U's `otp.bin` for WUP output only.
 
 ## Using it
 
@@ -18,15 +18,15 @@ No game data and no keys come with the builder. Everything it builds from is you
 4. **Your Files**: the lights turn cyan when the builder has what it needs.
    - **3DS keys** are only needed for encrypted dumps. The builder decrypts them the way `cia_to_decrypted_3ds.py` does: makerom turns a game's CIA into a `.3ds`, then pyctr decrypts it, with `boot9.bin` and `seeddb.bin` from your own 3DS. It looks for them in `.3ds` in your user folder (`C:\Users\<you>\.3ds`), pyctr's own place; choose another folder if yours are elsewhere. GodMode9 can dump both from a 3DS.
    - **Wii U otp.bin** comes from your own console's NAND backup. The WUP is packed with the key inside it; the builder never shows or stores that key.
-5. **Put it on**: your SD card (cards set up for a Wii U come first), or a folder.
+5. **Output**: choose **WUP install** or **Homebrew (.wuhb)**. Homebrew supports full games and small executable/shader exports; see [Homebrew output and small exports](#homebrew-output-and-small-exports). **Put it on**: your SD card (cards set up for a Wii U come first), or a folder.
 6. **Build It!** It takes a while, longer for bigger games: the game's code is recompiled for the Wii U and its shaders are compiled ahead of time. You see each stage tick off. Your PC stays usable meanwhile, **Cancel** stops it cleanly, and **Details** shows everything the build prints.
-7. Put the card in your Wii U and install with **WUP Installer GX2**. If you installed an older build of the same game, delete that one first (System Settings, Data Management), then install the new one.
+7. Put the card in your Wii U. Launch a complete Homebrew WUHB from the Aroma Menu, or install WUP output with **WUP Installer GX2**. If you installed an older build of the same game, delete that one first (System Settings, Data Management), then install the new one.
 
 **Games** in the bar on the left holds the games you picked before and lists the games tested on a real Wii U; **Help** answers questions about what you need, and holds the version, the update check and the light or dark look.
 
 **Game language** defaults to the computer's display language, with English as the fallback. Choose a language to override it for the selected title. The game must already include that language.
 
-Saves live in the game's own save storage on the console, like any installed game. They show up in Data Management.
+WUP saves use the installed title's NAND/USB save storage and appear in Data Management. Aroma Homebrew saves use the loader's SD-backed save mapping. Save states follow the same backend; small executable/shader imports preserve the original WUHB's save identity.
 
 ### Rebuild just the executable for hardware testing
 
@@ -227,3 +227,36 @@ material/pass shader selections and shared DVLB constants/output declarations
 before compiling vertex variants. This does not infer arbitrary fragment states
 or promise complete coverage; recognized-but-invalid assets print a discovery
 diagnostic and leave the existing fallback available.
+
+## Homebrew output and small exports
+
+Both window layouts have an **Output** choice: **WUP install** or **Homebrew (.wuhb)**.
+Homebrew does not require `otp.bin`. Its **Build** choice selects a complete playable
+WUHB, just the executable, just the two shader files, or executable and shaders.
+Binary-only exports skip shader compilation; shader-only exports skip game-code
+compilation. Partial exports contain no ROM assets and require an existing WUHB.
+The included **Homebrew import guide** explains the companion release layout,
+retaining compatible components, and installing the custom Aroma loader once.
+The loader and its corresponding GPL source are in **Aroma support** in the ZIP.
+
+The pipeline exposes the same choices through `--output-format homebrew` and
+`--homebrew-parts full|binary|shaders|both`. WUP remains the default. A complete
+Homebrew build written to an SD card goes under `wiiu/apps`; small exports go
+under `wiiu/3dii-u/updates` for explicit import. Game saves are not replaced.
+
+To package the Windows app with the custom loader, set `THREEDII_AROMA_MODULE`
+to its built `RPXLoadingModule.wms` and `THREEDII_AROMA_SOURCE` to its matching
+source checkout before running `make_app.py`.
+
+
+### Validation of the November 25 Windows test package
+
+The packaged Windows executable was checked under Steam Proton 11: its frozen
+CLI, both QML layouts and all Homebrew choices, export/artwork/failure handling,
+and compiler-policy scenarios passed. Windows devkitPPC compiled the resumable
+checkpoint, renderer and kernel units. The bundled Windows wuhbtool produced a
+WUHB whose embedded content was checked. The ZIP passed CRC, source-hash and
+payload checks, and includes the Aroma module with corresponding GPL source.
+This is Proton validation, not a native Windows test or a full game build through
+the GUI. Test exports should use the same base game, update, mods and shader
+revision as their original WUHB; rebuild the full game when those assets change.

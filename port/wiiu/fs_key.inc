@@ -97,6 +97,15 @@ DrawState fs_normal(const DrawState &in) {
         LutSel *sels[7] = {&ds.light.d0, &ds.light.d1, &ds.light.sp, &ds.light.fr, &ds.light.rb, &ds.light.rg, &ds.light.rr};
         for (LutSel *s : sels)
             if (!s->enabled) s->abs = false, s->input = 0;
+        for (u32 i = 0; i < ds.light.num_lights; i++) {
+            LightState &lt = ds.light.lights[i];
+            // The per-draw att.z uniform carries the spotlight enable.
+            lt.spot_atten = false;
+            // Per-light shadow gates RGB only. Shadow alpha is applied after
+            // the light loop and does not read this flag.
+            if (!ds.light.shadow_enable || !(ds.light.shadow_primary || ds.light.shadow_secondary)) lt.shadow = false;
+            if (!lt.dist_atten && !ds.light.sp.enabled) lt.num = 0;
+        }
     }
     return ds;
 }

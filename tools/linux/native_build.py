@@ -2,6 +2,7 @@
 """Drive the existing builder with native Linux host/PPC tools and optional Wine GLSLC."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -53,8 +54,14 @@ def main():
     ap.add_argument("--sdk-alias", type=Path)
     ap.add_argument("--tools-dir", type=Path)
     ap.add_argument("--jobs", type=int, default=min(3, os.cpu_count() or 1))
-    ap.add_argument("--resumable", action="store_true", help="experimental dispatcher-boundary code; not whole-game save states (use a separate --work and --output)")
+    ap.add_argument("--resumable", action="store_true", help="alias for --execution-mode resumable")
+    ap.add_argument("--execution-mode", choices=("auto", "classic", "resumable"), default="auto",
+                    help="classic disables checkpoint execution for controlled comparisons; keep separate work/output folders")
+    ap.add_argument("--opt", choices=("-O0", "-O1", "-O2", "-Os"), help="explicit game-code optimization for matched benchmarks")
     a = ap.parse_args()
+    if a.resumable and a.execution_mode == "classic": ap.error("--resumable conflicts with classic execution")
+    if a.resumable: a.execution_mode = "resumable"
+    a.resumable = a.execution_mode == "resumable"
     if a.jobs < 1: ap.error("--jobs must be positive")
     if a.resumable and a.command != 'code': ap.error('--resumable applies only to code')
     if a.resumable and a.work == ROOT / 'build_native':
@@ -87,13 +94,27 @@ def main():
         b.DKP = str(alias); b.WUT = str(alias / "wut"); b.BIN = str(tools.resolve() / "powerpc-eabi-")
         if a.cafeglsl_ppc: b.CAFEGLSL_PPC = str(a.cafeglsl_ppc.resolve())
         os.environ.update(DEVKITPRO=str(alias), DEVKITPPC=str(alias / "devkitPPC"), PATH=str(tools.resolve()) + os.pathsep + str(alias / "devkitPPC/bin") + os.pathsep + str(alias / "tools/bin") + os.pathsep + os.environ["PATH"])
-    game = b.Game(a.name or a.game_dir.name, str(a.game_dir.resolve()))
+    previous = os.environ.get("THREEDII_SESSION_STATES")
+    if a.execution_mode != "auto":
+        os.environ["THREEDII_SESSION_STATES"] = "0" if a.execution_mode == "classic" else "1"
+    try:
+        game = b.Game(a.name or a.game_dir.name, str(a.game_dir.resolve()))
+    finally:
+        if previous is None: os.environ.pop("THREEDII_SESSION_STATES", None)
+        else: os.environ["THREEDII_SESSION_STATES"] = previous
     if a.resumable:
         game.gen, game.mode, game.opt, game.safe_ranges = 'gen_resumable', 'resumable', ['-O1'], []
         game.gen_dir = game.dir + '/' + game.gen
     game.out = str(a.output.resolve()); game.rpx = game.out + "/" + game.name + ".rpx"; game.nm = game.out + "/game.nm"; game.shaders = game.out + "/shaders"
-    args = SimpleNamespace(jobs=a.jobs, force=False, extra_flags='-DRECOMP_RESUMABLE' if a.resumable else None, only=None, opt=None, link_flags=None)
-    if a.command == "code": b.build_code(game, args)
+    args = SimpleNamespace(jobs=a.jobs, force=False, extra_flags='-DRECOMP_RESUMABLE' if a.resumable else None, only=None, opt=a.opt, link_flags=None)
+    if a.command == "code":
+        b.build_code(game, args)
+        manifest = {"game": game.name, "execution_mode": game.mode,
+                    "checkpoint_runtime": game.mode == "resumable",
+                    "optimization": shlex.split(a.opt) if a.opt else game.opt or b.GAME_OPT,
+                    "code_sha256": hashlib.sha256((a.game_dir / "code.bin").read_bytes()).hexdigest(),
+                    "rpx_sha256": hashlib.sha256(Path(game.rpx).read_bytes()).hexdigest()}
+        (a.output / "execution-build.json").write_text(json.dumps(manifest, indent=2) + "\n")
     else: b.build_shaders(game, args)
 
 

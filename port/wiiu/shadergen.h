@@ -6,7 +6,8 @@
 
 namespace gpu {
 std::string gen_fs_glsl(const DrawState &ds);
-std::string gen_uber_fs(bool lit);
+std::string gen_uber_fs(bool lit, u32 texture_mask = 7);
+std::string uber_family_key(bool lit, u32 texture_mask);
 constexpr char kUberKey[] = "uber", kUberLitKey[] = "uber lit";  // their entries in the fragment index, hashed like any key
 // open: the bools the shader reads as it runs, where it is to serve every set of them (vs_open_bools)
 std::string gen_vs_glsl(const ShaderProgram *p, u32 entry, u32 b, const u8 (*iu)[4], const s8 *slot_src, u32 *inputs, u32 open = 0);
@@ -69,5 +70,5 @@ constexpr u32 kShaderIndexMagic = 0x53484458;
 constexpr u32 kShaderIndexVersion = 1;
 // Raised whenever gen_fs_glsl or gen_vs_glsl comes to write a state differently. A console's shader cache holds the text the generator of
 // the build that wrote it made, and a build with another number here starts that cache over (shader_compile.cpp).
-constexpr u32 kShaderGenRevision = 5;
+constexpr u32 kShaderGenRevision = 8;
 }  // namespace gpu

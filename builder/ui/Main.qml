@@ -757,6 +757,48 @@ ApplicationWindow {
 
                     Card {
                         visible: app.view === "form"
+                        enabled: !win.busy
+                        title: "Output"
+                        subtitle: "Choose an installed title or Homebrew."
+                        CardRow {
+                            label: "Package"
+                            ComboBox {
+                                width: 280
+                                palette.base: pal.card
+                                palette.button: pal.card
+                                palette.text: pal.label
+                                palette.buttonText: pal.label
+                                Accessible.name: "Output package type"
+                                model: ["WUP install", "Homebrew (.wuhb)"]
+                                currentIndex: app.outputFormat === "homebrew" ? 1 : 0
+                                onActivated: function(index) { app.setOutputFormat(index === 1 ? "homebrew" : "wup") }
+                            }
+                        }
+                        CardRow {
+                            visible: app.outputFormat === "homebrew"
+                            label: "Build"
+                            ComboBox {
+                                width: 280
+                                palette.base: pal.card
+                                palette.button: pal.card
+                                palette.text: pal.label
+                                palette.buttonText: pal.label
+                                Accessible.name: "Homebrew build contents"
+                                readonly property var keys: ["full", "binary", "shaders", "both"]
+                                model: ["Full game (.wuhb)", "Binary only (.rpx)", "Shaders only", "Binary + shaders"]
+                                currentIndex: keys.indexOf(app.homebrewParts)
+                                onActivated: function(index) { app.setHomebrewParts(keys[index]) }
+                            }
+                        }
+                        CardRow {
+                            visible: app.outputFormat === "homebrew"
+                            label: "Import guide"; sub: "Small exports update an existing WUHB."
+                            Pill { text: "Open"; accessibleName: "Open Homebrew import guide"; onClicked: app.homebrewGuide() }
+                        }
+                    }
+
+                    Card {
+                        visible: app.view === "form"
                         enabled: !win.restarting
                         title: "Your Files"
                         subtitle: "These will be staying in your PC.\nThe Builder won't ever show or keep keys."
@@ -766,11 +808,13 @@ ApplicationWindow {
                             Pill { text: "Folder"; tone: "cyan"; onClicked: app.chooseKeys() }
                         }
                         CardRow {
+                            visible: app.outputFormat === "wup"
                             label: "Wii U otp.bin"; sub: app.otpText; light: app.otpOk ? "cyan" : "red"
                             Pill { text: "Info"; onClicked: app.explain("otp") }
                             Pill { text: "File"; tone: "cyan"; onClicked: app.chooseOtp() }
                         }
                         CardRow {
+                            visible: app.outputFormat !== "homebrew" || app.homebrewParts === "full"
                             label: "3DS System Files"; sub: app.sysText; light: app.sysOk ? "cyan" : "red"
                             Pill { text: "Info"; onClicked: app.explain("system") }
                             Pill { text: "Folder"; tone: "cyan"; onClicked: app.chooseSystem() }

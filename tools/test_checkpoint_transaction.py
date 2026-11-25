@@ -148,6 +148,12 @@ int main(int argc, char **argv) {
  cpu=111;gpu=222;ram[3]=33;command(5);
  assert((g_3dii_state_status&0x80000000)&&cpu==111&&gpu==222&&ram[3]==33); // corrupt file never partially restores
 
+ // A failed storage write must retain a usable RAM checkpoint.
+ g_save_base += "/missing-folder";cpu=432;gpu=876;ram[3]=54;
+ command(4);checkpoint::finish_pending_write();
+ assert(std::string(checkpoint::result_message()).find("RAM STATE RETAINED")!=std::string::npos);
+ cpu=1;gpu=2;ram[3]=3;command(2);
+ assert(g_3dii_state_status==2&&cpu==432&&gpu==876&&ram[3]==54);
 }
 '''
 with tempfile.TemporaryDirectory(prefix='checkpoint-transaction-') as tmp:

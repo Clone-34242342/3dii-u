@@ -51,7 +51,12 @@ std::map<std::string, std::shared_ptr<wiiu::SaveFile>> cache;
 u64 cached_bytes;
 constexpr u64 CACHE_FILE_MAX = 16 << 20, CACHE_MAX = 48 << 20;  // bigger files go to storage as the game writes them
 
+// Unknown storage keeps strict quota commits; only a verified ordinary directory
+// (Aroma's SD-backed homebrew save mapping) can omit them.
+bool checkpoint_quota_required = true;
+std::mutex quota_mutex;
 int flush_save_quotas(bool now) {
+    std::lock_guard<std::mutex> lock(quota_mutex);
     if (!flush_quota) return 0;
     const bool mine = !account_dir.empty() && !g_save_base.compare(0, account_dir.size(), account_dir);
     wiiu::fs_begin(0xC007);
@@ -199,6 +204,7 @@ void save_mount() {
          flush_quota ? "yes" : "no");
     fsa_direct_check_writes();
     if (!account_dir.empty()) fsa_report_save_quota(account_dir.c_str());
+    checkpoint_quota_required = fsa_report_save_quota("/vol/save/common") != 0;
 }
 
 const std::string &save_account_dir() { return account_dir; }
@@ -221,6 +227,21 @@ bool save_pending() {
 
 // Once a burst of writes has settled, or every few seconds if one doesn't. On the card thread, so that a slow flush only makes the game's next file operation wait.
 // The game's storage, and the common one too when asked for at once: the logs, test runs and markers are written there just before.
+int flush_checkpoint_storage() {
+    // Checkpoints only write common storage. Do not commit the unrelated account
+    // directory or ask nn_save to flush an SD directory as a title quota.
+    // fflush/fclose still check the actual file writes on every backend.
+    if (!checkpoint_quota_required) return 0;
+    std::lock_guard<std::mutex> lock(quota_mutex);
+    if (!flush_quota) return -1;
+    fs_begin(0xC007);
+    int result;
+    if (!fsa_direct_flush_quota("/vol/save/common", result))
+        result = flush_quota(&client, &block, COMMON, FS_ERROR_FLAG_ALL);
+    fs_end();
+    return result;
+}
+
 void save_flush(bool now) {
     if (!flush_quota) return;
     const OSTime t = OSGetSystemTime();

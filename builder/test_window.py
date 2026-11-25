@@ -65,6 +65,15 @@ try:
         return len(pills)
 
     settle('loading')
+    for parts in ('full', 'binary', 'shaders', 'both'):
+        state.setOutputFormat('homebrew')
+        state.setHomebrewParts(parts)
+        settle('Homebrew ' + parts)
+        assert state.outputFormat == 'homebrew' and state.homebrewParts == parts
+        saved = json.load(open(settings))
+        assert saved['output_format'] == 'homebrew' and saved['homebrew_parts'] == parts
+    state.setOutputFormat('wup')
+    settle('returning to WUP')
     used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Main.qml'), encoding='utf-8').read()))
     missing = sorted(n for n in used if not hasattr(state, n))
     assert not missing, f'Main.qml uses app.{missing}, which App lacks'
@@ -513,6 +522,12 @@ try:
     simple = engine.rootObjects()[-1]
     assert simple.objectName() == 'simple' and not simple.property('visible'), 'the simple window did not load, or showed itself'
     settle('the simple window')
+    state.setOutputFormat('homebrew')
+    for parts in ('full', 'binary', 'shaders', 'both'):
+        state.setHomebrewParts(parts)
+        settle('simple Homebrew ' + parts)
+    state.setOutputFormat('wup')
+    settle('simple WUP')
     state.tell('A message', 'In the simple window.')
     settle('a message in the simple window')
     assert simple.findChild(QObject, 'dialog').property('visible'), 'the simple window did not show the message'

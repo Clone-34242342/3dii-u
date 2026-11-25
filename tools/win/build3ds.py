@@ -514,6 +514,9 @@ def build_code(g, args):
     link_setup()
     rt = build_runtime(g, args)
     code = build_game_code(g, args)
+    # Game-code compilation may take minutes while runtime fixes are edited.
+    # Recheck dependencies before linking so the executable includes those fixes.
+    rt = build_runtime(g, args)
     link_game(g, rt, code, getattr(args, 'link_flags', None))
 
 
@@ -747,7 +750,7 @@ def prepare_logs(g, shadergen):
     spec.loader.exec_module(fsv)
     # (a finished game's confirmed.bin holds an earlier build's guesses, not what runs met: builder/shaderlogs.py)
     own_logs = [f for f in glob.glob(logs + '/*.bin') if not os.path.basename(f).startswith('other_')
-                and os.path.basename(f) not in ('dvlb.bin', 'variants.bin', 'confirmed.bin')]
+                and os.path.basename(f) not in ('dvlb.bin', 'variants.bin', 'confirmed.bin', 'neighborhood_fs.bin')]
     own = {k for f in own_logs for k in fsv.keys(f)}
     near = []  # the logs of games whose states this one shares: an engine's
     for other in sorted(glob.glob(ROOT + '/games/*/')):
@@ -758,7 +761,7 @@ def prepare_logs(g, shadergen):
         # fs_log.bin and the *_fs.bin files hold fragment states alone; the other_ ones are that game's own copies (taking them nested the names without
         # end), and its models are its own
         theirs = [f for f in glob.glob(f'{other}/shader_logs/*.bin') if (os.path.basename(f) == 'fs_log.bin' or f.endswith('_fs.bin'))
-                  and not os.path.basename(f).startswith('other_') and os.path.basename(f) != 'models_fs.bin']
+                  and not os.path.basename(f).startswith('other_') and os.path.basename(f) not in ('models_fs.bin', 'neighborhood_fs.bin')]
         copied = []
         for f in theirs:
             to = f'{logs}/other_{name}.bin' if os.path.basename(f) == 'fs_log.bin' else f'{logs}/other_{name}_{os.path.basename(f)}'
@@ -768,6 +771,9 @@ def prepare_logs(g, shadergen):
         if states and len(states & own) >= 0.05 * len(states):  # 7% and more within an engine, 3% and less across them (the nine, 2026-11)
             near += copied
     # combinations of the lit parts runs met, made from this game's states and its engine's: another engine's parts only multiply them
+    sys.path.insert(0, ROOT + '/tools')
+    import fragment_neighborhood
+    fragment_neighborhood.write(logs, [f for f in own_logs if os.path.basename(f) != 'models_fs.bin'])
     r = run([sys.executable, ROOT + '/tools/fs_variants.py', logs + '/variants.bin', '--max', str(FRAGMENT_VARIANTS)] + own_logs + near,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-300:].strip())
@@ -779,6 +785,8 @@ def build_shaders(g, args):
     exe = build_shadergen(args)
     prepare_logs(g, exe)
     os.makedirs(g.shaders, exist_ok=True)
+    discovery = g.dir + '/shader_logs/fragment-discovery-report.json'
+    if os.path.isfile(discovery): shutil.copyfile(discovery, g.shaders + '/fragment-discovery-report.json')
     empty = WORK + '/shadergen/no_pipelines.bin'
     open(empty, 'wb').close()
     diagnostic_file = g.shaders + '/shader-diagnostics.tsv'

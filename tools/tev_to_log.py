@@ -245,6 +245,16 @@ def normal(s):
     s = dict(s, tex=tex, tev=tev, fogat=fogat, blend=3 << 24, mask=0)
     if s['light']:
         s['lsel'] = [w if w & 1 else 0 for w in s['lsel']]
+        lights = []
+        for w in s['lights']:
+            # Per-draw spotlight enable is carried by Light.att.z.
+            w &= ~256
+            if not s['lcfg'] & (1 << 15) or not s['lcfg'] & ((1 << 17) | (1 << 18)):
+                w &= ~512
+            if not w & 128 and not s['lsel'][2] & 1:
+                w &= ~7
+            lights.append(w)
+        s['lights'] = lights
     return s
 
 
@@ -457,7 +467,7 @@ def main():
     keys = set()
     for f in glob.glob(logs + '/*.bin'):
         b = os.path.basename(f)
-        if b.startswith('other_') or b in (OUT, 'dvlb.bin', 'vs_log.bin', 'abi_vs_log.bin', 'variants.bin', 'confirmed.bin') or b.endswith('_vs.bin'):
+        if b.startswith('other_') or b in (OUT, 'neighborhood_fs.bin', 'dvlb.bin', 'vs_log.bin', 'abi_vs_log.bin', 'variants.bin', 'confirmed.bin') or b.endswith('_vs.bin'):
             continue
         (held if holdout and 'console' in b else keys).update(records(f))
     for k in keys:

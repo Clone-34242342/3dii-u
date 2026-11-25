@@ -36,6 +36,7 @@ struct Settings {
                               // the bottom small, 4 the bottom screen, 5 the bottom large and the top small
     int pad_layout = 0;       // Wii U: what the GamePad shows (gx2_backend.cpp pad_rect): 0 the bottom screen, 1 the top screen, 2 both, top above bottom
     int resolution = 720;     // Wii U: the rows the top screen is drawn at (gx2_backend.cpp rt_scale), 720 or 480, from the game's next start
+    int wiiu_render_mode = 0; // known Wii U profiles: 0 balanced, 1 sharp, 2 fast (uncapped)
     bool stack_items = false;  // stacks in the pockets, for games whose profile has them (runtime/stacks.mm)
 };
 

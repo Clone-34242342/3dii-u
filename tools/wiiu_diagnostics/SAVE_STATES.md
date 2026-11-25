@@ -76,3 +76,74 @@ paths. `tools/test_state_archive.py` covers logical collection serialization,
 size/truncation rejection and rejection of native pointers/callbacks. These host
 checks complement the hardware tests; they do not emulate the Wii U's allocator
 or prove every persistent service combination safe.
+
+## Installed-title storage quota
+
+The Urban Champion WUP test exposed a storage-size mismatch: its metadata
+allowed 64 MiB of common save storage, while the captured checkpoint payload was
+95,511,936 bytes. RAM restore worked, but the background file write failed.
+Homebrew SD redirection and Cemu do not establish that an installed quota fits.
+New titles request 1 GiB of common storage, covering final/backup/temporary
+archives up to the 256 MiB archive limit plus working space. Ordinary in-game
+account-save quotas are unchanged. Existing installed save-directory resizing
+has not been established; the hardware retest uses a fresh test title ID.
+
+Large checkpoint writes flush stdio and commit storage periodically, and commit
+again after publication. Quota flushes are serialized with the save worker.
+Failure logs identify the operation, error and bytes written; the RAM checkpoint
+remains available if disk storage fails. The overlay uses storage-neutral text.
+
+The fresh Urban Champion WUP Test 2 subsequently logged a completed
+95,298,074-byte background save in 31,398 ms. The user also confirmed loading
+the state after closing and reopening the installed game. This establishes the
+tested title's persistent path, not universal installed-title service coverage.
+A subsequent UI revision adds a pre-submitted loading message during file
+reconstruction and flushes the saving overlay's color cache before scanout;
+its real-console visibility still needs confirmation.
+
+The first homebrew overlay revision regressed SD persistence: both recorded
+attempts failed at the first periodic quota commit (8,427,239 payload bytes),
+with FS_STATUS_NOT_FOUND (-6), while retaining the RAM state. ContentRedirection
+redirects file operations but its FSAFlushQuota replacement passes the original
+path through. Checkpoint commits now inspect the mounted common directory:
+ordinary directories use checked file writes/close without title-quota commits;
+quota directories retain periodic/final commits. Unknown mount information keeps
+the strict commit path. Checkpoints commit only common storage, not an unrelated
+account directory. The corrected homebrew build still needs a completed hardware
+write and cross-launch restore to verify this regression is resolved.
+
+The SD retest completed a 95,325,063-byte background save in 19,888 ms;
+mounted common/account paths both reported ordinary directories, confirming
+that the corrected backend selection removed the quota-flush regression.
+The user still could not see the progress indicator on hardware. The next
+candidate renders it on the actual TV/GamePad target (the same destination as
+the working options menu), submits scanout, then restores the clean retained
+picture from its backup in GPU command order. Each screen logs show/clear and
+backup availability once per transition. This display candidate requires a
+hardware visibility test; successful file writes alone do not verify it.
+
+That display candidate logged both TV and GamePad show/clear with valid backup
+buffers, but the user still saw no GamePad indicator. The next correction
+restores the runtime GX2 context after the backup surface copy and before
+issuing the overlay draw. Native GX2CopySurface uses rendering state internally;
+Cemu's HLE implementation does not reproduce those state changes. The scanout
+fixture deliberately clobbers context on each copy and checks that both screen
+indicators are drawn only after rebinding, scanned out, and removed from the
+retained paused image. This is a hardware-state hypothesis pending console test.
+
+The user confirmed the context-reset revision finally made the indicator work
+on real hardware. A matching Urban Champion WUP Test 2 package was then rebuilt
+for an installed-title regression test, retaining its existing test title ID,
+1 GiB common quota, and the same executable/shaders as the verified homebrew.
+
+
+## Latest storage/display verification summary
+
+Urban Champion's fresh WUP test completed a persistent save and restored it after
+relaunch. The corrected Homebrew backend completed its SD write, and the user
+confirmed the final GX2 context-reset revision made the indicator visible on real
+hardware. A matching WUP package was uploaded afterward; this does not establish
+that every game/service combination or overlay transition is covered. The earlier
+candidate-by-candidate pending notes above document the investigation sequence.
+The loading message is submitted before blocking file reconstruction; it is not
+an animated progress guarantee while the GPU thread is blocked.

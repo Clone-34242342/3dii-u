@@ -4,7 +4,7 @@ from pathlib import Path
 from observed_fragments import fingerprint
 
 def harvest(data,root):
-    if len(data)<8 or struct.unpack_from('>II',data)[0]!=0x53484443 or struct.unpack_from('>II',data)[1] not in (2,4,5):
+    if len(data)<8 or struct.unpack_from('>II',data)[0]!=0x53484443 or struct.unpack_from('>II',data)[1] not in (2,4,5,6,7,8):
         raise ValueError('Unsupported or truncated SHDC cache')
     at=8;found={}
     while at<len(data):

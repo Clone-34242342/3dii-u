@@ -306,16 +306,20 @@ void fsa_direct_report() {
     else LOG("[fs] file calls go through the system's functions: %s\n", why);
 }
 
-void fsa_report_save_quota(const char *path) {
+int fsa_report_save_quota(const char *path) {
     const FSAClientHandle client = FSAAddClient(nullptr);
-    if (client < 0) return;
+    if (client < 0) return -1;
     FSStat status{};
     const FSError result = __wrap_FSAGetStat(client, path, &status);
     FSADelClient(client);
-    if (result == FS_ERROR_OK)
-        OSReport("[3dii-u save] mounted account quota=%llu bytes\n", (unsigned long long)status.quotaSize);
-    else
-        OSReport("[3dii-u save] mounted account quota query failed: %d\n", (int)result);
+    if (result == FS_ERROR_OK) {
+        const bool quota = (status.flags & FS_STAT_QUOTA) == FS_STAT_QUOTA;
+        OSReport("[3dii-u save] mounted storage %s: %s, quota %llu bytes\n", path,
+                 quota ? "quota" : "directory", (unsigned long long)status.quotaSize);
+        return quota ? 1 : 0;
+    }
+    OSReport("[3dii-u save] mounted storage query %s failed: %d\n", path, (int)result);
+    return -1;
 }
 
 // Once direct I/O has been validated, keep quota flushes on that route too.

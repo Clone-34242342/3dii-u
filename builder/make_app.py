@@ -98,7 +98,7 @@ def bundle_logs(src, dst):
         recipes += len(made)
     srcs, cache, left = shaderlogs.sources(src), {}, 0  # a tested game's own code.bin and romfs.bin
     for f in os.listdir(logs):
-        if not f.endswith('.bin') or f == 'dvlb.bin' or f.startswith('other_'):
+        if not f.endswith('.bin') or f in ('dvlb.bin', 'neighborhood_fs.bin') or f.startswith('other_'):
             continue
         with open(os.path.join(logs, f), 'rb') as h:
             frag, vsf, vsr, missing = shaderlogs.split(h.read(), progs, srcs, cache)
@@ -211,6 +211,7 @@ def main():
             '--add-data', f'{os.path.join(HERE, "ui")}{os.pathsep}ui',
             '--add-data', f'{os.path.join(HERE, "compat.json")}{os.pathsep}.',
             '--add-data', f'{os.path.join(HERE, "faq.json")}{os.pathsep}.',
+            '--add-data', f'{os.path.join(HERE, "HOMEBREW_GUIDE.txt")}{os.pathsep}.',
             '--add-data', f'{os.path.join(HERE, "icon.png")}{os.pathsep}.',
             '--add-data', f'{os.path.join(HERE, "bin", "makerom.exe")}{os.pathsep}bin',
             '--collect-submodules', 'pyctr', '--hidden-import', 'gui', '--hidden-import', 'covers', '--hidden-import', 'cia_to_decrypted_3ds']
@@ -229,6 +230,14 @@ def main():
     with open(os.path.join(app, 'Read me first.txt'), 'w', encoding='utf-8') as f:
         f.write(readme)
     shutil.copyfile(os.path.join(HERE, 'app_notices.txt'), os.path.join(app, 'Third-party notices.txt'))
+    shutil.copyfile(os.path.join(HERE, 'HOMEBREW_GUIDE.txt'), os.path.join(app, 'Homebrew import guide.txt'))
+    import aroma_support
+    module = os.environ.get('THREEDII_AROMA_MODULE')
+    source = os.environ.get('THREEDII_AROMA_SOURCE')
+    if not module or not source:
+        sys.exit('Set THREEDII_AROMA_MODULE and THREEDII_AROMA_SOURCE to include the Homebrew update loader and corresponding source.')
+    aroma_support.bundle(app, module, source)
+
     # the app's licence (EUPL-1.2) and every bundled part's notice and full licence text, as the licences ask of a binary release
     shutil.copyfile(os.path.join(ROOT, 'LICENSE'), os.path.join(app, 'LICENSE.txt'))
     shutil.copyfile(os.path.join(ROOT, 'THIRD_PARTY_LICENSES.md'), os.path.join(app, 'THIRD_PARTY_LICENSES.md'))

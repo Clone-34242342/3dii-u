@@ -54,6 +54,8 @@
 #include "loader.h"
 #include "present_rule.h"
 #include "screen_layouts.h"
+#include "scaled_copy.h"
+#include "darkmoon_policy.h"
 #include "settings.h"
 #include "shader_compile.h"
 #include "shadergen.h"
@@ -72,6 +74,7 @@ extern "C" uint64_t GX2GPUTimeToCPUTime(uint64_t time);
 namespace wiiu {
 #ifdef RECOMP_RESUMABLE
 void draw_state_saving_on(GX2ColorBuffer *cb);
+bool state_loading_visible();
 #endif
 static void relieve_mem1();  // fast memory found full the first time (beside tv_buffer_to_mem2, which it uses)
 }
@@ -280,6 +283,13 @@ std::unordered_map<u64, VsEntry> vs_table;
 std::unordered_map<u64, PsEntry> ps_table;
 GX2VertexShader *vs_passthrough, *vs_blit;
 GX2PixelShader *ps_blit, *ps_fallback, *ps_fallback_tex, *ps_uber, *ps_uber_lit;
+GX2PixelShader *ps_uber_family[2][8];
+GX2PixelShader *uber_for(const DrawState &ds) {
+    u32 mask = 0;
+    for (u32 i = 0; i < 3; i++) if (ds.need_tex[i] && !ds.tex[i].null_tex) mask |= 1u << i;
+    GX2PixelShader *p = ps_uber_family[ds.lighting != 0][mask];
+    return p ? p : ds.lighting ? ps_uber_lit : ps_uber;
+}
 GX2PixelShader *ps_depth_copy;
 GX2PixelShader *ps_decode[14];        // by texture format: decodes it on the GPU (gpu_decode); null in a pack from before it had that one
 // A bit per attribute format (s8, u8, s16, float) kept the old way: copied by itself, integers as floats made by the CPU. Files named "cpuattr"
@@ -480,6 +490,11 @@ void load_shader_tables() {
     if (uber != ps_table.end()) ps_uber = load_ps(uber->second.index);
     const auto uber_lit = ps_table.find(fnv64(kUberLitKey, strlen(kUberLitKey)));
     if (uber_lit != ps_table.end()) ps_uber_lit = load_ps(uber_lit->second.index);
+    for (bool lit : {false, true}) for (u32 mask = 0; mask < 8; mask++) {
+        const std::string key = uber_family_key(lit, mask);
+        const auto it = ps_table.find(fnv64(key.data(), key.size()));
+        if (it != ps_table.end()) ps_uber_family[lit][mask] = load_ps(it->second.index);
+    }
     // A state with no compiled shader draws through these until the console has compiled its own (shader_compile.cpp, about 24 ms), in every game. In the Laytons, before
     // that compiler, Emmy's materials came through the lit one see-through on a console, though every draw through it looks right in Cemu, and why was never found: their lit
     // states are compiled ahead (tools/fs_variants.py), so few draws come here. "set uberfb 0" draws misses solid instead, losing only their shading.
@@ -510,7 +525,7 @@ GX2PixelShader *find_ps(const DrawState &ds) {
     if (&ds == last_ds && g.ds_version == last_version) return last;
     last_ds = &ds;
     last_version = g.ds_version;
-    GX2PixelShader *const uber = ds.lighting ? ps_uber_lit : ps_uber;
+    GX2PixelShader *const uber = uber_for(ds);
     if (uber_all && uber && ds.need_shade) return last = uber;
     // Nearly every state has been seen before, and a quick hash finds it. The shaders' own keys are hashed a byte at a time, slow on this CPU.
     u32 words[FS_KEY_WORDS];
@@ -527,9 +542,13 @@ GX2PixelShader *find_ps(const DrawState &ds) {
     const std::string k((const char *)words, nwords * 4);
     const u64 h = fnv64(k.data(), k.size());
     auto it = ps_table.find(h);
+    u64 compile_key = h;
+    DrawState normalized;
     if (it == ps_table.end()) {
-        const std::string n = fs_key(fs_normal(ds));
-        it = ps_table.find(fnv64(n.data(), n.size()));
+        normalized = fs_normal(ds);
+        const std::string n = fs_key(normalized);
+        compile_key = fnv64(n.data(), n.size());
+        it = ps_table.find(compile_key);
     }
     GX2PixelShader *const fallback = !ds.need_shade ? ps_fallback : uber && uber_fallback ? uber : ds.need_tex[0] && !ds.tex[0].null_tex ? ps_fallback_tex : ps_fallback;
     GX2PixelShader *r = fallback;
@@ -548,13 +567,16 @@ GX2PixelShader *find_ps(const DrawState &ds) {
         r = it->second.shader;
     } else {
         st_ps_misses++;
-        ps_table[h].shader = fallback;  // log it once
-        ps_table[h].index = MISSED;
+        // Unknown states share the same canonical key as shipped programs.
+        // Otherwise changes to fixed-function state or uniform-only flags
+        // repeatedly compile identical fragment programs during a cold run.
+        ps_table[compile_key].shader = fallback;  // log the first raw state once
+        ps_table[compile_key].index = MISSED;
         const u32 n = le32((u32)k.size());
         miss_put("FS  ", 4);
         miss_put(&n, 4);
         miss_put(k.data(), k.size());
-        if (ds.need_shade && shader_compile_on()) shader_compile_request(false, h, gen_fs_glsl(ds), 0);  // the console compiles it meanwhile: gfx_pump installs it
+        if (ds.need_shade && shader_compile_on()) shader_compile_request(false, compile_key, gen_fs_glsl(normalized), 0);  // gfx_pump installs it under the same canonical key
     }
     seen[quick] = r;
     last = r;
@@ -2140,6 +2162,10 @@ void set_state(const DrawState &ds) {
     if (has_depth && (ds.depth_write || (stencil && ds.st_mask_w))) cur_depth->written_since_flush = cur_depth->gpu_newer = true;
 }
 
+// Opt-in globally; enabled by the measured Dark Moon title policy below.
+std::atomic<bool> light_guard_experiment{false};
+std::atomic<bool> copy_rect_experiment{false};
+
 struct PsUni {
     u32 depth[4];
     u32 scissor[4];
@@ -2156,7 +2182,7 @@ struct PsUber {
     u32 csrc[6][4], cmod[6][4], asrc[6][4], amod[6][4], stage[6][4];
     u32 tex_coord[3][4], tex_add[3][4], wrap[3][4];
     u32 uber[4];
-    u32 lit[4], lit2[4], lit3[4], lit4[4], sel[7][4], light[4][4], light2[4][4];  // only the lit one reads these
+    u32 lit[4], lit2[4], lit3[4], lit4[4], sel[7][4], light[8][4], light2[8][4];  // only the lit one reads these
 };
 // the procedural texture's settings, after PsUni for the shaders that read it (uPt in shadergen.cpp)
 struct PsProctex {
@@ -2237,7 +2263,7 @@ inline void put3(u32 *d, const float *v, float w = 0) {
 
 // fragment uniforms and textures for this draw
 void set_fragment(const DrawState &ds, bool uber) {
-    const u32 lights = !ds.lighting ? 0 : uber ? std::min<u32>(ds.light.num_lights, 4) : ds.light.num_lights;
+    const u32 lights = !ds.lighting ? 0 : std::min<u32>(ds.light.num_lights, 8);
     const bool proctex = !uber && ds.need_shade && uses_proctex(ds);
     const u32 size = uber ? sizeof(PsUni) + sizeof(PsUber) : proctex ? sizeof(PsUni) + sizeof(PsProctex) : offsetof(PsUni, lights) + lights * sizeof(PsUni::lights[0]);
     auto *u = (PsUni *)ring_alloc((std::max<u32>(size, 256) + 255) & ~255u, 256);
@@ -2262,7 +2288,7 @@ void set_fragment(const DrawState &ds, bool uber) {
         const LutSel *sels[7] = {&l.d0, &l.d1, &l.sp, &l.fr, &l.rb, &l.rg, &l.rr};
         for (u32 k = 0; k < 4; k++) u->lscale0[k] = swap_float(sels[k]->scale);
         for (u32 k = 0; k < 3; k++) u->lscale1[k] = swap_float(sels[k + 4]->scale);
-        u->lscale1[3] = 0;
+        u->lscale1[3] = swap_float(light_guard_experiment.load(std::memory_order_relaxed) ? 1.0f : 0.0f);
         put3(u->ambient, l.global_ambient);
         for (u32 k = 0; k < lights; k++) {
             const LightState &s = l.lights[k];
@@ -2275,7 +2301,9 @@ void set_fragment(const DrawState &ds, bool uber) {
             put3(d.spot, s.spot);
             d.att[0] = swap_float(s.da_scale);
             d.att[1] = swap_float(s.da_bias);
-            d.att[2] = d.att[3] = 0;
+            // Shared specialized shaders branch on this per-draw enable.
+            d.att[2] = swap_float(s.spot_atten ? 1.0f : 0.0f);
+            d.att[3] = 0;
         }
     }
     if (uber) {
@@ -2478,8 +2506,7 @@ void trace_draw(const DrawState &ds, GX2PixelShader *ps, u64 vs) {
     const auto word_count = fs_key_words(ds, words);
     const u64 key = fnv64(words, word_count * sizeof(u32));
     u32 shader = MISSED;
-    if (ps == ps_uber) shader = MISSED - 1;
-    else if (ps == ps_uber_lit) shader = MISSED - 2;
+    if (ps == uber_for(ds) && ps) shader = ds.lighting ? MISSED - 2 : MISSED - 1;
     else if (ps == ps_fallback_tex) shader = MISSED - 3;
     else if (ps && ps != ps_fallback) {
         auto entry = ps_table.find(key);
@@ -2538,7 +2565,7 @@ void begin_draw_common(const DrawState &ds, GX2PixelShader *ps, u64 vs = 0) {
     set_state(ds);
     GX2SetPixelShader(ps);
     lap(P_STATE);
-    set_fragment(ds, ps && (ps == ps_uber || ps == ps_uber_lit));
+    set_fragment(ds, ps && ps == uber_for(ds));
 }
 }  // namespace
 
@@ -3533,9 +3560,12 @@ bool dyn_test;  // a file named "dynres" in the data folder: changes level every
 // fails (back below within 20 seconds) makes the next wait twice as long, up to about 3 minutes.
 void dyn_res_update() {
     if (dyn_force >= 0 || (top_rows <= 720 && !dyn_720)) {  // at 1080p ("top1080"), or when asked: 720p targets fit, and mostly draw at full size
-        if (dyn_force >= 0 && (u32)dyn_force != dyn_level) {
-            if (kMeasure) LOG("[gx2] top screen held at %s size\n", dyn_force ? "the lower" : "full");
-            dyn_level = (u32)dyn_force;
+        // Returning from a forced lower level must also restore full size
+        // when automatic scaling is disabled at the selected resolution.
+        const u32 wanted = dyn_force >= 0 ? (u32)dyn_force : 0;
+        if (wanted != dyn_level) {
+            if (kMeasure) LOG("[gx2] top screen held at %s size\n", wanted ? "the lower" : "full");
+            dyn_level = wanted;
         }
         dyn_waited = 0;
         return;
@@ -3584,9 +3614,30 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
     }
     if (to.surface.image) GX2CopySurface(&from->surface, 0, 0, &to.surface, 0, 0);
 #ifdef RECOMP_RESUMABLE
-    // Compose only onto the temporary scanout copy. The retained game picture
-    // must never contain the spinner, even when the game stops redrawing.
-    if (to.surface.image && checkpoint::saving_to_disk()) wiiu::draw_state_saving_on(&to);
+    const bool overlay = checkpoint::saving_to_disk() || wiiu::state_loading_visible();
+    static bool visible[2];
+    const unsigned screen = target == GX2_SCAN_TARGET_DRC;
+    if (overlay != visible[screen]) {
+        LOG("[state-overlay] %s %s: %ux%u, backup %s\n", screen ? "GamePad" : "TV",
+            overlay ? "show" : "clear", from->surface.width, from->surface.height,
+            to.surface.image ? "ready" : "unavailable");
+        visible[screen] = overlay;
+    }
+    if (to.surface.image && overlay) {
+        // Use the actual screen target, just like the working options menu.
+        // The copy above retains its clean picture. Scan out the overlay, then
+        // restore that picture in GPU command order so paused games stay clean.
+        // Native GX2CopySurface uses its own rendering state. Rebind our
+        // context after that copy, before the menu's small blit setup; Cemu's
+        // HLE copy does not reproduce this state change.
+        restore_context();
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, from->surface.image, from->surface.imageSize);
+        wiiu::draw_state_saving_on(from);
+        GX2CopyColorBufferToScanBuffer(from, target);
+        GX2CopySurface(&to.surface, 0, 0, &from->surface, 0, 0);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, from->surface.image, from->surface.imageSize);
+        return;
+    }
 #endif
     GX2CopyColorBufferToScanBuffer(to.surface.image ? &to : from, target);
 }
@@ -3647,8 +3698,10 @@ static void report_frame_pacing(OSTime began) {
     memset(buckets, 0, sizeof buckets);
 }
 
+static OSTime renderer_started;
 void present() {
     const OSTime pacing_begin = OSGetSystemTime();
+    if (!renderer_started) renderer_started = pacing_begin;
     const OSTime tp = cpu_timing_enabled() ? pacing_begin : 0;
     gt_mark(GT_PRESENT, 0);
     if (dump_enabled && st_flips % 120 == 0) {
@@ -3716,6 +3769,15 @@ PresentRule present_rule;  // when a finished frame is shown (present_rule.h, gf
 // is up, with what it has queued sent to the GPU first; the game waits for the GPU thread as it does for a 3DS's GPU.
 // Which games: by program ID, until there's a way to know a game's own rate. "set capfps N" (0: none) from the PC.
 u32 cap_fps, cap_game;  // what it's held to now, and what this game is held to when it is (the options menu turns it off and on)
+bool has_darkmoon_profile() { return wiiu_render::darkmoon(g_game.program_id); }
+void apply_darkmoon_profile() {
+    if (!has_darkmoon_profile()) return;
+    const auto p = wiiu_render::darkmoon_policy(g_settings.wiiu_render_mode, top_rows);
+    cap_game = 30;
+    cap_fps = p.fps;
+    dyn_low = p.scale;
+    dyn_force = p.force;
+}
 void frame_cap_wait() {
     if (!cap_fps) return;
     static OSTime next;
@@ -3911,6 +3973,14 @@ struct LastTransfer {
     u32 in_paddr = 0, out_paddr = 0, in_dims = 0, out_dims = 0, flags = 0, out_size = 0;
 } last_transfer[3];
 
+// Opt-in hardware comparison. Disable and relaunch to restore existing targets.
+std::atomic<bool> screen_slice_experiment{false};
+float screen_slice_scale(u32 in_w, u32 in_h, u32 out_w, u32 out_h, u32 scaling, u32 rows) {
+    if (rows != 480 || scaling != 1 || in_w != out_w * 2 || in_h != out_h ||
+        (in_w != 240 && in_w != 256) || (in_h != 400 && in_h != 416)) return 0;
+    return rows / 240.0f;
+}
+
 // A transfer between two surfaces the game draws at screen size stays on the GPU, at their higher resolution. Paper Mario draws its 3D at
 // double width, scales it down into a buffer, and copies that into the target it draws the 2D on. Through guest memory that would be a
 // readback every frame at the original resolution, and Cemu doesn't read the GPU's work back at all.
@@ -3953,6 +4023,20 @@ static bool gpu_copy_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_
     const bool linear_out = !(flags & 0x22);
     Surface *dst = get_surface(out_paddr, out_w, out_h, cbuf_to_pixfmt((flags >> 12) & 7), false, src->gpu_chain ? src : nullptr, nullptr, nullptr, linear_out);
     if (dst == src) return false;
+    if (half_ss && screen_slice_experiment.load(std::memory_order_relaxed)) {
+        const float scale = screen_slice_scale(src->w, src->h, out_w, out_h, scaling, top_rows);
+        if (scale && dst->base_sx >= scale && dst->base_sy >= scale &&
+            (dst->base_sx > scale || dst->base_sy > scale)) {
+            // Shrink only: the original allocation remains large enough. The
+            // transfer below rewrites its picture; clear padding before it does.
+            GX2DrawDone();
+            dst->base_sx = dst->base_sy = scale;
+            apply_scale(*dst);
+            dst->first_use = true;
+            state_lost = true;
+            LOG("[gx2] screen-slice experiment: %08x %ux%u at %.1fx selected scale\n", out_paddr, out_w, out_h, scale);
+        }
+    }
     dst->gpu_chain |= src->gpu_chain;
     dst->copy = own_size_copy;
     dst->linear = linear_out;
@@ -4087,12 +4171,23 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     cur_color = nullptr;
     begin_blit();
     // memory row 0 at the top of a surface's rows, as gpu_copy_transfer draws them
-    const u32 x0 = (u32)(first_col * dst->sx), y0 = dst->row0 + (u32)(first_row * dst->sy), w = (u32)(cols * dst->sx), h = (u32)(rows * dst->sy);
+    const bool exact_rect = copy_rect_experiment.load(std::memory_order_relaxed);
+    const auto dx = gx2_copy::span(first_col, cols, dst->sx);
+    const auto dy = gx2_copy::span(first_row, rows, dst->sy);
+    const u32 x0 = dx.first, y0 = dst->row0 + dy.first;
+    const u32 w = exact_rect ? dx.size() : (u32)(cols * dst->sx);
+    const u32 h = exact_rect ? dy.size() : (u32)(rows * dst->sy);
+    if (!w || !h) { state_lost = true; return true; }
     GX2SetViewport((float)x0, (float)y0, (float)w, (float)h, 0, 1);
     GX2SetScissor(x0, y0, w, h);
     float *q = (float *)ring_alloc(4 * 16 + 64, 64);
-    const float th = (float)src->tex_h, u0 = (float)src_col0 / src->w, u1 = (float)(src_col0 + cols) / src->w;
-    const float v0 = (th - src->h + src_row0) / th, v1 = (th - src->h + src_row0 + rows) / th;
+    const auto sx = gx2_copy::span(src_col0, cols, src->sx);
+    const auto sy = gx2_copy::span(src_row0, rows, src->sy);
+    const float th = (float)src->tex_h;
+    const float u0 = exact_rect ? gx2_copy::uv(sx.first, src->sw) : (float)src_col0 / src->w;
+    const float u1 = exact_rect ? gx2_copy::uv(sx.last, src->sw) : (float)(src_col0 + cols) / src->w;
+    const float v0 = exact_rect ? gx2_copy::uv(src->row0 + sy.first, src->sh) : (th - src->h + src_row0) / th;
+    const float v1 = exact_rect ? gx2_copy::uv(src->row0 + sy.last, src->sh) : (th - src->h + src_row0 + rows) / th;
     const float data[16] = {-1, 1, u0, v0, 1, 1, u1, v0, -1, -1, u0, v1, 1, -1, u1, v1};
     memcpy(q, data, sizeof data);
     DCFlushRange(q, sizeof data);
@@ -4908,8 +5003,6 @@ void gfx_thread_init() {
     pad_layout = std::clamp(g_settings.pad_layout, 0, screens::kPadLayouts - 1);
     top_rows = start_resolution = g_settings.resolution == 480 ? 480 : 720;  // "top1080" below can still change top_rows
     if (wiiu::debug_flag("dynres")) dyn_test = true;
-    if (wiiu::debug_flag("nocap")) cap_fps = 0;
-    if (cap_fps) LOG("[gx2] this game is held to %u frames a second\n", cap_fps);
     if (wiiu::debug_flag("uberall")) uber_all = true;
     if (wiiu::debug_flag("glslforce")) glsl_force = true;
     if (wiiu::debug_flag("noglslvs")) glsl_vs = false;
@@ -4925,6 +5018,15 @@ void gfx_thread_init() {
         top_rows = 1080;
         LOG("[gx2] top screen drawn at 1800x1080\n");
     }
+    if (has_darkmoon_profile()) {
+        light_guard_experiment.store(true, std::memory_order_relaxed);
+        copy_rect_experiment.store(true, std::memory_order_relaxed);
+        apply_darkmoon_profile();
+        LOG("[gx2] Dark Moon render mode %d: limit %u, selected scale %.2f\n",
+            std::clamp(g_settings.wiiu_render_mode, 0, 2), cap_fps, dyn_low);
+    }
+    if (wiiu::debug_flag("nocap")) cap_fps = 0;
+    if (cap_fps) LOG("[gx2] this game is held to %u frames a second\n", cap_fps);
     if (wiiu::debug_flag("stalecheck")) stale_check = true;
     if (FILE *f = fopen((wiiu::data_dir() + "/gxtrace").c_str(), "rb")) {
         if (fscanf(f, "%u %u", &gxt_from, &gxt_left) != 2) gxt_left = 0;
@@ -5058,7 +5160,13 @@ void menu_input(u32 pressed) {
         g_settings.show_fps = !g_settings.show_fps;
         wiiu::settings_due = true;
     }
-    if (cap_game && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) cap_fps = cap_fps ? 0 : cap_game;
+    if (cap_game && menu_item == 8 && (dir || (pressed & VPAD_BUTTON_A))) {
+        if (has_darkmoon_profile()) {
+            g_settings.wiiu_render_mode = (std::clamp(g_settings.wiiu_render_mode, 0, 2) + (dir < 0 ? 2 : 1)) % 3;
+            apply_darkmoon_profile();
+            wiiu::settings_due = true;
+        } else cap_fps = cap_fps ? 0 : cap_game;
+    }
 #ifdef RECOMP_RESUMABLE
     if (pressed & VPAD_BUTTON_A) {
         const int save_item = cap_game ? 9 : 8;
@@ -5112,7 +5220,10 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     snprintf(tv, sizeof tv, "TV: %s", k_tv_layouts[tv_layout % screens::kTvLayouts]);
     snprintf(pad, sizeof pad, "GAMEPAD: %s", k_pad_layouts[pad_layout % screens::kPadLayouts]);
     snprintf(res, sizeof res, "RESOLUTION: %dP", g_settings.resolution);
-    if (cap_fps) snprintf(cap, sizeof cap, "FRAME LIMIT: %u", (unsigned)cap_fps);
+    if (has_darkmoon_profile()) {
+        const char *modes[] = {"BALANCED", "SHARP", "FAST"};
+        snprintf(cap, sizeof cap, "MODE: %s", modes[std::clamp(g_settings.wiiu_render_mode, 0, 2)]);
+    } else if (cap_fps) snprintf(cap, sizeof cap, "FRAME LIMIT: %u", (unsigned)cap_fps);
     else snprintf(cap, sizeof cap, "FRAME LIMIT: OFF");
     const char *items[12] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF"};
     int item_count = 8;
@@ -5129,6 +5240,11 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     const char *hint = "A: CHOOSE   LEFT/RIGHT: CHANGE   B: BACK";
     if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "THE GAME CHANGES LANGUAGE WHEN IT NEXT STARTS";  // a game takes its language as it starts
     if (menu_item == 5 && pad_layout == 1) hint = "TOUCH IS OFF WHILE THE GAMEPAD SHOWS THE TOP";
+    if (menu_item == 8 && has_darkmoon_profile()) {
+        const char *hints[] = {top_rows == 720 ? "BALANCED: 85% SCALE, 30 FPS LIMIT" : "BALANCED: 30 FPS LIMIT",
+                               "SHARP: FULL RESOLUTION, 30 FPS LIMIT", "FAST: UNCAPPED; TIMING MAY CHANGE"};
+        hint = hints[std::clamp(g_settings.wiiu_render_mode, 0, 2)];
+    }
     if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "RESOLUTION CHANGES WHEN THE GAME NEXT STARTS";  // targets keep their size
 #ifdef RECOMP_RESUMABLE
     const int state_item = cap_game ? 9 : 8;
@@ -5139,6 +5255,18 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
 }
 #ifdef RECOMP_RESUMABLE
+static bool loading_state_overlay;
+bool state_loading_visible() { return loading_state_overlay; }
+void show_state_loading(bool visible) {
+    loading_state_overlay=visible;
+    gpu::screen_fresh=true;
+    if(visible && tv_cb && drc_cb) {
+        // Submit before disk I/O blocks this GPU thread. Scanout keeps this
+        // immutable copy visible while state reconstruction is paused.
+        gpu::present();
+        GX2DrawDone();
+    }
+}
 void draw_state_saving_on(GX2ColorBuffer *cb) {
     const u32 w=854,h=480;
     GX2SetColorBuffer(cb,GX2_RENDER_TARGET_0);cur_color=nullptr;begin_blit();
@@ -5150,9 +5278,12 @@ void draw_state_saving_on(GX2ColorBuffer *cb) {
     GX2SetColorControl(GX2_LOGIC_OP_COPY,1,FALSE,TRUE);
     GX2SetBlendControl(GX2_RENDER_TARGET_0,GX2_BLEND_MODE_SRC_ALPHA,GX2_BLEND_MODE_INV_SRC_ALPHA,GX2_BLEND_COMBINE_MODE_ADD,FALSE,GX2_BLEND_MODE_ONE,GX2_BLEND_MODE_ZERO,GX2_BLEND_COMBINE_MODE_ADD);
     set_blit_colors(1,1,1,0,0,0);
-    char label[]="SAVING TO SD  /";
+    char label[]="SAVING STATE  /";
     label[14]="/-_>"[(OSTicksToMilliseconds(OSGetSystemTime())/150)%4];
-    draw_text(w,h,label,640,452,2);
+    draw_text(w,h,loading_state_overlay ? "LOADING STATE..." : label,640,452,2);
+    // Publish render-cache writes before the scan-buffer copy, as the menu
+    // and FPS overlays do. Cemu can appear coherent without this on hardware.
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER,cb->surface.image,cb->surface.imageSize);
 }
 #endif
 static void draw_menu() {
@@ -5531,7 +5662,11 @@ u64 gfx_flips() { return st_flips; }
 
 // (net thread) a switch from the PC, from now on
 bool gfx_set(const char *name, u32 v) {
-    if (!strcmp(name, "uberall")) uber_all = v;
+    if (!strcmp(name, "slicescale") && v <= 1) {
+        screen_slice_experiment.store(v != 0, std::memory_order_relaxed);
+        LOG("[gx2] screen-slice experiment %s; relaunch to restore already resized targets\n", v ? "enabled" : "disabled");
+    }
+    else if (!strcmp(name, "uberall")) uber_all = v;
     else if (!strcmp(name, "uberfb")) {
         uber_fallback = v;
         forget_ps = true;
@@ -5548,6 +5683,8 @@ bool gfx_set(const char *name, u32 v) {
     else if (!strcmp(name, "halfss")) half_ss = v;  // a target its transfer scales down is drawn at the smaller size (note_downscaled); from the next one made
     else if (!strcmp(name, "capfps")) cap_fps = v;  // the game's frames a second (frame_cap_wait); 0 for as fast as it goes
     else if (!strcmp(name, "gsshared")) g_gs_shared = v;  // geometry shader runs on two threads (vertex.cpp: gs_run_shared)
+    else if (!strcmp(name, "copyrect") && v <= 1) copy_rect_experiment.store(v != 0, std::memory_order_relaxed);
+    else if (!strcmp(name, "lightguard") && v <= 1) light_guard_experiment.store(v != 0, std::memory_order_relaxed);
     else if (!strcmp(name, "cputime") && v <= 1) g_cpu_timing.store(v != 0, std::memory_order_relaxed);
     else if (!strcmp(name, "gputime")) {  // the GPU's own time per pass (gt_mark), in the [prof] lines
         gt_on = v;
@@ -5585,7 +5722,7 @@ static void write_report() {
     static u64 last_flips, last_draws, last_cpu_draws;
     static u32 last_busy;
     const OSTime now = OSGetSystemTime();
-    const float secs = last_t ? OSTicksToMicroseconds(now - last_t) / 1e6f : 1;
+    const float secs = std::max(0.001f, OSTicksToMicroseconds(now - (last_t ? last_t : renderer_started)) / 1e6f);
     const float fps = (st_flips - last_flips) / secs;
     const float busy = last_t ? (gpu_busy_us - last_busy) / (secs * 1e6f) * 100 : 0;
     LOG("[gx2] %.1f fps, gpu thread %.0f%% busy, %.0f draws/s, %llu on CPU, %llu fragment misses, %llu textures uploaded (%llu KB, %.1f ms, %llu decoded on the GPU), %u KB textures, %u surfaces\n",

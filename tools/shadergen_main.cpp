@@ -182,6 +182,10 @@ int main(int argc, char **argv) {
     }
     ps_index[fnv64(kUberKey, strlen(kUberKey))] = add_ps(gen_uber_fs(false));
     ps_index[fnv64(kUberLitKey, strlen(kUberLitKey))] = add_ps(gen_uber_fs(true));
+    for (bool lit : {false, true}) for (u32 mask = 0; mask < 8; mask++) {
+        const std::string key = uber_family_key(lit, mask);
+        ps_index[fnv64(key.data(), key.size())] = add_ps(gen_uber_fs(lit, mask));
+    }
     ps_index[fnv64(kEtc1Key, strlen(kEtc1Key))] = add_ps(gen_etc1_fs(false));
     ps_index[fnv64(kEtc1A4Key, strlen(kEtc1A4Key))] = add_ps(gen_etc1_fs(true));
     for (u32 fmt = 0; fmt < 12; fmt++) {

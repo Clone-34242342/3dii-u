@@ -271,6 +271,7 @@ class App(QObject):
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
     buildText, buildCustom = _p(str, 'buildText'), _p(bool, 'buildCustom')
+    outputFormat, homebrewParts = _p(str, 'outputFormat'), _p(str, 'homebrewParts')
     target, destText, cards = _p(str, 'target'), _p(str, 'destText'), _p('QVariantList', 'cards')
     building, view = _p(bool, 'building'), _p(str, 'view')
     stages, stage, failed, progress, detail = _p('QVariantList', 'stages'), _p(int, 'stage'), _p(bool, 'failed'), _p(float, 'progress'), _p(str, 'detail')
@@ -309,7 +310,7 @@ class App(QObject):
                        languages=[f'System ({self.system_language})', *pipeline.LANGUAGES],
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
-                       otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
+                       otpText='', sysOk=False, sysText='', outputFormat=self.st.get('output_format', 'wup') if self.st.get('output_format') in ('wup','homebrew') else 'wup', homebrewParts=self.st.get('homebrew_parts', 'full') if self.st.get('homebrew_parts') in ('full','binary','shaders','both') else 'full', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
                        games=[dict(name=g['name'], status=g['status'], note=g['note']) for k, g in compat.items() if not k.startswith('_')],
@@ -934,6 +935,26 @@ class App(QObject):
             self.refresh_files()
 
     @Slot(str)
+    def setOutputFormat(self, value):
+        if self._s['building'] or value not in ('wup','homebrew'): return
+        self.st['output_format'] = value
+        self.set(outputFormat=value)
+        save_settings(self.st)
+
+    @Slot(str)
+    def setHomebrewParts(self, value):
+        if self._s['building'] or value not in ('full','binary','shaders','both'): return
+        self.st['homebrew_parts'] = value
+        self.set(homebrewParts=value)
+        save_settings(self.st)
+
+    @Slot()
+    def homebrewGuide(self):
+        path = os.path.join(HERE, 'HOMEBREW_GUIDE.txt')
+        if WIN: os.startfile(path)
+        else: subprocess.Popen(['xdg-open', path])
+
+    @Slot(str)
     def setTarget(self, t):
         self.st['target'] = t
         self.set(target=t)
@@ -1177,20 +1198,24 @@ class App(QObject):
             self.tell('The build engine is missing', 'The engine folder next to 3Dii U Builder.exe holds the recompiler and its toolchain. Copy the '
                                                      'whole 3Dii U Builder folder again, engine folder included.', 'error')
             return
-        if not otp_ok(self.st.get('otp', '')):
+        if self._s['outputFormat'] == 'wup' and not otp_ok(self.st.get('otp', '')):
             self.tell('otp.bin is missing', 'Choose your Wii U\'s otp.bin: it should be exactly 1024 bytes.', 'warn')
             return
         dest = self.st.get('card', '') if self._s['target'] == 'card' else self.st.get('folder', '')
         if not dest or not os.path.isdir(dest):
             self.tell('Where should it go?', 'Choose an SD card or a folder for the game.', 'warn')
             return
-        self.find_system(True)
-        if not dumps.have_system_archives(pipeline.ARCHIVES):
+        partial = self._s['outputFormat'] == 'homebrew' and self._s['homebrewParts'] != 'full'
+        if not partial: self.find_system(True)
+        if not partial and not dumps.have_system_archives(pipeline.ARCHIVES):
             self.tell('The 3DS system files are missing', HELP['system'][1], 'warn')
             return
         save_settings(self.st)
         argv = [sys.executable, '--pipeline'] if FROZEN else [sys.executable.replace('pythonw.exe', 'python.exe'), '-u', os.path.join(HERE, 'pipeline.py')]
-        argv += ['--game', self.game.path, '--otp', self.st['otp'], '--card' if self._s['target'] == 'card' else '--out', dest, '--keys', self.st['keys']]
+        argv += ['--game', self.game.path, '--output-format', self._s['outputFormat'],
+                 '--card' if self._s['target'] == 'card' else '--out', dest, '--keys', self.st['keys']]
+        if self._s['outputFormat'] == 'wup': argv += ['--otp', self.st['otp']]
+        else: argv += ['--homebrew-parts', self._s['homebrewParts']]
         for kind in ('update', 'dlc'):
             if getattr(self, kind):
                 argv += [f'--{kind}', getattr(self, kind).path]
@@ -1212,7 +1237,7 @@ class App(QObject):
             argv += ['--no-menu']
         argv += ['--language', self._s['language'] or self.system_language]
         self.log_lines, self.result, self.cancelled = [], None, False
-        stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or self._s['target'] == 'card']
+        stages = [n for n, _ in pipeline.stages_for(self._s['outputFormat'], self._s['homebrewParts'] if self._s['outputFormat'] == 'homebrew' else 'full') if n != 'Copying' or self._s['target'] == 'card']
         self.set(building=True, view='building', stages=stages, stage=0, failed=False, progress=0.0, detail='Starting...', log='')
         self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
                                      creationflags=NO_WINDOW, start_new_session=not WIN, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
@@ -1259,8 +1284,11 @@ class App(QObject):
             msg = (f'{self._s["gameName"]} is on your SD card, in install\\{os.path.basename(where)}. Put the card in your Wii U and install it with WUP '
                    f'Installer GX2.' if self._s['target'] == 'card' else
                    f'The WUP is in {where}. Copy it to your SD card\'s install folder and install it with WUP Installer GX2.')
-            self.set(building=False, view='done', stage=len(self._s['stages']), where=where, resultText=msg + ' If an older build of it is installed, '
-                                                                                                            'delete that first.')
+            if self._s['outputFormat'] == 'homebrew':
+                msg = (f'Homebrew is ready at {where}. Launch its icon with Aroma.' if self._s['homebrewParts'] == 'full' else
+                       f'Homebrew update files are ready in {where}. Follow the included Homebrew import guide to apply them to your existing WUHB.')
+            else: msg += ' If an older build of it is installed, delete that first.'
+            self.set(building=False, view='done', stage=len(self._s['stages']), where=where, resultText=msg)
         elif self.cancelled:
             self.set(building=False, view='form')
         else:
@@ -1285,6 +1313,7 @@ class App(QObject):
     @Slot()
     def openFolder(self):
         where = self._s['where']
+        if os.path.isfile(where): where = os.path.dirname(where)
         if os.path.isdir(where):
             os.startfile(where) if WIN else subprocess.Popen(['xdg-open', where])
 

@@ -2,6 +2,7 @@
 #ifdef RECOMP_RESUMABLE
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <thread>
 #include <coreinit/debug.h>
 #include <gx2/event.h>
@@ -12,7 +13,7 @@
 #include "kernel.h"
 #include "loader.h"
 
-namespace wiiu { const std::string &data_dir(); void save_flush(bool); }
+namespace wiiu { const std::string &data_dir(); void save_flush(bool); int flush_checkpoint_storage(); void show_state_loading(bool); }
 
 namespace kernel {
 void checkpoint_services(checkpoint::Image &);
@@ -169,25 +170,40 @@ static std::unique_ptr<Image> save_persistent() {
 #endif
         const auto started=std::chrono::steady_clock::now();
         const auto temporary=path+".new",backup=path+".bak";
+        const char *phase="open";u64 written=0,flushed=0;int io_error=0;
         FILE *f=fopen(temporary.c_str(),"wb");bool ok=f!=nullptr;
+        if(!ok)io_error=errno;
         if (f) {
             setvbuf(f,nullptr,_IOFBF,256u<<10);
-            ok=fwrite(&h,1,sizeof h,f)==sizeof h;
+            phase="header";ok=fwrite(&h,1,sizeof h,f)==sizeof h;
+            if(!ok)io_error=errno;
             h.checksum=14695981039346656037ull;
             for (auto &chunk:chunks) {
                 if (disk_cancel.load(std::memory_order_acquire)) {ok=false;break;}
                 if (!ok) break;
                 h.checksum=state_hash(chunk->data(),chunk->size(),h.checksum);
-                ok=fwrite(chunk->data(),1,chunk->size(),f)==chunk->size();
+                phase="payload";const size_t count=fwrite(chunk->data(),1,chunk->size(),f);written+=count;
+                ok=count==chunk->size();if(!ok)io_error=errno;
+#ifdef __WIIU__
+                if(ok && written-flushed >= (8u<<20)) {
+                    phase="journal flush";ok=fflush(f)==0;if(!ok)io_error=errno;
+                    if(ok){const int result=wiiu::flush_checkpoint_storage();ok=result>=0;if(!ok)io_error=result;}
+                    flushed=written;
+                }
+#endif
             }
-            if(ok)ok=!fseek(f,0,SEEK_SET)&&fwrite(&h,1,sizeof h,f)==sizeof h&&!fflush(f);
-            if(fclose(f))ok=false;
+            if(ok){phase="final header";ok=!fseek(f,0,SEEK_SET)&&fwrite(&h,1,sizeof h,f)==sizeof h&&!fflush(f);if(!ok)io_error=errno;}
+            const int closed=fclose(f);if(closed && ok){phase="close";io_error=errno;ok=false;}
         }
         if(disk_cancel.load(std::memory_order_acquire))ok=false;
         if(ok) {
             remove(backup.c_str());const bool backed=rename(path.c_str(),backup.c_str())==0;
-            if(rename(temporary.c_str(),path.c_str())) {if(backed)rename(backup.c_str(),path.c_str());ok=false;}
+            if(rename(temporary.c_str(),path.c_str())) {const int error=errno;if(backed)rename(backup.c_str(),path.c_str());phase="publish";io_error=error;ok=false;}
         }
+#ifdef __WIIU__
+        if(ok){phase="storage commit";const int result=wiiu::flush_checkpoint_storage();ok=result>=0;if(!ok)io_error=result;}
+#endif
+        if(!ok && !disk_cancel.load())LOG("[state-file] background write failed: phase %s, error %d, payload %llu/%llu, path %s\n",phase,io_error,(unsigned long long)written,(unsigned long long)h.size,path.c_str());
         if(!ok)remove(temporary.c_str());
         LOG("[state-time] background save: %llu bytes, %llu ms, %s\n",(unsigned long long)h.size,(unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-started).count(),ok ? "complete" : disk_cancel.load() ? "superseded" : "failed");
         disk_result.store(ok ? 1 : disk_cancel.load(std::memory_order_acquire) ? 2 : -1,std::memory_order_release);
@@ -216,12 +232,12 @@ static std::unique_ptr<Image> load_persistent() {
 
 bool has_state() { return slot_available.load(std::memory_order_acquire) || disk_available.load(std::memory_order_acquire); }
 const char *result_message() {
-    if (saving_to_disk()) return "SAVING TO SD...";
-    if (disk_result.load()==-1) return "SD SAVE FAILED; RAM STATE RETAINED";
+    if (saving_to_disk()) return "SAVING TO STORAGE...";
+    if (disk_result.load()==-1) return "STORAGE SAVE FAILED; RAM STATE RETAINED";
     switch (g_3dii_state_status) {
     case 1: return "SESSION STATE SAVED";
     case 2: return "SESSION STATE LOADED";
-    case 4: return disk_result.load()==1 ? "STATE SAVED TO SD AND RAM" : "STATE CAPTURED IN RAM";
+    case 4: return disk_result.load()==1 ? "STATE SAVED TO STORAGE AND RAM" : "STATE CAPTURED IN RAM";
     case 5: return "STATE LOADED FROM FILE";
     case 0x80000006: return "STATE FILE FAILED: SEE DIAGNOSTIC LOG";
     case 0x80000002: return "SAVE FAILED: UNSUPPORTED SERVICE OR APPLET";
@@ -258,6 +274,13 @@ void pump() {
     }
     audio::pause(true);
     GX2DrawDone();
+#ifdef __WIIU__
+    struct LoadScreen {
+        bool shown;
+        explicit LoadScreen(bool value):shown(value){if(shown)wiiu::show_state_loading(true);}
+        ~LoadScreen(){if(shown)wiiu::show_state_loading(false);}
+    } load_screen((command==2 && !slot) || command==5);
+#endif
     if (command == 4) {
         slot.reset();slot_available.store(false,std::memory_order_release);g_3dii_state_bytes=0;
         slot=save_persistent();
