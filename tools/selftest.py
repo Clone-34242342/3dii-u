@@ -260,6 +260,7 @@ def main():
         'camera': camera(),
         'vertex arrays': vertex_arrays(),
         'vertex cache': [[py, ROOT + '/tools/test_vertex_cache.py'], [py, ROOT + '/tools/test_native_immediate.py']],
+        'Wii U vertex worker scheduling': [[py, ROOT + '/tools/test_wiiu_pool_idle.py']],
         'present rule': present_rule(),
         'screen layouts': screen_layouts(),
         'depth viewport': depth_viewport(),

@@ -163,17 +163,22 @@ void worker_main(u32 tid) {
     u32 seen = 0;
     for (;;) {
         u32 gen;
+#ifndef __WIIU__
         u32 spins = 0;
+#endif
         while ((gen = (u32)(pool_work.load(std::memory_order_acquire) >> 48)) == seen) {
+            // On Wii U an idle worker's 64-bit polling uses a shared spinlock and stalls the shader compiler on core 0.
+#ifndef __WIIU__
             if (++spins < 20000) {
                 cpu_relax();
-            } else {
-                std::unique_lock<std::mutex> lk(pool_mtx);
-                pool_sleepers.fetch_add(1);
-                pool_cv.wait(lk, [&] { return (u32)(pool_work.load() >> 48) != seen; });
-                pool_sleepers.fetch_sub(1);
-                spins = 0;
+                continue;
             }
+            spins = 0;
+#endif
+            std::unique_lock<std::mutex> lk(pool_mtx);
+            pool_sleepers.fetch_add(1);
+            pool_cv.wait(lk, [&] { return (u32)(pool_work.load() >> 48) != seen; });
+            pool_sleepers.fetch_sub(1);
         }
         seen = gen;
         run_items(gen, tid);
