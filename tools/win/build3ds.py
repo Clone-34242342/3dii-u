@@ -745,12 +745,25 @@ def prepare_logs(g, shadergen):
     shadergen: the generator, which also finds the vertex programs in the game's command lists for dvlb_to_log.py."""
     logs = g.dir + '/shader_logs'
     os.makedirs(logs, exist_ok=True)
+    sys.path.insert(0, ROOT + '/tools')
+    import observation_catalog
+    inventory = observation_catalog.validate(ROOT)
+    if not getattr(g, 'skip_catalog', False):
+        observation_catalog.stage_own(ROOT, getattr(g, 'observation_slug', g.name), logs)
+    print(f'Shader observation inventory: {len(inventory["files"])} files verified', flush=True)
     run_dir = f'{WORK}/run_{g.name}'
     for f in ('vs_log.bin', 'fs_log.bin'):
         if os.path.exists(f'{run_dir}/{f}'):
             shutil.copyfile(f'{run_dir}/{f}', f'{logs}/{f}')
     r = run([sys.executable, ROOT + '/tools/dvlb_to_log.py', g.dir, '--lists', shadergen], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-300:].strip())
+    if r.returncode:
+        sys.exit('dvlb_to_log failed')
+    sys.path.insert(0, ROOT + '/builder')
+    import shaderlogs
+    made, left = shaderlogs.restore(logs)
+    if made or left:
+        print(f'vertex records from portable observations: {made}, {left} incompatible with this dump', flush=True)
     r = run([sys.executable, ROOT + '/tools/tev_to_log.py', g.dir], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     print(r.stdout[-300:].strip())
     if r.returncode:
@@ -761,21 +774,30 @@ def prepare_logs(g, shadergen):
     spec.loader.exec_module(fsv)
     # (a finished game's confirmed.bin holds an earlier build's guesses, not what runs met: builder/shaderlogs.py)
     own_logs = [f for f in glob.glob(logs + '/*.bin') if not os.path.basename(f).startswith('other_')
+                and not os.path.basename(f).startswith('preserved_')
                 and os.path.basename(f) not in ('dvlb.bin', 'variants.bin', 'confirmed.bin', 'neighborhood_fs.bin')]
     own = {k for f in own_logs for k in fsv.keys(f)}
     near = []  # the logs of games whose states this one shares: an engine's
-    for other in sorted(glob.glob(ROOT + '/games/*/')):
+    catalog_games = str(observation_catalog.directory(ROOT) / 'games').replace('\\', '/')
+    shared = glob.glob(ROOT + '/games/*/')
+    if not getattr(g, 'skip_catalog', False):
+        shared += glob.glob(catalog_games + '/*/')
+    for other in sorted(shared):
         other = other.rstrip('/\\').replace('\\', '/')
         name = os.path.basename(other)
+        from_catalog = other.startswith(catalog_games + '/')
+        if from_catalog and name == getattr(g, 'observation_slug', g.name):
+            continue  # already staged as this game's own preserved/observed inputs
         if other == g.dir or name == getattr(g, 'twin', None):  # (a cold build's own folder: builder/pipeline.py --cold)
             continue
         # fs_log.bin and the *_fs.bin files hold fragment states alone; the other_ ones are that game's own copies (taking them nested the names without
         # end), and its models are its own
         theirs = [f for f in glob.glob(f'{other}/shader_logs/*.bin') if (os.path.basename(f) == 'fs_log.bin' or f.endswith('_fs.bin'))
-                  and not os.path.basename(f).startswith('other_') and os.path.basename(f) not in ('models_fs.bin', 'neighborhood_fs.bin')]
+                  and not os.path.basename(f).startswith(('other_', 'preserved_')) and os.path.basename(f) not in ('models_fs.bin', 'neighborhood_fs.bin')]
         copied = []
         for f in theirs:
-            to = f'{logs}/other_{name}.bin' if os.path.basename(f) == 'fs_log.bin' else f'{logs}/other_{name}_{os.path.basename(f)}'
+            source_name = ('catalog_' if from_catalog else '') + name
+            to = f'{logs}/other_{source_name}.bin' if os.path.basename(f) == 'fs_log.bin' else f'{logs}/other_{source_name}_{os.path.basename(f)}'
             shutil.copyfile(f, to)
             copied.append(to)
         states = {k for f in theirs for k in fsv.keys(f)}
@@ -813,6 +835,8 @@ def build_shaders(g, args):
     sys.path.insert(0, ROOT + '/tools')
     import observed_fragments
     observed_fragments.inject(ROOT, g.dir + '/shader_logs', g.shaders)
+    import shader_coverage
+    shader_coverage.check(g.dir + '/shader_logs', g.shaders, g.pipelines)
     compile_shaders(g.shaders, args.jobs)
     shutil.rmtree(g.shaders + '/glsl', ignore_errors=True)  # compiled into shaders.gsh; nothing reads the GLSL after
 

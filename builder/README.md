@@ -251,6 +251,15 @@ source checkout before running `make_app.py`.
 
 ### Validation of the November 25 Windows test package
 
+Portable shader observations now live in the tracked
+`tools/shader_observations/` catalog. Source and Windows builds verify its
+inventory before preparing shaders; Windows packaging also checks the copied
+inventory. Shader generation must cover every supplied fragment state through
+an exact or canonical-equivalent lookup, or the build fails with
+`shader-coverage-report.json`. This prevents an incomplete source archive from
+silently shipping reduced precompiled coverage. It does not promise discovery
+of all runtime states or full-speed rendering in every game.
+
 The packaged Windows executable was checked under Steam Proton 11: its frozen
 CLI, both QML layouts and all Homebrew choices, export/artwork/failure handling,
 and compiler-policy scenarios passed. Windows devkitPPC compiled the resumable

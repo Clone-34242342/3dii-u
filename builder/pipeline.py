@@ -398,6 +398,8 @@ def main():
     if not os.path.exists(b3.BIN + 'gcc.exe'):
         fail('The build tools aren\'t installed: see builder/README.md.')
     g = b3.Game(info['slug'], game_dir)  # the recipe every game gets, read from this game's own code (build3ds.py)
+    g.observation_slug = (known or derived(game))['slug']
+    g.skip_catalog = bool(a.cold or code_mods)
     if a.cold:
         g.twin = derived(game)['slug']  # its own folder in games/ is no other game's: nothing of it is borrowed
     # Cold checks exclude learned data, while testing the same compiler policy as a normal build.

@@ -90,6 +90,8 @@ def bundle_logs(src, dst):
     dvlb = os.path.join(logs, 'dvlb.bin')
     progs = shaderlogs.programs(dvlb) if os.path.isfile(dvlb) else set()
     recipes, shipped = 0, set()
+    for f in [f for f in os.listdir(logs) if f.endswith('.vsf')]:
+        shutil.copy2(os.path.join(logs, f), os.path.join(out, f))
     for f in [f for f in os.listdir(logs) if f.endswith('.vsr')]:  # made from a dump this repository doesn't keep (shaderlogs.py --recipes)
         shutil.copy2(os.path.join(logs, f), os.path.join(out, f))
         with open(os.path.join(logs, f), 'rb') as h:
@@ -114,6 +116,9 @@ def bundle_logs(src, dst):
 
 def bundle_engine(engine):
     """the build engine, in the repository's layout, so the app builds wherever it is"""
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import observation_catalog
+    observation_catalog.validate(ROOT)
     def skip(folder, names):  # caches, links WSL left that Windows can't open (third_party/3dsrecomp/games/*/profile.txt), and the tools
         # for testing on this PC's own console (its address, this PC's paths), which no build runs
         console = os.path.normcase(folder) == os.path.normcase(os.path.join(ROOT, 'tools'))
@@ -124,8 +129,9 @@ def bundle_engine(engine):
     for f in ENGINE_FILES:
         os.makedirs(os.path.dirname(os.path.join(engine, f)), exist_ok=True)
         shutil.copy2(os.path.join(ROOT, f), os.path.join(engine, f))
+    observation_catalog.validate(engine)
     recipes = left = 0
-    for g in sorted(os.listdir(os.path.join(ROOT, 'games'))):  # what runs learned: where code starts, the render states they met
+    for g in sorted(os.listdir(os.path.join(ROOT, 'games')) if os.path.isdir(os.path.join(ROOT, 'games')) else []):  # optional local learned data
         src, dst = os.path.join(ROOT, 'games', g), os.path.join(engine, 'games', g)
         if os.path.isfile(os.path.join(src, 'functions.txt')):
             os.makedirs(dst, exist_ok=True)
@@ -173,12 +179,13 @@ def version_resource(path, version):
         f.write(str(info))
 
 
-def unconfirmed(compat, games):
+def unconfirmed(compat, games, catalog_games=None):
     """the games compat.json calls Complete that have no confirmed shader list under games (shaderlogs.py --confirm): built without it, such a
     game could lose shaders the build it was confirmed with had"""
     def listed(slug):
-        path = os.path.join(games, slug, 'shader_logs', shaderlogs.CONFIRMED)
-        return os.path.isfile(path) and os.path.getsize(path) > 0
+        return any(os.path.isfile(path) and os.path.getsize(path) > 0 for path in
+                   (os.path.join(base, slug, 'shader_logs', shaderlogs.CONFIRMED)
+                    for base in (games, catalog_games) if base))
     return sorted(g['slug'] for k, g in compat.items() if not k.startswith('_') and g['status'] == 'Complete' and not listed(g['slug']))
 
 
@@ -197,8 +204,11 @@ def main():
     import PyInstaller.__main__
     import gui
     release = release_tag(sys.argv, gui.VERSION)
+    sys.path.insert(0, os.path.join(ROOT, 'tools'))
+    import observation_catalog
+    observation_catalog.validate(ROOT)
     with open(os.path.join(HERE, 'compat.json'), encoding='utf-8') as f:
-        loose = unconfirmed(json.load(f), os.path.join(ROOT, 'games'))
+        loose = unconfirmed(json.load(f), os.path.join(ROOT, 'games'), str(observation_catalog.directory(ROOT) / 'games'))
     if loose:
         sys.exit('Complete in compat.json, but with no confirmed shader list (shaderlogs.py --confirm): ' + ', '.join(loose))
     os.makedirs(WORK, exist_ok=True)

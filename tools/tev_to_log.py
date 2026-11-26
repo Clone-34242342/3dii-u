@@ -260,7 +260,9 @@ def normal(s):
 
 def records(path):
     """Read mixed miss logs, retaining only fragment keys; reject partial records."""
-    d, p, out = open(path, 'rb').read(), 0, []
+    with open(path, 'rb') as source:
+        d = source.read()
+    p, out = 0, []
     def require(at, size):
         if size < 0 or at > len(d) or size > len(d) - at:
             raise ValueError(f'{path}: truncated shader record at {p}')
@@ -476,7 +478,7 @@ def main():
     keys = set()
     for f in glob.glob(logs + '/*.bin'):
         b = os.path.basename(f)
-        if b.startswith('other_') or b in (OUT, 'neighborhood_fs.bin', 'dvlb.bin', 'vs_log.bin', 'abi_vs_log.bin', 'variants.bin', 'confirmed.bin') or b.endswith('_vs.bin'):
+        if b.startswith(('other_', 'preserved_')) or b in (OUT, 'neighborhood_fs.bin', 'dvlb.bin', 'vs_log.bin', 'abi_vs_log.bin', 'variants.bin', 'confirmed.bin') or b.endswith('_vs.bin'):
             continue
         (held if holdout and 'console' in b else keys).update(records(f))
     for k in keys:
