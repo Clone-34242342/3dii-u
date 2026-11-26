@@ -2,6 +2,8 @@
 # builds the same files as a clone anywhere else.
 * text=auto eol=lf
 *.bin binary
+*.vsf binary
+*.vsr binary
 *.h264 binary
 *.gpg binary
 # Source patches must retain upstream CRLF context exactly to remain applicable.
