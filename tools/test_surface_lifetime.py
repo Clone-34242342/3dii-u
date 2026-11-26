@@ -39,6 +39,7 @@ def main():
     production += '\n' + function(source, 'static int screen_of(')
     production += '\n' + source[source.index('bool gx2_skip_pass;'):source.index('void gx2_cpu_will_read(')]
     production += '\n' + function(source, 'static void show_bottom_lcd(')
+    production += '\n' + source[source.index('static u32 lcd_buffer_size('):source.index('// The top screen as its LCD buffer holds it')]
     production += '\n' + function(source, 'bool transfer_source(const Surface &s) {')
     production += '\n' + function(source, 'void forget_unused()')
     production += '\n' + '\n'.join(function(source, signature) for signature in (

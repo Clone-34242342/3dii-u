@@ -1,5 +1,6 @@
 // Allocator and GPU operations are observable stand-ins for surface lifetime and layout tests.
 #include "surface_readback.h"
+#include "scaled_copy.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -27,6 +28,7 @@ static u32 gsp_swaps(int screen) { return swaps[screen]; }
 }
 namespace mem {
 static constexpr u32 VRAM_PADDR = 0x18000000, VRAM_SIZE = 0x600000;
+static constexpr u32 FCRAM_PADDR = 0x20000000, LINEAR_SIZE = 0x08000000;
 static u32 vaddr_to_paddr(u32 addr) { return addr; }
 }
 struct DrawState {};
@@ -506,6 +508,39 @@ static void compose_selected_bottom_buffer() {
     show_bottom_lcd();
     check(displays == 5 && shown_texture == &source->tex, "a fallback write supersedes an older retained copy of that destination");
 }
+static void detect_cpu_lcd_frames() {
+    constexpr u32 row = 720, frame = row * 400;
+    constexpr u32 a = mem::FCRAM_PADDR, b = a + frame, end = a + mem::LINEAR_SIZE;
+    check(lcd_buffer_size(end - frame, row, row) == frame, "a frame ending at FCRAM's boundary is readable");
+    check(lcd_buffer_size(end - frame + 1, row, row) == 0, "a frame crossing FCRAM's boundary is rejected");
+    check(lcd_buffer_size(a, row - 1, row) == 0 && lcd_buffer_size(a, UINT32_MAX, row) == 0,
+          "undersized and overflowing strides are rejected");
+    check(lcd_buffer_size(end - frame - 399 * 8, row + 8, row) == frame + 399 * 8,
+          "row padding after the visible pixels of the last row is unnecessary");
+    check(lcd_buffer_size(mem::VRAM_PADDR, row, row) == frame, "tracked video writes to VRAM still have a valid span");
+    CpuLcdFrames frames{};
+    check(!frames.observe(a, row, 1) && !frames.observe(b, row, 2) &&
+          !frames.observe(a, row, 1) && !frames.observe(b, row, 2),
+          "alternating stale buffers don't activate CPU video");
+    check(frames.observe(a, row, 3) && frames.observe(a, row, 3) && frames.observe(b, row, 4),
+          "pixel changes activate each buffer and allow a presentation retry");
+    check(!frames.observe(a, row + 8, 5), "a format or stride change starts a fresh baseline");
+    frames = {};
+    check(!frames.observe(b, row, 5), "a display transfer resets CPU video detection");
+}
+
+static void cover_fractional_copy_edges() {
+    for (float scale : {0.75f, 1.0f, 1.85f, 2.75f, 3.0f}) {
+        u32 end = 0;
+        for (u32 row = 0; row < 416; row += 16) {
+            const auto span = gx2_copy::span(row, 16, scale);
+            check(span.first == end, "adjacent scaled copies share their rounded top and bottom edges");
+            end = span.first + span.size();
+        }
+        check(end == (u32)(416 * scale), "the sum of adjacent copies reaches the last texel");
+    }
+}
+
 int main() {
     reuse_latest_color();
     whole_tiled_copy();
@@ -513,6 +548,8 @@ int main() {
     locate_complete_lcd();
     show_scaled_crop_and_keep_offscreen();
     compose_selected_bottom_buffer();
+    detect_cpu_lcd_frames();
+    cover_fractional_copy_edges();
     churn();
     pins_and_ownership();
     dirty_churn();

@@ -51,6 +51,7 @@
 #include "memory_fills.h"
 #include "loader.h"
 #include "present_rule.h"
+#include "scaled_copy.h"
 #include "screen_layouts.h"
 #include "surface_readback.h"
 #include "settings.h"
@@ -4047,6 +4048,9 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     if (dst == src || first_col + cols > dst->w) return false;
     used(*dst);
     take_dyn_level(*dst);
+    const auto dx = gx2_copy::span(first_col, cols, dst->sx), dy = gx2_copy::span(first_row, rows, dst->sy);
+    const auto sx = gx2_copy::span(src_col0, cols, src->sx), sy = gx2_copy::span(src_row0, rows, src->sy);
+    if (!dx.size() || !dy.size() || !sx.size() || !sy.size()) return false;
     static u32 notes;
     if (notes++ < 4) wiiu::note("copying rows on the GPU: %08x into %08x, %u columns from %u", in_paddr, base, cols, first_col);
     st_gpu_copies++;
@@ -4062,12 +4066,12 @@ static bool linear_copy_on_gpu(u32 in_paddr, u32 out_paddr, u32 size, u32 in_wid
     cur_color = nullptr;
     begin_blit();
     // memory row 0 at the top of a surface's rows, as gpu_copy_transfer draws them
-    const u32 x0 = (u32)(first_col * dst->sx), y0 = dst->row0 + (u32)(first_row * dst->sy), w = (u32)(cols * dst->sx), h = (u32)(rows * dst->sy);
+    const u32 x0 = dx.first, y0 = dst->row0 + dy.first, w = dx.size(), h = dy.size();
     GX2SetViewport((float)x0, (float)y0, (float)w, (float)h, 0, 1);
     GX2SetScissor(x0, y0, w, h);
     float *q = (float *)ring_alloc(4 * 16 + 64, 64);
-    const float th = (float)src->tex_h, u0 = (float)src_col0 / src->w, u1 = (float)(src_col0 + cols) / src->w;
-    const float v0 = (th - src->h + src_row0) / th, v1 = (th - src->h + src_row0 + rows) / th;
+    const float u0 = (float)sx.first / src->sw, u1 = (float)sx.last / src->sw;
+    const float v0 = (float)(src->row0 + sy.first) / src->sh, v1 = (float)(src->row0 + sy.last) / src->sh;
     const float data[16] = {-1, 1, u0, v0, 1, 1, u1, v0, -1, -1, u0, v1, 1, -1, u1, v1};
     memcpy(q, data, sizeof data);
     DCFlushRange(q, sizeof data);
@@ -5508,6 +5512,38 @@ static std::atomic<bool> report_due;
 static std::atomic<float> report_draws_per_flip;
 static void write_report();
 
+static u32 lcd_buffer_size(u32 pa, u32 stride, u32 row_bytes) {
+    if (stride < row_bytes) return 0;
+    const u64 end = u64(pa) + u64(stride) * 399 + row_bytes;
+    if ((pa >= mem::VRAM_PADDR && end <= mem::VRAM_PADDR + mem::VRAM_SIZE) ||
+        (pa >= mem::FCRAM_PADDR && end <= mem::FCRAM_PADDR + mem::LINEAR_SIZE))
+        return (u32)(end - pa);
+    return 0;
+}
+
+// Observe each buffer independently so alternating stale GPU buffers don't look like CPU video.
+struct CpuLcdFrames {
+    struct Buffer {
+        u32 addr, layout;
+        u64 hash;
+        bool changed;
+    };
+    std::array<Buffer, 4> buffers{};
+    u32 next = 0;
+
+    bool observe(u32 addr, u32 layout, u64 hash) {
+        for (Buffer &b : buffers)
+            if (b.addr == addr) {
+                b.changed = b.layout == layout && (b.changed || b.hash != hash);
+                b.layout = layout;
+                b.hash = hash;
+                return b.changed;
+            }
+        buffers[next++ % buffers.size()] = {addr, layout, hash, false};
+        return false;
+    }
+};
+
 // The top screen as its LCD buffer holds it, for a game that brings it by no display transfer: Luigi's Mansion 2 draws its top screen in parts and
 // puts them together in the LCD buffer with texture copies. A 3DS's LCD just shows the buffer, so this does too: 240x400, read as a render target's
 // texture is (its last memory row the texture's first), so show_screen takes it as one. A game writes the buffer the LCD doesn't show and swaps to
@@ -5515,11 +5551,13 @@ static void write_report();
 static void show_lcd_from_memory() {
     gt_mark(GT_LCD, 0);
     static u32 shown_pa, shown_seq;
-    static u64 shown_drawn;
+    static u64 shown_drawn, shown_hash;
+    static u32 shown_layout;
+    static CpuLcdFrames cpu_frames;
     const kernel::FramebufferInfo f = kernel::gsp_framebuffer(0);
     const u32 pa = f.valid && f.addr_left ? mem::vaddr_to_paddr(f.addr_left) : 0;
     const u32 fmt = f.format & 7, bpp = fmt == 0 ? 4 : fmt == 1 ? 3 : 2;
-    const u32 stride = f.stride ? f.stride : 240 * bpp, size = stride * 400;
+    const u32 row_bytes = 240 * bpp, stride = f.stride ? f.stride : row_bytes;
     if (pa && std::find(std::begin(recent_top), std::end(recent_top), pa) == std::end(recent_top)) {
         static u32 next_top;
         recent_top[next_top++ % 4] = pa;
@@ -5538,14 +5576,16 @@ static void show_lcd_from_memory() {
         transfer_seq = memory_write_seq;
         transfer_drawn = gpu_writes;
         quiet = 0;
+        cpu_frames = {};
         return;
     }
     if (quiet < 60) {
         quiet++;
         return;
     }
-    const u8 *src = pa ? pptr(pa) : nullptr;
-    if (!src || stride < 240 * bpp) return;
+    const u32 size = fmt <= 4 ? lcd_buffer_size(pa, stride, row_bytes) : 0;
+    const u8 *src = size ? pptr(pa) : nullptr;
+    if (!src) return;
     // put together on the GPU (linear_copy_on_gpu): shown from there, never read back, unless the game has written over it since
     Surface *lcd = nullptr;
     for (auto &s : surfaces)
@@ -5557,6 +5597,9 @@ static void show_lcd_from_memory() {
         if (lcd->drawn <= transfer_drawn || (pa == shown_pa && lcd->drawn == shown_drawn)) return;
         shown_pa = pa;
         shown_drawn = lcd->drawn;
+        shown_seq = 0;
+        shown_layout = 0;
+        cpu_frames = {};
         flush_surface(*lcd);
         const float h = (float)lcd->tex_h, first_row = (float)((pa - lcd->addr) / stride);
         if (gxt()) LOG("[gxt] top screen from the LCD buffer put together on the GPU, %08x, from row %u of %08x\n", pa, (u32)first_row, lcd->addr);
@@ -5567,9 +5610,23 @@ static void show_lcd_from_memory() {
     u32 latest = 0;
     for (const MemoryWrite &w : memory_writes)
         if (w.seq && w.pa < pa + size && pa < w.pa + w.size) latest = std::max(latest, w.seq);
-    if (!latest || latest <= transfer_seq || (pa == shown_pa && latest == shown_seq)) return;
-    shown_pa = pa;
-    shown_seq = latest;
+    const u32 layout = stride * 8 + fmt;
+    u64 hash = 0;
+    if (!latest || latest <= transfer_seq) {
+        if (pa < mem::FCRAM_PADDR) return;
+        latest = 0;
+        // The CPU can decode directly into the LCD buffer without issuing a GPU command.
+        if (stride == row_bytes)
+            hash = hash_bytes(src, size);
+        else
+            for (u32 row = 0; row < 400; row++)
+                hash = hash * 31 + hash_bytes(src + size_t(row) * stride, row_bytes);
+        if (!cpu_frames.observe(pa, layout, hash)) return;
+        if (pa == shown_pa && shown_seq == 0 && shown_layout == layout && shown_hash == hash) return;
+    } else {
+        if (pa == shown_pa && latest == shown_seq) return;
+        cpu_frames = {};
+    }
     static GX2Texture tex[2];
     static u32 next;
     GX2Texture &t = tex[next++ & 1];  // the other may still be on its way to the TV
@@ -5591,6 +5648,11 @@ static void show_lcd_from_memory() {
         s.image = memalign(s.alignment, s.imageSize);
         if (!s.image) return;
     }
+    shown_pa = pa;
+    shown_seq = latest;
+    shown_layout = layout;
+    shown_hash = hash;
+    shown_drawn = 0;
     u8 *out = (u8 *)t.surface.image;
     const u32 pitch = t.surface.pitch * 4;
     for (u32 r = 0; r < 400; r++) {
