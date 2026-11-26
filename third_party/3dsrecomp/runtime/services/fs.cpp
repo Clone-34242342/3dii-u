@@ -657,11 +657,12 @@ struct DirSession : Service {
 struct FormatInfo {
     u32 bytes = 0x20000, dirs = 0x10, files = 0x10, duplicate = 0;  // what's answered for an archive formatted before this was kept
 };
-static void keep_format_info(const std::string &dir, const FormatInfo &info) {
-    if (FILE *f = fopen((dir + ".format").c_str(), "wb")) {
-        fwrite(&info, sizeof info, 1, f);
-        fclose(f);
-    }
+static bool keep_format_info(const std::string &dir, const FormatInfo &info) {
+    FILE *f = fopen((dir + ".format").c_str(), "wb");
+    if (!f) return false;
+    const bool written = fwrite(&info, sizeof info, 1, f) == 1;
+    const int closed = fclose(f);
+    return written && !closed;
 }
 static FormatInfo format_info(const std::string &dir) {
     FormatInfo info, kept;
@@ -1143,8 +1144,13 @@ struct FsUser : Service {
             FS_NOTE("save: formatting");
             if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             fsys::remove_all(d, ec);
-            fsys::create_directories(d);
-            keep_format_info(d, {ipc[at] * 512, ipc[at + 1], ipc[at + 2], ipc[at + 5] & 0xff});
+            if (ec) { ipc.result(ERR_IO); break; }
+            const bool created = fsys::create_directories(d, ec);
+            if (ec || !keep_format_info(d, {ipc[at] * 512, ipc[at + 1], ipc[at + 2], ipc[at + 5] & 0xff})) {
+                if (created) fsys::remove(d, ec);
+                ipc.result(ERR_IO);
+                break;
+            }
             FS_NOTE("save: formatted");
             LOG("[fs] formatted save data at %s\n", d.c_str());
             save_changed(d);
@@ -1174,16 +1180,21 @@ struct FsUser : Service {
             char b[64];
             snprintf(b, sizeof b, "/extdata/%08x%08x", ipc.cmd() == 0x0835 ? 0u : ipc[3], ipc[2]);
             const std::string d = save_root() + b;
+            std::error_code ec;
             if (deleting) {  // what a game does before it makes its extra data anew ("initialize")
-                std::error_code ec;
                 if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
                 fsys::remove_all(d, ec);
-                fsys::remove(d + ".format", ec);
+                if (!ec) fsys::remove(d + ".format", ec);
+                if (ec) { ipc.result(ERR_IO); break; }
             } else {
                 // The counts are asked back (GetFormatInfo), with no size, as for a save: answered with a save's defaults, Pokemon Ultra Sun
                 // called its extra data corrupted at every start after the first (2026-11-13).
-                fsys::create_directories(d);
-                keep_format_info(d, {legacy_create ? ~0u : 0u, ipc[5], ipc[6], 0});
+                const bool created = fsys::create_directories(d, ec);
+                if (ec || !keep_format_info(d, {legacy_create ? ~0u : 0u, ipc[5], ipc[6], 0})) {
+                    if (created) fsys::remove(d, ec);
+                    ipc.result(ERR_IO);
+                    break;
+                }
             }
             save_changed(d);
             ipc.ok(1, legacy_create ? 2 : 0);

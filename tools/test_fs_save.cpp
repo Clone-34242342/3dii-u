@@ -389,6 +389,32 @@ int main(int argc,char **argv) {
         const fs::path ext=kernel::save_root()+std::string(command==0x0835?"/extdata/0000000000000042":"/extdata/1234567800000042");
         put(ext.generic_string()+".format","format kept");fault_call(user,ext/"file",ext.generic_string(),command<<16,{1,0x42,0x12345678,0});assert(get(ext.generic_string()+".format")=="format kept");
     }
+    {
+        const auto file = save / "file";
+        assert(_sopen_s(&lock_fd, file.string().c_str(), O_RDONLY | O_BINARY, _SH_DENYRW, 0) == 0);
+        put(save.generic_string() + ".format", "format kept");
+        assert(call(user, 0x080F0180, {1, 2, 3, 0, 0, 1}) == kernel::ERR_IO);
+        assert(get(save.generic_string() + ".format") == "format kept");
+        ::close(lock_fd);
+        assert(call(user, 0x080F0180, {1, 2, 3, 0, 0, 1}) == 0);
+        const auto format = kernel::format_info(save.generic_string());
+        assert(format.bytes == 512 && format.dirs == 2 && format.files == 3 && format.duplicate == 1);
+    }
+    {
+        const fs::path ext = kernel::save_root() + "/extdata/1234567800000042";
+        const auto file = ext / "file";
+        assert(_sopen_s(&lock_fd, file.string().c_str(), O_RDONLY | O_BINARY, _SH_DENYRW, 0) == 0);
+        assert(call(user, 0x08520100, {1, 0x42, 0x12345678, 0}) == kernel::ERR_IO);
+        assert(get(ext.generic_string() + ".format") == "format kept");
+        ::close(lock_fd);
+        assert(call(user, 0x08520100, {1, 0x42, 0x12345678, 0}) == 0);
+        fs::create_directory(ext.generic_string() + ".format");
+        assert(call(user, 0x08510242, {1, 0x42, 0x12345678, 0, 2, 3, 0, 0, 0}) == kernel::ERR_IO);
+        assert(!fs::exists(ext));
+        fs::remove(ext.generic_string() + ".format");
+        assert(call(user, 0x08510242, {1, 0x42, 0x12345678, 0, 2, 3, 0, 0, 0}) == 0);
+        assert(kernel::format_info(ext.generic_string()).files == 3);
+    }
     for(int kind=0;kind<5;++kind) {
         const auto path=root/("retry"+std::to_string(kind));auto file=cached(path,"new bytes");
         if(kind==0)fail_write=true;if(kind==1)partial_write=1;if(kind==2)fail_stat=true;if(kind==3)fail_truncate=true;if(kind==4)fail_close=true;
