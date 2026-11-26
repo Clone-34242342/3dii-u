@@ -165,6 +165,15 @@ def tool(name):
 
 LANGUAGES = ('Japanese', 'English', 'French', 'German', 'Italian', 'Spanish',
              'Simplified Chinese', 'Korean', 'Dutch', 'Portuguese', 'Russian', 'Traditional Chinese')
+MENU_BUTTONS = ('L', 'R', 'ZL', 'ZR', 'L Stick', 'R Stick', 'A', 'B', 'X', 'Y', 'Plus', 'Minus',
+                'D-Pad Up', 'D-Pad Down', 'D-Pad Left', 'D-Pad Right')
+
+
+def valid_menu_shortcut(value):
+    if not isinstance(value, str):
+        return False
+    buttons = value.split('+')
+    return len(buttons) == 2 and buttons[0] != buttons[1] and all(button in MENU_BUTTONS for button in buttons)
 
 
 def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
@@ -284,7 +293,9 @@ def main():
     ap.add_argument('--pad-art', help="a picture of its own for the GamePad's start-up screen, shown as it is; the TV's otherwise")
     ap.add_argument('--boot-sound', help="the game's own start-up sound, a .btsnd (tools/make_boot_sound.py); the one for every game otherwise")
     ap.add_argument('--save', help="a 3DS save to pack in, which the game takes on the console (saves.py): Checkpoint's, JKSM's or an emulator's folder")
-    ap.add_argument('--no-menu', action='store_true', help='no options menu in the game: clicking the left stick does nothing (content/no_menu)')
+    menu = ap.add_mutually_exclusive_group()
+    menu.add_argument('--no-menu', action='store_true', help='disable the in-game options menu')
+    menu.add_argument('--menu-shortcut', metavar='BUTTON+BUTTON', help='two different buttons to open the in-game menu, for example L+R')
     ap.add_argument('--language', choices=LANGUAGES, help='default game language, when supported (otherwise follows the console)')
     ap.add_argument('--art-style', choices=('picture', 'console'), default='console',
                     help='the start-up screens: laid out as the Virtual Console shows a game, or --art as it is')
@@ -295,6 +306,8 @@ def main():
                                                         'its code and shaders (tools/check_ports.py --cold)')
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
+    if a.menu_shortcut is not None and not valid_menu_shortcut(a.menu_shortcut):
+        ap.error('--menu-shortcut requires two different buttons from ' + ', '.join(MENU_BUTTONS))
     for s in (sys.stdout, sys.stderr):  # run from a console, whose code page may lack a character of a game's name: shown escaped, not fatal
         if s:
             s.reconfigure(errors='backslashreplace')
@@ -612,6 +625,9 @@ def build(a):
             fail(f"The 3DS save couldn't be packed in: {e}")
     if a.no_menu:  # the game looks for it as it starts (frontend_wiiu.cpp)
         open(os.path.join(out, 'title', 'content', 'no_menu'), 'wb').close()
+    elif a.menu_shortcut:
+        with open(os.path.join(out, 'title', 'content', 'menu_shortcut.txt'), 'w', encoding='ascii', newline='\n') as f:
+            f.write(a.menu_shortcut + '\n')
 
     if b3.MEASURE and not b3.MEASURE_CONSOLE:  # the checks' own kind of build, for Cemu (build3ds.py): packed only when asked by name
         print('a measuring build: not packed', flush=True)

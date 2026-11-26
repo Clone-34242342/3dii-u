@@ -33,6 +33,7 @@ code = r'''
 #include <map>
 #include <string>
 #include <type_traits>
+#include "menu_shortcut.h"
 #include "save_backup.h"
 using u32 = unsigned;
 enum { VPAD_BUTTON_STICK_L=1, VPAD_BUTTON_ZL=2, VPAD_BUTTON_ZR=4,
@@ -63,7 +64,9 @@ code += 'u32 top_rows = 720; int start_resolution = 720;\n'
 startup = next(line for line in source.splitlines() if line.strip().startswith('top_rows = start_resolution = '))
 code += 'void start_resolution_for_test() { ' + startup + '\n}\n'
 code += function(source, 'void rt_scale(') + '\n' + function(source, 'static void next_resolution(') + '\n'
-code += function(source, 'static int menu_items()') + '\n' + function(source, 'void menu_input(u32 pressed, u32 held)')
+code += function(source, 'static int menu_items()') + '\n' + function(source, 'void menu_input(u32 pressed, bool toggle)') + '\n'
+frontend = (ROOT / 'port' / 'wiiu' / 'frontend_wiiu.cpp').read_text()
+code += 'u32 overlay_combo;\n' + function(frontend, 'static bool overlay_pressed(')
 code += r'''
 }
 int main(int argc, char **argv) {
@@ -72,6 +75,34 @@ int main(int argc, char **argv) {
 #define CHECK(test) do { ++checks; if (!(test)) { ++failures; std::printf("FAIL line %d: %s\n", __LINE__, #test); } } while (0)
     using namespace wiiu;
     using save_backup::Action;
+
+    constexpr menu_shortcut::Button keys[] = {{"A", VPAD_BUTTON_A}, {"B", VPAD_BUTTON_B}};
+    constexpr u32 ab = VPAD_BUTTON_A | VPAD_BUTTON_B;
+    constexpr u32 triggers = VPAD_BUTTON_ZL | VPAD_BUTTON_ZR;
+    CHECK(overlay_pressed(VPAD_BUTTON_STICK_L, VPAD_BUTTON_STICK_L));
+    CHECK(overlay_pressed(VPAD_BUTTON_ZR, triggers));
+    CHECK(!overlay_pressed(VPAD_BUTTON_ZR, VPAD_BUTTON_ZR));
+    CHECK(!overlay_pressed(0, triggers));
+    for (auto invalid : {"", "A", "A+A", "A+B+C", "A+X", "A+"})
+        CHECK(menu_shortcut::parse(invalid, keys) == 0);
+    overlay_combo = menu_shortcut::parse("B+A", keys);
+    CHECK(overlay_combo == ab && menu_shortcut::parse("A+B", keys) == ab);
+    CHECK(!overlay_pressed(VPAD_BUTTON_STICK_L, VPAD_BUTTON_STICK_L));
+    CHECK(!overlay_pressed(VPAD_BUTTON_ZR, triggers));
+    CHECK(!overlay_pressed(VPAD_BUTTON_A, VPAD_BUTTON_A));
+    CHECK(!overlay_pressed(VPAD_BUTTON_B, VPAD_BUTTON_B));
+    CHECK(overlay_pressed(VPAD_BUTTON_A, ab | VPAD_BUTTON_STICK_L));
+    CHECK(!overlay_pressed(0, ab));
+    menu_input(VPAD_BUTTON_B, overlay_pressed(VPAD_BUTTON_B, ab));
+    CHECK(menu_is_open);
+    menu_restore_confirm = true;
+    menu_input(VPAD_BUTTON_B, overlay_pressed(VPAD_BUTTON_B, ab));
+    CHECK(!menu_restore_confirm && !menu_is_open);
+    menu_allowed = false;
+    menu_input(VPAD_BUTTON_A, overlay_pressed(VPAD_BUTTON_A, ab));
+    CHECK(!menu_is_open);
+    menu_allowed = true;
+    overlay_combo = 0;
 
     CHECK(Settings{}.resolution == 720);
     for (int rows : {240, 440, 480, 720}) {
@@ -113,7 +144,7 @@ int main(int argc, char **argv) {
     menu_is_open = false;
     for (int cap : {0,30}) {
         cap_game=cap; cap_fps=cap; menu_is_open=false; menu_quit=false;
-        menu_input(VPAD_BUTTON_STICK_L,0);
+        menu_input(0, true);
         assert(menu_is_open && !menu_restore_confirm);
         assert(menu_items() == (cap ? 12 : 11));
         menu_item=menu_items()-2;

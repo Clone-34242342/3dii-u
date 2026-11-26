@@ -355,7 +355,9 @@ class App(QObject):
     padArtText, hasPadArt, gameSoundText, hasGameSound = _p(str, 'padArtText'), _p(bool, 'hasPadArt'), _p(str, 'gameSoundText'), _p(bool, 'hasGameSound')
     saveText, hasSave = _p(str, 'saveText'), _p(bool, 'hasSave')
     artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
-    gameMenu = _p(bool, 'gameMenu')  # the options menu in the games it builds (click the left stick)
+    gameMenu = _p(bool, 'gameMenu')
+    menuShortcut = _p(str, 'menuShortcut')
+    menuButtons = Property('QVariantList', lambda self: list(pipeline.MENU_BUTTONS), constant=True)
     gameLanguage = _p(str, 'gameLanguage')
     gameLanguages = Property('QVariantList', lambda self: ['Console default', *pipeline.LANGUAGES], constant=True)
     library = _p('QVariantList', 'library')
@@ -399,7 +401,9 @@ class App(QObject):
             faq = []
         faq = [e for e in faq if isinstance(e, dict) and isinstance(e.get('q'), str) and isinstance(e.get('a'), str) and e['q'] and e['a']]             if isinstance(faq, list) else []
         theme_mode = self.st.get('theme')
+        shortcut = self.st.get('menu_shortcut')
         self._s = dict(hasGame=False, gameName='', gameLanguage='', maker='', badge='', known=False, icon='', meta='',
+                       menuShortcut=shortcut if pipeline.valid_menu_shortcut(shortcut) else '',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
@@ -479,10 +483,18 @@ class App(QObject):
 
     @Slot(bool)
     def setGameMenu(self, on):
-        """whether the games it builds have the options menu (click the left stick): some players asked to leave it out"""
+        """Whether to include the overlay in future builds."""
         self.st['game_menu'] = bool(on)
         save_settings(self.st)
         self.set(gameMenu=bool(on))
+
+    @Slot(str)
+    def setMenuShortcut(self, shortcut):
+        if shortcut and not pipeline.valid_menu_shortcut(shortcut):
+            return
+        self.st['menu_shortcut'] = shortcut
+        save_settings(self.st)
+        self.set(menuShortcut=shortcut)
 
     @Slot(str)
     def setArtStyle(self, style):
@@ -1342,6 +1354,8 @@ class App(QObject):
             argv += ['--save', self.save_in]
         if not self._s['gameMenu']:
             argv += ['--no-menu']
+        elif self._s['menuShortcut']:
+            argv += ['--menu-shortcut', self._s['menuShortcut']]
         if self._s['gameLanguage']:
             argv += ['--language', self._s['gameLanguage']]
         env = dict(os.environ, PYTHONIOENCODING='utf-8', THREEDII_BUILD=self.build_folder())

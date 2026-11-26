@@ -102,6 +102,8 @@ WHAT STAYS ON YOUR PC
   its start-up screens from SteamGridDB instead. Its menu icon still uses the game's own framed icon unless you choose a custom one. The builder sends the game's name (and its names in other
   regions, if SteamGridDB doesn't know this one) and your key there, and nothing else; the key stays in the builder's settings on this PC.
 - A start-up sound is yours to add (Help page, "Art and sound"): choose a WAV file and every game you build plays it while it starts.
+- Choose two buttons under Overlay shortcut on the Help page, or on the Art and Sound tab in the simple window. The choice applies to new builds.
+  With Default selected, click the left stick or press ZL + ZR to open the in-game menu.
 - The builder asks GitHub for the list of its releases, and downloads one from there only when you press "Update".
 
 UI and art design by syntcity.

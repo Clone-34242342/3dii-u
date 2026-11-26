@@ -621,7 +621,7 @@ try:
     # Queue selection is a snapshot. Only a completed worker, including a failed launch, can advance it.
     kept_st = dict(state.st)
     kept_game, kept_update, kept_save = state.game, state.update, state.save_in
-    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'building', 'view', 'updateState')}
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'gameMenu', 'menuShortcut', 'building', 'view', 'updateState')}
     card = os.path.join(base, 'test card')
     os.makedirs(card)
 
@@ -656,6 +656,8 @@ try:
              mock.patch.object(gui.subprocess, 'Popen', side_effect=[worker, OSError('launch failed'), worker, worker]) as launch:
             state.update = SimpleNamespace(path='queued update.cia')
             state.save_in = 'queued save folder'
+            state.setMenuShortcut('L+R')
+            assert json.load(open(settings))['menu_shortcut'] == 'L+R'
             enqueue('First', language='French')
             assert json.load(open(settings))['game_languages'][f'{state.game.title_id:016x}'] == 'French'
             enqueue('First', language='German')
@@ -663,10 +665,15 @@ try:
             state.answer(True)
             state.update = state.save_in = None
             state.st['otp'] = 'second otp'
+            state.setMenuShortcut('L+L')
+            assert state.menuShortcut == 'L+R'
+            state.setGameMenu(False)
             os.environ['THREEDII_BUILD'] = 'second work folder'
             os.environ['BOOT9_PATH'] = 'second keys'
             enqueue('Second')
             enqueue('Third', 'card')
+            state.setGameMenu(True)
+            state.setMenuShortcut('')
             enqueue('Remove me')
             state.removeQueued(3)
             enqueue('Fourth')
@@ -681,6 +688,7 @@ try:
             assert first_args[first_args.index('--update') + 1] == 'queued update.cia'
             assert first_args[first_args.index('--save') + 1] == 'queued save folder'
             assert first_args[first_args.index('--language') + 1] == 'French'
+            assert first_args[first_args.index('--menu-shortcut') + 1] == 'L+R'
             assert first_env['THREEDII_BUILD'] == 'first work folder' and first_env['BOOT9_PATH'] == 'first keys'
             state.build()
             state.clearQueue()
@@ -694,6 +702,7 @@ try:
             assert state.queueItems[1]['detail'] == 'launch failed'
             third_args = launch.call_args.args[0]
             assert third_args[third_args.index('--card') + 1] == card and '--save' not in third_args and '--language' not in third_args
+            assert '--no-menu' in third_args and '--menu-shortcut' not in third_args
             with mock.patch.object(gui, 'WIN', True), mock.patch.object(gui.subprocess, 'run'):
                 gui.App.stop_for_close(state)
             complete()
@@ -702,6 +711,7 @@ try:
             assert queue_status() == ['Done', 'Failed', 'Cancelled', 'Queued']
             state.startQueue()
             assert launch.call_count == 4 and state.buildName == 'Fourth'
+            assert all(flag not in launch.call_args.args[0] for flag in ('--no-menu', '--menu-shortcut'))
             complete('@error build failed')
             settle('queue finished')
             assert not state.busy() and state.queuePending == 0 and state.queueItems[-1]['detail'] == 'build failed'
@@ -719,6 +729,23 @@ try:
     assert state.st['game_menu'] is False and not state.gameMenu and json.load(open(settings))['game_menu'] is False
     state.setGameMenu(True)
     assert state.gameMenu and json.load(open(settings))['game_menu'] is True
+
+    def check_shortcut_picker(window):
+        first = window.findChild(QObject, 'overlayFirstButton')
+        second = window.findChild(QObject, 'overlaySecondButton')
+        assert first is not None and second is not None
+        assert first.property('currentText') == 'Default'
+        assert QMetaObject.invokeMethod(first, 'activated', Q_ARG(int, state.menuButtons.index('L') + 1))
+        settle('choose the first overlay button')
+        assert second.property('currentText') == 'L Stick'
+        assert QMetaObject.invokeMethod(second, 'activated', Q_ARG(int, 0))
+        settle('choose the second overlay button')
+        assert state.menuShortcut == 'L+R' and second.property('currentText') == 'R'
+        assert QMetaObject.invokeMethod(first, 'activated', Q_ARG(int, 0))
+        settle('reset the overlay shortcut')
+        assert not state.menuShortcut and first.property('currentText') == 'Default'
+
+    check_shortcut_picker(win)
 
     # The build folder (a tester's C: had no room): builds go to the one chosen, the old one's build files are offered for deletion and go only on
     # a yes, and Default comes back to the work folder. Nothing outside the build files is touched.
@@ -759,6 +786,7 @@ try:
     simple = engine.rootObjects()[-1]
     assert simple.objectName() == 'simple' and not simple.property('visible'), 'the simple window did not load, or showed itself'
     settle('the simple window')
+    check_shortcut_picker(simple)
     state.tell('A message', 'In the simple window.')
     settle('a message in the simple window')
     assert simple.findChild(QObject, 'dialog').property('visible'), 'the simple window did not show the message'

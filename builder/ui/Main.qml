@@ -1193,9 +1193,17 @@ ApplicationWindow {
                     }
                     CardRow {
                         label: "In-game menu"
-                        sub: app.gameMenu ? "Click the left stick in a game for its options, on the TV and the GamePad." : "Left out of the games you build."
+                        sub: app.gameMenu ? "Show the overlay on the TV and GamePad." : "Left out of the games you build."
                         Pill { text: "On"; accessibleName: "In-game menu on"; tone: app.gameMenu ? "cyan" : "grey"; onClicked: app.setGameMenu(true) }
                         Pill { text: "Off"; accessibleName: "In-game menu off"; tone: app.gameMenu ? "grey" : "cyan"; onClicked: app.setGameMenu(false) }
+                    }
+                    CardRow {
+                        visible: app.gameMenu
+                        enabled: !win.busy
+                        label: "Overlay shortcut"
+                        sub: app.menuShortcut ? "Press both buttons together. Applies to new builds."
+                                              : "Default: click the left stick or press ZL + ZR. Applies to new builds."
+                        OverlayShortcut { builder: app }
                     }
                     CardRow {
                         label: "Start-up sound"

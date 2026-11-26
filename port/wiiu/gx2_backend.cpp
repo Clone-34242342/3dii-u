@@ -4782,11 +4782,8 @@ int game_speed() { return menu_speed; }
 bool menu_wants_quit() { return menu_quit; }
 void menu_quit_now() { menu_quit = true; }
 
-void menu_input(u32 pressed, u32 held) {
+void menu_input(u32 pressed, bool toggle) {
     if (save_backup::requests.view().busy) return;  // keep the menu up until storage releases the snapshot
-    // ZL and ZR together, as the Virtual Console's menu opens, or a click of the left stick: it opens, and closes again
-    constexpr u32 kTriggers = VPAD_BUTTON_ZL | VPAD_BUTTON_ZR;
-    const bool toggle = (pressed & VPAD_BUTTON_STICK_L) || ((held & kTriggers) == kTriggers && (pressed & kTriggers));
     if (!menu_is_open) {
         if (menu_allowed && toggle) {
             menu_item = 0;
@@ -4795,12 +4792,12 @@ void menu_input(u32 pressed, u32 held) {
         }
         return;
     }
+    if (toggle) { menu_restore_confirm = false; menu_is_open = false; return; }
     if (pressed & VPAD_BUTTON_B) {
         if (menu_restore_confirm) { menu_restore_confirm = false; return; }
         menu_is_open = false;
         return;
     }
-    if (toggle) { menu_restore_confirm = false; menu_is_open = false; return; }
     const int count = menu_items();
     if (pressed & (VPAD_BUTTON_UP | VPAD_BUTTON_DOWN | VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT)) menu_restore_confirm = false;
     if (pressed & VPAD_BUTTON_UP) menu_item = (menu_item + count - 1) % count;

@@ -46,6 +46,7 @@
 #include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
+#include "menu_shortcut.h"
 #include "motion_input.h"
 #include "service.h"
 #include "services/services.h"
@@ -153,7 +154,7 @@ void frontend_live_text(const std::string &) {}
 // itself, as if the system had said so: what a game does as it closes then runs in a check too.
 static volatile bool route_quit;
 void frontend_live_key(const std::string &key) {  // a route's "KEY <name>"
-    if (key == "menu") wiiu::menu_input(VPAD_BUTTON_STICK_L);  // as a click of the left stick: opens the options menu, or closes it
+    if (key == "menu") wiiu::menu_input(0, true);
     if (key != "quit") return;
     if (wiiu::debug_flag("cemu")) route_quit = true;
     else wiiu::menu_quit_now();
@@ -281,11 +282,11 @@ static u32 map_pro(u32 h, bool z_too) {
     return b;
 }
 
-// its buttons as the GamePad's, for the options menu (menu_input): ZL and ZR or the left stick to open it, the D-pad, A and B; and for the
-// keyboard and the Mii list, X, Y and +
+// Its buttons as the GamePad's for the options menu, keyboard and Mii selector.
 static u32 pro_as_gamepad(u32 t) {
     u32 v = 0;
     if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
+    if (t & WPAD_PRO_BUTTON_STICK_R) v |= VPAD_BUTTON_STICK_R;
     if (t & WPAD_PRO_TRIGGER_ZL) v |= VPAD_BUTTON_ZL;
     if (t & WPAD_PRO_TRIGGER_ZR) v |= VPAD_BUTTON_ZR;
     if (t & WPAD_PRO_TRIGGER_L) v |= VPAD_BUTTON_L;
@@ -295,11 +296,39 @@ static u32 pro_as_gamepad(u32 t) {
     if (t & WPAD_PRO_BUTTON_X) v |= VPAD_BUTTON_X;
     if (t & WPAD_PRO_BUTTON_Y) v |= VPAD_BUTTON_Y;
     if (t & WPAD_PRO_BUTTON_PLUS) v |= VPAD_BUTTON_PLUS;
+    if (t & WPAD_PRO_BUTTON_MINUS) v |= VPAD_BUTTON_MINUS;
     if (t & WPAD_PRO_BUTTON_UP) v |= VPAD_BUTTON_UP;
     if (t & WPAD_PRO_BUTTON_DOWN) v |= VPAD_BUTTON_DOWN;
     if (t & WPAD_PRO_BUTTON_LEFT) v |= VPAD_BUTTON_LEFT;
     if (t & WPAD_PRO_BUTTON_RIGHT) v |= VPAD_BUTTON_RIGHT;
     return v;
+}
+
+static u32 overlay_combo;
+
+static void load_overlay_combo() {
+    constexpr menu_shortcut::Button buttons[] = {
+        {"L", VPAD_BUTTON_L}, {"R", VPAD_BUTTON_R}, {"ZL", VPAD_BUTTON_ZL}, {"ZR", VPAD_BUTTON_ZR},
+        {"L Stick", VPAD_BUTTON_STICK_L}, {"R Stick", VPAD_BUTTON_STICK_R},
+        {"A", VPAD_BUTTON_A}, {"B", VPAD_BUTTON_B}, {"X", VPAD_BUTTON_X}, {"Y", VPAD_BUTTON_Y},
+        {"Plus", VPAD_BUTTON_PLUS}, {"Minus", VPAD_BUTTON_MINUS}, {"D-Pad Up", VPAD_BUTTON_UP},
+        {"D-Pad Down", VPAD_BUTTON_DOWN}, {"D-Pad Left", VPAD_BUTTON_LEFT}, {"D-Pad Right", VPAD_BUTTON_RIGHT},
+    };
+    if (FILE *f = fopen((std::string(CONTENT_DIR) + "/menu_shortcut.txt").c_str(), "rb")) {
+        char data[40];
+        const size_t size = fread(data, 1, sizeof data, f);
+        if (!ferror(f) && size < sizeof data) {
+            std::string_view chord(data, size);
+            while (!chord.empty() && (chord.back() == '\n' || chord.back() == '\r')) chord.remove_suffix(1);
+            overlay_combo = menu_shortcut::parse(chord, buttons);
+        }
+        fclose(f);
+    }
+}
+
+static bool overlay_pressed(u32 down, u32 held) {
+    if (overlay_combo) return menu_shortcut::pressed(overlay_combo, down, held);
+    return (down & VPAD_BUTTON_STICK_L) || menu_shortcut::pressed(VPAD_BUTTON_ZL | VPAD_BUTTON_ZR, down, held);
 }
 
 // 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y
@@ -356,6 +385,7 @@ static int hid_thread(int, void *) {
     u16 tx = 0, ty = 0;
     for (;;) {
         u32 presses = 0;  // the GamePad's way, from either, for the options menu
+        bool toggle_menu = false;
         bool tap = false;  // a touch on the GamePad began, at px, py
         u16 px = 0, py = 0;
         VPADReadError err = VPAD_READ_SUCCESS;
@@ -372,6 +402,7 @@ static int hid_thread(int, void *) {
             pad_rx = st.rightStick.x;
             pad_ry = st.rightStick.y;
             presses |= st.trigger;
+            toggle_menu = overlay_pressed(st.trigger, st.hold);
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
             pad_x = st.leftStick.x;
             pad_y = st.leftStick.y;
@@ -392,7 +423,6 @@ static int hid_thread(int, void *) {
         }
         const bool z_too = !kernel::extra_pad_connected();
         buttons = map_buttons(pad_held, z_too);
-        u32 held = pad_held;  // the GamePad's way too
         float sx = pad_x, sy = pad_y;
         for (int ch = 0; ch < 4; ch++) {
             KPADStatus ks{};
@@ -404,13 +434,14 @@ static int hid_thread(int, void *) {
                 pro_y[ch] = ks.pro.leftStick.y;
                 pro_rx[ch] = ks.pro.rightStick.x;
                 pro_ry[ch] = ks.pro.rightStick.y;
-                presses |= pro_as_gamepad(ks.pro.trigger);
+                const u32 down = pro_as_gamepad(ks.pro.trigger);
+                presses |= down;
+                toggle_menu |= overlay_pressed(down, pro_as_gamepad(pro_hold[ch]));
             } else if (read || kerr == KPAD_ERROR_INVALID_CONTROLLER) {  // another kind of controller there, or none
                 pro_hold[ch] = 0;
                 pro_x[ch] = pro_y[ch] = pro_rx[ch] = pro_ry[ch] = 0;
             }
             buttons |= map_pro(pro_hold[ch], z_too);
-            held |= pro_as_gamepad(pro_hold[ch]);
             if (std::fabs(pro_x[ch]) + std::fabs(pro_y[ch]) > std::fabs(sx) + std::fabs(sy)) {
                 sx = pro_x[ch];
                 sy = pro_y[ch];
@@ -429,12 +460,13 @@ static int hid_thread(int, void *) {
         }
         cx = (s16)(sx * 156.0f);
         cy = (s16)(sy * 156.0f);
-        // the keyboard and the Mii list a game asked for take either controller's presses, but nothing while the options menu is over them
-        if (!wiiu::menu_open()) {
+        const bool menu_was_open = wiiu::menu_open();
+        wiiu::menu_input(presses, toggle_menu);
+        const bool menu_took_input = menu_was_open || wiiu::menu_open();
+        if (!menu_took_input) {
             wiiu::keyboard_input(presses, tap, px, py);
             wiiu::mii_selector_input(presses, tap, px, py);
         }
-        wiiu::menu_input(presses, held);
         if (!leaving && wiiu::menu_wants_quit()) {
             leaving = true;
             SYSLaunchMenu();
@@ -459,7 +491,12 @@ static int hid_thread(int, void *) {
             }
         }
         wiiu::input_override(buttons, touch, tx, ty);
-        if (wiiu::menu_open()) kernel::hid_extra_pad(0, 0, false, false, false);
+        if (menu_took_input) {
+            buttons = 0;
+            cx = cy = 0;
+            touch = false;
+            kernel::hid_extra_pad(0, 0, false, false, false);
+        }
         else kernel::hid_extra_pad(rx, ry, zl, zr, r);
         kernel::hid_update(buttons, cx, cy, touch, tx, ty);
         if (kMeasure) {
@@ -1020,6 +1057,7 @@ int main(int argc, char **argv) {
     }
     struct stat no_menu;
     if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
+    else load_overlay_combo();
     rt_log_open(log_path());
     if (FILE *f = fopen((wiiu::data_dir() + "/logsync").c_str(), "rb")) {  // debug aid: each line to the card as it's logged (core.cpp)
         fclose(f);
