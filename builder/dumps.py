@@ -484,11 +484,32 @@ def is_romfs(path):
         return os.path.getsize(path) > 0x28 and struct.unpack('<I', f.read(4))[0] == 0x28
 
 
+def unpack_system_app(app, tid, dst, work_dir):
+    with open(app, 'rb') as f:
+        p = FileSlice(f, 0, os.fstat(f.fileno()).st_size)
+        head = p.pread(0, MU)
+        if len(head) != MU or head[0x100:0x104] != b'NCCH' or struct.unpack_from('<Q', head, 0x118)[0] != int(tid, 16):
+            raise DumpError('The NCCH header does not match the system title.')
+        encrypted = not (head[0x18F] & 4 or plain(p, head))
+    staged = dst + '.candidate'
+    try:
+        with tempfile.TemporaryDirectory(prefix='sysarc-', dir=work_dir) as work:
+            path = decrypt.to_plain(app, os.path.join(work, 'plain')) if encrypted else app
+            with open(path, 'rb') as f:
+                p = ncch(FileSlice(f, 0, os.fstat(f.fileno()).st_size))
+                if not copy_romfs(p, p.pread(0, MU), staged) or not is_romfs(staged):
+                    raise DumpError('The system title has no usable RomFS.')
+        os.replace(staged, dst)
+    finally:
+        if os.path.exists(staged):
+            os.remove(staged)
+
+
 def import_system_archives(source, out_dir, work_dir):
     """The shared font, Mii data and the other system archives games read, into out_dir as <title id>.romfs. They come from a 3DS NAND (see
     nand_titles): as NCCH contents (<n>.app, Azahar and Citra) or as their RomFS already (<n>.app.romfs), or from a folder of
     <title id>.romfs files, as this builder keeps them. Returns which came out."""
-    got = []
+    got, locked = [], None
     os.makedirs(out_dir, exist_ok=True)
     titles = nand_titles(source)
     for tid in SYSTEM_ARCHIVES:
@@ -497,22 +518,29 @@ def import_system_archives(source, out_dir, work_dir):
         content = os.path.join(titles, tid[:8], tid[8:], 'content') if titles else ''
         names = sorted(os.listdir(content)) if os.path.isdir(content) else []
         ready = [os.path.join(content, n) for n in names if n.endswith('.app.romfs')] + ([flat] if os.path.isfile(flat) else [])
-        ready = [p for p in ready if is_romfs(p)]
+        ready = [p for p in ready if os.path.isfile(p) and is_romfs(p)]
         if ready:
             if os.path.abspath(ready[0]) != os.path.abspath(dst):
                 shutil.copyfile(ready[0], dst + '.part')  # whole or not at all: a copy cut short would pass for the archive from then on
                 os.replace(dst + '.part', dst)
             got.append(tid)
             continue
-        for app in [n for n in names if n.endswith('.app')]:
-            d = Dump(os.path.join(content, app))
-            path = d.path if not d.encrypted() else decrypt.to_plain(d.path, os.path.join(work_dir, 'sysarc_' + tid))
-            with open(path, 'rb') as f:
-                p = ncch(FileSlice(f, 0, os.path.getsize(path)))
-                os.makedirs(out_dir, exist_ok=True)
-                if copy_romfs(p, p.pread(0, 0x200), os.path.join(out_dir, tid + '.romfs')):
-                    got.append(tid)
-            if path != d.path:
-                os.remove(path)
+        failed = None
+        for app in (n for n in names if n.endswith('.app') and os.path.isfile(os.path.join(content, n))):
+            try:
+                unpack_system_app(os.path.join(content, app), tid, dst, work_dir)
+            except decrypt.DecryptError as e:
+                failed = decrypt.DecryptError(f'{tid}/{app}: {e}')
+                continue
+            except DumpError as e:
+                print(f'Skipping unusable 3DS system content {tid}/{app}: {e}', flush=True)
+                continue
+            got.append(tid)
             break
+        else:
+            if failed:
+                locked = failed
+                print(f'Could not decrypt 3DS system content {failed}', flush=True)
+    if locked and (not got or not have_system_archives(out_dir)):
+        raise locked
     return got
