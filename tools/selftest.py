@@ -216,6 +216,14 @@ def uds_room():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_uds_room.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def gsp_lcd():
+    exe = build3ds.WORK + '/selftest/test_gsp_lcd.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections',
+                               '-I' + build3ds.PORT + '/pc/win', '-include', build3ds.PORT + '/pc/shim.h',
+                               '-static', ROOT + '/tools/test_gsp_lcd.cpp', '-lpthread', '-o', exe], [exe]]
+
+
 def ir_ipc():
     exe = build3ds.WORK + '/selftest/test_ir.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
@@ -250,6 +258,7 @@ def main():
         'PC autoplay': [[py, ROOT + '/tools/test_pc_autoplay.py']],
         'mapped output': mapped_output(),
         'unanswered service replies': unanswered(),
+        'GSP LCD registers': gsp_lcd(),
         'module memory ownership': [[py, '-B', ROOT + '/tools/test_module_memory.py'],
                                     [py, '-B', ROOT + '/tools/test_cro_modules.py']],
         'offline UDS IPC': uds_room(),
