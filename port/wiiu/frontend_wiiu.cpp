@@ -364,7 +364,8 @@ static int hid_thread(int, void *) {
         if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
             pad_held = 0;
             pad_x = pad_y = pad_rx = pad_ry = 0;
-            touch = false;
+            touch = touch_was = false;
+            wiiu::mic_blow(false);
         }
         if (err == VPAD_READ_SUCCESS) {
             pad_held = st.hold;

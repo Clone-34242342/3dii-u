@@ -6,7 +6,7 @@ APP, VERSION = '3Dii U Builder', '1.0.3'
 LICENCE = 'EUPL-1.2'
 SOURCE = 'https://github.com/J-Glitch2502/3dii-u'
 DESIGN = 'syntcity'  # the Builder's UI and art design
-CONTRIBUTORS = 'sennecaelen, Clone-34242342, creeper88-boy, Mertoxx07 and matte-oss'
+CONTRIBUTORS = 'sennecaelen, Clone-34242342, creeper88-boy, Mertoxx07, matte-oss and s58faster'
 
 # (what, by whom, licence, where): the projects whose code is in the app or in the games it makes
 UPSTREAM = [
