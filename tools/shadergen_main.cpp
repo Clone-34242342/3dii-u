@@ -89,6 +89,15 @@ void read_log(const std::string &path) {
             memcpy(r.gs.slots, &d[q + 64], 24);
             gsx_records.push_back(std::move(r));
             p = end;
+        } else if (!memcmp(&d[p], "GS  ", 4)) {
+            // Legacy CPU geometry records are not fragment keys. Native
+            // geometry compilation consumes their separate .gsl representation.
+            if (p + 16 > d.size()) break;
+            const u32 nc = u32at(p + 8), ns = u32at(p + 12);
+            if (nc > 4096 || ns > 4096) break;
+            const size_t size = 16 + ((size_t)nc + ns) * 4;
+            if (size > d.size() - p) break;
+            p += size;
         } else if (!memcmp(&d[p], "VS  ", 4)) {
             VsRecord r;
             r.entry = u32at(p + 4);

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Geometry shaders a game runs on the CPU, as C compiled into its build: pica_to_c.py <out.c> <gs logs (.gsl)...>
 
-A geometry shader has no GPU path on the Wii U: the runtime runs it in its PICA interpreter on the GPU thread, a couple of hundred cycles an
+For programs without a supported GPU path on the Wii U: the runtime runs it in its PICA interpreter on the GPU thread, a couple of hundred cycles an
 instruction. Luigi's Mansion: Dark Moon's rain (90 instructions for each of 1600 vertices a frame) took 28 ms of every frame that way on a
 console (2026-11-13). A program logged in a .gsl file ("GS  " records: entry, code and swizzle word counts, the GS unit's whole code and swizzle
 memory, as port/wiiu/gx2_backend.cpp writes them) whose stretch uses supported arithmetic and bounded control flow is written here as plain C: the same
@@ -9,6 +9,8 @@ arithmetic as the interpreter's (pmul1, a dot product summed in the same order),
 returns; a LOOP (not nested) is a loop, and a uniform addressed by its counter is found as the interpreter finds it. Anything else (calls,
 nonempty else blocks, conditionals mixed with loops, jumps elsewhere, addressing by a0) leaves that program to the interpreter.
 Bounded IFU/IFC regions without an else use ordinary C conditionals, with the same condition tests as the interpreter.
+
+Declared DVLB geometry entries discovered by tools/dvlb_to_log.py can supply these records without a console run.
 
 The output is the game's own code translated, so it goes only into the build made from the user's own logs (build3ds.py), never into this
 repository. The runtime finds a function by its entry and a hash of the words it was made from (vertex.cpp: gs_native_find); check one

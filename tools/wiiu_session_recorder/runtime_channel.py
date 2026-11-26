@@ -1,4 +1,4 @@
-"""Read-only TCP console capture, sharing the GUI recorder's session and controls."""
+"""TCP console capture and explicit debug controls, sharing the recorder session."""
 import queue
 import re
 import select
@@ -9,7 +9,7 @@ import time
 
 def checked_command(command, allow_renderer=False):
     command = command.strip()
-    if command in {'st', 'ps', 'stats', 'diag'}:
+    if command in {'st', 'ps', 'stats', 'diag', 'state status', 'list', 'prof'}:
         return command
     match = re.fullmatch(r'mem ([0-9a-fA-F]{1,8}) ([0-9a-fA-F]{1,4})', command)
     if match:
@@ -17,16 +17,21 @@ def checked_command(command, allow_renderer=False):
         if 0 < size <= 4096 and address + size <= 0x100000000:
             return command
     if allow_renderer:
+        match = re.fullmatch(r'ram (read|write) ([0-9a-fA-F]{1,8})(?: ([0-9a-fA-F]{1,8}) ([0-9a-fA-F]{1,8}))?', command)
+        if match and int(match[2],16) % 4 == 0 and ((match[1]=='read' and match[3] is None) or (match[1]=='write' and match[3] is not None)): return command
+        if command in {'state save', 'state save-ram', 'state load', 'state load-file'}: return command
+        if re.fullmatch(r'set speed (100|200|400)', command): return command
+
         if re.fullmatch(r'set diag [0-3]', command): return command
         match = re.fullmatch(r'set diagthread ([0-9]{1,5})', command)
         if match and int(match[1]) <= 65535: return command
-        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy|vssimd|poolspin) [01]', command): return command
+        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy|vssimd|poolspin|pause|lightguard|copyrect) [01]', command): return command
         if re.fullmatch(r'set toplevel [012]', command): return command
         match = re.fullmatch(r'set cpuattr ([0-9]{1,2})', command)
         if match and int(match[1]) <= 15: return command
         match = re.fullmatch(r'set trace ([0-9]{1,3})', command)
         if match and int(match[1]) <= 256: return command
-    raise ValueError('Use st, ps, stats, or bounded mem. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh/gputime/cputime/avtime 0|1, toplevel 0..2, cpuattr 0..15 and trace 0..256 only.')
+    raise ValueError('Use st, ps, stats, or bounded mem. State changes require explicit debug controls. Explicit renderer controls allow cpuvs/vtxcache/drawtrace/inkrefresh/gputime/cputime/avtime 0|1, toplevel 0..2, cpuattr 0..15 and trace 0..256 only.')
 
 
 class RuntimeReceiver(threading.Thread):

@@ -127,6 +127,18 @@ class DualChannelTests(unittest.TestCase):
         self.assertEqual(events[0]['target'], 'cemu')
         self.assertEqual(events[-1]['event'], 'stopped')
 
+    def test_explicit_game_and_state_controls_reach_runtime(self):
+        self.connect()
+        self.controller.command('start')
+        for action,note,wire in [('state-save','','state save'),('state-load','','state load'),
+                                 ('state-status','','state status'),('game-pause','','set pause 1'),
+                                 ('game-resume','','set pause 0'),('game-speed','200','set speed 200')]:
+            result=self.controller.command(action,note)
+            self.assertEqual(result['runtime_command_queued'],wire)
+            wait_for(lambda: wire.encode() in self.server.commands)
+        with self.assertRaises(ValueError): self.controller.command('game-speed','9000')
+        self.assertFalse(self.rec.periodic_capture)
+
     def test_pause_aroma_preserves_runtime_and_recording(self):
         self.connect()
         folder = Path(self.controller.command('start')['session'])

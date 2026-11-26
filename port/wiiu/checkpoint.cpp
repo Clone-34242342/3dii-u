@@ -12,6 +12,7 @@
 #endif
 #include "kernel.h"
 #include "loader.h"
+#include "gpu/pica.h"
 
 namespace wiiu { const std::string &data_dir(); void save_flush(bool); int flush_checkpoint_storage(); void show_state_loading(bool); }
 
@@ -248,7 +249,41 @@ const char *result_message() {
     }
 }
 void request(unsigned command) { __atomic_store_n(&g_3dii_state_command, command, __ATOMIC_RELEASE); }
+namespace {
+struct DebugMemory32 { u32 address=0, expected=0, replacement=0; bool write=false, pending=false; };
+std::mutex debug_memory_mutex;
+DebugMemory32 debug_memory;
+}
+bool request_memory32(u32 address, bool write, u32 expected, u32 replacement) {
+    if (address & 3) return false;
+    std::lock_guard<std::mutex> lock(debug_memory_mutex);
+    if (debug_memory.pending) return false;
+    debug_memory = {address, expected, replacement, write, true};
+    return true;
+}
+static void pump_debug_memory() {
+    DebugMemory32 job;
+    { std::lock_guard<std::mutex> lock(debug_memory_mutex); job=debug_memory; debug_memory.pending=false; }
+    if (!job.pending) return;
+    // Same barrier as a checkpoint: no guest or renderer thread races the edit.
+    ExclusiveScope hold(gate());
+    if (!kernel::guest_readable(job.address,4) || (job.write && !kernel::guest_writable(job.address,4))) {
+        LOG("[debug-ram] %08x refused: guest mapping/permissions\n",job.address); return;
+    }
+    const u32 old=r32(job.address);
+    if (!job.write) { LOG("[debug-ram] %08x = %08x\n",job.address,old); return; }
+    if (old!=job.expected) {
+        LOG("[debug-ram] %08x unchanged: expected %08x actual %08x\n",job.address,job.expected,old); return;
+    }
+    w32(job.address,job.replacement);
+#ifdef __WIIU__
+    DCFlushRange(gptr(job.address),4);
+    if (const u32 physical=mem::vaddr_to_paddr(job.address)) gpu::metal_guest_written(physical,4,true);
+#endif
+    LOG("[debug-ram] %08x changed %08x -> %08x\n",job.address,old,job.replacement);
+}
 void pump() {
+    pump_debug_memory();
     if (!saving_to_disk() && disk_result.load(std::memory_order_acquire)==1) disk_available.store(true,std::memory_order_release);
     const unsigned command = __atomic_exchange_n(&g_3dii_state_command, 0, __ATOMIC_ACQ_REL);
     if (!command) return;

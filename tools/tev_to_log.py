@@ -259,27 +259,36 @@ def normal(s):
 
 
 def records(path):
-    """fragment keys in a log, or in a console's miss list (tagged records, as misses_to_log.py reads them)"""
+    """Read mixed miss logs, retaining only fragment keys; reject partial records."""
     d, p, out = open(path, 'rb').read(), 0, []
-    while p + 4 <= len(d):
+    def require(at, size):
+        if size < 0 or at > len(d) or size > len(d) - at:
+            raise ValueError(f'{path}: truncated shader record at {p}')
+    while p < len(d):
+        require(p, 4)
         tag = d[p:p + 4]
-        if tag == b'FS  ':
-            n = struct.unpack_from('<I', d, p + 4)[0]
-            out.append(d[p + 8:p + 8 + n])
-            p += 8 + n
-            continue
-        if tag == b'VS  ':
+        if tag in (b'VS  ', b'GS  '):
+            require(p, 16)
             _, nc, ns = struct.unpack_from('<III', d, p + 4)
-            p += 16 + (nc + ns) * 4 + 56
+            if nc > 4096 or ns > 4096:
+                raise ValueError(f'{path}: oversized shader program at {p}')
+            size = 16 + (nc + ns) * 4 + (56 if tag == b'VS  ' else 0)
+            require(p, size); p += size
             continue
-        if tag == b'GSX ':  # a vertex shader and a geometry shader: its size after the tag
-            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
+        if tag == b'GSX ':
+            require(p, 8)
+            n = struct.unpack_from('<I', d, p + 4)[0]
+            if n > 1 << 20:
+                raise ValueError(f'{path}: oversized geometry record at {p}')
+            require(p, 8 + n); p += 8 + n
             continue
-        n = struct.unpack_from('<I', d, p)[0]
-        if n > 4096 or n % 4:
+        q = p + 4 if tag == b'FS  ' else p
+        require(q, 4)
+        n = struct.unpack_from('<I', d, q)[0]
+        if n < 4 or n > 4096 or n % 4:
             raise ValueError(f'{path}: not a fragment log at {p}')
-        out.append(d[p + 4:p + 4 + n])
-        p += 4 + n
+        require(q + 4, n)
+        out.append(d[q + 4:q + 4 + n]); p = q + 4 + n
     return out
 
 

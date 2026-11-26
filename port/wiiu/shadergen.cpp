@@ -394,7 +394,7 @@ std::string gen_fs_glsl(const DrawState &ds) {
 }
 
 // For combiner settings no run has logged: reads them from uniforms and does what gen_fs_glsl() would have compiled in, far more slowly, but with the right colours. A miss draws
-// with this until a build has its own shader. The plain fallbacks have no combiners, lighting or alpha test, so cut-outs draw solid and lit things go black. Leaves out cube maps,
+// with this until a build has its own shader. The plain fallbacks have no combiners, lighting or alpha test, so cut-outs draw solid and lit things go black. Supports 2D shadow comparison; leaves out cube maps,
 // cube shadow-map variants and procedural textures. Lit families support up to eight lights; specialized programs remain preferred.
 std::string uber_family_key(bool lit, u32 texture_mask) {
     return std::string(lit ? "uber lit textures " : "uber textures ") + std::to_string(texture_mask & 7);
@@ -572,6 +572,9 @@ void light(int i) {
         vec2 e = lut_entry(texelFetch(uLut, ivec2(idx, 16 + f.x), 0));
         dist = e.x + e.y * (loc * 256.0 - float(idx));
     }
+    // Match the specialized zero-distance guard without dropping Fresnel alpha.
+    bool alpha_light = i == uLit.x - 1 && uSel[3].x != 0 && (uLit3.x != 0 || uLit3.y != 0);
+    if (uLscale1.w != 0.0 && dist == 0.0 && !alpha_light) return;
     float hl = length(hv);
     vec3 nh = hl > 0.0 ? hv * (1.0 / hl) : hv;
     lin0 = scalar_dot3(normal, nh); lin1 = scalar_dot3(nv, nh); lin2 = scalar_dot3(normal, nv); lin3 = scalar_dot3(lv, normal); lin4 = scalar_dot3(lv, uLights[i].spot.xyz);
@@ -676,6 +679,16 @@ void lighting() {
         else s += "uTexAdd[" + n + "]";
         s += ";\n";
     }
+    if (texture_mask & 1) s += R"(    if (uWrap[0].z == 2) {
+        // A shadow texture packs depth into GBA and visibility into R; it is
+        // not an ordinary RGBA material texture. Match gen_fs_glsl exactly.
+        vec2 uvs = uWrap[0].w != 0 ? c0 : c0 / vTc2w.z;
+        vec4 b = textureLod(t0, uvs, 0.0);
+        float zz = min(abs(vTc2w.z), 1.0) - uShadow.x;
+        float zref = b.a * 0.99609375 + b.b * 0.00389099 + b.g * 0.0000152;
+        tx0 = vec4(zref >= zz ? b.r : 0.0);
+    }
+)";
     if (lit) s += "    lighting();\n";
     s += R"(    outc = uTevInit[0]; buf = uTevInit[1]; nxt = uTevInit[2];
     if (uUber.x > 0) stage(0);

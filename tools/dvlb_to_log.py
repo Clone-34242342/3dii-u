@@ -5,7 +5,7 @@ Walks code.bin and the whole romfs, inside LZ10, LZ11 and Yaz0 streams and whate
 generator reads like any other log: one for each vertex program and each one that can draw an outline. Which output each register feeds comes from the program's own table, as a game
 sets it up. With --lists and the shader generator's path, the programs a game loads with GPU command lists kept in its files go in too (Game Freak's model files: the generator
 finds them, tools/shadergen_lists.cpp). dvlb_to_log.py <game dir> [--check] [--lists <shadergen>]. Output: <game dir>/shader_logs/dvlb.bin. --check only compares with what runs
-have logged, and writes nothing.
+have logged, and writes nothing. --geometry-only instead exports declared geometry entries to shader_logs/assets_geometry.gsl for native CPU translation.
 """
 import bisect
 import glob
@@ -154,13 +154,13 @@ def readable(blob):
     return True
 
 
-def programs(game):
+def programs(game, romfs_name="romfs.bin", include_code=True):
     """Each shader binary in the game. The first time a compressed stream holds the magic it can't be a copy of anything, so it's there as literals, with at most one flag byte
     among them: shortcut: a stream that already had 3 of those letters in a row wouldn't show, which would need the whole romfs unpacked to rule out."""
     code = f'{game}/code.bin'
-    if os.path.exists(code):
+    if include_code and os.path.exists(code):
         yield from plain(open(code, 'rb').read())
-    with open(f'{game}/romfs.bin', 'rb') as f:
+    with open(os.path.join(game, romfs_name), 'rb') as f:
         data = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
     files = romfs_files(data)
     starts = [f[0] for f in files]
@@ -224,6 +224,49 @@ def parse(blob):
             outs.append((sem, reg, mask))
         entries.append((kind, entry, outs))
     return code, swz, entries
+
+
+def geometry_records(blobs):
+    """Native-CPU candidates from declared DVLE geometry entries, without a run log.
+
+    Keep the shared DVLP code memory: a geometry entry can be beyond word 512.
+    The native translator still declines unsupported control flow, and the runtime
+    matches instruction/swizzle hashes before using any generated function.
+    """
+    seen = set()
+    for blob in blobs:
+        try:
+            code, swz, entries = parse(blob)
+        except (ValueError, struct.error, IndexError):
+            continue
+        if not 0 < len(code) <= 4096 or len(swz) > 4096:
+            continue
+        for kind, entry, _outs in entries:
+            if kind != 1 or not 0 <= entry < len(code):
+                continue
+            rec = (b'GS  ' + struct.pack('<III', entry, len(code), len(swz))
+                   + struct.pack(f'<{len(code)}I', *code)
+                   + struct.pack(f'<{len(swz)}I', *swz))
+            if rec not in seen:
+                seen.add(rec)
+                yield rec
+
+
+def discover_geometry(game):
+    def blobs():
+        for image in ('romfs.bin', 'update_romfs.bin'):
+            if os.path.exists(os.path.join(game, image)):
+                yield from programs(game, image, include_code=image == 'romfs.bin')
+    records = list(geometry_records(blobs()))
+    logs = os.path.join(game, 'shader_logs')
+    os.makedirs(logs, exist_ok=True)
+    path = os.path.join(logs, 'assets_geometry.gsl')
+    # Replace only this derived file; preserve the user's recorded .gsl files.
+    tmp = path + '.new'
+    with open(tmp, 'wb') as f:
+        f.write(b''.join(records))
+    os.replace(tmp, path)
+    print(f'{len(records)} geometry programs discovered in assets for native CPU translation')
 
 
 def labels(blob):
@@ -325,6 +368,9 @@ def start_of(entry, code):
 def main():
     game = sys.argv[1]
     check = '--check' in sys.argv
+    if '--geometry-only' in sys.argv:
+        discover_geometry(game)
+        return
     lists = listed(game, sys.argv[sys.argv.index('--lists') + 1]) if '--lists' in sys.argv[:-1] else b''
     out = b''
     table = {}

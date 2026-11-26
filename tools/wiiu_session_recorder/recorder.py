@@ -23,6 +23,8 @@ UDP_PORT, TCP_PORT = 4445, 7965
 DEFAULT_DIR = Path(os.environ.get("WIIU_LOG_DIR", Path.home() / "Wii U" / "Logs"))
 CONTROL = Path(os.environ.get("XDG_RUNTIME_DIR", Path.home() / ".cache")) / "wiiu-session-recorder.sock"
 SCREENSHOT_DIR = "/fs/vol/external01/wiiu/screenshots/recorder"
+PERIODIC_CAPTURE_SECONDS = 0.2
+CAPTURE_RETRY_SECONDS = 2.0
 
 
 def timestamp():
@@ -61,6 +63,7 @@ def capture_gamepad(console, destination):
                     if stream.read(8) != b"\x89PNG\r\n\x1a\n":
                         raise ValueError("Console returned an invalid PNG")
                 pending.replace(destination)
+                return {"capture_token": token, "image_received_at": timestamp()}
             finally:
                 for filename in (token + ".request", "request", remote):
                     try:
@@ -79,6 +82,17 @@ class Recorder:
         self.screenshot_queue = deque()
         self.screenshot_worker = None
         self.screenshot_status = ""
+        self.periodic_capture = False
+        self.periodic_worker = None
+        self.periodic_wake = threading.Event()
+        self.periodic_saved = self.periodic_failed = self.periodic_skipped = self.periodic_sequence = 0
+        self.capture_not_before = 0.0
+        self.capture_failures_in_a_row = 0
+        self.last_capture_seconds = None
+        self.capture_times = deque(maxlen=12)
+        self.runtime_frame = None
+        self.runtime_frame_observed_at = None
+        self.runtime_pending = ""
         self.lock = threading.Lock()
         self.connected = False
         self.last_data = None
@@ -102,6 +116,7 @@ class Recorder:
             if self.connected != connected and self.events:
                 self.event("connected" if connected else "disconnected")
             self.connected = connected
+            self.periodic_wake.set()
             if not connected:
                 self.last_data = None
                 self.mapped_mutexes.clear()
@@ -148,14 +163,25 @@ class Recorder:
             if self.runtime_connected != connected and self.events:
                 self.event("runtime_connected" if connected else "runtime_disconnected")
             self.runtime_connected = connected
+            self.periodic_wake.set()
             if not connected:
                 self.runtime_last_data = None
+                self.runtime_frame = self.runtime_frame_observed_at = None
+                self.runtime_pending = ""
 
     def receive_runtime(self, data):
         if not data:
             return
         with self.lock:
             self.runtime_last_data = time.monotonic()
+            self.runtime_pending += data.decode(errors="replace")
+            lines = self.runtime_pending.split("\n")
+            self.runtime_pending = lines.pop()[-4096:]
+            for line in lines:
+                match = re.search(r'\[st\] frame (\d+)', line)
+                if match:
+                    self.runtime_frame = int(match[1])
+                    self.runtime_frame_observed_at = timestamp()
             if self.runtime_log:
                 self.runtime_log.write(data)
                 self.runtime_log.flush()
@@ -187,6 +213,12 @@ class Recorder:
         self.session = path
         self.bytes = self.runtime_bytes = self.markers = 0
         self.screenshot_status = ""
+        self.periodic_saved = self.periodic_failed = self.periodic_skipped = self.periodic_sequence = 0
+        self.capture_not_before = 0.0
+        self.capture_failures_in_a_row = 0
+        self.last_capture_seconds = None
+        self.capture_times.clear()
+        self.periodic_wake.set()
         self.event("started", target=self.target, connected=self.connected, runtime_connected=self.runtime_connected)
         for name in ("console.log", "runtime.log", "events.jsonl"):
             (path / name).chmod(0o600)
@@ -197,33 +229,97 @@ class Recorder:
         self.runtime_log.close()
         self.events.close()
         self.log = self.runtime_log = self.events = None
+        self.periodic_wake.set()
 
-    def _capture(self, session, filename, marker):
+    def _queue_capture(self, session, filename, marker):
+        # Called with self.lock held. Manual and periodic captures share one worker.
+        self.screenshot_queue.append((session, filename, marker, self.screenshot_console))
+        if self.screenshot_worker is None:
+            self.screenshot_worker = threading.Thread(target=self._capture_pending, daemon=True)
+            self.screenshot_worker.start()
+
+    def _periodic_loop(self):
+        while True:
+            with self.lock:
+                if not self.periodic_capture:
+                    self.periodic_worker = None
+                    return
+                self.periodic_wake.clear()
+                delay = None  # A busy capture wakes us when its worker finishes.
+                if self.log and self.target == "wiiu" and self.screenshot_console and (self.connected or self.runtime_connected):
+                    if self.screenshot_worker is None:
+                        delay = max(0.0, self.capture_not_before - time.monotonic())
+                        if delay <= 0:
+                            self.periodic_sequence += 1
+                            now = datetime.now().astimezone()
+                            filename = f"captures/gamepad-{self.periodic_sequence:06d}-{now:%H-%M-%S-%f}.png"
+                            marker = {"periodic": True, "number": self.periodic_sequence,
+                                      "capture_requested_at": now.isoformat(timespec="milliseconds"),
+                                      "request_log_offset": self.bytes, "request_runtime_offset": self.runtime_bytes,
+                                      "request_runtime_frame": self.runtime_frame,
+                                      "request_runtime_frame_observed_at": self.runtime_frame_observed_at}
+                            self.log.flush(); self.runtime_log.flush()
+                            self.event("periodic_screenshot_requested", screenshot=filename, **marker)
+                            self._queue_capture(self.session, filename, marker)
+                            delay = None
+                    else:
+                        self.periodic_skipped += 1
+            self.periodic_wake.wait(delay)
+
+    def _capture(self, session, filename, marker, console):
+        began = time.monotonic()
         try:
-            capture_gamepad(self.screenshot_console, session / filename)
-            result = {"status": "saved", "screenshot": filename}
+            destination = session / filename
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            transport = capture_gamepad(console, destination) or {}
+            result = {"status": "saved", "screenshot": filename, **transport}
             message = f"GamePad screenshot saved: {filename}"
-        except all_errors + (ValueError,) as exc:
-            result = {"status": "failed", "error": str(exc)}
-            message = f"Screenshot unavailable: {exc}"
+        except Exception as exc:
+            result = {"status": "failed", "screenshot": filename, "error": str(exc)}
+            message = f"Screenshot unavailable; periodic capture will retry: {exc}"
         with self.lock:
-            details = {**marker, **result, "capture_completed_at": timestamp()}
-            if self.session == session and self.events:
-                self.event("graphics_screenshot", **details)
+            current = self.session == session
+            details = {**marker, **result, "capture_completed_at": timestamp(),
+                       "duration_seconds": round(time.monotonic() - began, 3),
+                       "capture_completed_log_offset": self.bytes if current else None,
+                       "capture_completed_runtime_offset": self.runtime_bytes if current else None,
+                       "completion_runtime_frame": self.runtime_frame if current else None,
+                       "completion_runtime_frame_observed_at": self.runtime_frame_observed_at if current else None,
+                       "timing_note": "Request/completion bound an asynchronous capture; runtime frames are last observed status, not exact image-frame IDs."}
+            kind = "periodic_screenshot" if marker.get("periodic") else "graphics_screenshot"
+            if current and self.events:
+                self.event(kind, **details)
             else:
                 with (session / "events.jsonl").open("a", encoding="utf-8") as events:
-                    events.write(json.dumps({"event": "graphics_screenshot", **details}) + "\n")
-            if self.session == session:
+                    events.write(json.dumps({"event": kind, **details}) + "\n")
+            try:
+                (session / filename).with_suffix('.json').write_text(json.dumps(details, indent=2) + "\n", encoding="utf-8")
+            except OSError:
+                pass  # The event log still carries the mapping if the sidecar cannot be written.
+            if current:
                 self.screenshot_status = message
+                if marker.get("periodic"):
+                    self.last_capture_seconds = round(time.monotonic() - began, 3)
+                    if result['status'] == 'saved':
+                        self.periodic_saved += 1
+                        self.capture_failures_in_a_row = 0
+                        self.capture_times.append(time.monotonic())
+                        cooldown = PERIODIC_CAPTURE_SECONDS
+                    else:
+                        self.periodic_failed += 1
+                        self.capture_failures_in_a_row += 1
+                        cooldown = CAPTURE_RETRY_SECONDS * 2 ** min(self.capture_failures_in_a_row - 1, 2)
+                    self.capture_not_before = time.monotonic() + cooldown
 
     def _capture_pending(self):
         while True:
             with self.lock:
                 if not self.screenshot_queue:
                     self.screenshot_worker = None
+                    self.periodic_wake.set()
                     return
-                session, filename, marker = self.screenshot_queue.popleft()
-            self._capture(session, filename, marker)
+                session, filename, marker, console = self.screenshot_queue.popleft()
+            self._capture(session, filename, marker, console)
 
     def command(self, action, note=""):
         with self.lock:
@@ -233,6 +329,19 @@ class Recorder:
                 self._start()
             elif action == "stop" and self.log:
                 self._stop()
+            elif action == "screenshots":
+                if note not in ("on", "off"):
+                    raise ValueError("Use screenshots on or off")
+                if note == "on" and (self.target != "wiiu" or not self.screenshot_console):
+                    raise ValueError("Periodic GamePad capture requires Wii U screenshots to be enabled.")
+                self.periodic_capture = note == "on"
+                if self.events:
+                    self.event("periodic_screenshot_mode", enabled=self.periodic_capture,
+                               mode="continuous_best_effort", minimum_cooldown_seconds=PERIODIC_CAPTURE_SECONDS)
+                if self.periodic_capture and self.periodic_worker is None:
+                    self.periodic_worker = threading.Thread(target=self._periodic_loop, daemon=True)
+                    self.periodic_worker.start()
+                self.periodic_wake.set()
             elif action == "mark":
                 if not self.log:
                     raise ValueError("Start recording before marking a glitch.")
@@ -246,10 +355,10 @@ class Recorder:
                     filename = f"glitch-{self.markers:03d}-{instant:%H-%M-%S-%f}.png"
                     details = {"screenshot": filename, "screenshot_status": "requested"}
                     self.screenshot_status = "Waiting for GamePad screenshot…"
-                    self.screenshot_queue.append((self.session, filename, marker))
-                    if self.screenshot_worker is None:
-                        self.screenshot_worker = threading.Thread(target=self._capture_pending)
-                        self.screenshot_worker.start()
+                    marker.update(capture_requested_at=marker['time'], request_log_offset=self.bytes,
+                                  request_runtime_offset=self.runtime_bytes, request_runtime_frame=self.runtime_frame,
+                                  request_runtime_frame_observed_at=self.runtime_frame_observed_at)
+                    self._queue_capture(self.session, filename, marker)
                 self.event("graphics_glitch", **marker, **details, note=note[:500])
             elif action not in {"status", "start", "stop"}:
                 raise ValueError("Unknown recorder action.")
@@ -261,6 +370,16 @@ class Recorder:
                 "bytes": self.bytes,
                 "markers": self.markers,
                 "screenshot_status": self.screenshot_status,
+                "periodic_capture": self.periodic_capture,
+                "periodic_capture_available": self.target == "wiiu" and bool(self.screenshot_console),
+                "periodic_interval_seconds": PERIODIC_CAPTURE_SECONDS,
+                "periodic_capture_mode": "continuous_best_effort",
+                "last_capture_seconds": self.last_capture_seconds,
+                "captures_per_second": (round((len(self.capture_times)-1)/(self.capture_times[-1]-self.capture_times[0]), 2)
+                                        if len(self.capture_times)>1 and self.capture_times[-1]>self.capture_times[0] else None),
+                "periodic_saved": self.periodic_saved,
+                "periodic_failed": self.periodic_failed,
+                "periodic_skipped": self.periodic_skipped,
                 "runtime_connected": self.runtime_connected,
                 "runtime_seconds_since_data": round(time.monotonic() - self.runtime_last_data, 1) if self.runtime_last_data else None,
                 "runtime_bytes": self.runtime_bytes,
@@ -386,6 +505,14 @@ class Controller:
 
     def command(self, action, note=""):
         with self.lock:
+            if action in ('state-save', 'state-load', 'state-status', 'game-pause', 'game-resume', 'game-speed'):
+                if not self.runtime_receiver or not self.runtime_receiver.is_alive() or not self.recorder.runtime_connected:
+                    raise RuntimeError("Connect to the running game's debugger first.")
+                commands = {'state-save': 'state save', 'state-load': 'state load', 'state-status': 'state status',
+                            'game-pause': 'set pause 1', 'game-resume': 'set pause 0'}
+                command = ('set speed ' + note) if action == 'game-speed' else commands[action]
+                self.recorder.runtime_event('debug_control_requested', action=action, command=command)
+                action, note = 'renderer', command
             if action == "diagnose":
                 if not self.runtime_receiver or not self.runtime_receiver.is_alive() or not self.recorder.runtime_connected:
                     raise RuntimeError("Connect to the running game's debugger before capturing performance.")
@@ -457,6 +584,13 @@ class Controller:
             else:
                 queued = None
             result = self.recorder.command(action, note)
+            if action == 'screenshots' and self.preferences_path:
+                self.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                values = read_preferences(self.preferences_path)
+                values['periodic_screenshots'] = result['periodic_capture']
+                pending = self.preferences_path.with_suffix('.tmp')
+                pending.write_text(json.dumps(values) + '\n')
+                pending.replace(self.preferences_path)
             if queued:
                 result["runtime_command_queued"] = queued
             result["listening"] = bool(self.receiver and self.receiver.is_alive())
@@ -570,8 +704,8 @@ def gui(controller, hotkey_enabled):
 
     root = tk.Tk()
     root.title("Wii U Session Recorder")
-    root.geometry("780x380")
-    root.minsize(650, 310)
+    root.geometry("900x490")
+    root.minsize(850, 460)
     panel = ttk.Frame(root, padding=18)
     panel.pack(fill="both", expand=True)
     target_row = ttk.Frame(panel)
@@ -600,6 +734,8 @@ def gui(controller, hotkey_enabled):
             result = controller.command(action)
             if action == "mark":
                 message.set(f"Graphics glitch marked ({result['markers']})")
+            elif action in ('state-save', 'state-load', 'state-status', 'game-pause', 'game-resume'):
+                message.set("Debug request queued; completion and state results appear in the runtime log.")
             elif action == "diagnose":
                 message.set("Capturing performance for 10 seconds; results go to this session.")
             else:
@@ -622,12 +758,34 @@ def gui(controller, hotkey_enabled):
     record.pack(side="left", padx=(0, 10))
     mark.pack(side="left")
     ttk.Button(buttons, text="Capture performance (10s)", command=lambda: act("diagnose")).pack(side="left", padx=(10, 0))
+    debug_buttons = ttk.Frame(panel)
+    debug_buttons.pack(anchor="w", pady=(0, 8))
+    for label, action in (("Save state", "state-save"), ("Load state", "state-load"), ("State status", "state-status"),
+                          ("Pause (menu)", "game-pause"), ("Resume", "game-resume")):
+        ttk.Button(debug_buttons, text=label, command=lambda a=action: act(a)).pack(side="left", padx=(0, 6))
+    speed_choice = tk.StringVar(value="100")
+    speed_box = ttk.Combobox(debug_buttons, textvariable=speed_choice, values=("100", "200", "400"), state="readonly", width=5)
+    speed_box.pack(side="left")
+    ttk.Label(debug_buttons, text="% speed").pack(side="left")
+    def change_speed(_event):
+        try: controller.command('game-speed', speed_choice.get()); message.set('Game speed request queued; see runtime log.')
+        except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
+    speed_box.bind("<<ComboboxSelected>>", change_speed)
     aroma_choice = tk.BooleanVar(value=controller.aroma_enabled)
     def toggle_aroma():
         try: controller.command('aroma', 'on' if aroma_choice.get() else 'off')
         except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
     aroma_toggle = ttk.Checkbutton(panel, text="Stream Aroma trace", variable=aroma_choice, command=toggle_aroma)
     aroma_toggle.pack(anchor="w")
+    capture_choice = tk.BooleanVar(value=controller.recorder.periodic_capture)
+    def toggle_capture():
+        try: controller.command('screenshots', 'on' if capture_choice.get() else 'off')
+        except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
+    capture_toggle = ttk.Checkbutton(panel, text="Capture GamePad continuously (best effort)",
+                                     variable=capture_choice, command=toggle_capture)
+    capture_toggle.pack(anchor="w", pady=(4, 0))
+    capture_note = tk.StringVar()
+    ttk.Label(panel, textvariable=capture_note).pack(anchor="w")
     ttk.Label(panel, textvariable=message).pack(anchor="w")
     shot_note = tk.StringVar()
     ttk.Label(panel, textvariable=shot_note, wraplength=610).pack(anchor="w")
@@ -658,6 +816,12 @@ def gui(controller, hotkey_enabled):
         summary.set(f"{status}   ·   Aroma {state['bytes']:,} B   ·   Runtime {state['runtime_bytes']:,} B   ·   {state['markers']} markers")
         location.set(state["session"] or str(controller.recorder.directory))
         shot_note.set(state["screenshot_status"])
+        capture_choice.set(state['periodic_capture'])
+        capture_toggle.state(['!disabled'] if state['periodic_capture_available'] else ['disabled'])
+        capture_note.set((f"{state['periodic_saved']} saved · {state['periodic_failed']} failed · "
+                          + (f"{state['captures_per_second']:.2f} captures/s · " if state['captures_per_second'] is not None else "")
+                          + "One request at a time; timestamps and log offsets saved."
+                          if state['periodic_capture'] else "Captures run only while recording. Failures retry with backoff; logging continues."))
         if keys and keys.error:
             key_note.set("Global keys unavailable. Use the buttons or Python control.")
         elif keys and keys.ready.is_set():
@@ -682,7 +846,7 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--no-hotkeys", action="store_true")
     parser.add_argument("--no-screenshots", action="store_true")
-    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma", "target", "diagnose"))
+    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma", "target", "diagnose", "screenshots", "state-save", "state-load", "state-status", "game-pause", "game-resume", "game-speed"))
     parser.add_argument("--note", default="")
     args = parser.parse_args()
     if args.control:
@@ -697,12 +861,15 @@ def main():
     controller = Controller(Recorder(args.output, None if args.no_screenshots else args.console), args.console,
                             aroma_enabled=enabled, preferences_path=preferences, target=target,
                             cemu_host=args.cemu_host, cemu_port=args.cemu_port)
+    if read_preferences(preferences).get('periodic_screenshots') is True and controller.recorder.screenshot_console:
+        controller.recorder.command('screenshots', 'on')
     with ControlServer(CONTROL, controller) as server:
         control_thread = threading.Thread(target=server.serve_forever, daemon=True)
         control_thread.start()
         try:
             gui(controller, not args.no_hotkeys)
         finally:
+            controller.recorder.command('screenshots', 'off')
             server.shutdown()
             controller.command("disconnect")
             controller.command("stop")

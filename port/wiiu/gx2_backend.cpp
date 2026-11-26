@@ -284,6 +284,7 @@ std::unordered_map<u64, PsEntry> ps_table;
 GX2VertexShader *vs_passthrough, *vs_blit;
 GX2PixelShader *ps_blit, *ps_fallback, *ps_fallback_tex, *ps_uber, *ps_uber_lit;
 GX2PixelShader *ps_uber_family[2][8];
+std::atomic<bool> copy_rect_experiment{false};
 GX2PixelShader *uber_for(const DrawState &ds) {
     u32 mask = 0;
     for (u32 i = 0; i < 3; i++) if (ds.need_tex[i] && !ds.tex[i].null_tex) mask |= 1u << i;
@@ -2052,7 +2053,18 @@ void send_state(const DrawState &ds, Surface &c, bool has_depth, bool stencil) {
     if (ds.scissor_mode == 3) {
         const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, c.w), x2 = std::clamp<s32>(ds.sc_x2, 0, c.w);
         const s32 y1 = std::clamp<s32>(ds.sc_y1, 0, c.h), y2 = std::clamp<s32>(ds.sc_y2, 0, c.h);
-        GX2SetScissor((u32)(x1 * Sx), (u32)(y1 * Sy) + c.row0, (u32)((x2 - x1) * Sx), (u32)((y2 - y1) * Sy));
+        if (copy_rect_experiment.load(std::memory_order_relaxed)) {
+            // Clip pixel centres, including the viewport's alignment offset.
+            // Copy extents use floor endpoints; that is too small for a
+            // fractional raster clip and can turn a slice's last pixel black.
+            auto x = gx2_copy::raster_span(x1, x2 - x1, Sx, nudge);
+            auto y = gx2_copy::raster_span(y1, y2 - y1, Sy, nudge);
+            x.first=std::min(x.first,c.sw); x.last=std::min(x.last,c.sw);
+            y.first=std::min(y.first,c.sh-c.row0); y.last=std::min(y.last,c.sh-c.row0);
+            GX2SetScissor(x.first, y.first + c.row0, x.size(), y.size());
+        } else {
+            GX2SetScissor((u32)(x1 * Sx), (u32)(y1 * Sy) + c.row0, (u32)((x2 - x1) * Sx), (u32)((y2 - y1) * Sy));
+        }
     } else {
         GX2SetScissor(0, c.row0, c.sw, c.sh - c.row0);
     }
@@ -2164,7 +2176,6 @@ void set_state(const DrawState &ds) {
 
 // Opt-in globally; enabled by the measured Dark Moon title policy below.
 std::atomic<bool> light_guard_experiment{false};
-std::atomic<bool> copy_rect_experiment{false};
 
 struct PsUni {
     u32 depth[4];
@@ -2328,7 +2339,8 @@ void set_fragment(const DrawState &ds, bool uber) {
             const float use[4] = {t.coord == 0 ? 1.0f : 0.0f, t.coord == 1 ? 1.0f : 0.0f, t.coord >= 2 ? 1.0f : 0.0f, on ? 1.0f : 0.0f};
             for (u32 c = 0; c < 4; c++) b->tex_coord[k][c] = swap_float(use[c]);
             put_rgba(b->tex_add[k], ds.need_tex[k] && t.null_tex ? 0xff000000u : 0);
-            put_i(b->wrap[k], on ? t.wrap_s : 0, on ? t.wrap_t : 0, 0, 0);
+            put_i(b->wrap[k], on ? t.wrap_s : 0, on ? t.wrap_t : 0,
+                  k == 0 && on ? t.type : 0, k == 0 && on && t.shadow_ortho);
         }
         put_i(b->uber, ds.tev_count, ds.alpha_test ? ds.alpha_func : ~0u, ds.fog ? (ds.fog_flip ? 2 : 1) : 0, ds.need_tex[0] && !ds.tex[0].null_tex && ds.tex[0].type == 3);
         if (ds.lighting) {
@@ -5092,6 +5104,7 @@ static int menu_items() {
 }
 static volatile bool menu_is_open;
 static volatile int menu_item, menu_speed = 100, menu_volume = 100;
+static std::atomic<int> debug_menu_request{-1}, debug_speed_request{0};
 static volatile bool menu_quit;
 
 // The game's language from its next start, as cfg.cpp will pick it (services/languages.h). settings.ini keeps a choice; the card thread
@@ -5553,6 +5566,11 @@ static void show_lcd_from_memory() {
 
 // (the GPU thread, after each look at its queue) quiet: it had nothing to do for its whole wait. present_rule.h says when a frame is shown.
 void gfx_pump(bool quiet) {
+    const int pause = debug_menu_request.exchange(-1, std::memory_order_relaxed);
+    if (pause >= 0) { menu_is_open = pause != 0; LOG("[debug] menu pause %s\n", pause ? "on" : "off"); }
+    const int speed = debug_speed_request.exchange(0, std::memory_order_relaxed);
+    if (speed) { menu_speed = speed; kernel::set_clock_speed(speed); LOG("[debug] game speed %d%%\n", speed); }
+
     if (av_timing_enabled()) {
         static OSTime since;
         static u32 polls, blanks, idle, held;
@@ -5670,7 +5688,9 @@ bool gfx_set(const char *name, u32 v) {
     else if (!strcmp(name, "uberfb")) {
         uber_fallback = v;
         forget_ps = true;
-    } else if (!strcmp(name, "cpuvs")) gxt_cpu_vs = v;
+    } else if (!strcmp(name, "pause") && v <= 1) debug_menu_request.store((int)v, std::memory_order_relaxed);
+    else if (!strcmp(name, "speed") && (v == 100 || v == 200 || v == 400)) debug_speed_request.store((int)v, std::memory_order_relaxed);
+    else if (!strcmp(name, "cpuvs")) gxt_cpu_vs = v;
     else if (!strcmp(name, "poolspin") && v<=1) g_pool_idle_spin.store(v!=0,std::memory_order_relaxed);
     else if (!strcmp(name, "vssimd") && v<=1) g_cpu_vs_simd.store(v!=0,std::memory_order_relaxed);
     else if (!strcmp(name, "cpuattr") && v <= 15) gxt_cpu_attr = v;

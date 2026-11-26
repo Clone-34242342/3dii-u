@@ -34,6 +34,8 @@ namespace audio { void pause(bool) {} void checkpoint_clear_output() { ++cleared
 void checkpoint_audio(checkpoint::Image &) {} }
 namespace mem { void checkpoint_allocator(checkpoint::Image &) {} }
 namespace kernel {
+bool guest_readable(u32 a,u32 n) { return n && (u64)a+n<=ram.size(); }
+bool guest_writable(u32 a,u32 n) { return guest_readable(a,n) && a<16; }
 void checkpoint_services(checkpoint::Image &) {}
 void checkpoint_hid(checkpoint::Image &) {}
 void checkpoint_dsp(checkpoint::Image &) {}
@@ -74,6 +76,18 @@ static void check_barrier() {
 }
 int main(int argc, char **argv) {
  assert(argc==2);g_save_base=argv[1];g_mem=ram.data();
+ // Debug RAM operations queue until the same barrier pump, check mappings,
+ // and compare the expected word before changing anything.
+ w32(0,0x12345678);
+ assert(!checkpoint::request_memory32(1,true,0,1));
+ assert(checkpoint::request_memory32(0,true,0x12345678,0x87654321));
+ assert(!checkpoint::request_memory32(4,false));
+ assert(r32(0)==0x12345678);checkpoint::pump();assert(r32(0)==0x87654321);
+ assert(checkpoint::request_memory32(0,true,0,9));checkpoint::pump();assert(r32(0)==0x87654321);
+ assert(checkpoint::request_memory32(16,true,0,9));checkpoint::pump();assert(r32(16)==0);
+ assert(checkpoint::request_memory32(0xfffffffcu,true,0,9));checkpoint::pump();
+ assert(checkpoint::request_memory32(0,false));checkpoint::pump();
+ ram.fill(0);
  check_barrier();
  g_game.program_id=0x000400000010bf00ULL;
  ram[3]=42; identity=handle;

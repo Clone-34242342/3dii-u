@@ -485,6 +485,14 @@ def build_game_code(g, args):
         items.append((n, c, f'{obj_dir}/{n}.o', (flag_os if lo <= i < hi else flag_o2) if split else flags))
     # The geometry shaders this game's runs met on the CPU (.gsl files in its shader logs) as C, which the runtime runs instead of its
     # interpreter (vertex.cpp: gs_native_find): the game's own code, made here from the user's logs, never shared.
+    # Code-only exports need this too: shader-pack discovery may never run.
+    # Extract declared geometry programs before linking, so a fresh install
+    # need not interpret them until a hardware log is imported and rebuilt.
+    discovered = run([sys.executable, ROOT + '/tools/dvlb_to_log.py', g.dir, '--geometry-only'],
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
+    print(discovered.stdout.strip(), flush=True)
+    if discovered.returncode:
+        sys.exit('geometry asset discovery failed')
     gsl = sorted(glob.glob(g.dir + '/shader_logs/*.gsl'))
     if gsl:
         made = f'{obj_dir}/gs_native.c'
@@ -497,7 +505,10 @@ def build_game_code(g, args):
             os.remove(tmp)
         else:
             os.replace(tmp, made)
-        items.append(('gs_native', made, f'{obj_dir}/gs_native.o', flags))
+        # Shader functions have no resumable game execution frames. Optimize
+        # these hot arithmetic loops independently of the game's -O1 policy;
+        # keep strict arithmetic and disabled contraction from game_flags.
+        items.append(('gs_native', made, f'{obj_dir}/gs_native.o', game_flags(g, '-O2')))
     # a new generation can come in fewer files: the old ones' objects would be linked too, defining their functions twice
     wanted = {n for n, *_ in items}
     for o in glob.glob(obj_dir + '/*.o*'):

@@ -13,6 +13,12 @@ assert len(made)==total and total>0
 assert any(decode(k)['tex'][0]==9 for k in made)
 assert any(decode(k)['lcfg']&15==1 for k in made)
 assert any(decode(k)['lights']==[128,129] for k in made)
+assert any(decode(k)['lights']==[128,0] for k in made) # positional shadow light without distance attenuation
+# Fog is combined with material/lighting independently; alpha-test bits survive.
+b=dict(s,fogat=3 | 4 | (6<<3), tex=[0,0,0])
+fogged,_=variants([a,encode(b)])
+assert any(decode(k)['tex']==s['tex'] and decode(k)['fogat']==3 and decode(k)['lights']==[128,0] for k in fogged)
+assert all(decode(k)['fogat']&~3 in (0,b['fogat']&~3) for k in fogged)
 assert variants([a],1)[0]==made[:1] and variants([a],0)[0]==[]
 assert variants([a,a])[0]==made
 # Do not erase physical light numbers before constructing attenuation variants.

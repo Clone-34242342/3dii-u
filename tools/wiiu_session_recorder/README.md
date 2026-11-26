@@ -33,7 +33,7 @@ A diagnostic build can also load `extra-pixel-shaders.bin` from the same save di
 
 Connect starts both Aroma's syslog receiver and the read-only game runtime client. Runtime shows "waiting for game" on the Wii U Menu or with builds that do not expose the opt-in TCP console. It reconnects automatically when the game starts. Disconnect stops both receivers.
 
-Record starts one session folder containing console.log, runtime.log, and events.jsonl. Stop closes both logs together. Reconnection events, runtime commands, and markers share ISO timestamps and byte offsets for both files. Existing GamePad screenshots remain attached to Mark Glitch/F9 and are stored as timestamped PNGs beside the logs. There are no periodic screenshots.
+Record starts one session folder containing console.log, runtime.log, and events.jsonl. Stop closes both logs together. Reconnection events, runtime commands, and markers share ISO timestamps and byte offsets for both files. Existing GamePad screenshots remain attached to Mark Glitch/F9 and are stored as timestamped PNGs beside the logs. The optional **Capture GamePad continuously (best effort)** checkbox requests an image as soon as the previous request completes while recording. It starts off by default.
 
 The runtime client requests status and the mapped heap header about every three seconds while recording, and thread snapshots about every thirty seconds. A repeatedly observed nonzero owner causes an additional thread listing and bounded owner-memory snapshot. This is an observation for investigation, not an automatic deadlock diagnosis. When not recording it keeps the connection alive without requesting unsaved automatic snapshots. An attached runtime client prevents the existing game's watchdog from forcing its fatal screen; it cannot prevent a kernel failure.
 
@@ -126,3 +126,67 @@ Changing targets disconnects and saves the current session so logs never mix.
 The Wii U address, Aroma preference and output root are preserved. The selected
 target is remembered. CLI options: `--target cemu`, `--cemu-host 127.0.0.1`,
 `--cemu-port 4405`; local control: `--control target --note cemu` (or `wiiu`).
+
+
+## Periodic GamePad capture
+
+Enable **Capture GamePad continuously (best effort)** beside the Aroma checkbox. It uses the
+same ScreenshotWUPS/FTP transport as F9. Only one capture is in flight; a busy
+attempt waits rather than adding to a queue. Successful captures have a short
+200 ms cooldown; there is no five-second polling delay. The achieved rate is
+shown in the window and depends on the console, encoding and FTP transfer.
+Failures are recorded and retry after 2, 4, then 8 seconds. Stopping recording or disconnecting pauses new requests; one
+already in flight may finish. Turning the checkbox off stops future attempts.
+The setting is remembered and is unavailable for Cemu or --no-screenshots.
+
+Images go in the current session's `captures/` folder. Each PNG has a JSON
+sidecar with request/completion timestamps, offsets into console.log and
+runtime.log, the most recently observed runtime status frames, and the request
+token. The same information is indexed in events.jsonl. These offsets describe
+the capture window, not a guaranteed exact GPU frame: capture, encoding and
+transfer are asynchronous. Last-observed runtime frames can lag the image.
+Manual F9 markers keep their existing names and also receive timeline sidecars.
+
+This is periodic diagnosis, not video or an every-frame recorder. Captures add
+GPU/CPU/SD/network work; disable the checkbox for clean performance comparisons.
+The status line shows saved images, failures and the achieved capture rate.
+
+```sh
+python3 recorder.py --control screenshots --note on
+python3 recorder.py --control screenshots --note off
+```
+
+
+## Explicit game and checkpoint controls
+
+Compatible updated builds accept recorder control actions `state-save`,
+`state-load`, `state-status`, `game-pause`, `game-resume`, and `game-speed`
+(with note `100`, `200`, or `400`). The GUI exposes the same actions. Requests
+are recorded in the session timeline. A queued response is not completion:
+`[net-state]`, `[state-time]` and `[debug]` lines show the actual outcome.
+Save uses the normal persistent checkpoint path; Load prefers the completed RAM
+snapshot, otherwise storage. `renderer` also accepts `state save-ram` and
+`state load-file` for explicit session/file tests. Older builds do not implement
+these commands. Checkpoint coordination is required for state and RAM commands.
+
+Pause opens the existing options menu, with its existing VBlank/input pause
+behavior; Resume closes it. It is not an instruction-level CPU halt. Speed
+uses the same 100/200/400% guest-clock settings as that menu and cannot create
+CPU/GPU throughput the hardware lacks. Restore 100% after experiments.
+
+For Python experiments, `renderer` accepts `ram read <guest-address>` and
+`ram write <guest-address> <expected-u32> <replacement-u32>`. Addresses are aligned
+32-bit guest virtual addresses; words are hexadecimal, interpreted in the guest's
+little-endian order. The GPU-thread checkpoint barrier quiesces runtime workers
+before the operation. Writes check readable/writable guest mappings and compare
+the expected old word, then flush/invalidate GPU-visible data when applicable.
+No host-native code or allocator metadata is patched through this command. A
+single pending memory operation is supported; read `[debug-ram]` completion
+before submitting the next. To reverse a successful edit, compare against the
+replacement value and write the old value back. Patching data is not a renderer
+fix and must remain an explicitly recorded diagnostic experiment.
+
+Additional recorded A/B controls include `set lightguard 0|1` and
+`set copyrect 0|1`. These are explicit temporary developer controls.
+Manual screenshots remain separate from timing windows. Automatic capture is
+not enabled by any debug/state action.

@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
                     for (u32 i = 0; i < 16; i++) s.b[i] = (rng() & 1) != 0;
                     s.b[14] = run % 3 != 0;  // the bool that picks between its two ways (the plain quads, or the loop)
                     for (u32 k = 0; k < 4; k++) {  // loops: a count of 1 to 6, from a small start, in steps of 1 to 3
-                        s.i[k][0] = (u8)(rng() % 6);
+                        s.i[k][0] = run >= 1984 ? (u8)((run & 3) == 3 ? 255 : run & 3) : (u8)(rng() % 6);
                         s.i[k][1] = (u8)(rng() % 4);
                         s.i[k][2] = (u8)(1 + rng() % 3);
                         s.i[k][3] = 0;

@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "rt.h"
+#include "checkpoint.h"
 #include "wiiu.h"
 
 namespace kernel {
@@ -299,7 +300,8 @@ std::string test_flags;
 
 bool run_command(int c, char *line) {
     char word[16] = "", path[128] = "", name[16] = "";
-    u32 a = 0, b = 0;
+    u32 a = 0, b = 0, value = 0;
+    char trailing = 0;
     unsigned long long title = 0;
     sscanf(line, "%15s", word);
     if (!strcmp(word, "ps")) {
@@ -309,6 +311,31 @@ bool run_command(int c, char *line) {
         kernel::dump_threads();
         wiiu::log_threads();
         wiiu::gfx_report();
+    } else if (!strcmp(word, "ram")) {
+#ifdef RECOMP_RESUMABLE
+        if (sscanf(line,"ram read %x %c",&a,&trailing)==1) {
+            LOG("[net-ram] read %08x: %s\n",a,checkpoint::request_memory32(a,false) ? "queued" : "unaligned or busy");
+        } else if (sscanf(line,"ram write %x %x %x %c",&a,&b,&value,&trailing)==3) {
+            LOG("[net-ram] compare/write %08x: %s\n",a,checkpoint::request_memory32(a,true,b,value) ? "queued" : "unaligned or busy");
+        } else LOG("[net-ram] use read <guest-address> or write <guest-address> <expected-u32> <new-u32>\n");
+#else
+        LOG("[net-ram] unavailable: this executable lacks checkpoint coordination\n");
+#endif
+    } else if (!strcmp(word, "state")) {
+#ifdef RECOMP_RESUMABLE
+        // Queue on the same GPU-thread checkpoint pump used by the menu.
+        // Acknowledgement is not completion; state status/logs report that.
+        if (!strcmp(line, "state save")) { checkpoint::request(4); LOG("[net-state] persistent save queued\n"); }
+        else if (!strcmp(line, "state save-ram")) { checkpoint::request(1); LOG("[net-state] RAM save queued\n"); }
+        else if (!strcmp(line, "state load")) { checkpoint::request(2); LOG("[net-state] automatic load queued\n"); }
+        else if (!strcmp(line, "state load-file")) { checkpoint::request(5); LOG("[net-state] file load queued\n"); }
+        else if (!strcmp(line, "state status")) {
+            const char *message = checkpoint::result_message();
+            LOG("[net-state] available %u writing %u; %s\n", (u32)checkpoint::has_state(), (u32)checkpoint::saving_to_disk(), message ? message : "no completed operation");
+        } else LOG("[net-state] use save, save-ram, load, load-file, or status\n");
+#else
+        LOG("[net-state] unavailable: this executable lacks checkpoint execution\n");
+#endif
     } else if (!strcmp(word, "stats")) {
         wiiu::gfx_report();  // counters and any enabled GPU timestamps, published between frames
     } else if (!strcmp(word, "st")) {

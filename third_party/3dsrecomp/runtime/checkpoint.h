@@ -130,6 +130,7 @@ bool services_capture(Image &image);
 bool gpu_capture(Image &image);
 void audio_capture(Image &image);
 void request(unsigned command);  // 1 RAM save, 2 automatic load, 3 RAM discard, 4 persistent save, 5 file load
+bool request_memory32(u32 address, bool write, u32 expected = 0, u32 replacement = 0);
 void pump();                     // GPU thread only, outside native guest execution
 bool has_state();
 bool saving_to_disk();
