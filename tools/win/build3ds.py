@@ -311,6 +311,7 @@ class Game:
         if MEASURE:  # never where the games for a console are built and packed
             self.out = f'{ROOT}/build_measure/{name}'
         self.rpx, self.nm, self.shaders = f'{self.out}/{name}.rpx', f'{self.out}/game.nm', f'{self.out}/shaders'
+        self.asset_geometry = None
         self.extra_functions = f'{self.dir}/functions.txt'  # what runs of the game found that static analysis missed
         # what the 3dsrecomp project's own runs of this game learned: its functions and the render states it uses
         with open(f'{self.dir}/info.json', encoding='utf-8') as f:
@@ -499,11 +500,11 @@ def build_game_code(g, args):
         c = c.replace('\\', '/')
         n = os.path.basename(c)[:-2]
         items.append((n, c, f'{obj_dir}/{n}.o', (flag_os if lo <= i < hi else flag_o2) if split else flags))
-    # The geometry shaders this game's runs met on the CPU (.gsl files in its shader logs), and those its logs hold with a vertex shader (GSX
-    # records, tools/gsx_to_gsl.py), as C, which the runtime runs instead of its interpreter (vertex.cpp: gs_native_find) wherever the pack has
-    # no GPU shader for a draw's own set: the game's own code, made here from the user's logs, never shared.
-    # (not dvlb.gsl: the dump's own geometry programs, for the app's fingerprints, made by the shader step, after this one on the command line)
+    # Use captured geometry and the current dump's discovered programs when no GPU program matches the draw.
+    # The asset log may belong to a previous build unless discovery ran on this Game instance.
     gsl = sorted(f for f in glob.glob(g.dir + '/shader_logs/*.gsl') if os.path.basename(f) != 'dvlb.gsl')
+    if g.asset_geometry and os.path.getsize(g.asset_geometry):
+        gsl.append(g.asset_geometry)
     from_gsx = f'{obj_dir}/from_gsx.gsl'
     if os.path.exists(from_gsx):
         os.remove(from_gsx)
@@ -764,6 +765,7 @@ def prepare_vertex_logs(g, shadergen):
     print(r.stdout[-300:].strip())
     if r.returncode:
         sys.exit('dvlb_to_log failed')
+    g.asset_geometry = logs + '/dvlb.gsl'
 
 
 def prepare_logs(g, shadergen):

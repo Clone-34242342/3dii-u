@@ -182,6 +182,28 @@ class GeneratedObjects(unittest.TestCase):
             b.link_game(game, str(rt), str(code))
             self.assertNotIn('gs_native.o', (self.root/'link/fixture_code.rsp').read_text())
 
+    def test_ppc_uses_only_geometry_discovered_for_this_build(self):
+        logs = self.root / 'shader_logs'
+        logs.mkdir()
+        asset = logs / 'dvlb.gsl'
+        asset.write_bytes(b'discovered geometry')
+        game = SimpleNamespace(name='fixture', dir=self.root.as_posix(), gen_dir=self.root.as_posix(), opt=[], asset_geometry=None)
+        args = SimpleNamespace(jobs=1, opt=None)
+
+        def generate(argv, **kwargs):
+            self.assertEqual(Path(argv[-1]), asset)
+            Path(argv[2]).write_text('generated geometry')
+            return SimpleNamespace(returncode=0, stdout='')
+
+        with patch.object(b, 'run', side_effect=generate) as run, patch.object(b, 'compile_all') as compile_all, contextlib.redirect_stdout(io.StringIO()):
+            b.build_game_code(game, args)
+            run.assert_not_called()
+            self.assertEqual(compile_all.call_args.args[0], [])
+            game.asset_geometry = asset.as_posix()
+            b.build_game_code(game, args)
+            run.assert_called_once()
+            self.assertEqual([item[0] for item in compile_all.call_args.args[0]], ['gs_native'])
+
     def test_runtime_source_lists_match_each_platform(self):
         runtime = self.root/'rt_source'
         port = self.root/'port'

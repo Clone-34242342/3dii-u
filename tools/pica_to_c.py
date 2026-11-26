@@ -58,6 +58,7 @@ class Unsupported(Exception):
 def translate(entry, code, swz, fname):
     """(C source, end, swizzle entries used) for the program from entry, or Unsupported"""
     out, used, end, loop_end = [], set(), None, None
+    early_ends = set()
     pc = entry
     while True:
         if pc >= len(code):
@@ -122,6 +123,7 @@ def translate(entry, code, swz, fname):
             dest = (w >> 10) & 0xfff
             if dest >= len(code) or code[dest] >> 26 != 0x22:
                 raise Unsupported('a jump elsewhere than an END')
+            early_ends.add(dest)
             if op == 0x2d:  # jumps on its bool being set, or with the low bit of num on its being clear
                 o.append(f'if (b[{(w >> 22) & 0xf}] == {int(not (w & 1))}) return 1;')
             else:
@@ -154,6 +156,9 @@ def translate(entry, code, swz, fname):
         pc += 1
         if end is not None:
             break
+    # The runtime hashes the contiguous translated range, including its END.
+    if early_ends - {end - 1}:
+        raise Unsupported('a jump to an END outside the matched program')
     src = [f'/* the program from {entry:#x} to {end - 1:#x} */',
            f'static int {fname}(float (*r)[4], unsigned *bank, unsigned char *cond, const unsigned char *b, const unsigned char (*ui)[4], '
            f'gs_emit_fn emit, void *ctx) {{',

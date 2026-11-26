@@ -12,6 +12,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import dvlb_to_log  # noqa: E402
+import pica_to_c  # noqa: E402
 
 
 def dvlb(code, swz, entries):
@@ -51,4 +52,13 @@ vs, gs = written(dvlb(code, swz, [(0, 0, outs), (1, 550, [])]))
 assert vs == dvlb_to_log.record(0, code[:512], swz, bytes(16), dvlb_to_log.slots_for(outs)), 'the vertex record: the first 512 words'
 assert gs == dvlb_to_log.gs_record(550, code, swz), 'the geometry program whole'
 assert written(dvlb(code[:100], swz, [(0, 0, outs)]))[1] == b'', 'no geometry program: an empty dvlb.gsl'
+end = 0x22 << 26
+jump = 0x2D << 26
+assert pica_to_c.translate(0, (jump | (1 << 10), end), [], 'gs')[1] == 2
+try:
+    pica_to_c.translate(0, (jump | (2 << 10), end, end), [], 'gs')
+except pica_to_c.Unsupported as exc:
+    assert 'outside the matched program' in str(exc)
+else:
+    raise AssertionError('native geometry accepted a jump outside the hashed program')
 print('dvlb_to_log ok: the vertex view and the whole geometry program')
