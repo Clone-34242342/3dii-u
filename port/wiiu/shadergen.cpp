@@ -697,7 +697,8 @@ const char *const vs_registers =
     // doing what a PICA does took up to 54 registers, over a real GPU's 48 (tools/shadergen_main.cpp checks), so reciprocals stop short of infinity instead: 1e20 is past any PICA float.
     "vec4 vs_lim(float x) { return vec4(clamp(x, -1e20, 1e20)); }\n"
     "int vs_s32(float x) { return int(x); }\n"
-    "vec4 vs_rel(int base, int off) { if (off < -128 || off > 127) off = 0; int u = (base + off) & 127; return u >= 96 ? vec4(1.0) : f[u]; }\n";
+    // Fetch before selecting constant one to keep the uniform load out of CafeGLSL's branch.
+    "vec4 vs_rel(int base, int off) { if (off < -128 || off > 127) off = 0; int u = (base + off) & 127; vec4 v = f[min(u, 95)]; return u >= 96 ? vec4(1.0) : v; }\n";
 
 // What the rasterizer gets of the output registers in arr, through the output map. Y is negated: rows in a surface are PICA window rows, y up.
 void output_map(Gen &g, const s8 *slot_src, const char *arr) {

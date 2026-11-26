@@ -9,6 +9,8 @@ import shutil
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
@@ -29,6 +31,7 @@ base = tempfile.mkdtemp()
 settings = os.path.join(base, 'settings.json')
 gui.settings_file = lambda: settings  # the user's settings are never read or written, on any platform
 gui.updater.home = lambda: os.path.join(base, 'app')  # nor the downloaded versions' folder
+gui.pipeline.WORK = os.path.join(base, 'work')  # use the test's own workspace lock
 os.makedirs(os.path.join(base, 'keys'))
 json.dump({'keys': os.path.join(base, 'keys')}, open(settings, 'w'))  # an empty key folder: the user's keys are never looked at
 try:
@@ -65,6 +68,19 @@ try:
         return len(pills)
 
     settle('loading')
+    # Selected save folders must remain readable, including names with no spaces.
+    save_name = '20520623-074459_Animal_Crossing_New_Leaf_Checkpoint_backup_for_import'
+    state.set(saveText=save_name, hasSave=True)
+    for width, height in ((960, 540), (1280, 720), (1600, 900)):
+        win.setWidth(width)
+        win.setHeight(height)
+        settle('the save row resized')
+        subtitle = next(p for p in items(QQuickWindow.contentItem(win)) if p.property('text') == save_name)
+        assert not subtitle.property('truncated'), 'the selected save folder is cut off'
+        assert subtitle.y() + subtitle.height() <= subtitle.parentItem().height(), 'save text overlaps the next row'
+    state.set(saveText=gui.NO_SAVE, hasSave=False)
+    win.setWidth(1280)
+    win.setHeight(720)
     used = set(re.findall(r'\bapp\.(\w+)', open(os.path.join(HERE, 'ui', 'Main.qml'), encoding='utf-8').read()))
     missing = sorted(n for n in used if not hasattr(state, n))
     assert not missing, f'Main.qml uses app.{missing}, which App lacks'
@@ -76,12 +92,40 @@ try:
     icon = gui.icon_url([[(90, 120, 150)] * 48] * 48)
     state.set(hasGame=True, gameName='A game', badge='Untested', icon=icon, hasArt=True, artUrl=QUrl.fromLocalFile(art).toString(),
               library=[dict(path='C:/a.3ds', name='One', icon=icon, cover='', current=True), dict(path='C:/b.3ds', name='Two', icon=icon, cover='', current=False)],
-              cards=[dict(path='E:\\', label='E:\\    set up for a Wii U'), dict(path='F:\\', label='F:\\    removable drive')],
-              games=[dict(name='Finished', status='Complete', note='A note.')] + state.games)
+              cards=[dict(path='E:\\', label='E:\\    set up for a Wii U'), dict(path='F:\\', label='F:\\    removable drive')])
     for page in ('games', 'help', 'build'):
         win.setProperty('page', page)
         settle(f'page {page}')
         assert named_pills(f'page {page}')
+    win.setProperty('page', 'games')
+    games_page = next(p for p in items(QQuickWindow.contentItem(win)) if p.property('viewMode') is not None)
+    games_page.setProperty('viewMode', 'compat')
+    settle('compat list view')
+    assert named_pills('compat list view')
+    catalog = {g['program_id']: g for g in state.compatList}
+    usa, eur = (catalog[i] for i in ('0004000000033500', '0004000000033600'))
+    assert usa['name'] != eur['name'] and usa['wiiu_status'] == 'Plays' and eur['wiiu_status'] == 'Untested'
+    assert usa['cemu_status'] == eur['cemu_status'] == 'Plays'
+    miku, persona = (catalog[i] for i in ('0004000000148900', '0004000000123400'))
+    assert (miku['wiiu_status'], miku['cemu_status']) == ('Plays', 'Limited')
+    assert (persona['wiiu_status'], persona['cemu_status']) == ('Untested', 'Plays')
+    for f in ('all', 'wiiu', 'cemu'):
+        games_page.setProperty('platformFilter', f)
+        settle(f'compat filter {f}')
+        rows = [p for p in items(QQuickWindow.contentItem(win)) if p.objectName() == 'compatibilityRow']
+        texts = [p.property('text') for row in rows for p in items(row) if p.isVisible()]
+        assert (miku['name'] in texts) == (f != 'cemu')
+        assert (persona['name'] in texts) == (f != 'wiiu')
+        assert ('Wii U · ' + usa['wiiu_note'] in texts) == (f != 'cemu')
+        assert ('Cemu · ' + usa['cemu_note'] in texts) == (f != 'wiiu')
+    games_page.setProperty('viewMode', 'library')
+    settle('library view restored')
+    for result, badge in ((miku, 'Plays on Wii U'), (persona, 'Plays in Cemu')):
+        state.game = SimpleNamespace(title_id=int(result['program_id'], 16))
+        assert gui.pipeline.profile_for(state.game) is None
+        state.refresh_note()
+        assert state.badge == badge, state.note
+    state.game = None
     win.setProperty('openFaq', 0)
     settle('an open answer')
     menu = win.findChild(QObject, 'cardMenu')
@@ -104,6 +148,26 @@ try:
         state.set(view=view, stages=stages, stage=1, failed=view == 'failed', building=view == 'building', resultText='x', log='a\nb')
         win.setProperty('showLog', view == 'failed')
         settle(f'view {view}')
+    # Build with nowhere to put the game (#29): "Put it on" starts under the window's edge, and comes into view, whole, under the message
+    column = win.findChild(QObject, 'buildColumn')
+    state.setTarget('card')
+    state.st['card'] = ''
+    settle('no card chosen')
+    card = next(i for i in items(QQuickWindow.contentItem(win)) if i.property('text') == 'Put it on').parentItem()
+    assert card.mapToItem(column, 0, 0).y() >= column.property('height'), '"Put it on" is in view already: this check shows nothing'
+    real_otp_ok, gui.otp_ok, state.game = gui.otp_ok, lambda path: True, object()
+    try:
+        state.build()
+        settle('Build with nowhere to put the game')
+    finally:
+        gui.otp_ok, state.game = real_otp_ok, None
+    assert state.dialog['title'] == 'Where should it go?', state.dialog
+    top = card.mapToItem(column, 0, 0).y()
+    assert 0 <= top and top + card.property('height') <= column.property('height'), f'"Put it on" is not all in view: {top}'
+    assert column.property('contentY') <= column.property('contentHeight') - column.property('height'), 'scrolled past the end'
+    state.answer(True)
+    column.setProperty('contentY', 0)
+    settle('the message closed')
     for yes in ('Yes', 'Sure'):  # two questions queued: the second starts on its own yes button too
         state.dialogs.append(dict(title='A question with a title long enough to wrap onto a second line', message='A message', yes=yes, no='No',
                                   tone='ask', flow=False))
@@ -316,14 +380,13 @@ try:
     for st in ('downloading', 'unpacking', 'ready', 'restarting', 'failed'):
         state.set(updateState=st, updateProgress=37)
         settle(f'the update card, {st}')
-    # a picked game's art, with covers.py's two places faked: SteamGridDB's banner and icon where there's a key, GameTDB's cover for what it
-    # lacks and where there's none, and a key it turns down said so
-    made = {n: os.path.join(base, 'covers', n) for n in ('sgdb_1_banner.png', 'sgdb_1_icon.png', 'AAAE.jpg')}
+    # Downloaded art supplies startup screens; neither a SteamGridDB icon nor a fallback cover replaces the default menu icon.
+    made = {n: os.path.join(base, 'covers', n) for n in ('sgdb_0000000000000001_banner.png', 'sgdb_0000000000000001_icon.png', 'AAAE.jpg')}
     os.makedirs(os.path.join(base, 'covers'))
     for path in made.values():
         img.save(path)
     banner, square, cover = made.values()
-    picked = type('Game', (), dict(title_id=1, product='CTR-P-AAAE'))()
+    picked = type('Game', (), dict(title_id=1, product='CTR-P-AAAE', icon=[[(0, 255, 0)] * 48 for _ in range(48)]))()
     gui.covers.cover = lambda product, folder: cover
 
     def pick(found, key='a key'):
@@ -337,14 +400,38 @@ try:
         state.fetch_cover(picked, 'A game')
         return state.art, state.icon_art, state.artText
 
-    assert pick(dict(banner=banner, icon=square)) == (banner, square, gui.FROM_SGDB) and state.iconText == gui.FROM_SGDB
-    assert pick(dict(banner=banner, icon=None)) == (banner, cover, gui.FROM_SGDB) and state.iconText == gui.FROM_TDB
-    assert pick(dict(banner=None, icon=square)) == (cover, square, gui.FROM_TDB) and state.iconText == gui.FROM_SGDB
+    assert pick(dict(banner=banner, icon=square)) == (banner, None, gui.FROM_SGDB) and state.iconText == gui.NO_ICON_ART
+    assert pick(dict(banner=banner, icon=None)) == (banner, None, gui.FROM_SGDB) and state.iconText == gui.NO_ICON_ART
+    assert pick(dict(banner=None, icon=square)) == (cover, None, gui.FROM_TDB) and state.iconText == gui.NO_ICON_ART
     assert pick(dict(banner=None, icon=None)) == (cover, None, gui.FROM_TDB) and state.iconText == gui.NO_ICON_ART
+    preview = QImage.fromData(gui.base64.b64decode(state.iconArtUrl.split(',', 1)[1]))
+    assert (preview.width(), preview.height()) == (128, 128) and state.tileUrl == state.iconArtUrl
+    assert preview.pixelColor(64, 64).getRgb() == (0, 255, 0, 255) and 0 < preview.pixelColor(2, 2).green() < 255, 'the preview lost the default VC frame'
     assert pick(dict(banner=banner, icon=square), key='') == (cover, None, gui.FROM_TDB), 'SteamGridDB asked without a key'
     assert pick(None) == (cover, None, gui.FROM_TDB) and 'SteamGridDB' in state.dialog['title']
     state.answer(True)
     assert pick(None) == (cover, None, gui.FROM_TDB) and not state.dialog, 'a key turned down is said once, not for every game'
+
+    # Legacy migration recognizes only this game's exact downloader filenames in its managed directory, without deleting them.
+    gamekey = f'{picked.title_id:016x}'
+    for cached in (square, cover):
+        state.st.setdefault('icon_art', {})[gamekey] = cached
+        state.set_art(banner, state.stored_icon(picked), remember=False)
+        assert state.icon_art is None and state.iconText == gui.NO_ICON_ART
+        assert state.st['icon_art'][gamekey] == cached and os.path.isfile(cached)
+    for custom in (art, os.path.join(base, os.path.basename(square)), os.path.join(base, 'covers', 'my_icon.png'),
+                   os.path.join(base, 'covers', 'sgdb_0000000000000002_icon.png')):
+        state.st['icon_art'][gamekey] = custom
+        assert state.stored_icon(picked) == custom, 'a custom or uncertain path was treated as a downloaded icon'
+    # An explicit choice of even a cached picture gets provenance and survives reopening, fetching, and a new banner.
+    gui.QFileDialog.getOpenFileName = lambda *a, **k: (square, '')
+    state.chooseIcon()
+    assert state.stored_icon(picked) == square and json.load(open(settings))['icon_picked'][gamekey] == square
+    state.set_art(None, state.stored_icon(picked), remember=False)
+    state.cover_ready(gamekey, banner, '')
+    assert state.icon_art == square and state.iconText == gui.CUSTOM
+    state.removeIcon()
+    assert gamekey not in state.st['icon_picked'] and state.icon_art is None
 
     # a new key fetches the open game's art again, unless the player chose its picture or removed it on purpose
     asked_again = threading.Event()
@@ -368,7 +455,7 @@ try:
     assert state.st['sgdb_key'] == '' and not state.artKeySet
     state.fetch_cover = fetch_cover
 
-    # An icon picture of its own. Each line says what its own picture is; choosing the art keeps an icon the player picked, not a fetched one;
+    # An icon picture of its own. Each line says what its own picture is; choosing startup art keeps the selected icon;
     # removing the icon keeps the art; an icon picked with no art leaves the game's art to be fetched, and fetched art keeps that icon.
     title = f'{picked.title_id:016x}'
     chosen = iter([art, cover, own_icon, art])
@@ -381,14 +468,14 @@ try:
     assert state.art == cover and state.icon_art == art and (state.artText, state.iconText) == (gui.FROM_TDB, gui.CUSTOM)
     state.removeIcon()
     assert state.icon_art is None and state.art == cover and not state.hasIconArt and state.iconText == gui.NO_ICON_ART
-    state.set_art(banner, square)  # SteamGridDB's banner and icon: art the player chooses now replaces both
+    state.set_art(banner, square)  # a complete chosen icon is independent of the startup banner
     state.chooseIcon()  # own_icon
     state.set_art(None, own_icon)  # and with no art, what's fetched for it comes in beside that icon
     state.cover_ready(title, banner, square)
     assert (state.art, state.icon_art) == (banner, own_icon), 'fetched art took the place of the icon the player picked'
     state.set_art(banner, square)
     state.chooseArt()  # art
-    assert (state.art, state.icon_art) == (art, None) and state.artText == gui.CUSTOM, "a fetched icon stayed beside the player's art"
+    assert (state.art, state.icon_art) == (art, square) and state.artText == gui.CUSTOM, "startup art replaced the selected icon"
     # the default art again: the player's pictures forgotten for the game, its art looked up again; offered after a removal too
     asked_again.clear()
     state.fetch_cover = lambda *a: asked_again.set()
@@ -396,7 +483,7 @@ try:
     state.findArt()
     assert asked_again.wait(5) and (state.art, state.icon_art) == (None, None) and title not in state.st['art'] and not state.artOwn
     state.cover_ready(title, banner, square)
-    assert (state.art, state.icon_art) == (banner, square) and not state.artOwn, 'the fetched art was offered as the default again'
+    assert (state.art, state.icon_art) == (banner, None) and not state.artOwn, 'fetched art replaced the default VC icon'
     state.removeArt()
     assert state.artOwn, 'art removed on purpose had no way back'
     state.fetch_cover = fetch_cover
@@ -468,11 +555,197 @@ try:
     else:
         os.environ['BOOT9_PATH'] = kept_env
 
+    # A complete essential cache must not hide newly added files in the selected source.
+    import struct
+    source, cached = os.path.join(base, 'system source with spaces'), os.path.join(base, 'system cache')
+    os.makedirs(source)
+    def archive(folder, tid, body):
+        with open(os.path.join(folder, tid + '.romfs'), 'wb') as file:
+            file.write(struct.pack('<I', 0x28) + body)
+    for tid in gui.dumps.ESSENTIAL_ARCHIVES:
+        archive(source, tid, tid.encode() * 4)
+    real_import(source, cached, base)
+    archive(cached, '0004009b00010402', b'offline cached region data' * 4)
+    cached_before = {name: open(os.path.join(cached, name), 'rb').read() for name in os.listdir(cached)}
+    badword = '000400db00010302'
+    assert real_have(cached) and not os.path.exists(os.path.join(cached, badword + '.romfs'))
+    archive(source, badword, b'new bad-word fixture' * 4)
+    dest = os.path.join(base, 'build destination')
+    os.makedirs(dest)
+    kept_st, kept_game = dict(state.st), state.game
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'building', 'view', 'updateState')}
+    captured = []
+    class BuildCaptured(Exception):
+        pass
+    def capture(argv, **kwargs):
+        captured.append(argv)
+        raise BuildCaptured  # stop before a process/thread/timer can be started
+    try:
+        state.game = SimpleNamespace(path=os.path.join(base, 'test.3ds'), encrypted=lambda: False)
+        state.st.update(system=source, folder=dest, otp='unused test otp')
+        with mock.patch.object(gui.pipeline, 'ARCHIVES', cached), mock.patch.object(gui, 'otp_ok', return_value=True), \
+             mock.patch.object(gui.subprocess, 'Popen', side_effect=capture):
+            state.set(rootOk=True, target='folder', building=False, view='form', updateState='')
+            try:
+                state.build()
+            except BuildCaptured:
+                pass
+            assert captured and '--emulator' in captured[-1], 'GUI build dropped its selected system source once essentials were cached'
+            selected = captured[-1][captured[-1].index('--emulator') + 1]
+            assert selected == source and state.st['system'] == source
+            assert badword in real_import(selected, cached, base)
+            assert open(os.path.join(cached, badword + '.romfs'), 'rb').read() == open(os.path.join(source, badword + '.romfs'), 'rb').read()
+            assert all(open(os.path.join(cached, name), 'rb').read() == body for name, body in cached_before.items())
+            assert json.load(open(settings))['system'] == source
+            # An unplugged source leaves cached/offline files and the selection intact.
+            missing = os.path.join(base, 'unplugged source')
+            state.st['system'] = missing
+            state.set(building=False)
+            try:
+                state.build()
+            except BuildCaptured:
+                pass
+            assert captured[-1][captured[-1].index('--emulator') + 1] == missing
+            assert not real_import(missing, cached, base) and real_have(cached)
+            assert state.st['system'] == missing and json.load(open(settings))['system'] == missing
+            assert all(open(os.path.join(cached, name), 'rb').read() == body for name, body in cached_before.items())
+            messages = []
+            while not state.lines.empty():
+                messages.append(state.lines.get_nowait())
+            assert any(message and 'system folder is unavailable' in message for message in messages)
+    finally:
+        state.st, state.game = kept_st, kept_game
+        state.set(**kept_flags)
+        gui.save_settings(state.st)
+
+    # Queue selection is a snapshot. Only a completed worker, including a failed launch, can advance it.
+    kept_st = dict(state.st)
+    kept_game, kept_update, kept_save = state.game, state.update, state.save_in
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'gameMenu', 'menuShortcut', 'building', 'view', 'updateState')}
+    card = os.path.join(base, 'test card')
+    os.makedirs(card)
+
+    def enqueue(name, target='folder', language='Console default'):
+        state.game = SimpleNamespace(path=os.path.join(base, name + '.3ds'), name=name,
+                                     title_id=int.from_bytes(name.encode()[:8], 'little'), encrypted=lambda: False)
+        state.set(gameName=name, target=target)
+        state.setGameLanguage(language)
+        state.enqueueBuild()
+
+    def complete(result=None):
+        if result:
+            state.lines.put(result)
+            state.poll()
+            assert state.building, 'a result alone advanced the queue before the worker exited'
+        state.lines.put(None)
+        state.poll()
+
+    def queue_status():
+        return [item['status'] for item in state.queueItems]
+
+    worker = mock.Mock()
+    worker.poll.return_value = None
+    try:
+        state.st.update(system='', folder=dest, card=card, otp='first otp')
+        state.set(rootOk=True, building=False, view='form', updateState='')
+        with mock.patch.object(gui, 'otp_ok', return_value=True), mock.patch.object(state, 'find_system'), \
+             mock.patch.object(gui.dumps, 'have_system_archives', return_value=True), \
+             mock.patch.object(gui.pipeline, 'profile_for', side_effect=lambda game: {'folder': game.name}), \
+             mock.patch.dict(os.environ, THREEDII_BUILD='first work folder', BOOT9_PATH='first keys'), \
+             mock.patch.object(gui.threading, 'Thread'), \
+             mock.patch.object(gui.subprocess, 'Popen', side_effect=[worker, OSError('launch failed'), worker, worker]) as launch:
+            state.update = SimpleNamespace(path='queued update.cia')
+            state.save_in = 'queued save folder'
+            state.setMenuShortcut('L+R')
+            assert json.load(open(settings))['menu_shortcut'] == 'L+R'
+            enqueue('First', language='French')
+            assert json.load(open(settings))['game_languages'][f'{state.game.title_id:016x}'] == 'French'
+            enqueue('First', language='German')
+            assert state.queuePending == 1 and state.dialog['title'] == 'That output is already queued'
+            state.answer(True)
+            state.update = state.save_in = None
+            state.st['otp'] = 'second otp'
+            state.setMenuShortcut('L+L')
+            assert state.menuShortcut == 'L+R'
+            state.setGameMenu(False)
+            os.environ['THREEDII_BUILD'] = 'second work folder'
+            os.environ['BOOT9_PATH'] = 'second keys'
+            enqueue('Second')
+            enqueue('Third', 'card')
+            state.setGameMenu(True)
+            state.setMenuShortcut('')
+            enqueue('Remove me')
+            state.removeQueued(3)
+            enqueue('Fourth')
+            state.set(gameName='Still editing', target='folder')
+            state.startQueue()
+            settle('queue started')
+            assert state.buildName == 'First' and queue_status() == ['Building', 'Queued', 'Queued', 'Queued']
+            first_args, first_env = launch.call_args.args[0], launch.call_args.kwargs['env']
+            assert first_args[first_args.index('--game') + 1].endswith('First.3ds')
+            assert first_args[first_args.index('--out') + 1] == dest
+            assert first_args[first_args.index('--otp') + 1] == 'first otp'
+            assert first_args[first_args.index('--update') + 1] == 'queued update.cia'
+            assert first_args[first_args.index('--save') + 1] == 'queued save folder'
+            assert first_args[first_args.index('--language') + 1] == 'French'
+            assert first_args[first_args.index('--menu-shortcut') + 1] == 'L+R'
+            assert first_env['THREEDII_BUILD'] == 'first work folder' and first_env['BOOT9_PATH'] == 'first keys'
+            state.build()
+            state.clearQueue()
+            state.removeQueued(1)
+            assert launch.call_count == 1 and state.queuePending == 3
+            complete('@done first output')
+            assert launch.call_count == 2 and state.buildName == 'Second'
+            state.poll()
+            assert launch.call_count == 3 and state.buildName == 'Third' and 'Copying' in state.stages
+            assert queue_status() == ['Done', 'Failed', 'Building', 'Queued']
+            assert state.queueItems[1]['detail'] == 'launch failed'
+            third_args = launch.call_args.args[0]
+            assert third_args[third_args.index('--card') + 1] == card and '--save' not in third_args and '--language' not in third_args
+            assert '--no-menu' in third_args and '--menu-shortcut' not in third_args
+            with mock.patch.object(gui, 'WIN', True), mock.patch.object(gui.subprocess, 'run'):
+                gui.App.stop_for_close(state)
+            complete()
+            assert launch.call_count == 3 and not state.busy() and state.queuePending == 1, (
+                launch.call_count, state.building, state.queueRunning, queue_status())
+            assert queue_status() == ['Done', 'Failed', 'Cancelled', 'Queued']
+            state.startQueue()
+            assert launch.call_count == 4 and state.buildName == 'Fourth'
+            assert all(flag not in launch.call_args.args[0] for flag in ('--no-menu', '--menu-shortcut'))
+            complete('@error build failed')
+            settle('queue finished')
+            assert not state.busy() and state.queuePending == 0 and state.queueItems[-1]['detail'] == 'build failed'
+            assert state.gameName == 'Still editing'
+            state.clearQueue()
+            assert state.queueItems == []
+    finally:
+        state.timer.stop()
+        state.st, state.game, state.update, state.save_in = kept_st, kept_game, kept_update, kept_save
+        state.set(**kept_flags)
+        gui.save_settings(state.st)
+
     # the in-game menu (click the left stick), on or left out of the games it builds, kept in the settings
     state.setGameMenu(False)
     assert state.st['game_menu'] is False and not state.gameMenu and json.load(open(settings))['game_menu'] is False
     state.setGameMenu(True)
     assert state.gameMenu and json.load(open(settings))['game_menu'] is True
+
+    def check_shortcut_picker(window):
+        first = window.findChild(QObject, 'overlayFirstButton')
+        second = window.findChild(QObject, 'overlaySecondButton')
+        assert first is not None and second is not None
+        assert first.property('currentText') == 'Default'
+        assert QMetaObject.invokeMethod(first, 'activated', Q_ARG(int, state.menuButtons.index('L') + 1))
+        settle('choose the first overlay button')
+        assert second.property('currentText') == 'L Stick'
+        assert QMetaObject.invokeMethod(second, 'activated', Q_ARG(int, 0))
+        settle('choose the second overlay button')
+        assert state.menuShortcut == 'L+R' and second.property('currentText') == 'R'
+        assert QMetaObject.invokeMethod(first, 'activated', Q_ARG(int, 0))
+        settle('reset the overlay shortcut')
+        assert not state.menuShortcut and first.property('currentText') == 'Default'
+
+    check_shortcut_picker(win)
 
     # The build folder (a tester's C: had no room): builds go to the one chosen, the old one's build files are offered for deletion and go only on
     # a yes, and Default comes back to the work folder. Nothing outside the build files is touched.
@@ -513,6 +786,7 @@ try:
     simple = engine.rootObjects()[-1]
     assert simple.objectName() == 'simple' and not simple.property('visible'), 'the simple window did not load, or showed itself'
     settle('the simple window')
+    check_shortcut_picker(simple)
     state.tell('A message', 'In the simple window.')
     settle('a message in the simple window')
     assert simple.findChild(QObject, 'dialog').property('visible'), 'the simple window did not show the message'

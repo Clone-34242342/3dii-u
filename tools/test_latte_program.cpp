@@ -93,6 +93,26 @@ static std::vector<u32> from_new_compiler(bool fixed, u32 spare) {
 }
 
 int main() {
+    {
+        const auto hollow = bytes_of({0xc0000000, 0x94200fff});
+        auto live = hollow;
+        const auto expect = [&](const char *name, const void *p, u32 size, bool want) {
+            if (latte::hollow_pixel_program(p, size) != want) { ++failures; printf("FAILED: hollow pixel %s\n", name); }
+        };
+        expect("actual empty export", hollow.data(), 8, true);
+        expect("null", nullptr, 8, false);
+        for (u32 size : {0u, 1u, 7u, 9u, 16u}) expect("size boundary", hollow.data(), size, false);
+        latte::set_word(live.data(), 1, 0x94200ff8);  // one channel reads a register
+        expect("live passthrough", live.data(), 8, false);
+        latte::set_word(live.data(), 1, 0x94200ffc);  // one channel exports constant zero
+        expect("constant color", live.data(), 8, false);
+        latte::set_word(live.data(), 1, 0x94000fff);  // no END_OF_PROGRAM
+        expect("not complete", live.data(), 8, false);
+        live = bytes_of({0xc0002000, 0x94200fff});  // not a pixel-color export
+        expect("other export target", live.data(), 8, false);
+        live = {0xc0, 0, 0, 0, 0x94, 0x20, 0x0f, 0xff};
+        expect("wrong byte order", live.data(), 8, false);
+    }
     check("the console compiler's two habits", from_new_compiler(false, 0), 7, kVertexRegisters, true, 8, from_new_compiler(true, 7));
     check("a program that says it uses fewer registers than it does", from_new_compiler(false, 0), 3, kVertexRegisters, true, 8, from_new_compiler(true, 7));
     check("a program that says it uses more", from_new_compiler(false, 0), 20, kVertexRegisters, true, 21, from_new_compiler(true, 20));

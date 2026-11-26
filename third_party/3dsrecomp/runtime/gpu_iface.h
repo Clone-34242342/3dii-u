@@ -10,6 +10,7 @@ void process_command_list(u32 paddr, u32 size_bytes);
 void memory_fill(u32 start_paddr, u32 end_paddr, u32 value, u32 control);
 void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
 void invalidate_memory(u32 paddr, u32 size);
+void service_written(u32 paddr, u32 size);
 void dma_written(u32 paddr, u32 size);  // a copy the runtime made itself (GX RequestDma): a definite write
 bool save_state(const char *path);
 // A high-resolution upright RGBA image of what the framebuffer at fb_paddr shows, if the GPU backend has one

@@ -3,55 +3,36 @@
 Geometry shaders the console ran on its CPU go to <out>.gsl beside it, for tools/pica_to_c.py.
 Records are already little-endian: this drops the tags and repeats that the generator does not expect in fs_log.bin.
 Fragment shaders depend on render state, not on the game, so other games' builds take the fragment-only file too (build3ds.prepare_logs)."""
-import struct
 import sys
+
+from dvlb_to_log import log_spans
 
 d = open(sys.argv[1], 'rb').read()
 known = set()
 out = bytearray()
 only_fs = bytearray()
-p = 0
 fs = vs = gs = 0
 gs_out = bytearray()
-while p + 8 <= len(d):
-    tag = d[p:p + 4]
+for tag, p, end in log_spans(d):
+    if d[p:p + 4] != tag:
+        sys.exit(f'unknown record at {p}: {d[p:p + 4]!r}')
     if tag == b'FS  ':
-        n = struct.unpack_from('<I', d, p + 4)[0]
-        key = d[p + 8:p + 8 + n]
-        p += 8 + n
+        key = d[p + 8:end]
         if key not in known:
             known.add(key)
-            out += struct.pack('<I', n) + key
-            only_fs += struct.pack('<I', n) + key
+            out += d[p + 4:end]
+            only_fs += d[p + 4:end]
             fs += 1
-    elif tag == b'VS  ':
-        entry, nc, ns = struct.unpack_from('<III', d, p + 4)
-        body = d[p + 16:p + 16 + (nc + ns) * 4]
-        tail = d[p + 16 + (nc + ns) * 4:p + 16 + (nc + ns) * 4 + 56]
-        words = struct.unpack(f'<{nc + ns}I', body)
-        rec = b'VS  ' + struct.pack('<III', entry, nc, ns) + struct.pack(f'<{nc + ns}I', *words) + tail
-        if rec not in known:
-            known.add(rec)
-            out += rec
-            vs += 1
-        p += 16 + (nc + ns) * 4 + 56
-    elif tag == b'GS  ':  # a geometry shader the CPU ran: into <out>.gsl, for tools/pica_to_c.py
-        entry, nc, ns = struct.unpack_from('<III', d, p + 4)
-        rec = d[p:p + 16 + (nc + ns) * 4]
-        if rec not in known:
-            known.add(rec)
-            gs_out += rec
-            gs += 1
-        p += 16 + (nc + ns) * 4
-    elif tag == b'GSX ':  # a vertex shader and the geometry shader after it: its size, then words already little-endian
-        rec = d[p:p + 8 + struct.unpack_from('<I', d, p + 4)[0]]
-        if rec not in known:
-            known.add(rec)
-            out += rec
-            vs += 1
-        p += len(rec)
     else:
-        sys.exit(f'unknown record at {p}: {tag!r}')
+        rec = d[p:end]
+        if rec not in known:
+            known.add(rec)
+            if tag == b'GS  ':  # a geometry shader the CPU ran, for tools/pica_to_c.py
+                gs_out += rec
+                gs += 1
+            else:
+                out += rec
+                vs += 1
 open(sys.argv[2], 'wb').write(out)
 if gs_out:
     open(sys.argv[2][:-4] + '.gsl' if sys.argv[2].endswith('.bin') else sys.argv[2] + '.gsl', 'wb').write(gs_out)

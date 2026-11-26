@@ -133,13 +133,16 @@ static u64 use_counter = 1;
 
 void set_trust_invalidations(bool trust) { trust_invalidations = trust; }
 
-void invalidate_memory(u32 paddr, u32 size) {
+static void invalidate_memory(u32 paddr, u32 size, bool definite) {
     ensure_init();
     raster_flush();
     metal_poll();
     texcache_invalidate(paddr, size);
-    metal_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
+    metal_guest_written(paddr, size, definite);
 }
+
+void invalidate_memory(u32 paddr, u32 size) { invalidate_memory(paddr, size, false); }
+void service_written(u32 paddr, u32 size) { invalidate_memory(paddr, size, true); }
 
 // GX RequestDma. A "maybe": the textures there are checked against their hashes and uploaded only if they changed. Taken as definite,
 // Metroid: Samus Returns, which copies the same data every frame, uploaded 130 MB of textures every 5 s. Dream Team's Goombas with Luigi's

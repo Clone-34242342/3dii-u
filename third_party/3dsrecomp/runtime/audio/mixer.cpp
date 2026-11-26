@@ -49,9 +49,9 @@ void Mixer::Delay::process(QuadFrame &f) {
 }
 
 void Mixer::tick(DspConfig &cfg, const IntermediateMix (&read)[2], IntermediateMix (&write)[2],
-                 const std::array<QuadFrame, 3> &input) {
+                 const std::array<QuadFrame, 3> &input, bool fresh) {
     // configuration
-    if (const u32 d = cfg.dirty) {
+    if (const u32 d = fresh ? cfg.dirty : 0) {
         if (d & CFG_AUX_BUS_ENABLE0_DIRTY) st.aux_enable[0] = cfg.aux_bus_enable[0] != 0;
         if (d & CFG_AUX_BUS_ENABLE1_DIRTY) st.aux_enable[1] = cfg.aux_bus_enable[1] != 0;
         if (d & CFG_MASTER_VOLUME_DIRTY) st.volume[0] = cfg.master_volume;
@@ -67,13 +67,16 @@ void Mixer::tick(DspConfig &cfg, const IntermediateMix (&read)[2], IntermediateM
     // Aux return: the application's processed samples (from the region it just submitted).
     for (int bus = 0; bus < 2; bus++) {
         if (!st.aux_enable[bus]) continue;
-        for (int i = 0; i < kFrameSamples; i++)
-            for (int c = 0; c < 4; c++) st.mix[bus + 1][i][c] = read[bus].pcm32[c][i];
+        if (fresh)
+            for (int i = 0; i < kFrameSamples; i++)
+                for (int c = 0; c < 4; c++) st.aux_return[bus][i][c] = read[bus].pcm32[c][i];
+        st.mix[bus + 1] = st.aux_return[bus];
     }
     // Aux send: hand this frame's mixes 1/2 to the application, or route them directly.
     st.mix[0] = input[0];
     for (int bus = 0; bus < 2; bus++) {
         if (st.aux_enable[bus]) {
+            if (!fresh) continue;
             for (int i = 0; i < kFrameSamples; i++)
                 for (int c = 0; c < 4; c++) write[bus].pcm32[c][i] = input[bus + 1][i][c];
         } else {

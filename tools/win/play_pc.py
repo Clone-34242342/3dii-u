@@ -8,43 +8,37 @@ programs and fragment states the session met (vs_log.bin, fs_log.bin) are then a
 the next build (the Builder, or build3ds.py all) compiles ahead. No sound: the PC version plays none."""
 import argparse
 import os
-import struct
 import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(ROOT, 'builder'))
-import shaderlogs  # noqa: E402
-
-
-def spans(path):
-    """each record's bytes, as shaderlogs.records reads them"""
-    d = open(path, 'rb').read()
-    p = 0
-    while p + 8 <= len(d):
-        if d[p:p + 4] == b'VS  ':
-            _, nc, ns = struct.unpack_from('<III', d, p + 4)
-            q = p + 16 + (nc + ns) * 4 + shaderlogs.TAIL
-            yield d[p:q]
-            p = q
-        else:
-            q = p + 4 if d[p:p + 4] == b'FS  ' else p
-            if q + 4 > len(d):
-                return
-            end = q + 4 + struct.unpack_from('<I', d, q)[0]
-            yield d[p:end]
-            p = end
+sys.path.insert(0, os.path.join(ROOT, 'tools'))
+from dvlb_to_log import log_spans  # noqa: E402
 
 
 def merge(src, dst):
     """src's records not in dst yet, added to it; how many"""
     if not os.path.isfile(src):
         return 0
-    have = set(spans(dst)) if os.path.isfile(dst) else set()
-    new = [r for r in spans(src) if r not in have and not have.add(r)]
-    with open(dst, 'ab') as f:
-        f.write(b''.join(new))
-    return len(new)
+    with open(src, 'rb') as f:
+        source = f.read()
+    with open(dst, 'a+b') as f:
+        f.seek(0)
+        saved = f.read()
+        have = set()
+        end = 0
+        for _, start, end in log_spans(saved):
+            have.add(saved[start:end])
+        if end < len(saved):
+            f.truncate(end)  # the next append must start at a complete record boundary
+        added = 0
+        for _, start, end in log_spans(source):
+            record = source[start:end]
+            if record not in have:
+                f.write(record)
+                have.add(record)
+                added += 1
+    return added
 
 
 def main():

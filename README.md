@@ -32,8 +32,8 @@ learned from Maschell's [NUSPacker](https://github.com/Maschell/NUSPacker), but 
 there are no paid builds, no paid beta tiers and no paywalled features. You may use, study, share and change it under the
 EUPL-1.2. If you distribute a changed version, you must offer its source under the same licence.
 
-**Status: beta, Windows only.** [`builder/compat.json`](builder/compat.json) lists the games that have been played on a
-real Wii U. Any other game builds as "untested": it may not start, or it may stop partway.
+**Status: beta, Windows only.** The Builder's **Games → Compatibility List** shows separate results for Wii U hardware and Cemu.
+The test notes and known issues are in [`builder/compat.json`](builder/compat.json).
 
 ## What you need to supply
 
@@ -62,6 +62,25 @@ Most people want **3Dii U Builder**, the desktop app in [`builder/`](builder/REA
 the game and puts it on your SD card. Releases of the standalone app need no Python and no toolchain. Its About button,
 and `pipeline.py --credits`, list the projects it's built on. Its UI and art design are by syntcity, and sennecaelen and
 Clone-34242342 contributed code.
+
+[creeper88-boy](https://github.com/creeper88-boy) contributed first-trial extraction fixes in
+[#24](https://github.com/J-Glitch2502/3dii-u/pull/24), Ocarina of Time 3D build-mode support in
+[#42](https://github.com/J-Glitch2502/3dii-u/pull/42) and the Circle Pad Pro/New 3DS input foundation in
+[#44](https://github.com/J-Glitch2502/3dii-u/pull/44). Integration corrections and validation are tracked separately.
+
+[Clone-34242342](https://github.com/Clone-34242342) contributed compressed-CRO and static-module startup support in
+[#16](https://github.com/J-Glitch2502/3dii-u/pull/16) and contributed fixes for save writeback reentry, render-target
+retirement, PICA shader IF-stack handling, vertex shader register pressure, Y2R tile batching, and ARM byte operations used by movie decoders in [#54](https://github.com/J-Glitch2502/3dii-u/pull/54).
+
+[Mertoxx07](https://github.com/Mertoxx07) reported and tested the padded GamePad framebuffer routing in
+[#37](https://github.com/J-Glitch2502/3dii-u/issues/37).
+
+[matte-oss](https://github.com/matte-oss) traced incorrectly skipped draws and stale display transfer sources in
+[#52](https://github.com/J-Glitch2502/3dii-u/issues/52).
+
+[Walegy](https://github.com/Walegy) contributed the Virtual Console-style icon design in
+[#45](https://github.com/J-Glitch2502/3dii-u/issues/45). The builder applies its shared frame to each game's own SMDH icon;
+a custom Wii U Menu icon still takes precedence.
 
 ## Working on it
 

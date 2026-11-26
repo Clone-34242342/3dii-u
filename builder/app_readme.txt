@@ -23,6 +23,8 @@ WHAT YOU NEED
     In the builder, press "Folder" next to "3DS System Files" and choose that 0004009b folder. Copied this way the files are
     encrypted, so the builder needs your 3DS keys (boot9.bin) to read them.
   The builder also looks in Citra's user folder, and in Downloads, Desktop and Documents. It copies them once and keeps them for every game after.
+- For standard 3DS Mii QR codes, put just the slot0x31KeyN line from your own 3DS key file in 3dii-u/mii_qr.key on your Wii U SD card before
+  starting the game. The key stays on the card outside the install package.
 
 
 GETTING STARTED
@@ -33,6 +35,7 @@ GETTING STARTED
 3. Click the big "+" tile (or press Ctrl+O) and choose your dump. The builder then asks about the game's update, DLC and mods.
 4. Under "Your Files", each light turns cyan once the builder has that file.
 5. Under "Put it on", choose your SD card or a folder, then press "Build It!".
+   For several games, configure each one and press "Add to queue". Press "Run queue" to build them in order.
    Big games take a while: the game's code is recompiled for the Wii U and its shaders are compiled ahead of time.
    The first build also compiles the builder's own runtime, so it takes a few minutes longer than the rest.
 6. Put the SD card in the Wii U and install the game with WUP Installer GX2.
@@ -41,22 +44,14 @@ GETTING STARTED
 
 WHICH GAMES WORK
 
-- "Complete on Wii U": finished. Confirmed on a real Wii U to run as the game should, with no known problems left:
-  New Super Mario Bros. 2.
-- "Plays on Wii U": tested on a real Wii U, and it plays; some things may still be rough:
-  Tomodachi Life, Paper Mario: Sticker Star, Mario & Luigi: Dream Team, Mario & Luigi: Paper Jam,
-  Mario & Luigi: Superstar Saga + Bowser's Minions, Mario & Luigi: Bowser's Inside Story + Bowser Jr.'s Journey,
-  Professor Layton and the Azran Legacy, Professor Layton and the Miracle Mask,
-  and The Legend of Zelda: Ocarina of Time 3D (the American version).
-  Either badge shows when your dump is the same edition that was tested. They were tested without updates.
-- "Runs in Cemu" (the Games page): built with this builder and played in the Cemu emulator, not yet on a real Wii U:
-  Mario Kart 7, The Legend of Zelda: A Link Between Worlds, Metroid: Samus Returns, Kirby: Triple Deluxe, Rhythm Heaven Megamix,
-  Phoenix Wright: Ace Attorney Trilogy, Animal Crossing: New Leaf, Kid Icarus: Uprising, Super Mario 3D Land, Miitopia
-  and The Legend of Zelda: Majora's Mask 3D.
-- The right stick is a New 3DS's C-stick, and ZL and ZR are its own, for games that support the Circle Pad Pro: a New 3DS answers
-  them as one, and so does the Wii U. Majora's Mask 3D needs it to get past its Circle Pad Pro screen.
-- "Untested": every other game, and any game with a mod. It may play, it may not start, or it may stop partway.
-  Reports on these games help the most.
+Open Games > Compatibility List. Choose "Plays on Wii U" for hardware playtests or "Plays in Cemu" for emulator playtests.
+The notes describe the tested edition, the sections played, and any known problems.
+
+- "Complete on Wii U" means the game was confirmed to play as expected on hardware.
+- "Plays on Wii U" and "Plays in Cemu" describe gameplay on the named platform. Some games appear in both lists.
+- "Limited" means an earlier stage such as startup or setup was checked.
+- "Untested" means gameplay on that platform is unverified. Updates, DLC, and mods can change compatibility.
+- The right stick and ZL/ZR provide Circle Pad Pro input when a game connects to that accessory. Otherwise ZL/ZR also act as L/R.
 
 
 IF A GAME RUNS SLOWLY OR FREEZES ON THE WII U
@@ -97,18 +92,28 @@ WHAT STAYS ON YOUR PC
 - Your dumps are never changed. Your keys are only read.
 - The games you build are made from your dumps and your keys: don't share them.
 
-- When you pick a game, the builder downloads its cover art from GameTDB (art.gametdb.com) for the game's start-up screens and Wii U Menu icon.
+- When you pick a game, the builder downloads its cover art from GameTDB (art.gametdb.com) for the game's start-up screens.
+  The default Wii U Menu icon uses that game's own icon with a Virtual Console-style frame. A custom menu icon replaces it as supplied.
   It sends only the four letters of the game's product code. The "Art" pill on the game's tile lets you choose your own picture for the start-up screens, another for the Wii U Menu icon, or remove them to use the game's icon.
   Its "GamePad bezel" line takes a picture the GamePad shows beside the screens, a bezel or overlay, in place of black: any picture, scaled to fill
   the GamePad (854x480), its edges cut where its shape differs. "GamePad start screen" gives the GamePad a start-up picture of its own,
   shown as it is (the TV's otherwise), and "This game's sound" a start-up sound for that game alone, in place of the one for all games.
 - With a SteamGridDB key (Help page, "Art and sound"; the key is free, on steamgriddb.com under Preferences, API) each game gets a banner for
-  its start-up screens and an icon for the Wii U Menu from SteamGridDB instead. The builder sends the game's name (and its names in other
+  its start-up screens from SteamGridDB instead. Its menu icon still uses the game's own framed icon unless you choose a custom one. The builder sends the game's name (and its names in other
   regions, if SteamGridDB doesn't know this one) and your key there, and nothing else; the key stays in the builder's settings on this PC.
 - A start-up sound is yours to add (Help page, "Art and sound"): choose a WAV file and every game you build plays it while it starts.
+- Choose two buttons under Overlay shortcut on the Help page, or on the Art and Sound tab in the simple window. The choice applies to new builds.
+  With Default selected, click the left stick or press ZL + ZR to open the in-game menu.
 - The builder asks GitHub for the list of its releases, and downloads one from there only when you press "Update".
 
 UI and art design by syntcity.
+Virtual Console-style icon design by Walegy: https://github.com/J-Glitch2502/3dii-u/issues/45
+Compressed-CRO and static-module startup support by Clone-34242342:
+https://github.com/J-Glitch2502/3dii-u/pull/16
+First-trial extraction fixes, Ocarina of Time 3D build-mode support and the Circle Pad Pro/New 3DS input foundation by creeper88-boy:
+https://github.com/J-Glitch2502/3dii-u/pull/24
+https://github.com/J-Glitch2502/3dii-u/pull/42
+https://github.com/J-Glitch2502/3dii-u/pull/44
 
 The builder comes with no game, no game data and no keys. This is a beta, with no warranty.
 Third-party notices.txt lists the open-source software it carries.

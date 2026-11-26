@@ -43,7 +43,37 @@ USUM_BATTLE = ['WAIT 900'] + A(45, 90) + ['B 6', 'WAIT 60'] * 6 + ['CLEFT+B 240'
 # into the first race, then A held: the kart drives on, into walls and round them, among the other racers.
 MK7_RACE = ['WAIT 600'] + A(30, 120) + ['A 600', 'WAIT 10'] * 40
 
+# Enter Story Mode, then walk Kirby off the world map's return marker toward
+# Stage 1. A enters doors or jumps in a stage. Start would pause on every press.
+KIRBY_STAGE_1 = ['WAIT 600'] + A(18, 85) + ['CRIGHT 35', 'WAIT 20', 'A 6', 'WAIT 170'] * 8
+KIRBY_STAGE_1 += ['CRIGHT 45', 'CRIGHT+A 25', 'WAIT 210'] * 16
+
+# The generic center tap selects “Oops, I misspoke!” on the name prompt. Confirm
+# each keyboard explicitly, accept the first town map, then advance to the welcome.
+ACNL_ARRIVAL = (['WAIT 420'] + A(80, 32)
+                + ['T@22/122 5', 'WAIT 16', 'T@261/222 5', 'WAIT 90'] + A(4, 55) + ['A 6']
+                + ['A 8', 'WAIT 48'] * 18
+                + ['T@62/101 5', 'WAIT 12', 'T@218/101 5', 'WAIT 12', 'T@156/101 5', 'WAIT 12',
+                   'T@69/101 5', 'WAIT 12', 'T@261/222 5', 'WAIT 100'] + ['A 8', 'WAIT 48'] * 28
+                + ['T@260/224 8', 'WAIT 90'] + ['A 8', 'WAIT 45'] * 25
+                + A(66, 28) + A(32, 25) + A(28, 26) + A(10, 28))
+
+ACNL_ARRIVAL_HOLD = 'WAIT 1440'
+ACNL_LAST_STROKE = 'DRAG 200/100 120/160 40'
+ROUTE_CHECKPOINTS = {
+    'acnl_arrival': (ACNL_ARRIVAL_HOLD, 320),
+    'acnl_design': (ACNL_LAST_STROKE, 320),
+}
+
 ROUTES = {
+    'kirby_stage_1': KIRBY_STAGE_1,
+    # The generic center touch selects Rename; file 1's Begin button is lower down.
+    'zelda_albw': ['WAIT 600', 'A 6', 'WAIT 600', 'A 6', 'WAIT 300', 'T@160/60 10', 'WAIT 300', 'T@160/174 10', 'WAIT 600']
+                  + A(60, 60) + ['CDOWN 240', 'WAIT 1800', 'CLEFT 240', 'WAIT 3000'],
+    # Confirm extra-data setup, swipe through help, then decline SpotPass and reach the models.
+    'pokedex_3d': ['WAIT 600', 'T@160/180 10', 'WAIT 600']
+                  + ['DRAG 280/120 40/120 30', 'WAIT 240'] * 12
+                  + ['T@160/200 10', 'WAIT 600', 'T@214/180 10', 'WAIT 300', 'T@160/180 10', 'WAIT 300', 'WAIT 30000'],
     'mario_kart_7': MK7_RACE,
     # the same, held on through the cup: each race ends four to five minutes in with the kart against walls, and the third is Cheep Cheep
     # Lagoon, whose water is where a console loses the most frames (the user, 2026-11-14). A course can't be swapped in for the first: the game
@@ -64,8 +94,9 @@ ROUTES = {
     'nsmb2_run': NSMB2_INTO_1_1 + run_right(150),
     # in World 1-1 the options menu opens (a route's KEY menu, as a click of the left stick) and stays up, on the TV and the GamePad
     'nsmb2_menu': NSMB2_INTO_1_1 + ['WAIT 300', 'KEY menu', 'WAIT 30000'],
+    'acnl_arrival': ACNL_ARRIVAL + [ACNL_ARRIVAL_HOLD],
     # Animal Crossing from a kept town save: the title's Continue, the first player, into town, then the Touch Screen's menus
-    'acnl_design': ['WAIT 900'] + A(100, 60) + ['WAIT 600', 'X 6', 'WAIT 300', 'T@78/11 10', 'WAIT 300', 'T@35/82 10', 'WAIT 300', 'T@50/182 10', 'WAIT 400', 'A 6', 'WAIT 400', 'T@35/82 10', 'WAIT 400', 'T@50/182 10', 'WAIT 600', 'DRAG 120/70 200/70 40', 'WAIT 120', 'DRAG 120/100 200/160 40', 'WAIT 120', 'DRAG 200/100 120/160 40', 'WAIT 120', 'T@160/120 10', 'WAIT 600', 'WAIT 30000'],
+    'acnl_design': ['WAIT 900'] + A(100, 60) + ['WAIT 600', 'X 6', 'WAIT 300', 'T@78/11 10', 'WAIT 300', 'T@35/82 10', 'WAIT 300', 'T@50/182 10', 'WAIT 400', 'A 6', 'WAIT 400', 'T@35/82 10', 'WAIT 400', 'T@50/182 10', 'WAIT 600', 'DRAG 120/70 200/70 40', 'WAIT 120', 'DRAG 120/100 200/160 40', 'WAIT 120', ACNL_LAST_STROKE, 'WAIT 2400', 'WAIT 30000'],
     # standing where the level starts for the whole run: one place, drawn frame after frame, for timing a level against another
     'nsmb2_stand': NSMB2_INTO_1_1 + ['WAIT 30000'],
     'dream_team': A(8) + ['DDOWN 6', 'WAIT 40', 'A 6', 'WAIT 80'] * 6 + A(440, 30) + sweep(WALK) + A(500, 30),

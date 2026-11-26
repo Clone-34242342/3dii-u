@@ -34,7 +34,7 @@ ApplicationWindow {
     palette.placeholderText: dark ? "#9a9a9a" : "#6d6d6d"
     color: palette.window
 
-    readonly property bool busy: app.building || app.updateState === "restarting"
+    readonly property bool busy: app.building || app.queueRunning || app.updateState === "restarting"
 
     // [Button] [the path or what's chosen] (Remove)
     component PathRow: RowLayout {
@@ -129,7 +129,7 @@ ApplicationWindow {
                     Label { text: app.gameName || "None chosen"; font.bold: true }
                     Label { text: "Made by:" }
                     Label { text: app.maker || "-" }
-                    Label { text: "On the Wii U:" }
+                    Label { text: "Compatibility:" }
                     Label { text: app.hasGame ? app.badge : "-" }
                 }
                 Label { text: app.note; wrapMode: Text.WordWrap; Layout.fillWidth: true; opacity: 0.85 }
@@ -176,6 +176,7 @@ ApplicationWindow {
             }
 
             ColumnLayout {  // what the Wii U shows and plays while a game starts, and the GamePad's bezel while it plays
+                enabled: !win.busy
                 spacing: 8
                 PathRow {
                     label: "Start-up art..."; text: app.artText; removable: app.hasArt
@@ -207,6 +208,12 @@ ApplicationWindow {
                     Label { text: "In-game menu:" }
                     RadioButton { text: "On"; checked: app.gameMenu; onClicked: app.setGameMenu(true) }
                     RadioButton { text: "Off"; checked: !app.gameMenu; onClicked: app.setGameMenu(false) }
+                }
+                RowLayout {
+                    visible: app.gameMenu
+                    Label { text: "Overlay shortcut:" }
+                    OverlayShortcut { builder: app }
+                    Label { visible: !app.menuShortcut; text: "L Stick or ZL + ZR" }
                 }
                 RowLayout {
                     Label { text: "Start-up screens:" }
@@ -260,13 +267,20 @@ ApplicationWindow {
                         enabled: app.view === "form" && !win.busy
                         onClicked: app.hasGame ? app.build() : app.chooseGame()
                     }
-                    Button { text: "Cancel"; visible: app.view === "building"; enabled: app.building; onClicked: app.cancel() }
-                    Button { text: "Back"; visible: app.view === "failed" || app.view === "done"; onClicked: app.back() }
-                    Button { text: "Open the folder"; visible: app.view === "done" && app.target === "folder"; onClicked: app.openFolder() }
+                    Button {
+                        text: "Add to queue"
+                        visible: app.hasGame && app.view === "form"
+                        enabled: !win.busy
+                        onClicked: app.enqueueBuild()
+                    }
+                    Button { text: app.queueRunning ? "Stop queue" : "Cancel"; visible: app.view === "building"; enabled: app.building; onClicked: app.cancel() }
+                    Button { text: "Back"; visible: app.view === "failed" || app.view === "done"; enabled: !win.busy; onClicked: app.back() }
+                    Button { text: "Open the folder"; visible: app.view === "done"; enabled: !win.busy; onClicked: app.openFolder() }
                     Label {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
-                        text: app.view === "building" ? (app.stage >= 0 && app.stage < app.stages.length ? app.stages[app.stage] + ": " : "") + app.detail
+                        text: app.view === "building" ? (app.queueRunning ? app.buildName + " · " : "")
+                            + (app.stage >= 0 && app.stage < app.stages.length ? app.stages[app.stage] + " · " : "") + app.detail
                             : app.view === "failed" ? "The build stopped: " + app.resultText
                             : app.view === "done" ? app.resultText : ""
                     }
@@ -275,6 +289,45 @@ ApplicationWindow {
                     visible: app.view !== "form"
                     ProgressBar { Layout.fillWidth: true; from: 0; to: 1; value: app.progress }
                     Label { text: Math.round(app.progress * 100) + "%"; Layout.preferredWidth: 44; horizontalAlignment: Text.AlignRight }
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    visible: app.queueItems.length > 0
+                    Label { text: "Build queue"; font.bold: true; Layout.fillWidth: true }
+                    Button { text: "Clear queue"; enabled: !win.busy; onClicked: app.clearQueue() }
+                    Button { text: "Run queue"; enabled: !win.busy && app.queuePending > 0; onClicked: app.startQueue() }
+                }
+                ListView {
+                    id: buildQueue
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: Math.min(96, count * 32)
+                    visible: count > 0
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    model: app.queueItems
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AlwaysOn }
+                    delegate: RowLayout {
+                        required property var modelData
+                        required property int index
+                        width: buildQueue.width - 14
+                        height: 32
+                        Label {
+                            Layout.fillWidth: true
+                            text: modelData.name + " · " + modelData.status + (modelData.detail ? " · " + modelData.detail : "")
+                            textFormat: Text.PlainText
+                            elide: Text.ElideRight
+                            HoverHandler { id: queueHover }
+                            ToolTip.visible: queueHover.hovered && truncated
+                            ToolTip.text: text
+                        }
+                        Button {
+                            text: "Remove"
+                            Accessible.name: "Remove " + modelData.name + " from the queue"
+                            visible: modelData.status === "Queued"
+                            enabled: !win.busy
+                            onClicked: app.removeQueued(index)
+                        }
+                    }
                 }
                 ScrollView {
                     Layout.fillWidth: true

@@ -1313,9 +1313,10 @@ void start(const BootInfo &bi) {
     tq_event_ready = true;
     // From a megabyte clear of the program (its data and bss come last) to the heap. A game with modules has ldr:ro put them where it says,
     // anywhere in the code's region, which ends at 0x04000000: only what is past that is lent then. Pokemon Ultra Sun's field modules
-    // landed on the host's threads, and the game froze as it loaded its first route (2026-11-13).
+    // landed on the host's threads, and the game froze as it loaded its first route (2026-11-13). Cold builds can lack generated slots,
+    // so the original service ACL also decides whether the guest retains its module region.
     const u32 clear = ((g_game.data_addr + g_game.data_size + g_game.bss_size + 0xFFFFF) & ~0xFFFFFu) + 0x100000;
-    mem::lend(ro_has_modules() ? std::max(clear, 0x04000000u) : clear, mem::HEAP_BASE);
+    mem::lend(code_memory_lend_begin(clear, ro_has_modules()), mem::HEAP_BASE);
 #endif
     tq.th = std::thread(timeout_thread);
     tq.th.detach();

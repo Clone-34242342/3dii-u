@@ -27,25 +27,26 @@ int main() {
     m.store(0x100, -2);
     assert(r16(0x100) == 0xFFFE);
 
-    // looped: 81 8-bit samples per tick into 100 bytes from offset 16, so the second tick wraps
+    // The 8182 Hz stream writes 81 then 82 samples, carrying the fractional budget over.
     m.encoding = 0;
-    m.rate = 8180;
+    m.rate = 8182;
     m.start = m.pos = 16;
     m.end = 116;
     m.loop = m.sampling = true;
     m.tick(m.generation);
     assert(m.pos == 97 && r32(last_word) == 97 && !m.buf_full->signaled && r8(0x1000 + 16) == 128);
     m.tick(m.generation);
-    assert(m.pos == 16 + 62 && r32(last_word) == 78 && m.buf_full->signaled && m.sampling);
+    assert(m.pos == 16 + 63 && r32(last_word) == 79 && m.buf_full->signaled && m.sampling);
 
     // a tick left over from an earlier StartSampling does nothing
     m.tick(m.generation - 1);
-    assert(m.pos == 78);
+    assert(m.pos == 79);
 
     // unlooped: 16-bit samples stop at the end of a 200-byte buffer, and report that position
     m.buf_full->signaled = false;
     m.encoding = 1;
     m.loop = false;
+    m.sample_remainder = 0;
     m.pos = 16;
     m.end = 216;
     m.tick(m.generation);

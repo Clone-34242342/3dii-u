@@ -47,13 +47,17 @@ struct DmaWriter {
     u32 at, left, unit, gap;
     explicit DmaWriter(const Dma &d) : at(d.addr), left(d.unit), unit(d.unit), gap(d.gap) {}
     void put(const u8 *p, u32 n) {
-        memcpy(gptr(at), p, n);
-        at += n;
-        if (!unit) return;
-        left -= std::min(left, n);
-        if (!left) {
-            at += gap;
-            left = unit;
+        while (n) {
+            if (unit && !left) {
+                at += gap;
+                left = unit;
+            }
+            const u32 run = unit ? std::min(left, n) : n;
+            memcpy(gptr(at), p, run);
+            at += run;
+            p += run;
+            n -= run;
+            left -= unit ? run : 0;
         }
     }
 };
@@ -76,11 +80,16 @@ struct Y2rService : Service {
     bool warned_rotation = false;
     bool busy = false;  // a conversion is under way (StartConversion)
 
-    void convert() {
-        if (!width || (width & 7) || width > 1024 || !out.addr) {
-            LOG("[y2r] can't convert: width %u, output %08x\n", width, out.addr);
-            return;
-        }
+    u32 output_span() const {
+        if (!width || (width & 7) || width > 1024 || !lines) return 0;
+        const u32 bytes = output_format == 0 ? 4 : output_format == 1 ? 3 : 2;
+        const u32 payload = width * (block ? (lines + 7) & ~7u : lines) * bytes;
+        const u64 span = payload + (out.unit ? (u64)((payload - 1) / out.unit) * out.gap : 0);
+        if (payload > out.size || span > UINT32_MAX || !guest_writable(out.addr, (u32)span)) return 0;
+        return (u32)span;
+    }
+
+    void convert(u32 span) {
         VLOG("[y2r] convert %ux%u in %u out %u block %u rotation %u, from %08x/%08x (size %x) to %08x size %x unit %x gap %x\n", width, lines, input_format, output_format, block, rotation,
              yuyv.addr, y.addr, yuyv.size, out.addr, out.size, out.unit, out.gap);
         const u32 tiles_across = width / 8;
@@ -172,31 +181,23 @@ struct Y2rService : Service {
                 }
                 tiles.swap(turned);
             }
-            u8 px[4];
             if (block) {
-                std::vector<u32> shuffled(64);
+                u8 packed[64 * 4];
                 for (u32 t = 0; t < tiles_across; t++) {
-                    for (u32 i = 0; i < 64; i++) shuffled[order[i]] = tiles[t * 64 + i];
-                    for (u32 i = 0; i < 64; i++) {
-                        encode(shuffled[i], px);
-                        w.put(px, bytes);
-                    }
+                    for (u32 i = 0; i < 64; i++) encode(tiles[t * 64 + i], packed + order[i] * bytes);
+                    w.put(packed, 64 * bytes);
                 }
             } else {
                 for (u32 row = 0; row < rows; row++) {
                     u8 *d = line.data();
                     for (u32 x = 0; x < width; x++, d += bytes) encode(tiles[(x / 8) * 64 + row * 8 + (x & 7)], d);
-                    // whole lines in one go, unless the DMA pattern is finer than that
-                    if (!out.unit || out.unit >= width * bytes) {
-                        w.put(line.data(), width * bytes);
-                    } else {
-                        for (u32 x = 0; x < width; x++) w.put(line.data() + x * bytes, bytes);
-                    }
+                    w.put(line.data(), width * bytes);
                 }
             }
         }
-        // the GPU may read this next
-        gsp_cpu_wrote(out.addr, std::max<u32>(out.size, (out.unit ? (out.unit + out.gap) : width * bytes) * lines));
+        // A strided span also contains untouched bytes, so don't claim ownership of its gaps.
+        if (out.unit && out.gap && span > out.unit) gsp_cache_op(out.addr, span, false);
+        else gsp_cpu_wrote(out.addr, span);
     }
 
     static Dma dma(IPC &ipc) {
@@ -212,6 +213,11 @@ struct Y2rService : Service {
         auto get = [&](u32 v) {
             ipc.ok(2);
             ipc.set(2, v);
+        };
+        auto coefficients = [&](const s16 *values) {
+            ipc.ok(5);
+            for (u32 i = 0; i < 4; i++)
+                ipc.set(2 + i, (u32)(u16)values[2 * i] | (u32)(u16)values[2 * i + 1] << 16);
         };
         switch (ipc.cmd()) {
         case 0x0001: input_format = ipc[1] & 0xff; ipc.ok(); break;
@@ -247,10 +253,15 @@ struct Y2rService : Service {
             for (u32 i = 0; i < 8; i++) co[i] = (s16)(ipc[1 + i / 2] >> (16 * (i & 1)));
             ipc.ok();
             break;
+        case 0x001F: coefficients(co); break;  // GetCoefficient
         case 0x0020:  // SetStandardCoefficient
             standard = std::min<u32>(ipc[1], 3);
             memcpy(co, kStandard[standard], sizeof co);
             ipc.ok();
+            break;
+        case 0x0021:  // GetStandardCoefficient
+            if (ipc[1] >= 4) ipc.result(0xE0E053ED);  // CAM InvalidEnumValue / InvalidArgument / Usage
+            else coefficients(kStandard[ipc[1]]);
             break;
         case 0x0022: alpha = ipc[1] & 0xffff; ipc.ok(); break;
         case 0x0023: get(alpha); break;
@@ -258,16 +269,22 @@ struct Y2rService : Service {
             for (u32 i = 0; i < 8; i++) dither[i] = (u16)(ipc[1 + i / 2] >> (16 * (i & 1)));
             ipc.ok();
             break;
-        case 0x0026:  // StartConversion
+        case 0x0026: {  // StartConversion
             // A video frame takes tens of milliseconds to convert, and the game's other threads, its sound thread first, run meanwhile, as on
             // a 3DS, where the converter is hardware of its own (run_blocked). Done under the kernel lock, each frame of Kid Icarus's opening
             // video stopped them all for 25 to 120 ms (2026-11-11).
+            if (busy) { ipc.ok(); break; }
+            Y2rService conversion = *this;  // Guest threads can set up the next image once conversion releases the lock.
+            const u32 span = conversion.output_span();
+            if (!span) { ipc.result(RES_INVALID_ADDRESS); break; }
             busy = true;
-            run_blocked(*ipc.lk, [&] { convert(); });
+            run_blocked(*ipc.lk, [&] { conversion.convert(span); });
+            warned_rotation |= conversion.warned_rotation;
             busy = false;
             done->signal();
             ipc.ok();
             break;
+        }
         case 0x0027: ipc.ok(); break;   // StopConversion
         case 0x0028: get(busy); break;  // IsBusyConversion
         case 0x0029: {                  // SetPackageParameter

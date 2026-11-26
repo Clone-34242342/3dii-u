@@ -1,0 +1,178 @@
+diff --git a/src/gallium/drivers/r600/sb/sb_ir.h b/src/gallium/drivers/r600/sb/sb_ir.h
+index eecf17d..840c9a0 100644
+--- a/src/gallium/drivers/r600/sb/sb_ir.h
++++ b/src/gallium/drivers/r600/sb/sb_ir.h
+@@ -770,7 +770,7 @@ protected:
+ 	node(node_type nt, node_subtype nst, node_flags flags = NF_EMPTY)
+ 	: prev(), next(), parent(),
+ 	  type(nt), subtype(nst), flags(flags),
+-	  pred(), dst(), src() {}
++	  pred(), dst(), src(), uid() {}
+ 
+ 	virtual ~node() {};
+ 
+@@ -787,6 +787,11 @@ public:
+ 	vvec dst;
+ 	vvec src;
+ 
++	/* creation order within the shader (shader::create_*): containers keyed
++	 * by node pointer compare by it, so the compiler's output doesn't depend
++	 * on where the allocator put the nodes */
++	unsigned uid;
++
+ 	virtual bool is_valid() { return true; }
+ 	virtual bool accept(vpass &p, bool enter);
+ 
+@@ -1180,7 +1185,13 @@ typedef std::list<node*> sched_queue;
+ typedef sched_queue::iterator sq_iterator;
+ typedef std::vector<node*> node_vec;
+ typedef std::list<node*> node_list;
+-typedef std::set<node*> node_set;
++struct node_uid_less {
++	bool operator()(const node *a, const node *b) const {
++		return a->uid != b->uid ? a->uid < b->uid : a < b; /* nodes made outside shader::create_* keep uid 0 */
++	}
++};
++
++typedef std::set<node*, node_uid_less> node_set;
+ 
+ 
+ 
+diff --git a/src/gallium/drivers/r600/sb/sb_pass.h b/src/gallium/drivers/r600/sb/sb_pass.h
+index 179eab4..e9909d6 100644
+--- a/src/gallium/drivers/r600/sb/sb_pass.h
++++ b/src/gallium/drivers/r600/sb/sb_pass.h
+@@ -232,9 +232,9 @@ class gcm : public pass {
+ 		op_info() : top_bb(), bottom_bb() {}
+ 	};
+ 
+-	typedef std::map<node*, op_info> op_info_map;
++	typedef std::map<node*, op_info, node_uid_less> op_info_map;
+ 
+-	typedef std::map<node*, unsigned> nuc_map;
++	typedef std::map<node*, unsigned, node_uid_less> nuc_map;
+ 
+ 	op_info_map op_map;
+ 	nuc_map uses;
+diff --git a/src/gallium/drivers/r600/sb/sb_sched.h b/src/gallium/drivers/r600/sb/sb_sched.h
+index 91a34e0..78ae7cb 100644
+--- a/src/gallium/drivers/r600/sb/sb_sched.h
++++ b/src/gallium/drivers/r600/sb/sb_sched.h
+@@ -29,7 +29,7 @@
+ 
+ namespace r600_sb {
+ 
+-typedef sb_map<node*, unsigned> uc_map;
++typedef sb_map<node*, unsigned, node_uid_less> uc_map;
+ 
+ // resource trackers for scheduler
+ // rp = read port
+diff --git a/src/gallium/drivers/r600/sb/sb_shader.cpp b/src/gallium/drivers/r600/sb/sb_shader.cpp
+index a01972d..d0a68ed 100644
+--- a/src/gallium/drivers/r600/sb/sb_shader.cpp
++++ b/src/gallium/drivers/r600/sb/sb_shader.cpp
+@@ -256,12 +256,14 @@ value* shader::get_undef_value() {
+ 
+ node* shader::create_node(node_type nt, node_subtype nst, node_flags flags) {
+ 	node *n = new (pool.allocate(sizeof(node))) node(nt, nst, flags);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+ 
+ alu_node* shader::create_alu() {
+ 	alu_node* n = new (pool.allocate(sizeof(alu_node))) alu_node();
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -269,6 +271,7 @@ alu_node* shader::create_alu() {
+ alu_group_node* shader::create_alu_group() {
+ 	alu_group_node* n =
+ 			new (pool.allocate(sizeof(alu_group_node))) alu_group_node();
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -276,6 +279,7 @@ alu_group_node* shader::create_alu_group() {
+ alu_packed_node* shader::create_alu_packed() {
+ 	alu_packed_node* n =
+ 			new (pool.allocate(sizeof(alu_packed_node))) alu_packed_node();
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -283,12 +287,14 @@ alu_packed_node* shader::create_alu_packed() {
+ cf_node* shader::create_cf() {
+ 	cf_node* n = new (pool.allocate(sizeof(cf_node))) cf_node();
+ 	n->bc.barrier = 1;
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+ 
+ fetch_node* shader::create_fetch() {
+ 	fetch_node* n = new (pool.allocate(sizeof(fetch_node))) fetch_node();
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -297,6 +303,7 @@ region_node* shader::create_region() {
+ 	region_node *n = new (pool.allocate(sizeof(region_node)))
+ 			region_node(regions.size());
+ 	regions.push_back(n);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -305,6 +312,7 @@ depart_node* shader::create_depart(region_node* target) {
+ 	depart_node* n = new (pool.allocate(sizeof(depart_node)))
+ 			depart_node(target, target->departs.size());
+ 	target->departs.push_back(n);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -313,6 +321,7 @@ repeat_node* shader::create_repeat(region_node* target) {
+ 	repeat_node* n = new (pool.allocate(sizeof(repeat_node)))
+ 			repeat_node(target, target->repeats.size() + 1);
+ 	target->repeats.push_back(n);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+@@ -321,18 +330,21 @@ container_node* shader::create_container(node_type nt, node_subtype nst,
+ 		                                 node_flags flags) {
+ 	container_node *n = new (pool.allocate(sizeof(container_node)))
+ 			container_node(nt, nst, flags);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+ 
+ if_node* shader::create_if() {
+ 	if_node* n = new (pool.allocate(sizeof(if_node))) if_node();
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+ 
+ bb_node* shader::create_bb(unsigned id, unsigned loop_level) {
+ 	bb_node* n = new (pool.allocate(sizeof(bb_node))) bb_node(id, loop_level);
++	n->uid = (unsigned)all_nodes.size() + 1;
+ 	all_nodes.push_back(n);
+ 	return n;
+ }
+diff --git a/src/gallium/drivers/r600/sb/sb_valtable.cpp b/src/gallium/drivers/r600/sb/sb_valtable.cpp
+index f847138..4524472 100644
+--- a/src/gallium/drivers/r600/sb/sb_valtable.cpp
++++ b/src/gallium/drivers/r600/sb/sb_valtable.cpp
+@@ -189,7 +189,7 @@ value_hash value::hash() {
+ 	else if (def)
+ 		ghash = def->hash();
+ 	else
+-		ghash = ((uintptr_t)this) | 1;
++		ghash = ((value_hash)uid * 0x9E3779B1u) | 1;
+ 
+ 	return ghash;
+ }

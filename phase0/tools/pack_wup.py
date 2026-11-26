@@ -9,8 +9,12 @@ import re
 import shutil
 import struct
 import sys
+import xml.etree.ElementTree as ET
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'tools'))
+from wup_safety import check_output, check_title_id, check_title_replacement, publication_lock
 
 PAD_UNIT = 0x8000     # non-hashed contents are padded to this
 BLOCK_DATA = 0xFC00   # hashed contents: data per block...
@@ -272,6 +276,7 @@ def build_tmd(contents, title_id, group, app_type, os_version, title_version=0):
 
 
 def build_ticket(title_id, title_key, common_key):
+    check_title_id(title_id)
     iv = struct.pack('>Q', title_id) + bytes(8)
     t = bytes.fromhex('00010004') + os.urandom(0x100) + bytes(0x3C)
     t += b'Root-CA00000003-XS0000000c'.ljust(0x20, b'\0') + bytes(0x5C) + bytes.fromhex('010000')
@@ -390,13 +395,20 @@ def verify(out_dir, title, tree, common_key, title_id):
 
 
 def field(xml, tag):
-    m = re.search(r'<%s [^>]*>\s*([0-9A-Fa-f]+)\s*<' % tag, xml)
-    assert m, tag
-    return int(m.group(1), 16)
+    nodes = ET.fromstring(xml).findall(tag)
+    if len(nodes) != 1 or not re.fullmatch(r'[0-9A-Fa-f]+', (nodes[0].text or '').strip()):
+        raise ValueError(f'The title metadata must contain exactly one valid {tag}.')
+    return int(nodes[0].text.strip(), 16)
 
 
 def main():
     title, out_dir = sys.argv[1:3]
+    check_output(out_dir, title, replace=True)
+    with publication_lock(out_dir):
+        pack(title, out_dir)
+
+
+def pack(title, out_dir):
     key_hex = sys.stdin.read().strip()
     assert re.fullmatch(r'[0-9a-fA-F]{32}', key_hex), 'expected a 32-digit hex key on stdin'
     common_key = bytes.fromhex(key_hex)
@@ -405,7 +417,13 @@ def main():
     title_id, group = field(app, 'title_id'), field(app, 'group_id')
     app_type, os_version = field(app, 'app_type'), field(app, 'os_version')
     title_version = field(app, 'title_version')  # an update title (0005000E) carries a version above the base's 0; the system runs the highest installed
-    assert title_id >> 32 in (0x00050000, 0x0005000E), 'expected a Wii U game or update title id'
+    check_title_id(title_id)
+    if app_type != (0x80000000 if title_id >> 32 == 0x00050000 else 0x0800001B):
+        raise ValueError('The title type must match a 3Dii U game or game update.')
+    with open(os.path.join(title, 'meta', 'meta.xml'), encoding='utf8') as f:
+        if field(f.read(), 'title_id') != title_id:
+            raise ValueError('app.xml and meta.xml must name the same 3Dii U title.')
+    check_title_replacement(out_dir, title_id)
     # The file table names the title that holds each content: this one. For an update that is the 0005000E title itself; naming the base
     # instead (versions 1-3, 2026-11-06) made the console look for the update's files in the base's data: "cannot open fs:/vol/content/exheader.bin".
     parent_id = title_id

@@ -3,6 +3,7 @@
 Questions come up inside the window one at a time: a choice that asks several things is a generator that yields each question and is sent the
 answer (App.run_flow), and messages wait their turn in the same queue."""
 import base64
+import functools
 import json
 import os
 import queue
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from dataclasses import dataclass
 
 import shiboken6
 from PySide6.QtCore import QBuffer, QIODevice, QObject, Property, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal, Slot
@@ -39,7 +41,7 @@ DUMP_EXTS = ('.3ds', '.cci', '.cia', '.cxi', '.app')
 STAGE_OF = {n: i for i, (n, _) in enumerate(pipeline.STAGES)}
 # What the art lines show of each choice: a word or two, so the Art menu's right column fits them whole
 NO_ART = "Game's icon"
-NO_ICON_ART = 'Same as art'  # the Wii U Menu icon without a picture of its own
+NO_ICON_ART = 'VC game icon'  # the game's own SMDH with the shared Virtual Console frame
 NO_BEZEL = 'Black'  # the GamePad beside the screens without a picture
 NO_PAD_ART = 'Same as TV'  # the GamePad's start-up screen without a picture of its own
 NO_SAVE = 'None'  # no 3DS save packed in
@@ -95,6 +97,14 @@ FROM_SGDB, FROM_TDB = 'SteamGridDB', 'GameTDB'
 def picked(path):
     """whether a picture is one the player chose, not one fetched into the covers folder (covers.py)"""
     return bool(path) and os.path.dirname(os.path.abspath(path)) != os.path.abspath(covers_folder())
+
+
+def fetched_icon(path, game):
+    """Only the downloader's exact names for this game inside its own cache are legacy automatic icons."""
+    if not path or os.path.normcase(os.path.dirname(os.path.abspath(path))) != os.path.normcase(os.path.abspath(covers_folder())):
+        return False
+    stem, suffix = os.path.splitext(os.path.basename(path))
+    return suffix.lower() in ('.png', '.jpg') and stem in (f'sgdb_{game.title_id:016x}_icon', covers.game_code(game.product))
 
 
 def source(path):
@@ -157,22 +167,69 @@ def nands_below(top, depth):
     return found
 
 
+DRIVE_REMOVABLE, DRIVE_FIXED = 2, 3
+IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+CARD_BUSES = (7, 12, 13)  # STORAGE_BUS_TYPE: BusTypeUsb, BusTypeSd, BusTypeMmc
+
+
+@functools.cache
+def kernel32():
+    """kernel32 with the types card_reader_disk needs, in its own copy: ctypes.windll's stays as other code expects it"""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32')
+    k32.CreateFileW.restype = wintypes.HANDLE  # so a failure comes back as INVALID_HANDLE_VALUE, not a truncated int
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    return k32
+
+
+def card_reader_disk(k32, root):
+    """A FAT or FAT32 disk on a USB, SD or MMC bus: many card readers call the card in them a fixed disk. A Wii U card is FAT32, as an
+    internal disk never is."""
+    import ctypes
+    from ctypes import wintypes
+    name = ctypes.create_unicode_buffer(16)
+    if not k32.GetVolumeInformationW(root, None, 0, None, None, None, name, 16) or name.value not in ('FAT32', 'FAT'):
+        return False
+    disk = k32.CreateFileW(f'\\\\.\\{root[:2]}', 0, 3, None, 3, 0, None)  # no access asked for: what a disk is needs no rights
+    if disk in (None, ctypes.c_void_p(-1).value):  # INVALID_HANDLE_VALUE
+        return False
+    try:
+        query = (ctypes.c_uint32 * 3)()  # STORAGE_PROPERTY_QUERY: StorageDeviceProperty, PropertyStandardQuery
+        descriptor, got = ctypes.create_string_buffer(64), wintypes.DWORD()
+        if not k32.DeviceIoControl(disk, IOCTL_STORAGE_QUERY_PROPERTY, query, 12, descriptor, 64, ctypes.byref(got), None) or got.value < 32:
+            return False
+        return int.from_bytes(descriptor.raw[28:32], 'little') in CARD_BUSES  # STORAGE_DEVICE_DESCRIPTOR.BusType
+    finally:
+        k32.CloseHandle(disk)
+
+
+def wiiu_card(path):
+    return os.path.isdir(os.path.join(path, 'wiiu'))
+
+
 def sd_cards():
-    """removable drives, the ones already set up for a Wii U first"""
+    """(path, removable) for removable drives and card readers' disks: the ones already set up for a Wii U first, then removable ones"""
     found = []
     if WIN:
-        import ctypes
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        k32 = kernel32()
+        mask = k32.GetLogicalDrives()
         for i in range(26):
             root = f'{chr(65 + i)}:\\'
-            if mask >> i & 1 and ctypes.windll.kernel32.GetDriveTypeW(root) == 2:  # DRIVE_REMOVABLE
-                found.append(root)
+            if not mask >> i & 1:
+                continue
+            kind = k32.GetDriveTypeW(root)
+            if kind == DRIVE_REMOVABLE or (kind == DRIVE_FIXED and card_reader_disk(k32, root)):
+                found.append((root, kind == DRIVE_REMOVABLE))
     else:
         user = os.environ.get('USER', '')
         for base in (f'/media/{user}', f'/run/media/{user}'):
             if os.path.isdir(base):
-                found += [os.path.join(base, d) for d in sorted(os.listdir(base))]
-    return sorted(found, key=lambda d: not os.path.isdir(os.path.join(d, 'wiiu')))
+                found += [(os.path.join(base, d), True) for d in sorted(os.listdir(base))]
+    return sorted(found, key=lambda card: (not wiiu_card(card[0]), not card[1]))
 
 
 def describe(d):
@@ -203,8 +260,8 @@ def png_url(img):
 
 
 def icon_url(rows):
-    """a game's 48x48 icon (rows of RGB) as a picture the window can show"""
-    img = QImage(48, 48, QImage.Format_RGB32)
+    """An icon's RGB rows as a picture the window can show, including the generated 128x128 menu icon."""
+    img = QImage(len(rows[0]), len(rows), QImage.Format_RGB32)
     for y, row in enumerate(rows):
         for x, (r, g, b) in enumerate(row):
             img.setPixel(x, y, QColor(r, g, b).rgb())
@@ -243,7 +300,39 @@ def theme():
     return {'font': body, 'display': display, 'mono': 'Cascadia Mono' if 'Cascadia Mono' in families else 'Consolas', 'light': light, 'dark': dark}
 
 
+def build_compat_list(compat):
+    """Unified cross-platform compatibility records for Wii U and Cemu."""
+    wiiu = {program_id: g for program_id, g in compat.items() if not program_id.startswith('_')}
+    wiiu.update(compat.get('_wiiu', {}))
+    cemu = compat.get('_cemu', {})
+    rows = []
+    for program_id in wiiu.keys() | cemu.keys():
+        console = wiiu.get(program_id, {})
+        emulator = cemu.get(program_id, {})
+        name = (console or emulator)['name']
+        if console.get('edition'):
+            name += f' ({console["edition"]})'
+        rows.append(dict(name=name, program_id=program_id,
+                         wiiu_status=console.get('status', 'Untested'), wiiu_note=console.get('note', ''),
+                         cemu_status=emulator.get('status', 'Plays') if emulator else 'Untested', cemu_note=emulator.get('note', '')))
+    rows.sort(key=lambda r: (r['name'].casefold(), r['program_id']))
+    return rows
+
+
 # ---- what the window shows, and what its buttons do
+@dataclass(eq=False)
+class BuildJob:
+    name: str
+    argv: tuple[str, ...]
+    destination: str
+    card: bool
+    env: dict[str, str]
+    system_folder: str
+    output: str = ''
+    status: str = 'Queued'
+    detail: str = ''
+
+
 class App(QObject):
     changed = Signal()
     coverReady = Signal(str, str, str)  # title id, the picture's path, the icon's: from fetch_cover's thread
@@ -251,6 +340,7 @@ class App(QObject):
     keyRefused = Signal()  # SteamGridDB turned the key down: from fetch_cover's thread
     updateEvent = Signal(str, object)  # what, value: from the updater's worker threads, the value passed as it is
     logChanged = Signal()
+    destWanted = Signal()  # build() has nowhere to put the game: the window brings its choice into view
 
     def _p(kind, name, notify=changed):
         return Property(kind, lambda self: self._s[name], notify=notify)
@@ -265,17 +355,23 @@ class App(QObject):
     padArtText, hasPadArt, gameSoundText, hasGameSound = _p(str, 'padArtText'), _p(bool, 'hasPadArt'), _p(str, 'gameSoundText'), _p(bool, 'hasGameSound')
     saveText, hasSave = _p(str, 'saveText'), _p(bool, 'hasSave')
     artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
-    gameMenu = _p(bool, 'gameMenu')  # the options menu in the games it builds (click the left stick)
+    gameMenu = _p(bool, 'gameMenu')
+    menuShortcut = _p(str, 'menuShortcut')
+    menuButtons = Property('QVariantList', lambda self: list(pipeline.MENU_BUTTONS), constant=True)
+    gameLanguage = _p(str, 'gameLanguage')
+    gameLanguages = Property('QVariantList', lambda self: ['Console default', *pipeline.LANGUAGES], constant=True)
     library = _p('QVariantList', 'library')
     keysOk, keysNeeded, keysText, otpOk, otpText = _p(bool, 'keysOk'), _p(bool, 'keysNeeded'), _p(str, 'keysText'), _p(bool, 'otpOk'), _p(str, 'otpText')
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
     buildText, buildCustom = _p(str, 'buildText'), _p(bool, 'buildCustom')
     target, destText, cards = _p(str, 'target'), _p(str, 'destText'), _p('QVariantList', 'cards')
     building, view = _p(bool, 'building'), _p(str, 'view')
+    buildName = _p(str, 'buildName')
+    queueItems, queuePending, queueRunning = _p('QVariantList', 'queueItems'), _p(int, 'queuePending'), _p(bool, 'queueRunning')
     stages, stage, failed, progress, detail = _p('QVariantList', 'stages'), _p(int, 'stage'), _p(bool, 'failed'), _p(float, 'progress'), _p(str, 'detail')
     log = _p(str, 'log', logChanged)
     resultText, where, dialog = _p(str, 'resultText'), _p(str, 'where'), _p('QVariant', 'dialog')
-    games, others, version, rootOk = _p('QVariantList', 'games'), _p('QVariantList', 'others'), _p(str, 'version'), _p(bool, 'rootOk')
+    compatList, version, rootOk = _p('QVariantList', 'compatList'), _p(str, 'version'), _p(bool, 'rootOk')
     faq, themeMode, dark = _p('QVariantList', 'faq'), _p(str, 'themeMode'), _p(bool, 'dark')
     updateState, updateTitle, updateNotes, updateProgress = _p(str, 'updateState'), _p(str, 'updateTitle'), _p(str, 'updateNotes'), _p(int, 'updateProgress')
     updateMessage, releaseTag, updateSetAside = _p(str, 'updateMessage'), _p(str, 'releaseTag'), _p(bool, 'updateSetAside')
@@ -293,8 +389,11 @@ class App(QObject):
         self.save_in = None  # the folder of a 3DS save to pack into the build (saves.py)
         self.refused_key = None  # the SteamGridDB key it turned down, if it did (fetch_cover)
         self.proc, self.result, self.cancelled = None, None, False
+        self.jobs, self.active_build = [], None
         self.lines, self.log_lines, self.dialogs, self.flow = queue.Queue(), [], [], None
         compat = json.load(open(os.path.join(HERE, 'compat.json'), encoding='utf-8'))
+        compat_list = build_compat_list(compat)
+        self.compat_by_id = {row['program_id']: row for row in compat_list}
         try:  # the Help page's questions and answers: without them the app still runs
             with open(os.path.join(HERE, 'faq.json'), encoding='utf-8') as f:
                 faq = json.load(f)
@@ -302,14 +401,16 @@ class App(QObject):
             faq = []
         faq = [e for e in faq if isinstance(e, dict) and isinstance(e.get('q'), str) and isinstance(e.get('a'), str) and e['q'] and e['a']]             if isinstance(faq, list) else []
         theme_mode = self.st.get('theme')
-        self._s = dict(hasGame=False, gameName='', maker='', badge='', known=False, icon='', meta='',
+        shortcut = self.st.get('menu_shortcut')
+        self._s = dict(hasGame=False, gameName='', gameLanguage='', maker='', badge='', known=False, icon='', meta='',
+                       menuShortcut=shortcut if pipeline.valid_menu_shortcut(shortcut) else '',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
                        otpText='', sysOk=False, sysText='', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
+                       buildName='', queueItems=[], queuePending=0, queueRunning=False,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
-                       games=[dict(name=g['name'], status=g['status'], note=g['note']) for k, g in compat.items() if not k.startswith('_')],
-                       others=compat.get('_cemu', []),  # shown only: they build as untested games, by their own code
+                       compatList=compat_list,
                        faq=faq, themeMode=theme_mode if theme_mode in ('system', 'light', 'dark') else 'system', dark=False,
                        updateState='', updateTitle='', updateNotes='', updateProgress=0, updateMessage='', releaseTag=updater.own_tag(),
                        updateSetAside=False, buildText='', buildCustom=False)
@@ -374,7 +475,7 @@ class App(QObject):
     @Slot(str)
     def setLayout(self, name):
         """the modern window (ui/Main.qml) or the simple one (ui/Simple.qml): kept in the settings, and the window swapped at once (run)"""
-        if name not in ('modern', 'simple') or self._s['building']:
+        if name not in ('modern', 'simple') or self.busy():
             return
         self.st['layout'] = name
         save_settings(self.st)
@@ -382,10 +483,18 @@ class App(QObject):
 
     @Slot(bool)
     def setGameMenu(self, on):
-        """whether the games it builds have the options menu (click the left stick): some players asked to leave it out"""
+        """Whether to include the overlay in future builds."""
         self.st['game_menu'] = bool(on)
         save_settings(self.st)
         self.set(gameMenu=bool(on))
+
+    @Slot(str)
+    def setMenuShortcut(self, shortcut):
+        if shortcut and not pipeline.valid_menu_shortcut(shortcut):
+            return
+        self.st['menu_shortcut'] = shortcut
+        save_settings(self.st)
+        self.set(menuShortcut=shortcut)
 
     @Slot(str)
     def setArtStyle(self, style):
@@ -395,6 +504,15 @@ class App(QObject):
         self.st['art_style'] = style
         save_settings(self.st)
         self.set(artStyle=style)
+
+    @Slot(str)
+    def setGameLanguage(self, language):
+        if not self.game:
+            return
+        language = language if language in pipeline.LANGUAGES else ''
+        self.st.setdefault('game_languages', {})[f'{self.game.title_id:016x}'] = language
+        save_settings(self.st)
+        self.set(gameLanguage=language)
 
     @Slot(str)
     def setThemeMode(self, mode):
@@ -454,15 +572,15 @@ class App(QObject):
             self.tell('Couldn\'t read this game', str(e), 'error')
             return
         self.game, self.update, self.dlc, self.mod = d, None, None, None
+        language = self.st.get('game_languages', {}).get(f'{d.title_id:016x}')
         info = pipeline.profile_for(d) or pipeline.derived(d)
-        known = info['status'] in ('Plays', 'Complete')  # compat.json: tested on a real Wii U, or finished there
-        self.set(hasGame=True, gameName=info['name'], maker=d.publisher or '', known=known, badge=f'{info["status"]} on Wii U' if known else 'Untested',
+        self.set(hasGame=True, gameName=info['name'], gameLanguage=language if language in pipeline.LANGUAGES else '', maker=d.publisher or '',
                  icon=icon_url(d.icon) if d.icon else '', meta=f'{d.product}  ·  {d.title_id:016X}  ·  {describe(d)}', view='form')
         self.set_extra('update', None)
         self.set_extra('dlc', None)
         self.set_extra('mod', None)
         saved = self.st.get('art', {}).get(f'{d.title_id:016x}')  # a game keeps the banner art chosen for it; '' is "none, on purpose"
-        icon = self.st.get('icon_art', {}).get(f'{d.title_id:016x}')
+        icon = self.stored_icon(d)
         self.set_art(saved if saved and os.path.isfile(saved) else None, icon if icon and os.path.isfile(icon) else None, remember=False)
         bezel = self.st.get('pad_bezel', {}).get(f'{d.title_id:016x}')
         self.set_bezel(bezel if bezel and os.path.isfile(bezel) else None, remember=False)
@@ -516,16 +634,18 @@ class App(QObject):
         self.refresh_library()
 
     def refresh_note(self):
-        info = pipeline.profile_for(self.game)
-        if info:
-            note = f'Tested on a real Wii U: {info["note"][0].lower() + info["note"][1:]}'
-            if self.update:
-                note += ' It was tested without its update: with it, it should play the same, but nobody has checked yet.'
+        result = self.compat_by_id.get(f'{self.game.title_id:016X}', {})
+        if result.get('wiiu_status') in ('Plays', 'Complete'):
+            badge, note = f'{result["wiiu_status"]} on Wii U', result['wiiu_note']
+        elif result.get('cemu_status') == 'Plays':
+            badge, note = 'Plays in Cemu', 'Wii U play is unverified. ' + result['cemu_note']
         else:
-            note = 'Nobody has played this one on a Wii U yet: it may not start, or it may stop partway.'
+            badge = 'Untested'
+            note = result.get('wiiu_note') or result.get('cemu_note') or 'Wii U play is unverified. The game may fail to start or stop during play.'
         if self.mod:
-            note += ' With a mod it\'s untested: the mod is built in before the game is recompiled, so its code runs like the game\'s.'
-        self.set(note=note)
+            badge = 'Untested with mod'
+            note += ' The playtest status applies to the game without this mod.'
+        self.set(badge=badge, note=note, known=badge.startswith(('Plays', 'Complete')))
 
     def nearby(self):
         """updates and DLC for this game in the folder it came from"""
@@ -609,12 +729,14 @@ class App(QObject):
     def chooseArt(self):
         path = self.ask_picture(f'Choose start-up art for {self._s["gameName"]}')
         if path:
-            self.set_art(path, self.icon_art if picked(self.icon_art) else None)  # an icon the player picked stays, a fetched one goes with the old art
+            self.set_art(path, self.icon_art)  # automatic downloads no longer populate the menu icon
 
     @Slot()
     def chooseIcon(self):
         path = self.ask_picture(f'Choose a Wii U Menu icon for {self._s["gameName"]}')
         if path:
+            if self.game:
+                self.st.setdefault('icon_picked', {})[f'{self.game.title_id:016x}'] = path
             self.set_art(self.art, path)
 
     @Slot()
@@ -724,7 +846,7 @@ class App(QObject):
         self.set(saveText=os.path.basename(os.path.normpath(path)) if path else NO_SAVE, hasSave=bool(path))
 
     def fetch_cover(self, game, name):
-        """on a thread of its own: the game's banner and icon from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
+        """on a thread of its own: the game's banner from SteamGridDB where the player gave a key, its cover from GameTDB otherwise
         and for what SteamGridDB lacks (covers.py), handed to the window's thread when they're here"""
         folder, title_id, key = covers_folder(), f'{game.title_id:016x}', self.st.get('sgdb_key')
         found = {}
@@ -735,24 +857,31 @@ class App(QObject):
         except covers.BadKey:
             self.refused_key = key  # not asked with again until it's changed, and said once
             self.keyRefused.emit()
-        cover = None if found.get('banner') and found.get('icon') else covers.cover(game.product, folder)
-        banner, icon = found.get('banner') or cover, found.get('icon') or (cover if found.get('banner') else None)
-        if banner or icon:
-            self.coverReady.emit(title_id, banner or '', icon or '')
+        banner = found.get('banner') or covers.cover(game.product, folder)
+        if banner:
+            self.coverReady.emit(title_id, banner, '')
 
     def cover_ready(self, title_id, path, icon):
         # fetched art where the game has none; an icon the player picked stays
         if self.game and f'{self.game.title_id:016x}' == title_id and not self.art and not self._s['building']:
-            self.set_art(path or None, self.icon_art if picked(self.icon_art) else (icon or None))
+            self.set_art(path or None, self.icon_art)
         self.refresh_library()
+
+    def stored_icon(self, game):
+        key = f'{game.title_id:016x}'
+        icon = self.st.get('icon_art', {}).get(key)
+        # Keep explicit choices, including ones inside the cache. Old cache files remain on disk and in settings.
+        if icon and self.st.get('icon_picked', {}).get(key) != icon and fetched_icon(icon, game):
+            return None
+        return icon
 
     def key_refused(self):
         self.tell("SteamGridDB didn't take the key", 'Check it on the Help page, under Art and sound: it is the long code on steamgriddb.com under '
                   'Preferences, API. Until then the art comes from GameTDB.', 'warn')
 
     def set_art(self, path, icon=None, remember=True, removed=False):
-        """the pictures this game's start-up screens and Wii U Menu icon are made from, remembered for the game: path for both, or for the
-        screens alone where icon is the icon's. removed: the player took the art away, remembered as '' so none is fetched again"""
+        """Remember start-up art and an optional complete menu icon. Without an override, preview the shared SMDH composition.
+        removed: the player took the art away, remembered as '' so none is fetched again"""
         self.art, self.icon_art = path, icon
         if self.game and remember:
             title, arts, icons = f'{self.game.title_id:016x}', self.st.setdefault('art', {}), self.st.setdefault('icon_art', {})
@@ -764,12 +893,15 @@ class App(QObject):
                 icons[title] = icon
             else:
                 icons.pop(title, None)
+            if self.st.get('icon_picked', {}).get(title) != icon:
+                self.st.get('icon_picked', {}).pop(title, None)
             save_settings(self.st)
         url = lambda p: QUrl.fromLocalFile(p).toString() if p else ''  # noqa: E731
-        own = bool(self.game) and (picked(path) or picked(icon) or self.st.get('art', {}).get(f'{self.game.title_id:016x}') == '')  # findArt undoes it
+        default_icon = icon_url(pipeline.tool('make_game_title').vc_icon_pixels(self.game.icon)) if self.game and self.game.icon and not icon else ''
+        own = bool(self.game) and (picked(path) or bool(icon) or self.st.get('art', {}).get(f'{self.game.title_id:016x}') == '')  # findArt undoes it
         self.set(artText=source(path) if path else NO_ART, hasArt=bool(path or icon), artUrl=url(path), artOwn=own,
-                 iconText=source(icon) if icon else NO_ICON_ART if path else NO_ART, hasIconArt=bool(icon), iconArtUrl=url(icon),
-                 tileUrl=url(icon or path))  # the Build page's tile: a square icon fills it best
+                 iconText=CUSTOM if icon else NO_ICON_ART, hasIconArt=bool(icon), iconArtUrl=url(icon) or default_icon,
+                 tileUrl=url(icon) or default_icon or url(path))
         if remember:
             self.refresh_library()
 
@@ -785,7 +917,7 @@ class App(QObject):
         removed = self.game and self.st.get('art', {}).get(f'{self.game.title_id:016x}') == ''  # on purpose: it stays removed
         if self.game and self.st['sgdb_key'] and not self._s['building'] and not removed and (not self.art or source(self.art) == FROM_TDB):
             # the open game's fetched art, again from the new place; a picture the player chose stays
-            self.set_art(None, self.icon_art if picked(self.icon_art) else None, remember=False)
+            self.set_art(None, self.icon_art, remember=False)
             threading.Thread(target=self.fetch_cover, args=(self.game, self._s['gameName']), daemon=True).start()
 
     def ask_sound(self, title, to):
@@ -856,7 +988,8 @@ class App(QObject):
     def chooseSystem(self):
         p = QFileDialog.getExistingDirectory(None, 'Choose the folder with 0004009b and 000400db, or Azahar\'s user folder', self.st.get('system', ''))
         if p:
-            if not self.import_system(p):
+            got = self.import_system(p, report_busy=True)
+            if got is not None and not got:
                 if not self.system_locked:
                     self.tell('No 3DS system files there', HELP['system'][1], 'warn')
                 elif decrypt.have_keys(self.st['keys']):
@@ -872,10 +1005,20 @@ class App(QObject):
     def explain(self, what):
         self.tell(*HELP[what])
 
-    def import_system(self, folder):
+    def import_system(self, folder, report_busy=False):
         """the system archives from a folder into the ones every build takes (pipeline.ARCHIVES), once: they stay for the next games. A
         boot9.bin there, or beside the 0004009b folder chosen, is taken for the keys when the builder has none: a tester kept all of the
         3DS's files in one folder and chose it for the system files only"""
+        self.system_locked = False
+        try:
+            with pipeline.workspace_lock(pipeline.WORK):
+                return self.import_system_locked(folder)
+        except (OSError, ValueError) as e:
+            if report_busy:
+                self.tell('3DS system files could not be imported', str(e), 'warn')
+            return None
+
+    def import_system_locked(self, folder):
         if not decrypt.have_keys(self.st['keys']):
             for keys in (folder, os.path.dirname(os.path.normpath(folder))):
                 if decrypt.have_keys(keys):
@@ -884,7 +1027,6 @@ class App(QObject):
                     save_settings(self.st)
                     break
         tmp = tempfile.mkdtemp(prefix='3diiu_sys_')  # for contents that need decrypting first
-        self.system_locked = False  # the folder has them, as a 3DS keeps them, and they didn't decrypt: two testers were told "none there"
         try:
             got = dumps.import_system_archives(folder, pipeline.ARCHIVES, tmp)
         except decrypt.DecryptError:
@@ -956,7 +1098,7 @@ class App(QObject):
     def set_build(self, chosen):
         """Builds go to the chosen folder from the next one on ('' for the usual one). The old folder's build files are only a cache, so
         deleting them is offered: the point was room on that drive."""
-        if self._s['building']:
+        if self.busy():
             return
         old, new = self.build_folder(), chosen or os.environ.get('THREEDII_WORK') or pipeline.WORK
         try:
@@ -980,8 +1122,13 @@ class App(QObject):
     def drop_build_files(self, folders, size):
         if (yield dict(title='Delete the old build files?', message=f'{size / 2 ** 30:.1f} GB in {os.path.dirname(folders[0])}. The builder makes '
                        'them again as it needs them.', yes='Delete', no='Keep', tone='ask')):
-            for f in folders:
-                shutil.rmtree(f, ignore_errors=True)
+            try:
+                with pipeline.workspace_lock(os.path.dirname(folders[0])):
+                    for f in folders:
+                        folder, _ = pipeline._checked(f, directory=True)
+                        shutil.rmtree(folder, ignore_errors=True)
+            except (OSError, ValueError) as e:
+                self.tell('Build files could not be deleted', str(e), 'warn')
 
     @Slot(str)
     def pickCard(self, path):
@@ -995,9 +1142,11 @@ class App(QObject):
 
     def refresh_cards(self):
         cards = sd_cards()
-        if self.st.get('card') not in cards:
-            self.st['card'] = cards[0] if cards else ''
-        self.set(cards=[dict(path=c, label=f'{c}    {"set up for a Wii U" if os.path.isdir(os.path.join(c, "wiiu")) else "removable drive"}') for c in cards])
+        if self.st.get('card') not in [path for path, _ in cards]:
+            # chosen without asking only where it can't be some other disk: removable, or set up for a Wii U, never a USB hard drive
+            self.st['card'] = next((path for path, removable in cards if removable or wiiu_card(path)), '')
+        self.set(cards=[dict(path=path, label=f'{path}    {"set up for a Wii U" if wiiu_card(path) else "removable drive" if removable else "card reader"}')
+                        for path, removable in cards])
 
     def refresh_files(self):
         keys, otp = self.st['keys'], self.st.get('otp', '')
@@ -1107,7 +1256,7 @@ class App(QObject):
     def restartForUpdate(self):
         if self._s['updateState'] != 'ready':
             return
-        if self._s['building']:
+        if self.busy():
             self.tell('A build is running', 'Restart once the build has finished, or cancel it first.', 'warn')
             return
         self.set(updateState='restarting', updateMessage='Starting the new version...')  # no build starts meanwhile
@@ -1156,7 +1305,11 @@ class App(QObject):
     # ---- building
     @Slot()
     def build(self):
-        if not self.game or self._s['building'] or self._s['updateState'] == 'restarting':
+        if job := self.build_job():
+            self.launch_build(job)
+
+    def build_job(self):
+        if not self.game or self.busy() or self._s['updateState'] == 'restarting':
             return
         if not self._s['rootOk']:
             self.tell('The build engine is missing', 'The engine folder next to 3Dii U Builder.exe holds the recompiler and its toolchain. Copy the '
@@ -1167,6 +1320,7 @@ class App(QObject):
             return
         dest = self.st.get('card', '') if self._s['target'] == 'card' else self.st.get('folder', '')
         if not dest or not os.path.isdir(dest):
+            self.destWanted.emit()
             self.tell('Where should it go?', 'Choose an SD card or a folder for the game.', 'warn')
             return
         self.find_system(True)
@@ -1175,14 +1329,19 @@ class App(QObject):
             return
         save_settings(self.st)
         argv = [sys.executable, '--pipeline'] if FROZEN else [sys.executable.replace('pythonw.exe', 'python.exe'), '-u', os.path.join(HERE, 'pipeline.py')]
-        argv += ['--game', self.game.path, '--otp', self.st['otp'], '--card' if self._s['target'] == 'card' else '--out', dest, '--keys', self.st['keys']]
+        card = self._s['target'] == 'card'
+        argv += ['--game', self.game.path, '--otp', self.st['otp'], '--card' if card else '--out', dest, '--keys', self.st['keys']]
+        system = self.st.get('system', '')
+        if system:
+            argv += ['--emulator', system]
         for kind in ('update', 'dlc'):
             if getattr(self, kind):
                 argv += [f'--{kind}', getattr(self, kind).path]
         if self.mod:
             argv += ['--mod', self.mod]
+        argv += ['--art-style', self._s['artStyle']]
         if self.art:
-            argv += ['--art', self.art, '--art-style', self._s['artStyle'], '--tdb', covers_folder()]
+            argv += ['--art', self.art, '--tdb', covers_folder()]
         if self.icon_art:
             argv += ['--icon-art', self.icon_art]
         if self.bezel:
@@ -1195,19 +1354,90 @@ class App(QObject):
             argv += ['--save', self.save_in]
         if not self._s['gameMenu']:
             argv += ['--no-menu']
+        elif self._s['menuShortcut']:
+            argv += ['--menu-shortcut', self._s['menuShortcut']]
+        if self._s['gameLanguage']:
+            argv += ['--language', self._s['gameLanguage']]
+        env = dict(os.environ, PYTHONIOENCODING='utf-8', THREEDII_BUILD=self.build_folder())
+        return BuildJob(self._s['gameName'], tuple(argv), dest, card, env, system)
+
+    def refresh_queue(self):
+        rows = [dict(name=job.name, status=job.status, detail=job.detail) for job in self.jobs]
+        self.set(queueItems=rows, queuePending=sum(job.status == 'Queued' for job in self.jobs))
+
+    @Slot()
+    def enqueueBuild(self):
+        job = self.build_job()
+        if not job:
+            return
+        info = pipeline.profile_for(self.game) or pipeline.derived(self.game)
+        dest = os.path.join(job.destination, 'install') if job.card else job.destination
+        job.output = os.path.normcase(os.path.realpath(os.path.join(dest, info['folder'])))
+        if any(queued.status == 'Queued' and queued.output == job.output for queued in self.jobs):
+            self.tell('That output is already queued', 'Remove the earlier entry or choose a different destination for this build.', 'warn')
+            return
+        job.detail = job.destination
+        self.jobs.append(job)
+        self.refresh_queue()
+
+    @Slot()
+    def startQueue(self):
+        if self.busy() or not self._s['queuePending'] or self._s['updateState'] == 'restarting':
+            return
+        self.set(queueRunning=True)
+        self.start_next_build()
+
+    def start_next_build(self):
+        if not self._s['queueRunning']:
+            return
+        job = next((job for job in self.jobs if job.status == 'Queued'), None)
+        if job is None:
+            self.set(queueRunning=False)
+            return
+        job.status = 'Building'
+        self.refresh_queue()
+        self.launch_build(job)
+
+    @Slot(int)
+    def removeQueued(self, index):
+        if not self.busy() and 0 <= index < len(self.jobs) and self.jobs[index].status == 'Queued':
+            del self.jobs[index]
+            self.refresh_queue()
+
+    @Slot()
+    def clearQueue(self):
+        if not self.busy():
+            self.jobs.clear()
+            self.refresh_queue()
+
+    def launch_build(self, job):
+        self.active_build = job
         self.log_lines, self.result, self.cancelled = [], None, False
-        stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or self._s['target'] == 'card']
-        self.set(building=True, view='building', stages=stages, stage=0, failed=False, progress=0.0, detail='Starting...', log='')
-        self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
-                                     creationflags=NO_WINDOW, start_new_session=not WIN, env=dict(os.environ, PYTHONIOENCODING='utf-8'))
-        threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
+        stages = [n for n, _ in pipeline.STAGES if n != 'Copying' or job.card]
+        self.set(building=True, buildName=job.name, view='building', stages=stages, stage=0,
+                 failed=False, progress=0.0, detail='Starting...', log='', resultText='', where='')
+        if job.system_folder and not os.path.isdir(job.system_folder):
+            self.lines.put('The selected 3DS system folder is unavailable. Using cached files; reconnect it or choose its new location under 3DS system files.')
+        try:
+            if not os.path.isdir(job.destination):
+                raise OSError(f'The destination is unavailable: {job.destination}')
+            self.proc = subprocess.Popen(job.argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace',
+                                         creationflags=NO_WINDOW, start_new_session=not WIN, env=job.env)
+        except OSError as e:
+            self.lines.put('@error ' + ' '.join(str(e).splitlines()))
+            self.lines.put(None)
+        else:
+            threading.Thread(target=self.read, args=(self.proc,), daemon=True).start()
         self.timer.start(100)
 
     def read(self, proc):
-        for line in proc.stdout:
-            self.lines.put(line.rstrip('\n'))
-        proc.wait()
-        self.lines.put(None)
+        try:
+            with proc.stdout:
+                for line in proc.stdout:
+                    self.lines.put(line.rstrip('\n'))
+        finally:
+            proc.wait()
+            self.lines.put(None)
 
     def poll(self):
         done, logged = False, False
@@ -1238,21 +1468,30 @@ class App(QObject):
         if not done:
             return
         self.timer.stop()
+        job, self.active_build = self.active_build, None
+        self.proc = None
         if self.result and self.result.startswith('@done '):
             where = self.result[6:]
-            msg = (f'{self._s["gameName"]} is on your SD card, in install\\{os.path.basename(where)}. Put the card in your Wii U and install it with WUP '
-                   f'Installer GX2.' if self._s['target'] == 'card' else
+            job.status, job.detail = 'Done', where
+            msg = (f'{job.name} is on your SD card, in install\\{os.path.basename(where)}. Put the card in your Wii U and install it with WUP '
+                   f'Installer GX2.' if job.card else
                    f'The WUP is in {where}. Copy it to your SD card\'s install folder and install it with WUP Installer GX2.')
             self.set(building=False, view='done', stage=len(self._s['stages']), where=where, resultText=msg + ' If an older build of it is installed, '
                                                                                                             'delete that first.')
         elif self.cancelled:
+            job.status = 'Cancelled'
             self.set(building=False, view='form')
         else:
-            self.set(building=False, view='failed', failed=True,
-                     resultText=self.result[7:] if self.result else 'The build stopped. Details says where.')
+            job.status = 'Failed'
+            job.detail = self.result[7:] if self.result else self.log_lines[-1] if self.log_lines else 'The build stopped.'
+            self.set(building=False, view='failed', failed=True, resultText=job.detail)
+        if job in self.jobs:
+            self.refresh_queue()
+            self.start_next_build()
 
     @Slot()
     def cancel(self):
+        self.set(queueRunning=False)
         if self.proc and self.proc.poll() is None:
             self.cancelled = True
             self.set(detail='Stopping...')
@@ -1260,7 +1499,10 @@ class App(QObject):
                 subprocess.run(['taskkill', '/T', '/F', '/PID', str(self.proc.pid)], creationflags=NO_WINDOW, capture_output=True)
             else:
                 import signal
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                try:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
     @Slot()
     def back(self):
@@ -1274,7 +1516,7 @@ class App(QObject):
 
     @Slot(result=bool)
     def busy(self):
-        return bool(self.proc and self.proc.poll() is None)
+        return self._s['building'] or self._s['queueRunning']
 
     def stop_for_close(self):
         """the app is quitting: a build and an update download stop with it"""

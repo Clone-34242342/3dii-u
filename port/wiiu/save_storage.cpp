@@ -13,7 +13,9 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstring>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,6 +43,7 @@ constexpr u8 COMMON = 0xFF;  // as an account number, this means /vol/save/commo
 FSStatus (*flush_quota)(FSClient *, FSCmdBlock *, u8, FSErrorFlag);
 alignas(64) FSClient client;
 alignas(64) FSCmdBlock block;
+bool save_client_ready;
 volatile bool dirty;
 volatile OSTime first_change, last_change;
 u8 account_slot = COMMON;
@@ -48,15 +51,38 @@ std::string account_dir;
 
 std::mutex cache_m;
 std::map<std::string, std::shared_ptr<wiiu::SaveFile>> cache;
+struct DirectUsers { u32 users = 0; bool shared = false; };
+std::map<std::string, DirectUsers> direct_users;  // keep a path direct until every uncached file session closes
 u64 cached_bytes;
 constexpr u64 CACHE_FILE_MAX = 16 << 20, CACHE_MAX = 48 << 20;  // bigger files go to storage as the game writes them
+
+bool under(const std::string &path, const std::string &prefix) { return !path.compare(0, prefix.size(), prefix); }
+
+int flush_save_quota(const char *path, u8 slot) {
+    if (wiiu::fsa_direct_flush_quota(path)) return 0;
+    return flush_quota ? flush_quota(&client, &block, slot, FS_ERROR_FLAG_ALL) : -1;
+}
+
+int flush_save_quotas(bool now) {
+    const bool mine = !account_dir.empty() && under(g_save_base, account_dir);
+    wiiu::fs_begin(0xC007);
+    int result = 0;
+    if (!account_dir.empty() && (mine || now)) result = flush_save_quota(account_dir.c_str(), account_slot);
+    if (!mine || now) {
+        const int common = flush_save_quota("/vol/save/common", COMMON);
+        if (!result) result = common;
+    }
+    wiiu::fs_end();
+    return result;
+}
 
 // Until it's flushed the journal holds what was written, and refuses more once it's full. wut says so with -1, or with a short count if it got partway.
 long write_retrying(int fd, const void *data, size_t len, u64 at) {
     const long n = pwrite(fd, data, len, (off_t)at);
     if (n == (long)len) return n;
     LOG("[save] wrote %ld of %x bytes at %llx: error %d, flushing\n", n, (u32)len, (unsigned long long)at, errno);
-    wiiu::save_flush(true);
+    // A cache writeback can reach this retry while it is already draining the cache.
+    if (flush_quota && flush_save_quotas(true) < 0) wiiu::save_dirty();
     const long done = std::max(n, 0L), more = pwrite(fd, (const u8 *)data + done, len - done, (off_t)(at + done));
     if (more < 0) LOG("[save] still failing: error %d\n", errno);
     return more < 0 ? n : done + more;
@@ -94,8 +120,12 @@ bool write_out(const std::shared_ptr<wiiu::SaveFile> &f) {
     if (ok) {
         if (n) ok = wiiu::save_write(fd, copy, n, 0) == (long)n;
         struct stat st;
-        if (ok && !fstat(fd, &st) && (u64)st.st_size > n) wiiu::save_resize(fd, n);
-        close(fd);
+        if (ok) {
+            ok = !fstat(fd, &st);
+            if (ok && (u64)st.st_size > n) wiiu::save_resize(fd, n);
+            if (ok) ok = !fstat(fd, &st) && (u64)st.st_size == n;
+        }
+        if (close(fd)) ok = false;
     }
     free(copy);
     LOG("[save] wrote %s, %u bytes, %s, %u ms\n", f->path.c_str(), n, ok ? "done" : "FAILED", (u32)OSTicksToMilliseconds(OSGetSystemTime() - t));
@@ -126,7 +156,6 @@ bool write_out_all() {
     }
 }
 
-bool under(const std::string &path, const std::string &prefix) { return !path.compare(0, prefix.size(), prefix); }
 }  // namespace
 
 namespace wiiu {
@@ -149,7 +178,8 @@ void save_mount() {
     FSInit();
     const int added = FSAddClient(&client, FS_ERROR_FLAG_ALL);
     FSInitCmdBlock(&block);
-    if (added != FS_STATUS_OK) flush_quota = nullptr;
+    save_client_ready = added == FS_STATUS_OK;
+    if (!save_client_ready) flush_quota = nullptr;
     const int inited = init();
     int folder = init_dir(COMMON);
     if (folder && init_common) folder = init_common();
@@ -183,6 +213,20 @@ void save_mount() {
 
 const std::string &save_account_dir() { return account_dir; }
 
+bool save_dir_lacks(const std::string &path, const char *first, const char *second) {
+    if (!save_client_ready) return false;
+    const char *native = path.c_str() + (path.starts_with("fs:") ? 3 : 0);
+    FSDirectoryHandle handle;
+    if (FSOpenDir(&client, &block, native, &handle, FS_ERROR_FLAG_ALL) != FS_STATUS_OK) return false;
+    FSDirectoryEntry entry;
+    FSStatus status;
+    while ((status = FSReadDir(&client, &block, handle, &entry, FS_ERROR_FLAG_ALL)) == FS_STATUS_OK) {
+        if (!std::strncmp(entry.name, first, sizeof entry.name) || !std::strncmp(entry.name, second, sizeof entry.name)) break;
+    }
+    const FSStatus closed = FSCloseDir(&client, &block, handle, FS_ERROR_FLAG_ALL);
+    return status == FS_STATUS_END && closed == FS_STATUS_OK;
+}
+
 void save_dirty() {
     const OSTime now = OSGetSystemTime();
     if (!dirty) first_change = now;
@@ -207,15 +251,7 @@ void save_flush(bool now) {
     if (!now && (!dirty || (OSTicksToMilliseconds(t - last_change) < 1000 && OSTicksToSeconds(t - first_change) < 5))) return;
     dirty = false;
     const bool written = write_out_all();
-    const bool mine = !account_dir.empty() && under(g_save_base, account_dir);
-    fs_begin(0xC007);
-    int r = 0;
-    if (!account_dir.empty() && (mine || now)) r = fsa_direct_flush_quota(account_dir.c_str()) ? 0 : flush_quota(&client, &block, account_slot, FS_ERROR_FLAG_ALL);
-    if (!mine || now) {
-        const int c = fsa_direct_flush_quota("/vol/save/common") ? 0 : flush_quota(&client, &block, COMMON, FS_ERROR_FLAG_ALL);
-        if (!r) r = c;
-    }
-    fs_end();
+    const int r = flush_save_quotas(now);
     LOG("[save] flushed: %d, %u ms\n", r, (u32)OSTicksToMilliseconds(OSGetSystemTime() - t));
     if (r < 0 || !written) save_dirty();
 }
@@ -237,26 +273,29 @@ volatile u32 files_copied;
 // A folder and all in it, each file read and written whole from an aligned buffer (write_out says why): the C library's copy goes a little at a time. false: something
 // didn't copy.
 bool save_copy_tree(const std::string &from, const std::string &to) {
+    namespace fs = std::filesystem;
     std::error_code ec;
-    std::filesystem::create_directories(to, ec);
+    fs::create_directories(to, ec);
     if (ec) return false;
-    for (const auto &e : std::filesystem::directory_iterator(from, ec)) {
-        const std::string name = e.path().filename().string(), src = from + "/" + name, dst = to + "/" + name;
-        if (e.is_directory(ec)) {
+    for (fs::directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string(), src = from + "/" + name, dst = to + "/" + name;
+        const bool directory = it->is_directory(ec);
+        if (ec) return false;
+        if (directory) {
             if (!save_copy_tree(src, dst)) return false;
             continue;
         }
         const int in = open(src.c_str(), O_RDONLY);
         if (in < 0) return false;
         struct stat st;
-        bool ok = !fstat(in, &st);
+        bool ok = !fstat(in, &st) && st.st_size >= 0 && (u64)st.st_size <= std::numeric_limits<u32>::max();
         const u32 n = ok ? (u32)st.st_size : 0;
         u8 *buf = ok ? (u8 *)memalign(64, std::max(n, 64u)) : nullptr;
         ok = buf && (!n || pread(in, buf, n, 0) == (long)n);
-        close(in);
-        const int out = ok ? open(dst.c_str(), O_RDWR | O_CREAT, 0644) : -1;
+        if (close(in)) ok = false;
+        const int out = ok ? open(dst.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644) : -1;
         ok = out >= 0 && (!n || save_write(out, buf, n, 0) == (long)n);
-        if (out >= 0) close(out);
+        if (out >= 0 && close(out)) ok = false;
         free(buf);
         if (!ok) return false;
         files_copied = files_copied + 1;
@@ -264,27 +303,76 @@ bool save_copy_tree(const std::string &from, const std::string &to) {
     return !ec;
 }
 
+static bool flush_migrated_account() {
+    if (account_dir.empty()) return false;
+    fs_begin(0xC007);
+    const bool flushed = flush_save_quota(account_dir.c_str(), account_slot) >= 0;
+    fs_end();
+    return flushed;
+}
+
+void save_finish_migration(const std::string &to) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string old = to + "_old";
+    const bool pending = fs::exists(old, ec);
+    if (ec) FATAL("[save] Cannot read migration state at %s.\n", old.c_str());
+    if (!pending) return;
+    if (!flush_migrated_account())
+        FATAL("[save] Cannot confirm the account save at %s. The previous save is still at %s.\n", to.c_str(), old.c_str());
+    fs::remove_all(old, ec);
+}
+
 // A copy made whole beside where it goes, then put in its place, what was there set aside until it is: a copy cut short, or a flush
 // partway through one (a full journal, write_retrying), never stands for a save
-static bool copy_into_place(const std::string &from, const std::string &to) {
+static bool copy_into_place(const std::string &from, const std::string &to, bool preserve_existing = false) {
     namespace fs = std::filesystem;
     std::error_code ec, aside;
     const std::string fresh = to + "_new", old = to + "_old";
+    const bool had_old = fs::exists(old, ec);
+    if (ec) return false;
+    bool had_to = fs::exists(to, ec);
+    if (ec) return false;
+    if (had_old && !had_to) {
+        fs::rename(old, to, ec);  // a previous swap stopped before its rollback
+        if (ec) return false;
+        had_to = true;
+    }
     fs::remove_all(fresh, ec);
-    if (!save_copy_tree(from, fresh)) {
+    if (ec) return false;
+    if (!save_copy_tree(from, fresh) || (preserve_existing && had_to && !save_copy_tree(to, fresh))) {
         fs::remove_all(fresh, ec);
         return false;
     }
     fs::remove_all(old, ec);
-    fs::rename(to, old, aside);  // nothing there yet is fine
+    if (ec) return false;
+    if (had_to) fs::rename(to, old, aside);
+    else if (preserve_existing) fs::create_directory(old, aside);  // mark a pending commit even for a new account save
+    if (aside) {
+        fs::remove_all(fresh, ec);
+        return false;
+    }
     fs::rename(fresh, to, ec);
     if (ec) {
-        if (!aside) fs::rename(old, to, aside);
-        fs::remove_all(fresh, aside);
+        if (had_to) fs::rename(old, to, aside);
+        else if (preserve_existing) fs::remove_all(old, aside);
+        if (!aside) fs::remove_all(fresh, ec);  // a failed rollback keeps both recoverable trees
+        return false;
+    }
+    if (preserve_existing && !flush_migrated_account()) {
+        fs::rename(to, fresh, ec);
+        if (ec) FATAL("[save] Cannot roll back the unconfirmed account save at %s. The previous save is still at %s.\n", to.c_str(), old.c_str());
+        if (had_to) fs::rename(old, to, ec);
+        else fs::remove_all(old, ec);
+        if (!ec) fs::remove_all(fresh, ec);
         return false;
     }
     fs::remove_all(old, ec);
     return true;
+}
+
+bool save_migrate_common(const std::string &from, const std::string &to) {
+    return copy_into_place(from, to, true);  // the account's newer extdata wins collisions
 }
 
 // A 3DS save the builder packed into the game (builder/saves.py, the title's save_import), taken in once, before the game starts: its
@@ -318,6 +406,9 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
             it->second->users++;
             return it->second;
         }
+        // Reserve before loading: another open must not cache a path with a live direct session.
+        auto &direct = direct_users[path];
+        if (++direct.users != 1) { direct.shared = true; return nullptr; }
     }
     struct stat st;
     if (fstat(fd, &st) || (u64)st.st_size > CACHE_FILE_MAX) return nullptr;
@@ -332,20 +423,19 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
         if (!ok) return nullptr;
     }
     std::lock_guard<std::mutex> lk(cache_m);
-    auto it = cache.find(path);  // another thread's open may have got there first
-    if (it != cache.end()) {
-        it->second->users++;
-        return it->second;
-    }
-    for (auto e = cache.begin(); e != cache.end() && cached_bytes + f->data.size() > CACHE_MAX;)
+    const auto &direct = direct_users.at(path);
+    if (direct.users != 1 || direct.shared) return nullptr;
+    for (auto e = cache.begin(); e != cache.end() && cached_bytes + f->data.capacity() > CACHE_MAX;)
         if (!e->second->users && !e->second->dirty) {
-            cached_bytes -= e->second->data.size();
+            cached_bytes -= e->second->data.capacity();
             e = cache.erase(e);
         } else {
             ++e;
         }
+    if (cached_bytes + f->data.capacity() > CACHE_MAX) return nullptr;
+    direct_users.erase(path);
     f->users = 1;
-    cached_bytes += f->data.size();
+    cached_bytes += f->data.capacity();
     cache[path] = f;
     return f;
 }
@@ -353,6 +443,12 @@ std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd) {
 void save_file_close(SaveFile &f) {
     std::lock_guard<std::mutex> lk(cache_m);
     if (f.users) f.users--;
+}
+
+void save_file_close_direct(const std::string &path) {
+    std::lock_guard<std::mutex> lk(cache_m);
+    auto it = direct_users.find(path);
+    if (it != direct_users.end() && !--it->second.users) direct_users.erase(it);
 }
 
 long save_file_read(SaveFile &f, void *to, u32 len, u64 at) {
@@ -368,8 +464,9 @@ long save_file_write(SaveFile &f, const void *from, u32 len, u64 at) {
     if (!len) return 0;
     std::lock_guard<std::mutex> lk(cache_m);
     if (at + len > f.data.size()) {
-        cached_bytes += at + len - f.data.size();
+        const size_t old_capacity = f.data.capacity();
         f.data.resize((size_t)(at + len));
+        cached_bytes = cached_bytes - old_capacity + f.data.capacity();
     }
     memcpy(f.data.data() + at, from, len);
     f.dirty = true;
@@ -383,31 +480,49 @@ u64 save_file_size(SaveFile &f) {
 
 void save_file_resize(SaveFile &f, u64 size) {
     std::lock_guard<std::mutex> lk(cache_m);
-    cached_bytes = cached_bytes - f.data.size() + size;
+    const size_t old_capacity = f.data.capacity();
     f.data.resize((size_t)size);
+    cached_bytes = cached_bytes - old_capacity + f.data.capacity();
     f.dirty = true;
 }
 
 // Before the game deletes, renames or lists anything under prefix, storage has to hold what it wrote there. forget: it's going away or moving, so memory lets go too.
-void save_settle(const std::string &prefix, bool forget) {
+bool save_settle(const std::string &prefix, bool forget) {
     fs_begin(0xC009);
     std::vector<std::shared_ptr<SaveFile>> hit;
+    bool ok = true;
     {
         std::lock_guard<std::mutex> lk(cache_m);
+        if (forget)
+            for (const auto &e : direct_users)
+                if (under(e.first, prefix)) ok = false;
         for (auto &e : cache)
-            if (under(e.first, prefix) && e.second->dirty) hit.push_back(e.second);
-    }
-    for (auto &f : hit) write_out(f);
-    if (forget) {
-        std::lock_guard<std::mutex> lk(cache_m);
-        for (auto e = cache.begin(); e != cache.end();)
-            if (under(e->first, prefix)) {
-                cached_bytes -= e->second->data.size();
-                e = cache.erase(e);
-            } else {
-                ++e;
+            if (under(e.first, prefix)) {
+                // shortcut: live handles prevent moving/deleting; rebind ownership if a title needs live-handle rename.
+                if (forget && e.second->users) ok = false;
+                if (e.second->dirty) hit.push_back(e.second);
             }
     }
+    if (!ok) { fs_end(); return false; }
+    for (auto &f : hit) if (!write_out(f)) ok = false;
+    if (ok) {
+        std::lock_guard<std::mutex> lk(cache_m);
+        // A write that arrived during the snapshot must stay cached for the next attempt.
+        if (forget)
+            for (const auto &e : direct_users)
+                if (under(e.first, prefix)) ok = false;
+        for (auto &e : cache)
+            if (under(e.first, prefix) && (e.second->dirty || (forget && e.second->users))) ok = false;
+        if (forget && ok)
+            for (auto e = cache.begin(); e != cache.end();)
+                if (under(e->first, prefix)) {
+                    cached_bytes -= e->second->data.capacity();
+                    e = cache.erase(e);
+                } else {
+                    ++e;
+                }
+    }
     fs_end();
+    return ok;
 }
 }  // namespace wiiu

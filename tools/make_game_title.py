@@ -2,6 +2,7 @@
 """Assembles a game's Wii U title folder (code, content, meta), for Cemu and the WUP packer. Game files are hard links, so they take no extra disk.
 tools/win/build3ds.py and builder/pipeline.py call make_title() for every game. By hand:
     make_game_title.py <title folder> <game folder> <rpx> <shaders folder> <title id> <name> <product code> [system archives folder]"""
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,60 @@ def icon_pixels(smdh_path):
                     v = struct.unpack_from('<H', smdh, 0x24C0 + (ty * 6 + tx) * 128 + morton(x, y) * 2)[0]
                     icon[ty * 8 + y][tx * 8 + x] = (((v >> 11) & 31) * 255 // 31, ((v >> 5) & 63) * 255 // 63, (v & 31) * 255 // 31)
     return icon
+
+
+def resample_taps(src, dst, a=3):
+    """For each of dst pixels across: the src pixels it takes, with their Lanczos-a weights, and the two src pixels it lies between."""
+    taps = []
+    for o in range(dst):
+        c = (o + 0.5) * src / dst - 0.5
+        f = math.floor(c)
+        ws = [(i, 1.0 if c == i else a * math.sin(math.pi * (c - i)) * math.sin(math.pi * (c - i) / a) / (math.pi * (c - i)) ** 2)
+              for i in range(f - a + 1, f + a + 1)]
+        total = sum(w for _, w in ws)
+        taps.append(([(min(max(i, 0), src - 1), w / total) for i, w in ws], min(max(f, 0), src - 1), min(max(f + 1, 0), src - 1)))
+    return taps
+
+
+def sharp_icon(icon, size=128):
+    """The 48x48 icon at size x size, as sharp as its pixels allow: Lanczos-3, a light unsharp mask, and each pixel kept within the four it
+    lies between, so edges come out crisp without halos. Pure Python, as the Builder has no numpy or Pillow: a quarter of a second."""
+    tx, ty = resample_taps(len(icon[0]), size), resample_taps(len(icon), size)
+    across = [[[sum(row[i][ch] * k for i, k in taps) for ch in range(3)] for taps, _, _ in tx] for row in icon]
+    up = [[[sum(across[i][x][ch] * k for i, k in taps) for ch in range(3)] for x in range(size)] for taps, _, _ in ty]
+
+    def blur(line):  # [1 2 1] / 4 along a line, its ends repeated
+        n = len(line)
+        return [[(line[max(j - 1, 0)][ch] + 2 * line[j][ch] + line[min(j + 1, n - 1)][ch]) / 4 for ch in range(3)] for j in range(n)]
+    rows = [blur(line) for line in up]
+    soft = [blur([rows[y][x] for y in range(size)]) for x in range(size)]  # soft[x][y]
+    out = []
+    for y in range(size):
+        y0, y1 = ty[y][1], ty[y][2]
+        line = []
+        for x in range(size):
+            x0, x1 = tx[x][1], tx[x][2]
+            near = (icon[y0][x0], icon[y0][x1], icon[y1][x0], icon[y1][x1])
+            line.append(tuple(min(max(round(1.5 * up[y][x][ch] - 0.5 * soft[x][y][ch]), min(p[ch] for p in near)), max(p[ch] for p in near))
+                              for ch in range(3)))
+        out.append(line)
+    return out
+
+
+def vc_icon_pixels(icon):
+    """Each game's SMDH under Walegy's VC-inspired bands (issue #45); no game art is bundled."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QPainter
+    data = bytes(channel for row in sharp_icon(icon) for pixel in row for channel in pixel)
+    canvas = QImage(data, 128, 128, 128 * 3, QImage.Format_RGB888).copy()  # its own pixels: data goes when this returns
+    frame = QImage(os.path.join(os.path.dirname(__file__), 'art', 'vc_icon_frame.png'))
+    if frame.isNull():
+        raise ValueError('The shared Virtual Console icon frame is missing or unreadable')
+    painter = QPainter(canvas)
+    painter.drawImage(0, 0, frame.scaled(128, 128, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+    painter.end()
+    stride, data = canvas.bytesPerLine(), bytes(canvas.constBits())
+    return [[tuple(data[y * stride + 3 * x:y * stride + 3 * x + 3]) for x in range(128)] for y in range(128)]
 
 
 def write_tga(path, icon, w, h, bpp, scale, background):
@@ -115,22 +170,33 @@ def smdh_names(smdh_path):
 _qt = None  # the application Qt draws text with, made once
 
 
-def console_screens(art, smdh_path, released='', case_scan=False):
+# the console behind the Virtual Console's screens: the user's photo of a 3DS (2026-11-16), its screens blanked, cut out and faded to
+# light greys as the Virtual Console shows a DS (made once from the photo: the png's alpha is the console)
+CONSOLE_ART = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'art', 'vc_console_3ds.png')
+
+
+def console_screens(art, smdh_path, released='', case_scan=False, top_screen=False, icon=None):
     """The start-up screens as the Wii U's Virtual Console draws a DS game's (the user's picture of one, 2026-11-14): "Virtual Console" at the
-    top left, a large faint drawing of the console behind it all on the right, and across the middle a white band holding the game's art, the
-    console's name, the game's name from its SMDH, and released ("Released in Europe: 2011", say), or its publisher without one. A GameTDB cover
-    (case_scan: 768x680, the case's front) gives the case without the strip with the console's name down its side, shown whole.
-    All of it is drawn here; none of it is Nintendo's artwork. {'bootTvTex.tga': rows, 'bootDrcTex.tga': rows}, as art_pixels gives them, or
-    None if art can't be read."""
+    top left, a large faint 3DS behind it all on the right (CONSOLE_ART), and across the middle a white band holding the game's picture, the
+    console's name, the game's name from its SMDH, and released ("Released in Europe: 2011", say), or its publisher without one. The picture
+    is the game's title screen where there is one, as the Virtual Console shows (top_screen: libretro's picture of both screens, one above the
+    other, of which the top one shows), else its art or SMDH icon. A GameTDB cover (case_scan: 768x680, the case's front) gives the case without
+    the strip with the console's name down its side, shown whole. Returns both boot textures, or None if no usable art or icon was supplied."""
     global _qt
-    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtCore import QRectF, Qt
     from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QLinearGradient, QPainter, QPainterPath, QPen
     _qt = QGuiApplication.instance() or QGuiApplication([sys.argv[0]])
-    cover = QImage(art)
+    cover = QImage(art) if art else QImage()
     if cover.isNull():
-        return None
+        if icon is None:
+            return None
+        pixels = bytes(channel for row in icon for pixel in row for channel in pixel)
+        cover = QImage(pixels, 48, 48, 48 * 3, QImage.Format_RGB888)
+        case_scan = False
     if case_scan:  # a GameTDB case scan: its white strip down the right goes, and the whole height stays (a logo can sit low on it)
         cover = cover.copy(0, 0, 684, 680)
+    if top_screen and cover.height() > cover.width() * 0.9:  # both screens, the bottom one under the top: the top one, 5:3, alone
+        cover = cover.copy(0, 0, cover.width(), round(cover.width() * 3 / 5))
     name, publisher = smdh_names(smdh_path)
     img = QImage(1280, 720, QImage.Format_RGB888)
     p = QPainter(img)
@@ -152,25 +218,10 @@ def console_screens(art, smdh_path, released='', case_scan=False):
     bg.setColorAt(0, QColor(247, 247, 247))
     bg.setColorAt(1, QColor(212, 212, 212))
     p.fillRect(0, 0, 1280, 720, bg)
-    # an open 3DS in faint lines, behind everything on the right and running off the edge: lid, screens, hinge, base, controls, stylus
-    p.save()
-    p.translate(812, 8)
-    p.scale(1.3, 1.3)
-    p.setPen(QPen(QColor(192, 192, 192), 1.6))
-    p.setBrush(Qt.NoBrush)
-    for x, y, w, h, r in ((0, 0, 400, 240, 22), (50, 26, 300, 180, 4), (12, 244, 376, 16, 8), (0, 262, 400, 240, 22), (100, 296, 200, 150, 4)):
-        p.drawRoundedRect(QRectF(x, y, w, h), r, r)
-    p.drawEllipse(QPointF(45, 318), 25, 25)
-    cross = QPainterPath()
-    for x, y, w, h in ((34, 364, 22, 62), (14, 384, 62, 22)):
-        cross.addRect(QRectF(x, y, w, h))
-    p.drawPath(cross.simplified())
-    for dx, dy in ((0, -24), (24, 0), (0, 24), (-24, 0)):
-        p.drawEllipse(QPointF(355 + dx, 335 + dy), 11, 11)
-    for k in range(3):
-        p.drawRoundedRect(QRectF(130 + k * 52, 466, 36, 9), 4, 4)
-    p.drawLine(QPointF(330, 482), QPointF(395, 250))
-    p.restore()
+    # the console, faded, behind everything on the right and running off the edge
+    console = QImage(CONSOLE_ART)
+    if not console.isNull():
+        p.drawImage(QRectF(742, 22, 744, 744 * console.height() / console.width()), console)
     # the band across the middle, on a soft shadow
     for k in range(14):
         p.fillRect(QRectF(0, 564 + k, 1280, 1), QColor(0, 0, 0, 34 - 34 * k // 14))
@@ -240,13 +291,14 @@ def bezel_pixels(path):
 
 
 def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False,
-               pad_bezel=None, pad_art=None, boot_sound=None):
+               pad_bezel=None, pad_art=None, boot_sound=None, screen_art=None):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
-    art: a picture for the start-up screens and the Wii U Menu icon, in place of the game's own 48x48 icon scaled up. icon_art: another
-    picture for the icon alone (a square one, where art is a wide banner). style: 'picture' shows art as it is on the start-up screens,
+    art: a picture for the start-up screens. The Wii U Menu icon uses the game's SMDH with Virtual Console bands unless icon_art supplies
+    a complete custom icon (shown as supplied, without bands). style: 'picture' shows art as it is on the start-up screens,
     'console' lays it out as the Wii U's Virtual Console shows a game (console_screens), with released ("Released in Europe: 2011") under its name; case_scan says art is a GameTDB case scan.
     pad_art: a picture of its own for the GamePad's start-up screen, shown as it is. boot_sound: the game's own start-up sound (a .btsnd,
-    tools/make_boot_sound.py), in place of the one this PC has for every game."""
+    tools/make_boot_sound.py), in place of the one this PC has for every game. screen_art: the game's title screen (covers.title_screen), the
+    Virtual Console's picture in its screens in place of art."""
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):
@@ -266,12 +318,17 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
         icon_bin = os.path.join(game, 'icon.bin')
     icon = icon_pixels(icon_bin)
     meta_dir = os.path.join(title, 'meta')
-    write_tga(os.path.join(meta_dir, 'iconTex.tga'), icon, 128, 128, 32, 2, BACKGROUND)
+    write_art_tga(os.path.join(meta_dir, 'iconTex.tga'), vc_icon_pixels(icon), 32)
     write_tga(os.path.join(meta_dir, 'bootLogoTex.tga'), icon, 170, 42, 32, 0, (0, 0, 0))
     write_tga(os.path.join(meta_dir, 'bootDrcTex.tga'), icon, 854, 480, 24, 6, BACKGROUND)
     write_tga(os.path.join(meta_dir, 'bootTvTex.tga'), icon, 1280, 720, 24, 10, BACKGROUND)
-    screens = console_screens(art, os.path.join(game, 'exefs', 'icon.bin'), released, case_scan) if style == 'console' and art else None
-    for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art or art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
+    screens = None
+    if style == 'console':
+        if screen_art:
+            screens = console_screens(screen_art, icon_bin, released, top_screen=True)
+        if screens is None:
+            screens = console_screens(art, icon_bin, released, case_scan, icon=icon)
+    for tga, w, h, bpp, picture in (('iconTex.tga', 128, 128, 32, icon_art), ('bootDrcTex.tga', 854, 480, 24, art), ('bootTvTex.tga', 1280, 720, 24, art)):
         rows = screens[tga] if screens and tga in screens else art_pixels(picture, w, h, (0, 0, 0)) if picture else None
         if rows:
             write_art_tga(os.path.join(meta_dir, tga), rows, bpp)

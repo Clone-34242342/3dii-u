@@ -30,6 +30,12 @@ struct IPC {
         set(1, res);
     }
     void ok(u32 normal = 1, u32 translate = 0) { result(0, normal, translate); }
+    u32 mapped_output_error(int pos, u32 size) const {
+        const u32 desc = req[pos];
+        if (((desc & 15) != 12 && (desc & 15) != 14) || size > (desc >> 4))
+            return RES_INVALID_COMBINATION;
+        return size && !guest_writable(req[pos + 1], size) ? RES_INVALID_ADDRESS : RES_OK;
+    }
     // Writes a handle descriptor at word `pos` followed by the handles; returns the next word index.
     int handles(int pos, std::initializer_list<ObjPtr> objs, bool move = false);
     // The client's receive buffer for static buffer `index` (its TLS + 0x180)

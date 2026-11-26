@@ -24,6 +24,14 @@ with tempfile.TemporaryDirectory() as tmp:
         put(os.path.join(cp, when, 'main'), when.encode())
     put(os.path.join(cp, 'Thumbs.db'))
     assert saves.the_save(cp) == os.path.join(cp, '20261114-050000'), 'not the newest backup'
+    renamed = os.path.join(cp, '20261115-060000wU')
+    put(os.path.join(renamed, 'main'), b'latest renamed backup')
+    assert saves.the_save(cp) == renamed, 'a renamed dated backup turned the collection into the save'
+    assert saves.the_save(os.path.join(cp, '20261113-120000')) == os.path.join(cp, '20261113-120000'), 'explicit older backup was overridden'
+    ordinary = os.path.join(tmp, 'ordinary')
+    put(os.path.join(ordinary, 'slot1', 'data'))
+    put(os.path.join(ordinary, 'slot2', 'data'))
+    assert saves.the_save(ordinary) == ordinary, 'ordinary save subdirectories were mistaken for backups'
     plain = os.path.join(tmp, 'plain')
     put(os.path.join(plain, 'system.dat'))
     put(os.path.join(plain, 'sub', 'more.bin'))
@@ -46,5 +54,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert target == os.path.join(content, 'save_import')
     assert sorted(f for f, _ in saves.files_in(target)) == sorted(['system.dat', os.path.join('sub', 'more.bin')]), saves.files_in(target)
     assert not os.path.exists(os.path.join(target, '.DS_Store')) and not os.path.exists(os.path.join(target, 'stale'))
-    assert open(os.path.join(saves.pack(cp, content), 'main'), 'rb').read() == b'20261114-050000'
+    packed = saves.pack(cp, content)
+    assert os.listdir(packed) == ['main'], 'backup containers were packed instead of their files'
+    assert open(os.path.join(packed, 'main'), 'rb').read() == b'latest renamed backup'
 print('saves: ok')

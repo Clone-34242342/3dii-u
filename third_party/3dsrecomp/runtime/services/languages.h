@@ -20,6 +20,7 @@ inline uint32_t region_languages(uint32_t region) {
 
 // The languages of all the regions a game is for (its SMDH bits); none or all of them: Europe's, the widest set
 inline uint32_t regions_languages(uint32_t regions) {
+    regions &= 0x7F;
     if (!regions || regions == 0x7F) return region_languages(2);
     uint32_t languages = 0;
     for (uint32_t r = 0; r < 7; r++)
@@ -30,6 +31,7 @@ inline uint32_t regions_languages(uint32_t regions) {
 // The region a game is told: the first of its regions with its language, else its first (a game for Japan, the USA and Europe on
 // an English Wii U is American, not Japanese); Europe for a region-free game, and for Australia, whose set Europe's is
 inline uint32_t pick_region(uint32_t regions, int language) {
+    regions &= 0x7F;
     if (!regions || regions == 0x7F) return 2;
     uint32_t pick = __builtin_ctz(regions);
     for (uint32_t r = 0; r < 7; r++)
@@ -40,9 +42,9 @@ inline uint32_t pick_region(uint32_t regions, int language) {
     return pick == 3 ? 2 : pick;
 }
 
-// chosen (the options menu's, -1 for none), else the console's own, if offered has it; else English, or the region's one language
-inline int pick_language(uint32_t offered, int chosen, int console) {
-    for (int l : {chosen, console})
+// A saved choice comes before the build's default and the console's own language.
+inline int pick_language(uint32_t offered, int chosen, int console, int built = -1) {
+    for (int l : {chosen, built, console})
         if (l >= 0 && l < 12 && (offered >> l & 1)) return l;
     return offered & 2 ? 1 : __builtin_ctz(offered);
 }

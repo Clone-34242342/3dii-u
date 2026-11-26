@@ -32,38 +32,67 @@ def short_path(engine, work):
     directory junction in the work folder, which needs no administrator and moves with the app. Without one, the app's own path."""
     if os.name != 'nt' or 'THREEDII_ROOT' in os.environ:  # a build the app started inherits the window's choice
         return engine
-    link = os.path.join(work, 'engine')
+    import hashlib
+    name = 'e' + hashlib.sha256(os.fsencode(os.path.normcase(os.path.realpath(engine)))).hexdigest()[:6]
+    link = os.path.join(work, name)
     try:
-        if os.path.lexists(link):
-            if os.path.isdir(link) and os.path.normcase(os.path.realpath(link)) == os.path.normcase(os.path.realpath(engine)):
-                return link
-            os.rmdir(link)  # a junction to where the app was before, or to nothing now: rmdir takes the link, never what it pointed to
-        os.makedirs(work, exist_ok=True)
-        import _winapi
-        _winapi.CreateJunction(engine, link)  # not cmd's mklink: a hidden cmd.exe is one of the things antivirus guesses weigh
-        return link
+        if not os.path.lexists(link):
+            os.makedirs(work, exist_ok=True)
+            import _winapi
+            _winapi.CreateJunction(engine, link)
+        if os.path.isdir(link) and os.path.samefile(engine, link):
+            return link
     except OSError:
-        return engine
+        pass
+    return engine
 
 
 def fresh_cache(engine, work):
     """The work folder keeps the compiled runtime for the next game, and build3ds recompiles a file only when its source is newer than its
     object. A newer app's sources can be older than objects an earlier app compiled there, so with another engine the cache starts over."""
-    mark = os.path.join(work, 'engine_stamp.txt')
     try:
         with open(os.path.join(engine, 'stamp.txt')) as f:  # make_app.py writes one into each engine
             stamp = f.read()
-        if os.path.isfile(mark):
-            with open(mark) as f:
-                if f.read() == stamp:
-                    return
-        import shutil
-        shutil.rmtree(os.path.join(work, 'build_win_builder'), ignore_errors=True)
-        os.makedirs(work, exist_ok=True)
-        with open(mark, 'w') as f:
+    except FileNotFoundError:  # older/source engines without a stamp keep their existing behavior
+        return
+    # This runs before pipeline's output checks, including when changing the selected build folder.
+    sys.path.insert(0, os.path.join(find_root(), 'tools', 'win'))
+    from objcache import _checked
+    work, _ = _checked(work, directory=True)
+    mark, _ = _checked(work / 'engine_stamp.txt')
+    cache, existing = _checked(work / 'build_win_builder', directory=True)
+    if os.path.isfile(mark):
+        with open(mark) as f:
+            if f.read() == stamp:
+                return
+    import shutil
+    import tempfile
+    # Check the entire old tree before deletion: a nested alias must not escape this cache.
+    pending = [cache] if existing is not None else []
+    while pending:
+        folder = pending.pop()
+        _checked(folder, directory=True)
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                directory = entry.is_dir(follow_symlinks=False)
+                _checked(entry.path, directory=directory)
+                if directory:
+                    pending.append(entry.path)
+    _checked(cache, directory=True)
+    shutil.rmtree(cache, ignore_errors=True)
+    if os.path.lexists(cache):
+        raise OSError(f'Old compiled files are still in {cache}. Close other Builder windows and try again.')
+    _checked(work, directory=True)
+    os.makedirs(work, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='engine_stamp.', suffix='.tmp', dir=work)
+    try:
+        with os.fdopen(fd, 'w') as f:
             f.write(stamp)
-    except OSError:  # an engine with no stamp, or no work folder: builds go on with the cache as it is
-        pass
+        _checked(mark)
+        os.replace(temporary, mark)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
 
 
 def chosen_build():
@@ -81,9 +110,7 @@ def use_engine(root):
     if root and os.path.basename(root) == 'engine':
         base = os.environ.get('LOCALAPPDATA') or os.path.join(os.path.expanduser('~'), '.local', 'share')
         work = os.environ.setdefault('THREEDII_WORK', os.path.join(base, '3Dii U Builder'))
-        build = os.environ.setdefault('THREEDII_BUILD', chosen_build() or work)  # the big build files, pipeline.BUILD
-        if 'THREEDII_ROOT' not in os.environ:  # once, in the window: the builds it starts inherit the cache as it left it
-            fresh_cache(root, build)
+        os.environ.setdefault('THREEDII_BUILD', chosen_build() or work)  # the big build files, pipeline.BUILD
         root = short_path(root, work)
         os.environ.setdefault('THREEDII_DEVKITPRO', os.path.join(root, 'devkitpro').replace('\\', '/'))
         os.environ.setdefault('THREEDII_SHADERGEN', os.path.join(root, 'bin', 'shadergen.exe'))
@@ -95,8 +122,7 @@ PYTHON_FLAGS = ('-B', '-E', '-I', '-O', '-OO', '-P', '-S', '-s', '-u')  # python
 
 def hand_over():
     """An app with a downloaded update opens that version's window instead (updater.py), so the folder the person unzipped is never changed.
-    Holding Shift while it starts opens this one. Done before use_engine(), which would otherwise start the work folder's compiled cache
-    over for this engine at every start, and the newer version's again after it."""
+    Holding Shift while it starts opens this one."""
     if not FROZEN:
         return
     try:
@@ -112,10 +138,6 @@ def hand_over():
         updater.hold_version()  # a downloaded version, in any mode: its folder mustn't be cleared away while it runs
     except Exception:  # an update must never stop the app starting as itself
         pass
-
-
-hand_over()
-use_engine(find_root())
 
 
 def quiet_children():
@@ -208,6 +230,8 @@ def cannot_start(why=MISSING):
 
 
 def main():
+    hand_over()
+    use_engine(find_root())
     while len(sys.argv) > 1 and sys.argv[1] in PYTHON_FLAGS:
         del sys.argv[1]
     if len(sys.argv) > 1 and sys.argv[1] == '--pipeline':

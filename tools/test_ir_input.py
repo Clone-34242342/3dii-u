@@ -46,6 +46,10 @@ int main() {
         assert(map_buttons(VPAD_BUTTON_A|VPAD_BUTTON_X, aliases)==(1u|(1u<<10)));
         assert(map_pro(WPAD_PRO_BUTTON_A|WPAD_PRO_BUTTON_X, aliases)==(1u|(1u<<10)));
     }
+    assert(pro_as_gamepad(WPAD_PRO_TRIGGER_ZL|WPAD_PRO_TRIGGER_ZR|WPAD_PRO_BUTTON_STICK_L)==
+           (VPAD_BUTTON_ZL|VPAD_BUTTON_ZR|VPAD_BUTTON_STICK_L));
+    assert(pro_as_gamepad(WPAD_PRO_BUTTON_STICK_R|WPAD_PRO_BUTTON_MINUS)==
+           (VPAD_BUTTON_STICK_R|VPAD_BUTTON_MINUS));
     assert(pro_as_gamepad(WPAD_PRO_BUTTON_A|WPAD_PRO_BUTTON_B|WPAD_PRO_BUTTON_STICK_L)==
            (VPAD_BUTTON_A|VPAD_BUTTON_B|VPAD_BUTTON_STICK_L));
     float x[4]={0.1f,-0.8f,0.2f,0}, y[4]={0.1f,0.1f,0.1f,0};
@@ -71,8 +75,11 @@ int main() {
     assert 'pad_buttons' not in thread
     assert 'buttons = map_buttons(pad_held, z_too);' in thread
     assert 'pro_x[ch] = pro_y[ch] = pro_rx[ch] = pro_ry[ch] = 0;' in thread
-    assert 'if (wiiu::menu_open()) kernel::hid_extra_pad(0, 0, false, false, false);' in thread
-    print('IR input: actual GamePad/Pro mappings, menu controls, strongest right stick and trigger merging passed')
+    assert 'overlay_pressed(st.trigger, st.hold)' in thread
+    assert 'overlay_pressed(down, pro_as_gamepad(pro_hold[ch]))' in thread
+    assert 'menu_took_input = menu_was_open || wiiu::menu_open();' in thread
+    assert re.search(r'if \(menu_took_input\) \{[^}]*kernel::hid_extra_pad\(0, 0, false, false, false\);', thread)
+    print('IR input: actual GamePad/Pro mappings, menu chord, strongest right stick and trigger merging passed')
 
 
 if __name__ == '__main__':

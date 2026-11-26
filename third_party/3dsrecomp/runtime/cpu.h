@@ -133,8 +133,8 @@ static inline u32 smlaxy_add(u32 p, u32 acc, u32 *q) {
     return (u32)r;
 }
 static inline u32 ssat(u32 v, int bits, u32 *q) {
+    if (bits == 32) return v;  // before the limits: at 32 they overflow s32
     s32 x = (s32)v, hi = (1 << (bits - 1)) - 1, lo = -(1 << (bits - 1));
-    if (bits == 32) return v;
     if (x > hi) { *q = 1; return (u32)hi; }
     if (x < lo) { *q = 1; return (u32)lo; }
     return v;
@@ -165,9 +165,9 @@ static inline u32 uxtb16(u32 v) { return v & 0x00ff00ffu; }
 static inline u32 add16x(u32 a, u32 b) { return ((a + b) & 0xffff) | (((a >> 16) + (b >> 16)) << 16); }
 static inline u32 rev16(u32 v) { return ((v & 0x00ff00ffu) << 8) | ((v >> 8) & 0x00ff00ffu); }
 static inline u32 sel(u32 n, u32 m, u32 ge) {
-    u32 r = 0;
-    for (int i = 0; i < 4; i++) r |= ((ge >> i) & 1 ? n : m) & (0xffu << (8 * i));
-    return r;
+    const u32 lanes = (ge & 1u) | ((ge & 2u) << 7) | ((ge & 4u) << 14) | ((ge & 8u) << 21);
+    const u32 mask = lanes * 255u;
+    return (n & mask) | (m & ~mask);
 }
 static inline u32 usad8(u32 a, u32 b) {
     u32 s = 0;
@@ -214,6 +214,36 @@ static inline u32 pas16(int kind, int op, u32 a, u32 b, u32 *ge) {
     return ((u32)r0 & 0xffff) | ((u32)r1 << 16);
 }
 static inline u32 pas8(int kind, int sub, u32 a, u32 b, u32 *ge) {
+    // Separate byte lanes with room for carry and borrow, so the movie filters do not loop over each byte.
+    if (kind >= 3 && kind <= 5) {
+        const u32 mask = 0x00ff00ffu, guard = 0x01000100u;
+        const u32 ae = a & mask, ao = (a >> 8) & mask;
+        const u32 be = b & mask, bo = (b >> 8) & mask;
+        u32 even = sub ? (ae | guard) - be : ae + be;
+        u32 odd = sub ? (ao | guard) - bo : ao + bo;
+        const u32 ec = even & guard, oc = odd & guard;
+        if (kind == 3) {
+            *ge = (ec >> 8 & 1u) | (ec >> 22 & 4u) | (oc >> 7 & 2u) | (oc >> 21 & 8u);
+        } else if (kind == 4) {
+            const u32 even_mask = ec - (ec >> 8), odd_mask = oc - (oc >> 8);
+            if (sub) {
+                even &= even_mask;
+                odd &= odd_mask;
+            } else {
+                even |= even_mask;
+                odd |= odd_mask;
+            }
+        } else {
+            // Subtraction's guard bit is the inverse of its ninth result bit.
+            if (sub) {
+                even ^= guard;
+                odd ^= guard;
+            }
+            even >>= 1;
+            odd >>= 1;
+        }
+        return (even & mask) | ((odd & mask) << 8);
+    }
     int sgn = kind < 3;
     u32 out = 0;
     if (kind == 0 || kind == 3) *ge = 0;

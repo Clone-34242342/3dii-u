@@ -10,29 +10,22 @@ come before the ones it used once. Getting none, as such a game used to, left ev
 fs_variants.py <output.bin> [--max N] <fragment log>...
 fs_variants.py --self-check"""
 import heapq
+import os
 import struct
 import sys
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dvlb_to_log import fragment_keys  # noqa: E402
 
 MOST_RANKED = 4_000_000  # combinations worth walking through to rank; past it the rarest parts are left out first
 
 
 def keys(path):
-    d = open(path, 'rb').read()
-    p = 0
-    while p + 4 <= len(d):
-        if d[p:p + 4] == b'FS  ':
-            p += 4
-        elif d[p:p + 4] == b'VS  ':
-            _, nc, ns = struct.unpack_from('<III', d, p + 4)
-            p += 16 + (nc + ns) * 4 + 56
-            continue
-        elif d[p:p + 4] == b'GSX ':  # a vertex shader and a geometry shader: its size after the tag
-            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
-            continue
-        n = struct.unpack_from('<I', d, p)[0]
-        yield struct.unpack_from(f'<{n // 4}I', d, p + 4)
-        p += 4 + n
+    with open(path, 'rb') as f:
+        for key in fragment_keys(f.read()):
+            if key and len(key) % 4 == 0:
+                yield struct.unpack(f'<{len(key) // 4}I', key)
 
 
 def split(w):

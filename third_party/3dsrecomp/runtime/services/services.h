@@ -14,8 +14,13 @@ extern int g_host_my_mii;  // the current account's, or -1
 bool mii_3ds(const std::array<u8, 0x60> &host, std::array<u8, 0x60> &out);  // false: not a usable Mii
 const std::vector<std::array<u8, 0x60>> &console_miis(int *mine);  // the ones a game can take, each once; mine: the current account's number among them, or -1
 int mii_maker_place(u32 n);            // where the nth of console_miis() lies in the game's Mii Maker database (fs.cpp), or -1: no place was free
+std::array<u8, 0x60> console_mii(u32 n);  // the nth of console_miis(), as a game reads it: where its Mii Maker has it, and its checksum
 std::array<u8, 0x60> player_mii();     // the current account's Mii, or a stand-in "Mario" when it has no usable one
 u16 mii_crc16(const u8 *p, size_t n);  // CRC-16/XMODEM, as Mii data and Mii Maker's database use
+inline bool mii_id_empty(const u8 *id) {
+    for (unsigned i = 0; i < 10; i++) if (id[i]) return false;
+    return true;
+}
 void register_apt();
 void register_fs();
 void register_cfg();
@@ -36,6 +41,7 @@ void apt_notify(u32 signal);
 // cfg (languages.h has the rule)
 extern int g_system_language;  // the console's own language: the frontend sets it before the game starts (-1: none)
 u32 cfg_languages();           // the languages the game's regions have, a bit each
+int cfg_menu_language(int chosen);  // apply the build and console defaults to a menu choice
 int cfg_language();            // the one the game is told, the same all run
 
 // gsp
@@ -60,7 +66,7 @@ void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty);  // (h
 void hid_motion(const s16 *accel, const s16 *gyro);                        // (the thread that calls hid_update) x, y, z in the 3DS's units
 // ir (misc.cpp): the Circle Pad Pro a New 3DS answers with, from the host's second stick (-1..1, up positive) and ZL, ZR, R
 void hid_extra_pad(float x, float y, bool zl, bool zr, bool r);  // (host thread)
-void hid_extra_pad_live(u32 buttons);  // keep scripted extra-pad holds separate from physical refreshes
+void hid_extra_pad_live(u32 buttons);  // existing live R/ZL/ZR commands; axes remain physical
 bool extra_pad_connected();  // a game is reading it: ZL and ZR are its own then, not L and R as well
 // dsp
 void dsp_tick();  // (host thread, lock not held) one audio frame, played whether or not the game has come for the last one shortly
@@ -68,4 +74,9 @@ void dsp_tick();  // (host thread, lock not held) one audio frame, played whethe
 // The host's microphone, for mic:u (lock held). misc.cpp has weak defaults that give silence.
 void mic_host_start();
 void mic_host_stop();
-void mic_host_read(s16 *out, u32 n, u32 rate);  // the latest n samples, at this rate
+void mic_host_read(s16 *out, u32 n, u32 rate);
+u32 mic_host_read_available(s16 *out, u32 n, u32 rate);  // up to n consecutive samples at this rate
+// The host's camera (lock held). A fresh immutable 640x480 NV12 snapshot, pitch 768; false means unavailable/no new frame.
+bool cam_host_start();
+void cam_host_stop();
+bool cam_host_frame(u8 *out, u32 capacity);
