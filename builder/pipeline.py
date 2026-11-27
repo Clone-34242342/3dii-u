@@ -716,7 +716,7 @@ def build(a):
         except (saves.SaveError, OSError) as e:
             fail(f"The 3DS save couldn't be packed in: {e}")
     os.makedirs(os.path.join(out,'title','content'),exist_ok=True)
-    with open(os.path.join(out,'title','content','menu_enabled.txt'),'w',encoding='ascii') as f:
+    with open(os.path.join(out,'title','content','menu_enabled.txt'),'w',encoding='ascii',newline='\n') as f:
         f.write('0\n' if a.no_menu else '1\n')
     with open(os.path.join(out,'title','content','menu_shortcut.txt'),'w',encoding='ascii') as f:
         f.write(((a.menu_shortcut or '') if not a.no_menu else '') + '\n')

@@ -106,7 +106,7 @@ def remember_base(path, title, base_id, *, inputs=None, contract=None, root=None
     record = dict(format=MANIFEST_VERSION, base_title_id=f'{base_id:016X}', content=content,
                   inputs=inputs or {}, shader_contract=contract or shader_contract(root))
     record['identity'] = _identity(record)
-    (Path(title)/'content'/BASE_MARKER).write_text(record['identity']+'\n', encoding='ascii')
+    (Path(title)/'content'/BASE_MARKER).write_bytes((record['identity']+'\n').encode('ascii'))
     write_manifest(path, record)
     return record
 
@@ -226,10 +226,11 @@ def make_update(source, destination, parts='both', version=None, now=None, *, ba
             file = source/'content'/name
             (out/'content'/name).write_bytes(file.read_bytes() if file.exists() else (b'-1\n' if name=='language.txt' else b'\n'))
         enabled = source/'content/menu_enabled.txt'
-        (out/'content/menu_enabled.txt').write_bytes(enabled.read_bytes() if enabled.exists() else (b'0\n' if (source/'content/no_menu').exists() else b'1\n'))
-        if (out/'content/menu_enabled.txt').read_bytes().strip() not in (b'0',b'1'):
+        enabled_value = enabled.read_bytes().strip() if enabled.exists() else (b'0' if (source/'content/no_menu').exists() else b'1')
+        if enabled_value not in (b'0',b'1'):
             raise ValueError('Invalid menu enabled setting')
-        (out/'content'/UPDATE_MARKER).write_text(record['identity']+'\n',encoding='ascii')
+        (out/'content/menu_enabled.txt').write_bytes(enabled_value+b'\n')
+        (out/'content'/UPDATE_MARKER).write_bytes((record['identity']+'\n').encode('ascii'))
         details=dict(base_title_id=f'{base:016X}',update_title_id=f'{update:016X}',version=version,
                      built_at=now.isoformat(),parts=parts,version_policy='fixed',base_identity=record['identity'])
         (out/'content/3dii-update.json').write_text(json.dumps(details,indent=2)+'\n')

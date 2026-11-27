@@ -70,6 +70,8 @@ class UpdateTests(unittest.TestCase):
     self.assertNotIn('no_menu',links)
     self.assertEqual('shaders.gsh' in links, parts=='binary')
     self.assertEqual((out/'content'/u.UPDATE_MARKER).read_bytes(),(base/'content'/u.BASE_MARKER).read_bytes())
+    self.assertEqual(len((out/'content'/u.UPDATE_MARKER).read_bytes()),65)
+    self.assertEqual((out/'content/menu_enabled.txt').read_bytes(),b'1\n')
     result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/'phase0/tools/pack_wup.py'),str(out),str(root/(parts+'-wup'))],input='00'*16+'\n',text=True,capture_output=True)
     self.assertEqual(result.returncode,0,result.stderr)
     self.assertIn('round trip verified',result.stdout)
@@ -92,11 +94,13 @@ class UpdateTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);base,manifest=self.fixture(root)
    (base/'content/no_menu').unlink()
+   (base/'content/menu_enabled.txt').write_bytes(b'1\r\n')
    (base/'content/menu_shortcut.txt').unlink()
    u.make_update(base,root/'update','binary',base_manifest=manifest,contract='a'*64)
    self.assertEqual((root/'update/content/menu_enabled.txt').read_text(),'1\n')
    self.assertEqual((root/'update/content/menu_shortcut.txt').read_text(),'\n')
    (base/'content/no_menu').touch()
+   (base/'content/menu_enabled.txt').write_bytes(b'0\r\n')
    u.make_update(base,root/'update','binary',base_manifest=manifest,contract='a'*64)
    self.assertEqual((root/'update/content/menu_enabled.txt').read_text(),'0\n')
 
