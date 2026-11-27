@@ -793,6 +793,7 @@ def gui(controller, hotkey_enabled):
     ttk.Button(host_row, text="Apply IP", command=apply_host).pack(side="left", padx=8)
     ttk.Button(host_row, text="Open logs folder", command=lambda: open_logs_folder(controller.recorder.directory)).pack(side="left")
     scanning = False
+    scan_origin = None
     discovery_results = queue.SimpleQueue()
     auto_scan = tk.BooleanVar(value=bool(read_preferences(controller.preferences_path).get('auto_discover', False)) if controller.preferences_path else False)
     def save_auto_scan():
@@ -805,9 +806,9 @@ def gui(controller, hotkey_enabled):
         except OSError as exc:
             message.set(str(exc))
     def scan():
-        nonlocal scanning
+        nonlocal scanning, scan_origin
         if scanning: return
-        state = controller.recorder.status()
+        state = controller.command('status')
         if state['recording']:
             message.set('Stop recording before scanning; manual IP and Connect remain available.')
             return
@@ -815,6 +816,7 @@ def gui(controller, hotkey_enabled):
             message.set('Select Wii U before scanning; Cemu uses its own address.')
             return
         scanning = True
+        scan_origin = (controller.console, host_value.get())
         scan_button.state(['disabled'])
         message.set('Scanning the local network for Aroma or FTPiiU...')
         preferred = controller.console
@@ -834,9 +836,13 @@ def gui(controller, hotkey_enabled):
         host_entry.configure(values=addresses)
         if error: message.set('Scan failed: ' + error + '. Enter the IP manually.')
         elif len(addresses) == 1:
-            host_value.set(addresses[0])
-            apply_host()
-            message.set('Wii U found and address saved: ' + addresses[0] + '. Click Connect.')
+            if (controller.command('status')['recording'] or controller.target != 'wiiu'
+                    or (controller.console, host_value.get()) != scan_origin):
+                message.set('Wii U found: ' + addresses[0] + '. Current recording/address left unchanged; choose it from the list when ready.')
+            else:
+                host_value.set(addresses[0])
+                apply_host()
+                message.set('Wii U found and address saved: ' + addresses[0] + '. Click Connect.')
         elif addresses: message.set('Multiple Wii Us found. Choose an IP from the list, then Apply IP.')
         else: message.set('No Wii U found. Enable Aroma TCP logging or FTPiiU, or enter its IP manually.')
     discovery_row = ttk.Frame(panel)
