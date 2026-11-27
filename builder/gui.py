@@ -358,6 +358,7 @@ class App(QObject):
     saveText, hasSave = _p(str, 'saveText'), _p(bool, 'hasSave')
     artKeySet, soundSet, artStyle = _p(bool, 'artKeySet'), _p(bool, 'soundSet'), _p(str, 'artStyle')
     gameMenu = _p(bool, 'gameMenu')
+    menuStyle = _p(str, 'menuStyle')
     menuShortcut = _p(str, 'menuShortcut')
     menuButtons = Property('QVariantList', lambda self: list(pipeline.MENU_BUTTONS), constant=True)
     gameLanguage = _p(str, 'gameLanguage')
@@ -409,6 +410,7 @@ class App(QObject):
         self.system_language = pipeline.language_for_locale(next(iter(system_locale.uiLanguages()), system_locale.name()))
         shortcut = self.st.get('menu_shortcut')
         self._s = dict(hasGame=False, gameName='', gameLanguage='', language='', languages=[f'System ({self.system_language})', *pipeline.LANGUAGES], maker='', badge='', known=False, icon='', meta='',
+                       menuStyle='classic' if self.st.get('menu_style') == 'classic' else 'new',
                        menuShortcut=shortcut if pipeline.valid_menu_shortcut(shortcut) else '',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
@@ -493,6 +495,14 @@ class App(QObject):
         self.st['game_menu'] = bool(on)
         save_settings(self.st)
         self.set(gameMenu=bool(on))
+
+    @Slot(str)
+    def setMenuStyle(self, style):
+        if style not in ('new', 'classic'):
+            return
+        self.st['menu_style'] = style
+        save_settings(self.st)
+        self.set(menuStyle=style)
 
     @Slot(str)
     def setMenuShortcut(self, shortcut):
@@ -1388,6 +1398,8 @@ class App(QObject):
             argv += ['--boot-sound', self.game_sound]
         if self.save_in:
             argv += ['--save', self.save_in]
+        if self._s['gameMenu'] and self._s['menuStyle'] == 'classic':
+            argv += ['--menu-style', 'classic']
         if not self._s['gameMenu']:
             argv += ['--no-menu']
         elif self._s['menuShortcut']:

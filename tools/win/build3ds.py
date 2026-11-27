@@ -471,6 +471,8 @@ def build_runtime(g, args):
     """the runtime every game links: one build of it serves them all"""
     obj_dir = f'{WORK}/rt_measure' if MEASURE else f'{WORK}/rt_std'
     if g.mode == 'resumable': obj_dir += '_resumable'
+    if '-DRECOMP_CLASSIC_MENU' in shlex.split(args.extra_flags or ''):
+        obj_dir += '_classic_menu'
     if FFL_TRIAL:
         obj_dir += '_ffl'
     check_cache_dir(obj_dir)

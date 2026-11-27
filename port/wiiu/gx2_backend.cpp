@@ -5503,6 +5503,9 @@ static int menu_items() {
 #ifdef RECOMP_RESUMABLE
         + 2
 #endif
+#ifndef RECOMP_CLASSIC_MENU
+        + 2
+#endif
         ;
 }
 static volatile bool menu_is_open;
@@ -5550,7 +5553,19 @@ int game_speed() { return menu_speed; }
 bool menu_wants_quit() { return menu_quit; }
 void menu_quit_now() { menu_quit = true; }
 
+#ifndef RECOMP_CLASSIC_MENU
+static bool menu_restore_confirm;
+#endif
 void menu_input(u32 pressed, bool toggle) {
+#ifndef RECOMP_CLASSIC_MENU
+    if (save_backup::requests.view().busy) return;
+    if (toggle || (pressed & (VPAD_BUTTON_UP | VPAD_BUTTON_DOWN | VPAD_BUTTON_LEFT | VPAD_BUTTON_RIGHT)))
+        menu_restore_confirm = false;
+    if (menu_is_open && (pressed & VPAD_BUTTON_B) && menu_restore_confirm) {
+        menu_restore_confirm = false;
+        return;
+    }
+#endif
     if (!menu_is_open) {
         if (menu_allowed && toggle) {
             menu_item = 0;
@@ -5597,10 +5612,20 @@ void menu_input(u32 pressed, bool toggle) {
 #endif
     if (pressed & VPAD_BUTTON_A) {
         if (menu_item == 0) menu_is_open = false;
+#ifndef RECOMP_CLASSIC_MENU
+        if (menu_item == count - 3) save_backup::requests.request(save_backup::Action::Export);
+        if (menu_item == count - 2) {
+            if (menu_restore_confirm) {
+                save_backup::requests.request(save_backup::Action::StageRestore);
+                menu_restore_confirm = false;
+            } else menu_restore_confirm = true;
+        }
+#endif
         if (menu_item == count - 1) menu_quit = true;
     }
 }
 
+#ifdef RECOMP_CLASSIC_MENU
 // Keep the original left-stick options overlay, including checkpoint controls.
 static void draw_menu_on(GX2ColorBuffer *cb) {
     const u32 w = 854, h = 480;
@@ -5672,6 +5697,191 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     draw_text(w, h, hint, 165, 446, 2);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
 }
+#else
+static void draw_menu_on(GX2ColorBuffer *cb) {
+    const float W = (float)cb->surface.width, H = (float)cb->surface.height, k = H / 480;
+    const u32 w = (u32)W, h = (u32)H;
+    const auto at = [&](float v) { return std::floor(v * k + 0.5f); };
+    const bool font = ui_font::load();
+    const auto pixel_scale = [&](float size) { return std::max(1.0f, std::floor(size * k / 8)); };  // the built-in font, without the console's
+    const auto text_w = [&](const char *s, float size) { return font ? ui_font::width(s, size * k) : (6.0f * strlen(s) - 1) * pixel_scale(size); };
+    const auto text = [&](const char *s, float x, float y, float size, float r, float g, float b) {
+        set_blit_colors(r, g, b, 0, 0, 0);
+        if (!font) {
+            GX2SetPixelTexture(&font_tex, 0);
+            GX2SetPixelSampler(&lut_sampler, 0);
+            draw_text(w, h, s, std::floor(x), std::floor(y + (size * k - 7 * pixel_scale(size)) / 2), pixel_scale(size));
+            return;
+        }
+        GX2SetPixelTexture(&ui_font::texture(), 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        ui_font::Quad q[64];
+        const int n = ui_font::quads(s, size * k, std::floor(x), std::floor(y), q, 64);
+        for (int i = 0; i < n; i++) draw_rect(w, h, q[i].x0, q[i].y0, q[i].x1, q[i].y1, q[i].u0, q[i].v0, q[i].u1, q[i].v1);
+    };
+    const auto paint = [&](float r, float g, float b) {  // round shapes and plain areas after it
+        GX2SetPixelTexture(&disk_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(r, g, b, 0, 0, 0);
+    };
+    const auto fill = [&](float x0, float y0, float x1, float y1) { draw_rect(w, h, x0, y0, x1, y1, 0.5f, 0.5f, 0.5f, 0.5f); };
+    const auto arrow = [&](float x, float y, float size, bool left, float r, float g, float b) {
+        GX2SetPixelTexture(&arrow_tex, 0);
+        GX2SetPixelSampler(&blit_sampler, 0);
+        set_blit_colors(r, g, b, 0, 0, 0);
+        draw_rect(w, h, x, y, x + size, y + size, left ? 1 : 0, 0, left ? 0 : 1, 1);
+    };
+
+    // the lines: what each is, and what it's set to (nothing for the two that act)
+    static const char *const k_languages[12] = {"Japanese", "English", "French",  "German",     "Italian", "Spanish",
+                                                "Chinese",  "Korean",  "Dutch",   "Portuguese", "Russian", "Chinese (Taiwan)"};
+    static const char *const k_tv_layouts[screens::kTvLayouts] = {"Top Screen",      "Side by Side",  "Stacked",           "Big Top + Small",
+                                                                  "Bottom Screen",   "Big Bottom + Small", "Top Screen (16:9 stretch)"};
+    static const char *const k_pad_layouts[screens::kPadLayouts] = {"Bottom Screen", "Top Screen", "Stacked", "Side by Side", "Top Screen (16:9 stretch)"};
+    const int count = menu_items(), quit = count - 1;
+    char speed[16], vol[16], res[16], cap[16];
+    snprintf(speed, sizeof speed, "%d%%", menu_speed);
+    snprintf(vol, sizeof vol, "%d%%", menu_volume);
+    snprintf(res, sizeof res, "%dp", g_settings.resolution);
+    if (cap_fps) snprintf(cap, sizeof cap, "%u fps", (unsigned)cap_fps);
+    else snprintf(cap, sizeof cap, "Off");
+    const char *labels[14] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit"};
+    const char *values[14] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
+                              k_pad_layouts[pad_layout % screens::kPadLayouts], res, g_settings.show_fps ? "On" : "Off", cap};
+    if (cap_game && has_darkmoon_profile()) {
+        const char *modes[] = {"Balanced", "Sharp", "Fast"};
+        labels[8] = "Rendering Mode";
+        values[8] = modes[std::clamp(g_settings.wiiu_render_mode, 0, 2)];
+    }
+#ifdef RECOMP_RESUMABLE
+    const int state_item = cap_game ? 9 : 8;
+    labels[state_item] = "Save State";
+    labels[state_item + 1] = checkpoint::has_state() ? "Load State" : "Load State (Empty)";
+#endif
+    labels[count - 3] = "Back up Save to SD Card";
+    labels[count - 2] = menu_restore_confirm ? "Confirm Restore Next Start (A)" : "Restore Newest Backup Next Start";
+    labels[quit] = "Return to Wii U Menu";
+    values[quit] = "";
+
+    GX2SetColorBuffer(cb, GX2_RENDER_TARGET_0);
+    cur_color = nullptr;
+    begin_blit();
+    GX2SetViewport(0, 0, W, H, 0, 1);
+    GX2SetScissor(0, 0, w, h);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 1, FALSE, TRUE);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_SRC_ALPHA, GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE,
+                       GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    // the blue ground, lighter at the top
+    for (int b = 0; b < 24; b++) {
+        const float f = b / 23.0f;
+        paint(0.45f - 0.18f * f, 0.59f - 0.20f * f, 0.86f - 0.16f * f);
+        fill(0, std::floor(H * b / 24), W, std::floor(H * (b + 1) / 24));
+    }
+    // the heading band, its light edge, and the title on a shadow
+    for (int b = 0; b < 4; b++) {
+        paint(0.17f - 0.015f * b, 0.24f - 0.02f * b, 0.44f - 0.03f * b);
+        fill(0, at(14 * b), W, at(14 * (b + 1)));
+    }
+    paint(0.64f, 0.73f, 0.93f);
+    fill(0, at(56), W, at(58));
+    const char *title = "3Dii U Menu";
+    const float title_x = std::floor((W - text_w(title, 30)) / 2);
+    text(title, title_x + at(2), at(11) + at(2), 30, 0.04f, 0.07f, 0.16f);
+    text(title, title_x, at(11), 30, 1, 1, 1);
+    std::string status = save_backup::requests.view().message;
+#ifdef RECOMP_RESUMABLE
+    if (const char *result = checkpoint::result_message(); status.empty() && result) status = result;
+#endif
+    if (menu_restore_confirm) status = "The newest SD backup will replace this save next start. A confirms; B cancels.";
+    if (!status.empty()) {
+        const bool shorten = text_w(status.c_str(), 11) > W - at(80);
+        while (!status.empty() && text_w((status + (shorten ? "..." : "")).c_str(), 11) > W - at(80)) {
+            size_t end = status.size() - 1;
+            while (end && ((unsigned char)status[end] & 0xc0) == 0x80) --end;
+            status.resize(end);
+        }
+        if (shorten) status += "...";
+        text(status.c_str(), (W - text_w(status.c_str(), 11)) / 2, at(43), 11, 1, 1, 1);
+    }
+    // the dark frame and its tiles
+    paint(0.47f, 0.58f, 0.84f);
+    draw_round_rect(w, h, at(24), at(68), W - at(24), H - at(56), at(16));
+    paint(0.11f, 0.17f, 0.35f);
+    draw_round_rect(w, h, at(27), at(71), W - at(27), H - at(59), at(13));
+    const float gap = 5, first = 82, room = 480 - 68 - first, tile = (room - (count - 1) * gap) / count;
+    const float x0 = at(40), x1 = W - at(40), side = at(16), bar = at(9), bar_gap = at(3), arrow_size = at(11);
+    for (int i = 0; i < count; i++) {
+        const float y0 = at(first + i * (tile + gap)), y1 = at(first + i * (tile + gap) + tile), mid = (y0 + y1) / 2;
+        const bool chosen = i == menu_item, adjustable = i != 0 && i < (cap_game ? 9 : 8);
+        if (chosen) {
+            paint(0.18f, 0.76f, 1.0f);
+            draw_round_rect(w, h, x0 - at(4), y0 - at(4), x1 + at(4), y1 + at(4), at(11));
+            paint(1, 1, 1);
+            draw_round_rect(w, h, x0, y0, x1, y1, at(7));
+        } else {
+            paint(0.63f, 0.67f, 0.77f);
+            draw_round_rect(w, h, x0, y0, x1, y1, at(7));
+            paint(0.93f, 0.94f, 0.96f);
+            draw_round_rect(w, h, x0 + at(1.5f), y0 + at(1.5f), x1 - at(1.5f), y1 - at(1.5f), at(6));
+        }
+        const float ty = mid - 19 * k / 2;
+        if (i == quit) text(labels[i], x0 + side, ty, 19, 0.78f, 0.16f, 0.12f);
+        else text(labels[i], x0 + side, ty, 19, 0.17f, 0.19f, 0.24f);
+        if (!adjustable) continue;
+        float end = x1 - side;
+        if (chosen) {
+            arrow(end - arrow_size, mid - arrow_size / 2, arrow_size, false, 0.10f, 0.60f, 0.92f);
+            end -= arrow_size + at(10);
+        }
+        const float vw = text_w(values[i], 19);
+        text(values[i], end - vw, ty, 19, chosen ? 0.04f : 0.33f, chosen ? 0.38f : 0.37f, chosen ? 0.68f : 0.47f);
+        float start = end - vw;
+        if (i == 2) {  // the volume, as ten blocks before its number
+            for (int s = 9; s >= 0; s--) {
+                const float bx1 = start - at(12) - (9 - s) * (bar + bar_gap);
+                if (s < menu_volume / 10) paint(0.12f, 0.65f, 0.95f);
+                else paint(0.78f, 0.80f, 0.86f);
+                draw_round_rect(w, h, bx1 - bar, mid - at(7), bx1, mid + at(7), at(2));
+            }
+            start -= at(12) + 10 * (bar + bar_gap) - bar_gap;
+        }
+        if (chosen) arrow(start - at(10) - arrow_size, mid - arrow_size / 2, arrow_size, true, 0.10f, 0.60f, 0.92f);
+    }
+    // the dark bar at the foot: B to close, A to choose, left and right to change
+    const float by0 = H - at(46), by1 = H - at(10), bmid = (by0 + by1) / 2, ball = at(24), note = 16;
+    const char *const k_words[3] = {"Close", "Choose", "Change"};
+    float wide_bar = at(18);
+    for (int i = 0; i < 3; i++) wide_bar += ball + at(8) + text_w(k_words[i], note) + at(22);
+    paint(0.06f, 0.06f, 0.08f);
+    draw_round_rect(w, h, -at(30), by0, wide_bar, by1, (by1 - by0) / 2);
+    float x = at(18);
+    for (int i = 0; i < 3; i++) {
+        if (i < 2) {
+            paint(1, 1, 1);
+            draw_round_rect(w, h, x, bmid - ball / 2, x + ball, bmid + ball / 2, ball / 2);
+            const char *letter = i == 0 ? "B" : "A";
+            text(letter, x + (ball - text_w(letter, note)) / 2, bmid - note * k / 2, note, 0.12f, 0.12f, 0.15f);
+        } else {
+            arrow(x, bmid - ball / 4, ball / 2, true, 1, 1, 1);
+            arrow(x + ball / 2, bmid - ball / 4, ball / 2, false, 1, 1, 1);
+        }
+        x += ball + at(8);
+        text(k_words[i], x, bmid - note * k / 2, note, 1, 1, 1);
+        x += text_w(k_words[i], note) + at(22);
+    }
+    // what a change waits for, beside the bar
+    const char *hint = nullptr;
+    if (menu_item == 3 && menu_language() != kernel::cfg_language()) hint = "The game changes language when it next starts.";  // a game takes its language as it starts
+    if (menu_item == 5 && (pad_layout == 1 || pad_layout == 4)) hint = "Touch is off in top-only layouts.";
+    if (menu_item == 6 && g_settings.resolution != start_resolution) hint = "The resolution changes when the game next starts.";  // targets keep their size
+    if (hint) {
+        const float hx = wide_bar + at(16), hy = bmid - note * k / 2;
+        text(hint, hx + at(1), hy + at(1), note, 0.04f, 0.07f, 0.16f);
+        text(hint, hx, hy, note, 1, 1, 1);
+    }
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+}
+#endif
 #ifdef RECOMP_RESUMABLE
 static bool loading_state_overlay;
 bool state_loading_visible() { return loading_state_overlay; }

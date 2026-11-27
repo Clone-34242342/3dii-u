@@ -325,6 +325,7 @@ def main():
     ap.add_argument('--boot-sound', help="the game's own start-up sound, a .btsnd (tools/make_boot_sound.py); the one for every game otherwise")
     ap.add_argument('--save', help="a 3DS save to pack in, which the game takes on the console (saves.py): Checkpoint's, JKSM's or an emulator's folder")
     menu = ap.add_mutually_exclusive_group()
+    ap.add_argument('--menu-style', choices=('new', 'classic'), default='new', help='choose the in-game options layout when building code')
     menu.add_argument('--no-menu', action='store_true', help='disable the in-game options menu')
     menu.add_argument('--menu-shortcut', metavar='BUTTON+BUTTON', help='two different buttons to open the in-game menu, for example L+R')
     ap.add_argument('--language', choices=LANGUAGES, help='default game language, when supported (otherwise follows the console)')
@@ -600,7 +601,7 @@ def build(a):
                 if r.returncode:
                     fail(f'{tool} failed')
 
-    args = types.SimpleNamespace(jobs=a.jobs, force=False, extra_flags=None, only=None, opt=None)
+    args = types.SimpleNamespace(jobs=a.jobs, force=False, extra_flags='-DRECOMP_CLASSIC_MENU' if a.menu_style == 'classic' else None, only=None, opt=None)
     original_stdout = sys.stdout
     sys.stdout = held = Held(Watch(original_stdout, PROGRESS), b3.context)
     shader_stop = []

@@ -1244,6 +1244,14 @@ ApplicationWindow {
                     CardRow {
                         visible: app.gameMenu
                         enabled: !win.busy
+                        label: "In-game menu style"
+                        sub: "Applies when building the game executable."
+                        Pill { text: "New"; tone: app.menuStyle === "new" ? "cyan" : "grey"; onClicked: app.setMenuStyle("new") }
+                        Pill { text: "Classic"; tone: app.menuStyle === "classic" ? "cyan" : "grey"; onClicked: app.setMenuStyle("classic") }
+                    }
+                    CardRow {
+                        visible: app.gameMenu
+                        enabled: !win.busy
                         label: "Overlay shortcut"
                         sub: app.menuShortcut ? "Press both buttons together. Applies to new builds."
                                               : "Default: click the left stick or press ZL + ZR. Applies to new builds."

@@ -241,6 +241,13 @@ ApplicationWindow {
                 }
                 RowLayout {
                     visible: app.gameMenu
+                    enabled: !win.busy
+                    Label { text: "In-game menu style:" }
+                    RadioButton { text: "New"; checked: app.menuStyle === "new"; onClicked: app.setMenuStyle("new") }
+                    RadioButton { text: "Classic"; checked: app.menuStyle === "classic"; onClicked: app.setMenuStyle("classic") }
+                }
+                RowLayout {
+                    visible: app.gameMenu
                     Label { text: "Overlay shortcut:" }
                     OverlayShortcut { builder: app }
                     Label { visible: !app.menuShortcut; text: "L Stick or ZL + ZR" }

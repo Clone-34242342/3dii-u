@@ -630,7 +630,7 @@ try:
     # Queue selection is a snapshot. Only a completed worker, including a failed launch, can advance it.
     kept_st = dict(state.st)
     kept_game, kept_update, kept_save = state.game, state.update, state.save_in
-    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'gameMenu', 'menuShortcut', 'building', 'view', 'updateState')}
+    kept_flags = {key: state._s[key] for key in ('rootOk', 'target', 'gameName', 'gameLanguage', 'gameMenu', 'menuStyle', 'menuShortcut', 'building', 'view', 'updateState')}
     card = os.path.join(base, 'test card')
     os.makedirs(card)
 
@@ -667,7 +667,9 @@ try:
             state.save_in = 'queued save folder'
             state.setMenuShortcut('L+R')
             assert json.load(open(settings))['menu_shortcut'] == 'L+R'
+            state.setMenuStyle('classic')
             enqueue('First', language='French')
+            state.setMenuStyle('new')
             assert json.load(open(settings))['game_languages'][f'{state.game.title_id:016x}'] == 'French'
             enqueue('First', language='German')
             assert state.queuePending == 1 and state.dialog['title'] == 'That output is already queued'
@@ -698,6 +700,7 @@ try:
             assert first_args[first_args.index('--save') + 1] == 'queued save folder'
             assert first_args[first_args.index('--language') + 1] == 'French'
             assert first_args[first_args.index('--menu-shortcut') + 1] == 'L+R'
+            assert first_args[first_args.index('--menu-style') + 1] == 'classic'
             assert first_env['THREEDII_BUILD'] == 'first work folder' and first_env['BOOT9_PATH'] == 'first keys'
             state.build()
             state.clearQueue()
@@ -720,7 +723,7 @@ try:
             assert queue_status() == ['Done', 'Failed', 'Cancelled', 'Queued']
             state.startQueue()
             assert launch.call_count == 4 and state.buildName == 'Fourth'
-            assert all(flag not in launch.call_args.args[0] for flag in ('--no-menu', '--menu-shortcut'))
+            assert all(flag not in launch.call_args.args[0] for flag in ('--no-menu', '--menu-shortcut', '--menu-style'))
             complete('@error build failed')
             settle('queue finished')
             assert not state.busy() and state.queuePending == 0 and state.queueItems[-1]['detail'] == 'build failed'
