@@ -23,11 +23,12 @@ namespace wiiu { const std::string &data_dir(); }
 namespace kernel {
 namespace {
 std::shared_ptr<UdsContext> live_room;
+std::atomic<bool> room_shutting_down{false};
 
 // Kernel timer callbacks run with kmutex held. Networking only touches the
 // engine and the bridge's own mutex, so kernel callbacks never wait on sockets.
 void publish_room_events() {
-    if (!live_room) return;
+    if (!live_room || room_shutting_down.load(std::memory_order_acquire)) return;
     live_room->events.Publish();
     // The radio switch and the room transport are separate states. Games such
     // as Tri Force Heroes read this byte directly, without asking AC at all.
@@ -62,7 +63,7 @@ public:
             if (outcome == azl::DlpOutcome::JoinPending) {
                 const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
                 while (!context->dlp->PollPending(words)) {
-                    if (std::chrono::steady_clock::now() >= deadline) {
+                    if (!context->room.joined() || std::chrono::steady_clock::now() >= deadline) {
                         context->dlp->OnSessionClosed(kind);
                         words[0] = (u32(ipc.cmd()) << 16) | 0x40;
                         words[1] = azl::DlpHub::kResultWirelessOff;
@@ -199,6 +200,7 @@ bool register_room_uds() {
     live_room = std::make_shared<UdsContext>();
     live_room->configuration = config;
     live_room->room.SetTickCallback([](u64 now) {
+        if (room_shutting_down.load(std::memory_order_acquire)) return;
         live_room->engine.Tick(now);
         // Resumable guest timeouts run on the sole dispatcher. A service
         // waiting for DLP cannot also pump that queue: use the room worker.
@@ -211,13 +213,21 @@ bool register_room_uds() {
     });
     live_room->room.SetStateCallback([](azl::RoomClient::State state, azl::RoomClient::Error error) {
         OSReport("[uds-room] %s: %s\n", azl::RoomClient::StateName(state), azl::RoomClient::ErrorName(error));
-        if (state == azl::RoomClient::State::Idle)
+        if (state == azl::RoomClient::State::Idle && !room_shutting_down.load(std::memory_order_acquire))
             live_room->engine.OnTransportDown(azl::NetworkStatusChangeReason::ConnectionLost);
     });
     register_service(std::make_shared<UdsService>(live_room));
 
     publish_room_events();
     return true;
+}
+// Stop while the application's socket services and callbacks still exist.
+// Never hold kmutex here: the worker can be completing a DLP tick with it.
+void shutdown_room_uds() {
+    if (!live_room || room_shutting_down.exchange(true, std::memory_order_acq_rel)) return;
+    OSReport("[uds-room] shutdown: stopping room worker before process cleanup\n");
+    const bool stopped = live_room->room.StopWithin(1000);
+    OSReport("[uds-room] shutdown: worker %s\n", stopped ? "stopped" : "exceeded 1000 ms; process teardown will reclaim it");
 }
 }
 #endif

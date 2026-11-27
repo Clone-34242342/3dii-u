@@ -29,6 +29,43 @@ No game data and no keys come with the builder. Everything it builds from is you
 
 WUP saves use the installed title's NAND/USB save storage and appear in Data Management. Aroma Homebrew saves use the loader's SD-backed save mapping. Save states follow the same backend; small executable/shader imports preserve the original WUHB's save identity.
 
+### Native WUP updates
+
+Choose **WUP update** under Package, then **Binary only** or **Binary + shaders** (the default).
+Install the resulting update on the same NAND/USB device as the matching base game. Keep the base game and its saves installed.
+The package uses an update title ID (`0005000E`); the Menu keeps the original game icon.
+New WUP base titles encode the 3DS game's unique number as `000500001Dxxxx00`.
+The `1D` prefix supports Nintendo's native update lookup, and the final `00` lets
+Data Management group software and saves under the same entry. The full unique
+number is retained; adjacent games receive different IDs. Inputs outside this
+reserved range are rejected rather than truncated.
+Older `3D` titles and earlier `1D` titles with a nonzero final byte need a one-time
+separate base rebuild. Updates cannot change an installed base title's identity.
+The builder uses a distinct `_NativeWUP` output folder and leaves existing installs
+and saves intact. Move saves using a save manager when changing title IDs; the
+builder does not silently migrate console data. Homebrew identity is unchanged.
+
+Binary-only updates omit shader payloads and ROM assets. Build the matching full WUP install once on this PC first,
+using the same Builder work folder: the Builder retains a small shader-size inventory after packing the base.
+It uses that inventory for native links to the installed shaders, without compiling or copying them again.
+A missing inventory stops the binary-only build with instructions instead of producing an update with missing files.
+Binary + shaders includes both shader files and an optional fallback pack.
+Use the same ROM, 3DS update, DLC and mod inputs as the installed base. Changes to game assets require a new full base package, not an executable/shader update.
+The binary-only path has passed a repeated real Wii U install test; binary + shaders still needs a hardware comparison.
+
+Native update version stays fixed at **5**. Date/time labels identify the build folder and are recorded in the package metadata;
+there is no build counter, clock-derived version or rollover. Changed contents receive new content IDs, so a manually installed
+package can replace an earlier version-5 package without depending on a higher version number.
+On November 27, 2026, Urban Champion was tested on a real Wii U: a binary-only version-5 update launched, then a second version-5
+update replaced its executable and displayed a temporary menu label. The runtime log and installed metadata confirmed the new
+binary with version 5 unchanged. This validates that manual reinstall path on the tested Wii U; it does not establish automatic
+update discovery or behavior across every installer. The temporary menu text was excluded from production source.
+
+The corrected `1Dxxxx00` Urban Champion base was also installed and launched on real hardware.
+Existing user saves were restored while keeping Nintendo's new save metadata intact. The user confirmed
+that software, user saves and shared saves now appear together in Data Management. Existing titles are
+not renamed or migrated by the PC Builder; retain the old save until a manual migration is verified.
+
 ### Rebuild just the executable for hardware testing
 
 Keep the prepared files from a normal build with the pipeline's `--keep` flag. Use the same Builder work directory and devkitPro environment for subsequent builds:

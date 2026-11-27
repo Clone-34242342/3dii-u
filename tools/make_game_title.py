@@ -291,7 +291,7 @@ def bezel_pixels(path):
 
 
 def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCHIVES, art=None, icon_art=None, style='picture', released='', case_scan=False,
-               pad_bezel=None, pad_art=None, boot_sound=None, screen_art=None):
+               pad_bezel=None, pad_art=None, boot_sound=None, screen_art=None, *, include_shaders=True):
     """title: the folder to make. game: the unpacked game (exheader.bin, code.bin, romfs.bin, exefs/icon.bin). rpx and shaders: what the build made.
     art: a picture for the start-up screens. The Wii U Menu icon uses the game's SMDH with Virtual Console bands unless icon_art supplies
     a complete custom icon (shown as supplied, without bands). style: 'picture' shows art as it is on the start-up screens,
@@ -368,15 +368,15 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     meta = re.sub(r'WUP-N-[A-Z0-9]+', lambda m: product, meta)
     # the room for saves: the game's in the player's own storage, /vol/save/<persistent id>, which the system lists as save data and keeps when the software is deleted, and
     # the logs' and test runs' in /vol/save/common. With none, the console has nowhere to put them, which Cemu doesn't care about.
-    # Three checkpoint generations (final, backup, temporary), up to 256 MiB
-    # each, plus logs/cache. Installed titles enforce this; SD homebrew may not.
-    meta = meta.replace('<common_save_size type="hexBinary" length="8">0000000000000000<', '<common_save_size type="hexBinary" length="8">0000000040000000<')
+    # Native save quotas reserve real storage. Start small; the runtime grows
+    # them through SAVEUpdateSaveDir when a pending write needs more space.
+    meta = meta.replace('<common_save_size type="hexBinary" length="8">0000000000000000<', '<common_save_size type="hexBinary" length="8">0000000001000000<')
     # Mario Maker creates 221 course files of up to 256 KiB each. Leave room
     # for filesystem overhead and rewrites during save quota flushes.
-    account_save_size = 0x10000000 if title_id.upper() == '000500003D001A04' else 0x04000000
+    account_save_size = 0x04000000 if title_id.upper() in ('000500003D001A04', '000500001D1A0400') else 0x00800000
     account_save = f'<account_save_size type="hexBinary" length="8">{account_save_size:016X}<'
     meta = meta.replace('<account_save_size type="hexBinary" length="8">0000000000000000<', account_save)
-    assert '<common_save_size type="hexBinary" length="8">0000000040000000<' in meta and account_save in meta
+    assert '<common_save_size type="hexBinary" length="8">0000000001000000<' in meta and account_save in meta
     open(os.path.join(meta_dir, 'meta.xml'), 'w', encoding='utf-8', newline='').write(meta)
 
     content = os.path.join(title, 'content')
@@ -389,7 +389,7 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     if font:  # the console reads it as it is, with nothing to search or decompress while the game starts (services/misc.cpp)
         with open(os.path.join(content, 'shared_font.bcfnt'), 'wb') as f:
             f.write(font)
-    for f in ('shaders.gsh', 'shaders.idx'):
+    for f in (('shaders.gsh', 'shaders.idx') if include_shaders else ()):
         shutil.copyfile(os.path.join(shaders, f), os.path.join(content, f))
     bezel = bezel_pixels(pad_bezel) if pad_bezel else None
     if bezel:  # the GamePad's picture where no screen is: the console reads its bytes as they are

@@ -14,7 +14,7 @@
 #include "loader.h"
 #include "gpu/pica.h"
 
-namespace wiiu { const std::string &data_dir(); void save_flush(bool); int flush_checkpoint_storage(); void show_state_loading(bool); }
+namespace wiiu { const std::string &data_dir(); void save_flush(bool); int flush_checkpoint_storage(); void show_state_loading(bool); bool ensure_save_capacity(const std::string &,u64); }
 
 namespace kernel {
 void checkpoint_services(checkpoint::Image &);
@@ -172,6 +172,12 @@ static std::unique_ptr<Image> save_persistent() {
         const auto started=std::chrono::steady_clock::now();
         const auto temporary=path+".new",backup=path+".bak";
         const char *phase="open";u64 written=0,flushed=0;int io_error=0;
+#ifdef __WIIU__
+        if(!wiiu::ensure_save_capacity(temporary,sizeof h+h.size)) {
+            LOG("[state-file] save storage could not grow for %llu bytes; current state retained\n",(unsigned long long)(sizeof h+h.size));
+            disk_result.store(-1,std::memory_order_release);disk_writing.store(false,std::memory_order_release);return;
+        }
+#endif
         FILE *f=fopen(temporary.c_str(),"wb");bool ok=f!=nullptr;
         if(!ok)io_error=errno;
         if (f) {

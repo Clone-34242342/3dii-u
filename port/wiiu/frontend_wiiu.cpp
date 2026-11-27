@@ -1180,6 +1180,7 @@ void frontend_run() {
             if (quiet == 4) want_dump = true;
         }
     }
+    kernel::shutdown_room_uds();
     want_hang_dump = 1;  // a player who shuts down a frozen game shows what it was stuck on
     for (int i = 0; i < 100 && want_hang_dump; i++) OSSleepTicks(OSMillisecondsToTicks(10));
     let_card_catch_up();
@@ -1428,7 +1429,9 @@ int main(int argc, char **argv) {
     kernel::start(bi);
     stage("game started");
     frontend_run();
+    OSReport("[3dii-u quit] entering WHBProcShutdown\n");
     WHBProcShutdown();
+    OSReport("[3dii-u quit] WHBProcShutdown complete; exiting process\n");
     if (route_quit) OSExitThread(0);  // Cemu 2.6 spins in process exit, which prevents the runner from closing it.
     _exit(0);
     return 0;

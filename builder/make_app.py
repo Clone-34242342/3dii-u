@@ -263,7 +263,7 @@ def main():
             '--add-data', f'{os.path.join(HERE, "HOMEBREW_GUIDE.txt")}{os.pathsep}.',
             '--add-data', f'{os.path.join(HERE, "icon.png")}{os.pathsep}.',
             '--add-data', f'{os.path.join(HERE, "bin", "makerom.exe")}{os.pathsep}bin',
-            '--collect-submodules', 'pyctr', '--hidden-import', 'gui', '--hidden-import', 'covers', '--hidden-import', 'cia_to_decrypted_3ds']
+            '--collect-submodules', 'pyctr', '--hidden-import', 'gui', '--hidden-import', 'covers', '--hidden-import', 'cia_to_decrypted_3ds', '--hidden-import', 'wup_update']
     for m in SCRIPT_MODULES:
         args += ['--hidden-import', m]
     for m in EXCLUDE:

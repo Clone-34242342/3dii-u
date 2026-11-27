@@ -980,6 +980,19 @@ struct Ssl : Service {
     }
 };
 
+// Disabled networking must fail initialization rather than claim a lobby is
+// starting. In particular, MK7 polls GetServerState after a successful init.
+static constexpr u32 DLP_WIRELESS_OFF = 0xC940AC04;
+struct DlpFkcl : Service {
+    SERVICE_CHECKPOINT(DlpFkcl)
+    using Service::Service;
+    void handle(IPC &ipc) override {
+        // Cleanup must still succeed after an initialization failure.
+        const u32 cmd = ipc.cmd();
+        ipc.result(cmd == 2 || cmd == 6 || cmd == 0x10 ? 0 : DLP_WIRELESS_OFF);
+    }
+};
+
 // Download Play children are a separate 3DS title category. Use the current guest
 // program ID so retail games take their normal startup path.
 struct DlpSrvr : Service {
@@ -991,8 +1004,11 @@ struct DlpSrvr : Service {
             ipc.ok(2);
             ipc.set(2, (g_game.program_id >> 32) == 0x00040001);
             break;
+        case 0x0002:  // Finalize must succeed even when wireless is unavailable.
+            ipc.ok();
+            break;
         default:
-            unimplemented(ipc);
+            ipc.result(DLP_WIRELESS_OFF);
         }
     }
 };
@@ -1136,10 +1152,11 @@ void register_misc() {
     register_service(std::make_shared<Uds>("nwm::UDS"));
     register_service(std::make_shared<Am>("am:app"));  // was Generic: NSMB2's Coin Rush read its own request back as thousands of DLC tickets (2026-11-07)
     register_service(std::make_shared<DlpSrvr>("dlp:SRVR"));
+    register_service(std::make_shared<DlpFkcl>("dlp:FKCL"));
     register_y2r();
     register_cam();
     register_service(std::make_shared<Ssl>("ssl:C"));
-    for (const char *n : {"news:u", "soc:U", "http:C", "dlp:FKCL",
+    for (const char *n : {"news:u", "soc:U", "http:C",
                           "pxi:dev", "act:u", "nim:aoc", "qtm:u", "csnd:SND", "nfc:u"})
         register_service(std::make_shared<Generic>(n));
 #ifdef __WIIU__

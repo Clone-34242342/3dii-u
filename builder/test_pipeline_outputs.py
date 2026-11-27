@@ -199,6 +199,7 @@ def build_shaders(*args): pass
                                       (pipeline.dumps, 'archives_named', []), (pipeline.shaderlogs, 'restore', (0, 0)),
                                       (pipeline.shutil, 'disk_usage', mock.Mock(free=1 << 40))):
                 stack.enter_context(mock.patch.object(owner, name, return_value=value))
+            stack.enter_context(mock.patch.object(pipeline.wup_update, 'remember_base'))
             stack.enter_context(mock.patch.object(pipeline, 'make_title'))
             stack.enter_context(mock.patch.object(pipeline.mods, 'apply'))
             extraction = stack.enter_context(mock.patch.object(pipeline.dumps, 'extract_program', side_effect=extract))
@@ -299,6 +300,7 @@ def build_shaders(*args): pass
                     stack.enter_context(mock.patch.object(pipeline.dumps, 'extract_program', side_effect=lambda d, p, _: (Path(p) / 'code.bin').write_bytes(b'code')))
                     stack.enter_context(mock.patch.object(pipeline.mods, 'Mod', return_value=types.SimpleNamespace(changes_code=lambda: changed, close=lambda: None)))
                     stack.enter_context(mock.patch.object(pipeline.mods, 'apply'))
+                    stack.enter_context(mock.patch.object(pipeline.wup_update, 'remember_base'))
                     stack.enter_context(mock.patch.object(pipeline, 'make_title'))
                     stack.enter_context(mock.patch.object(pipeline, 'pack_wup'))
                     commands = stack.enter_context(mock.patch.object(pipeline.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '')))

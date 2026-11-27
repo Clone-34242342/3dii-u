@@ -75,6 +75,13 @@ try:
         assert state.outputFormat == 'homebrew' and state.homebrewParts == parts
         saved = json.load(open(settings))
         assert saved['output_format'] == 'homebrew' and saved['homebrew_parts'] == parts
+    for parts in ('binary','both'):
+        state.setOutputFormat('wup-update')
+        state.setWupUpdateParts(parts)
+        settle('WUP update '+parts)
+        assert state.outputFormat == 'wup-update' and state.wupUpdateParts == parts
+        saved = json.load(open(settings))
+        assert saved['output_format'] == 'wup-update' and saved['wup_update_parts'] == parts
     state.setOutputFormat('wup')
     settle('returning to WUP')
     # Selected save folders must remain readable, including names with no spaces.
@@ -636,7 +643,7 @@ try:
 
     def enqueue(name, target='folder', language='Console default'):
         state.game = SimpleNamespace(path=os.path.join(base, name + '.3ds'), name=name,
-                                     title_id=int.from_bytes(name.encode()[:8], 'little'), encrypted=lambda: False)
+                                     title_id=0x0004000000054500, encrypted=lambda: False)
         state.set(gameName=name, target=target)
         state.setGameLanguage(language)
         state.enqueueBuild()
@@ -659,7 +666,7 @@ try:
         state.set(rootOk=True, building=False, view='form', updateState='')
         with mock.patch.object(gui, 'otp_ok', return_value=True), mock.patch.object(state, 'find_system'), \
              mock.patch.object(gui.dumps, 'have_system_archives', return_value=True), \
-             mock.patch.object(gui.pipeline, 'profile_for', side_effect=lambda game: {'folder': game.name}), \
+             mock.patch.object(gui.pipeline, 'profile_for', side_effect=lambda game: {'folder': game.name, 'title_id': '000500003D000545'}), \
              mock.patch.dict(os.environ, THREEDII_BUILD='first work folder', BOOT9_PATH='first keys'), \
              mock.patch.object(gui.threading, 'Thread'), \
              mock.patch.object(gui.subprocess, 'Popen', side_effect=[worker, OSError('launch failed'), worker, worker]) as launch:
@@ -744,6 +751,23 @@ try:
                 assert state.stages == [name for name, _ in gui.pipeline.stages_for('homebrew', 'both') if name != 'Copying']
                 complete('@done homebrew update')
             state.clearQueue()
+            # Update choices and CLI flags belong to the queued job, not the form.
+            for parts in ('binary', 'both'):
+                state.setOutputFormat('wup-update')
+                state.setWupUpdateParts(parts)
+                enqueue('Native update')
+                job = state.jobs[0]
+                assert job.output.endswith('Native update_NativeWUP_Update')
+                assert job.argv[job.argv.index('--output-format') + 1] == 'wup-update'
+                assert job.argv[job.argv.index('--wup-update-parts') + 1] == parts
+                assert '--otp' in job.argv and '--homebrew-parts' not in job.argv
+                state.setOutputFormat('wup')
+                with mock.patch.object(gui.subprocess, 'Popen', return_value=worker):
+                    state.startQueue()
+                    assert state.stages == [name for name, _ in gui.pipeline.stages_for('wup-update', parts) if name != 'Copying']
+                    complete('@done native update')
+                assert 'same device' in state.resultText and 'delete that first' not in state.resultText
+                state.clearQueue()
     finally:
         state.timer.stop()
         state.st, state.game, state.update, state.save_in = kept_st, kept_game, kept_update, kept_save
@@ -818,6 +842,13 @@ try:
         settle('simple Homebrew ' + parts)
     state.setOutputFormat('wup')
     settle('simple WUP')
+    for parts in ('binary', 'both'):
+        state.setOutputFormat('wup-update')
+        state.setWupUpdateParts(parts)
+        settle('simple WUP update ' + parts)
+        assert state.wupUpdateParts == parts
+    state.setOutputFormat('wup')
+    settle('simple WUP after updates')
     check_shortcut_picker(simple)
     state.tell('A message', 'In the simple window.')
     settle('a message in the simple window')

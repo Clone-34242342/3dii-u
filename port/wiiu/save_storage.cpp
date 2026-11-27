@@ -125,6 +125,10 @@ bool write_out(const std::shared_ptr<wiiu::SaveFile> &f) {
         f->dirty = false;
     }
     const OSTime t = OSGetSystemTime();
+    if (!wiiu::ensure_save_capacity(f->path,n)) {
+        free(copy);
+        std::lock_guard<std::mutex> lk(cache_m);f->dirty=true;return false;
+    }
     const int fd = open(f->path.c_str(), O_RDWR | O_CREAT, 0644);
     bool ok = fd >= 0;
     if (ok) {

@@ -615,13 +615,16 @@ class ControlHandler(socketserver.StreamRequestHandler):
         self.request.settimeout(2)
         try:
             request = json.loads(self.rfile.readline(4096))
+            expected = getattr(self.server, "token", None)
+            if expected is not None and not secrets.compare_digest(str(request.get("token", "")), expected):
+                raise ValueError("Invalid local control token")
             result = self.server.controller.command(request["action"], request.get("note", ""))
         except (ValueError, TypeError, KeyError, AttributeError, OSError, RuntimeError) as exc:
             result = {"error": str(exc)}
         self.wfile.write(json.dumps(result).encode() + b"\n")
 
 
-class ControlServer(socketserver.UnixStreamServer):
+class UnixControlServer(getattr(socketserver, "UnixStreamServer", socketserver.TCPServer)):
     def __init__(self, path, controller):
         self.path = path
         self.controller = controller
@@ -641,11 +644,44 @@ class ControlServer(socketserver.UnixStreamServer):
         self.path.unlink(missing_ok=True)
 
 
-def control(action, note="", path=CONTROL):
-    with socket.socket(socket.AF_UNIX) as client:
+class WindowsControlServer(socketserver.TCPServer):
+    """Authenticated loopback control; no remote debugger listener on the PC."""
+    def __init__(self, path, controller):
+        self.path, self.controller = Path(path), controller
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                control("status", path=self.path, windows=True)
+            except (OSError, ValueError, KeyError):
+                self.path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError("Wii U Session Recorder is already running.")
+        self.token = secrets.token_hex(32)
+        super().__init__(("127.0.0.1", 0), ControlHandler)
+        self.path.write_text(json.dumps({"port": self.server_address[1], "token": self.token}))
+
+    def server_close(self):
+        super().server_close()
+        self.path.unlink(missing_ok=True)
+
+
+ControlServer = WindowsControlServer if os.name == "nt" else UnixControlServer
+
+
+def control(action, note="", path=CONTROL, windows=None):
+    windows = os.name == "nt" if windows is None else windows
+    request = {"action": action, "note": note}
+    if windows:
+        endpoint = json.loads(Path(path).read_text())
+        address = ("127.0.0.1", int(endpoint["port"]))
+        request["token"] = endpoint["token"]
+        family = socket.AF_INET
+    else:
+        address, family = str(path), socket.AF_UNIX
+    with socket.socket(family) as client:
         client.settimeout(3)
-        client.connect(str(path))
-        client.sendall(json.dumps({"action": action, "note": note}).encode() + b"\n")
+        client.connect(address)
+        client.sendall(json.dumps(request).encode() + b"\n")
         with client.makefile("rb") as stream:
             return json.loads(stream.readline())
 
@@ -710,7 +746,7 @@ def gui(controller, hotkey_enabled):
 
     root = tk.Tk()
     root.title("Wii U Session Recorder")
-    root.geometry("900x525")
+    root.geometry("1000x610")
     root.minsize(850, 495)
     panel = ttk.Frame(root, padding=18)
     panel.pack(fill="both", expand=True)
@@ -731,7 +767,34 @@ def gui(controller, hotkey_enabled):
     buttons = ttk.Frame(panel)
     buttons.pack(anchor="w", pady=13)
     pending = queue.SimpleQueue()
-    keys = Hotkeys(pending.put) if hotkey_enabled else None
+    host_row = ttk.Frame(panel)
+    host_row.pack(anchor="w", before=buttons, pady=(8, 0))
+    ttk.Label(host_row, text="Wii U IP: ").pack(side="left")
+    host_value = tk.StringVar(value=controller.console)
+    host_entry = ttk.Entry(host_row, textvariable=host_value, width=20)
+    host_entry.pack(side="left")
+    def apply_host():
+        try:
+            host = str(__import__('ipaddress').IPv4Address(host_value.get().strip()))
+            controller.command("disconnect")
+            controller.command("stop")
+            controller.console = host
+            controller.hardware_screenshot_console = host if controller.hardware_screenshot_console else None
+            if controller.target == "wiiu": controller.recorder.screenshot_console = controller.hardware_screenshot_console
+            if controller.preferences_path:
+                values = read_preferences(controller.preferences_path)
+                values['console'] = host
+                controller.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                controller.preferences_path.write_text(json.dumps(values))
+            message.set("Wii U address saved. Click Connect, then Start recording.")
+        except (OSError, ValueError, RuntimeError) as exc:
+            message.set(str(exc))
+    ttk.Button(host_row, text="Apply IP", command=apply_host).pack(side="left", padx=8)
+    ttk.Button(host_row, text="Open logs folder", command=lambda: open_logs_folder(controller.recorder.directory)).pack(side="left")
+    keys = Hotkeys(pending.put) if hotkey_enabled and os.name != "nt" else None
+    if os.name == "nt":
+        root.bind('<F8>', lambda event: pending.put('toggle'))
+        root.bind('<F9>', lambda event: pending.put('mark'))
     if keys:
         keys.start()
 
@@ -845,6 +908,7 @@ def gui(controller, hotkey_enabled):
             key_note.set("F8 starts or stops recording. F9 marks a graphics glitch.")
         root.after(100, refresh)
 
+    if os.name == "nt": key_note.set("F8/F9 work while this window has focus. Buttons are always available.")
     refresh()
     try:
         root.mainloop()
@@ -854,9 +918,17 @@ def gui(controller, hotkey_enabled):
             keys.join(1)
 
 
+def open_logs_folder(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt": os.startfile(str(directory))
+    else:
+        import subprocess
+        subprocess.Popen(["xdg-open", str(directory)])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--console", default=os.environ.get("WIIU_HOST", "127.0.0.1"))
+    parser.add_argument("--console", default=os.environ.get("WIIU_HOST"))
     parser.add_argument("--target", choices=("wiiu", "cemu"))
     parser.add_argument("--cemu-host", default="127.0.0.1")
     parser.add_argument("--cemu-port", type=int, default=4405)
@@ -871,6 +943,7 @@ def main():
         print(json.dumps(result))
         return int("error" in result)
     preferences = Path(os.environ.get('XDG_CONFIG_HOME', Path.home()/'.config'))/'wiiu-session-recorder/settings.json'
+    args.console = args.console or read_preferences(preferences).get("console", "127.0.0.1")
     enabled = read_preferences(preferences).get('aroma_enabled', True)
     if not isinstance(enabled, bool): enabled = True
     target = args.target or read_preferences(preferences).get('target', 'wiiu')
@@ -878,8 +951,7 @@ def main():
     controller = Controller(Recorder(args.output, None if args.no_screenshots else args.console), args.console,
                             aroma_enabled=enabled, preferences_path=preferences, target=target,
                             cemu_host=args.cemu_host, cemu_port=args.cemu_port)
-    if read_preferences(preferences).get('periodic_screenshots') is True and controller.recorder.screenshot_console:
-        controller.recorder.command('screenshots', 'on')
+    # Continuous screenshots always require an explicit click in this session.
     with ControlServer(CONTROL, controller) as server:
         control_thread = threading.Thread(target=server.serve_forever, daemon=True)
         control_thread.start()

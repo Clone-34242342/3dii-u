@@ -38,6 +38,7 @@ import dumps  # noqa: E402
 import mods  # noqa: E402
 import shaderlogs  # noqa: E402
 import homebrew  # noqa: E402
+import wup_update  # noqa: E402
 import user_files  # noqa: E402
 from objcache import _checked, workspace_lock  # noqa: E402
 
@@ -56,7 +57,7 @@ def stages_for(output_format='wup', parts='full'):
     names = list(STAGES[:3])
     if parts != 'shaders': names += STAGES[3:5]
     if parts != 'binary': names += [STAGES[5]]
-    if output_format == 'wup': names += STAGES[6:]
+    if output_format in ('wup','wup-update'): names += STAGES[6:]
     elif parts == 'full': names += [('Making the title', 2), ('Packing Homebrew', 10), ('Copying', 7)]
     else: names += [('Exporting Homebrew update', 10), ('Copying', 7)]
     return names
@@ -203,11 +204,11 @@ def valid_menu_shortcut(value):
 
 
 def make_title(game_dir, out, info, art=None, icon_art=None, style='picture', released='', case_scan=False, pad_bezel=None, pad_art=None,
-               boot_sound=None, screen_art=None, *, language=None):
+               boot_sound=None, screen_art=None, *, language=None, include_shaders=True):
     """the title every game gets, then its update, DLC and optional Download Play archive"""
     tool('make_game_title').make_title(os.path.join(out, 'title'), game_dir, os.path.join(out, info['slug'] + '.rpx'), os.path.join(out, 'shaders'),
                                        info['title_id'], info['name'], info['product'], ARCHIVES, art, icon_art, style, released, case_scan, pad_bezel,
-                                       pad_art, boot_sound, screen_art)
+                                       pad_art, boot_sound, screen_art, include_shaders=include_shaders)
     content = os.path.join(out, 'title', 'content')
     if language is not None:
         with open(os.path.join(content, 'language.txt'), 'w', encoding='ascii') as f:
@@ -313,7 +314,8 @@ def main():
     ap.add_argument('--emulator', help='a 3DS emulator\'s user folder (Azahar, Citra) or the 0004009b folder GodMode9 copies off your 3DS '
                                          '(title, in CTRNAND), for the system archives')
     ap.add_argument('--otp')
-    ap.add_argument('--output-format', choices=('wup','homebrew'), default='wup')
+    ap.add_argument('--output-format', choices=('wup','wup-update','homebrew'), default='wup')
+    ap.add_argument('--wup-update-parts', choices=wup_update.PARTS, default='both')
     ap.add_argument('--homebrew-parts', choices=homebrew.PARTS, default='full')
     ap.add_argument('--card', help='an SD card: WUPs go in install, full Homebrew in wiiu/apps, update exports in wiiu/3dii-u/updates')
     ap.add_argument('--out', help='a folder to put the selected output in instead')
@@ -410,8 +412,11 @@ def build(a):
         fail('Small update exports require Output: Homebrew.')
     partial = a.output_format == 'homebrew' and a.homebrew_parts != 'full'
     need_code = not partial or a.homebrew_parts != 'shaders'
-    need_shaders = not partial or a.homebrew_parts != 'binary'
-    PROGRESS.stages = stages_for(a.output_format, a.homebrew_parts)
+    is_update = a.output_format == 'wup-update'
+    if is_update and a.save:
+        fail('WUP updates contain executable/shader changes only. Import saves with a full base build or a save manager.')
+    need_shaders = (not partial or a.homebrew_parts != 'binary') and not (is_update and a.wup_update_parts == 'binary')
+    PROGRESS.stages = stages_for(a.output_format, a.wup_update_parts if is_update else a.homebrew_parts)
     try:
         for path in (WORK_GAMES, ARCHIVES, a.out):
             if path:
@@ -461,6 +466,20 @@ def build(a):
     known = None if a.cold else profile
     code_mods = any(m.changes_code() for m in mod_list)
     info = dict(known or derived(game))
+    if a.output_format in ('wup','wup-update'):
+        original_id=int(info['title_id'],16)
+        native_id=wup_update.native_base_id(original_id, game.title_id)
+        info['title_id']=f'{native_id:016X}'
+        if native_id!=original_id:
+            info['folder'] += '_NativeWUP'
+            print(f'Native WUP title ID: {original_id:016X} -> {native_id:016X}. Existing legacy installs remain separate.',flush=True)
+
+    base_inventory = None
+    inventory_path = os.path.join(WORK_GAMES, '_wup', 'base-inventories', info['title_id'] + '.json')
+    if is_update and a.wup_update_parts == 'binary':
+        try: base_inventory = wup_update.base_shaders(inventory_path, int(info['title_id'], 16))
+        except ValueError as error: fail(str(error))
+
     child_id = None
     if child_index is not None:
         child_id = 0x0004000100000000 | (game.unique & ~0xFF) | child_index
@@ -680,7 +699,7 @@ def build(a):
         case_scan = bool(a.art) and covers.is_case_scan(a.art, a.tdb)  # the folder is the covers' own
         title_shot = covers.title_screen(game.product, [game.name] + covers.other_names(game.product, a.tdb), a.tdb)
     make_title(game_dir, out, info, a.art, a.icon_art, a.art_style, released, case_scan, a.pad_bezel, a.pad_art, a.boot_sound, title_shot,
-               language=a.language)
+               language=a.language, include_shaders=need_shaders)
     if a.save:
         import saves
         try:
@@ -723,7 +742,24 @@ def build(a):
     else:
         folder = workspace_child(workspace_child(WORK_GAMES, '_wup'), info['slug'])
         wup = workspace_child(folder, info['folder'])
-    pack_wup(a.otp, os.path.join(out, 'title'), wup)
+    title = os.path.join(out, 'title')
+    if is_update:
+        import xml.etree.ElementTree as ET
+        app_xml = ET.parse(os.path.join(title,'code','app.xml'))
+        base_id = app_xml.findtext('title_id')
+        base_version = int(app_xml.findtext('title_version'),16)
+        version, now = wup_update.update_build_info()
+        if base_version>version:
+            fail('This base version exceeds the fixed native update version. Use a matching base made with this Builder.')
+        update_title = os.path.join(out,'update')
+        wup_update.make_update(title,update_title,a.wup_update_parts,version,now,base_shader_files=base_inventory)
+        wup += '_Update_' + now.strftime('%Y%m%d_%H%M%S') + f'_v{version}'
+        title = update_title
+        print(f'Native WUP update: {base_id}, version {version}, built {now.isoformat()}',flush=True)
+
+    pack_wup(a.otp, title, wup)
+    if not is_update:
+        wup_update.remember_base(inventory_path, title, int(info['title_id'], 16))
 
     where = wup
     if a.card:
@@ -738,7 +774,7 @@ def build(a):
         except OSError as e:  # the WUP stays in the work folder, as with a folder build
             fail(card_error(e) + f' The game is built: it is in {wup}.')  # one line: the window reads @error lines
         if not a.out:
-            shutil.rmtree(workspace_child(folder, info['folder']), ignore_errors=True)
+            shutil.rmtree(wup, ignore_errors=True)
     if not a.keep:  # the runtime's objects stay: every game shares them
         shutil.rmtree(workspace_child(WORK_GAMES, info['slug']), ignore_errors=True)
         shutil.rmtree(workspace_child(b3.WORK, f'ppc_{info["slug"]}'), ignore_errors=True)

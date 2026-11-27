@@ -330,6 +330,7 @@ class BuildJob:
     system_folder: str
     output_format: str = 'wup'
     homebrew_parts: str = 'full'
+    wup_update_parts: str = 'both'
     output: str = ''
     status: str = 'Queued'
     detail: str = ''
@@ -369,6 +370,7 @@ class App(QObject):
     sysOk, sysText = _p(bool, 'sysOk'), _p(str, 'sysText')
     buildText, buildCustom = _p(str, 'buildText'), _p(bool, 'buildCustom')
     outputFormat, homebrewParts = _p(str, 'outputFormat'), _p(str, 'homebrewParts')
+    wupUpdateParts = _p(str, 'wupUpdateParts')
     target, destText, cards = _p(str, 'target'), _p(str, 'destText'), _p('QVariantList', 'cards')
     building, view = _p(bool, 'building'), _p(str, 'view')
     buildName = _p(str, 'buildName')
@@ -414,7 +416,7 @@ class App(QObject):
                        menuShortcut=shortcut if pipeline.valid_menu_shortcut(shortcut) else '',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
-                       otpText='', sysOk=False, sysText='', outputFormat=self.st.get('output_format', 'wup') if self.st.get('output_format') in ('wup','homebrew') else 'wup', homebrewParts=self.st.get('homebrew_parts', 'full') if self.st.get('homebrew_parts') in ('full','binary','shaders','both') else 'full', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
+                       otpText='', sysOk=False, sysText='', outputFormat=self.st.get('output_format', 'wup') if self.st.get('output_format') in ('wup','wup-update','homebrew') else 'wup', homebrewParts=self.st.get('homebrew_parts', 'full') if self.st.get('homebrew_parts') in ('full','binary','shaders','both') else 'full', wupUpdateParts=self.st.get('wup_update_parts','both') if self.st.get('wup_update_parts') in ('binary','both') else 'both', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        buildName='', queueItems=[], queuePending=0, queueRunning=False,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -1084,9 +1086,16 @@ class App(QObject):
 
     @Slot(str)
     def setOutputFormat(self, value):
-        if self._s['building'] or value not in ('wup','homebrew'): return
+        if self._s['building'] or value not in ('wup','wup-update','homebrew'): return
         self.st['output_format'] = value
         self.set(outputFormat=value)
+        save_settings(self.st)
+
+    @Slot(str)
+    def setWupUpdateParts(self, value):
+        if self._s['building'] or value not in ('binary','both'): return
+        self.st['wup_update_parts'] = value
+        self.set(wupUpdateParts=value)
         save_settings(self.st)
 
     @Slot(str)
@@ -1357,7 +1366,7 @@ class App(QObject):
             self.tell('The build engine is missing', 'The engine folder next to 3Dii U Builder.exe holds the recompiler and its toolchain. Copy the '
                                                      'whole 3Dii U Builder folder again, engine folder included.', 'error')
             return
-        if self._s['outputFormat'] == 'wup' and not otp_ok(self.st.get('otp', '')):
+        if self._s['outputFormat'] != 'homebrew' and not otp_ok(self.st.get('otp', '')):
             self.tell('otp.bin is missing', 'Choose your Wii U\'s otp.bin: it should be exactly 1024 bytes.', 'warn')
             return
         dest = self.st.get('card', '') if self._s['target'] == 'card' else self.st.get('folder', '')
@@ -1375,8 +1384,9 @@ class App(QObject):
         card = self._s['target'] == 'card'
         argv += ['--game', self.game.path, '--output-format', self._s['outputFormat'],
                  '--card' if self._s['target'] == 'card' else '--out', dest, '--keys', self.st['keys']]
-        if self._s['outputFormat'] == 'wup': argv += ['--otp', self.st['otp']]
-        else: argv += ['--homebrew-parts', self._s['homebrewParts']]
+        if self._s['outputFormat'] != 'homebrew': argv += ['--otp', self.st['otp']]
+        if self._s['outputFormat'] == 'wup-update': argv += ['--wup-update-parts', self._s['wupUpdateParts']]
+        elif self._s['outputFormat'] == 'homebrew': argv += ['--homebrew-parts', self._s['homebrewParts']]
         system = self.st.get('system', '')
         if system:
             argv += ['--emulator', system]
@@ -1406,7 +1416,7 @@ class App(QObject):
             argv += ['--menu-shortcut', self._s['menuShortcut']]
         argv += ['--language', self._s['gameLanguage'] or self.system_language]
         env = dict(os.environ, PYTHONIOENCODING='utf-8', THREEDII_BUILD=self.build_folder())
-        return BuildJob(self._s['gameName'], tuple(argv), dest, card, env, system, output_format=self._s['outputFormat'], homebrew_parts=self._s['homebrewParts'])
+        return BuildJob(self._s['gameName'], tuple(argv), dest, card, env, system, output_format=self._s['outputFormat'], homebrew_parts=self._s['homebrewParts'], wup_update_parts=self._s['wupUpdateParts'])
 
     def refresh_queue(self):
         rows = [dict(name=job.name, status=job.status, detail=job.detail) for job in self.jobs]
@@ -1417,11 +1427,19 @@ class App(QObject):
         job = self.build_job()
         if not job:
             return
-        info = pipeline.profile_for(self.game) or pipeline.derived(self.game)
+        info = dict(pipeline.profile_for(self.game) or pipeline.derived(self.game))
+        if job.output_format in ('wup', 'wup-update'):
+            original = int(info['title_id'], 16)
+            try: native_id = pipeline.wup_update.native_base_id(original, self.game.title_id)
+            except ValueError as error:
+                self.tell('This WUP identity is unsupported', str(error), 'error')
+                return
+            if native_id != original:
+                info['folder'] += '_NativeWUP'
         dest = os.path.join(job.destination, 'install') if job.card else job.destination
         if job.output_format == 'homebrew':
             dest = os.path.join(job.destination, 'wiiu', 'apps') if job.card else job.destination
-        job.output = os.path.normcase(os.path.realpath(os.path.join(dest, info['folder'])))
+        job.output = os.path.normcase(os.path.realpath(os.path.join(dest, info['folder'] + ('_Update' if job.output_format == 'wup-update' else ''))))
         if any(queued.status == 'Queued' and queued.output == job.output for queued in self.jobs):
             self.tell('That output is already queued', 'Remove the earlier entry or choose a different destination for this build.', 'warn')
             return
@@ -1462,7 +1480,7 @@ class App(QObject):
     def launch_build(self, job):
         self.active_build = job
         self.log_lines, self.result, self.cancelled = [], None, False
-        stages = [n for n, _ in pipeline.stages_for(job.output_format, job.homebrew_parts if job.output_format == 'homebrew' else 'full') if n != 'Copying' or job.card]
+        stages = [n for n, _ in pipeline.stages_for(job.output_format, job.wup_update_parts if job.output_format == 'wup-update' else job.homebrew_parts if job.output_format == 'homebrew' else 'full') if n != 'Copying' or job.card]
         self.set(building=True, buildName=job.name, view='building', stages=stages, stage=0,
                  failed=False, progress=0.0, detail='Starting...', log='', resultText='', where='')
         if job.system_folder and not os.path.isdir(job.system_folder):
@@ -1525,9 +1543,11 @@ class App(QObject):
             msg = (f'{job.name} is on your SD card, in install\\{os.path.basename(where)}. Put the card in your Wii U and install it with WUP '
                    f'Installer GX2.' if job.card else
                    f'The WUP is in {where}. Copy it to your SD card\'s install folder and install it with WUP Installer GX2.')
-            if self._s['outputFormat'] == 'homebrew':
-                msg = (f'Homebrew is ready at {where}. Launch its icon with Aroma.' if self._s['homebrewParts'] == 'full' else
+            if job.output_format == 'homebrew':
+                msg = (f'Homebrew is ready at {where}. Launch its icon with Aroma.' if job.homebrew_parts == 'full' else
                        f'Homebrew update files are ready in {where}. Follow the included Homebrew import guide to apply them to your existing WUHB.')
+            elif job.output_format == 'wup-update':
+                msg += ' Install the update to the same device as the matching base game. Keep the base game and its saves installed.'
             else: msg += ' If an older build of it is installed, delete that first.'
             self.set(building=False, view='done', stage=len(self._s['stages']), where=where, resultText=msg)
         elif self.cancelled:

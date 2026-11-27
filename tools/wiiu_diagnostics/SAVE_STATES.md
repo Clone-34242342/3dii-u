@@ -83,10 +83,19 @@ The Urban Champion WUP test exposed a storage-size mismatch: its metadata
 allowed 64 MiB of common save storage, while the captured checkpoint payload was
 95,511,936 bytes. RAM restore worked, but the background file write failed.
 Homebrew SD redirection and Cemu do not establish that an installed quota fits.
-New titles request 1 GiB of common storage, covering final/backup/temporary
-archives up to the 256 MiB archive limit plus working space. Ordinary in-game
-account-save quotas are unchanged. Existing installed save-directory resizing
-has not been established; the hardware retest uses a fresh test title ID.
+The first workaround requested 1 GiB of common storage. Nintendo reserves this
+capacity even when the files are small, so that workaround wasted storage.
+New metadata starts at 16 MiB shared and 8 MiB per account (64 MiB per account
+for Mario Maker's course files). `quota_growth.cpp` requests larger quotas only
+when pending writes need them, using Nintendo's `SAVEUpdateSaveDir` API.
+
+A disposable hardware probe grew a quota from 16 to 32 MiB and preserved a marker
+file. This establishes the native API path, not full production coverage.
+Automatic checkpoint growth, interrupted-growth recovery, and growth while a
+native update is active still require hardware tests. The implementation uses
+CFW filesystem access to update only the running generated title's quota fields;
+if that access or growth fails, the write fails and its RAM checkpoint remains.
+Do not describe dynamic quota growth as release-validated yet.
 
 Large checkpoint writes flush stdio and commit storage periodically, and commit
 again after publication. Quota flushes are serialized with the save worker.
@@ -147,3 +156,23 @@ that every game/service combination or overlay transition is covered. The earlie
 candidate-by-candidate pending notes above document the investigation sequence.
 The loading message is submitted before blocking file reconstruction; it is not
 an animated progress guarantee while the GPU thread is blocked.
+
+
+## Native WUP identity and Data Management
+
+WUP base IDs now use `000500001Dxxxx00`, preserving the 3DS unique number in
+bits 8..23. The `1D` prefix supports native update lookup; the final
+zero byte is required for Data Management to group saves with software.
+System Settings masks this byte for save grouping but retains it for software.
+The earlier generated IDs could therefore show software and saves separately
+even on the same USB drive with otherwise matching metadata.
+
+On November 27, 2026, the corrected Urban Champion base launched on real Wii U.
+Its existing account saves were copied to the newly registered title while its
+new native save metadata remained intact. The user confirmed correct grouping.
+The Builder does not migrate existing installs or saves automatically. Use a
+save manager and verify restored progress before removing an old title.
+
+This identity fix does not change checkpoint ownership: persistent states are
+still in common storage. Moving states per user and adding a delete-state menu
+item remain separate work.

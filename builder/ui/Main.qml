@@ -857,9 +857,22 @@ ApplicationWindow {
                                 palette.text: pal.label
                                 palette.buttonText: pal.label
                                 Accessible.name: "Output package type"
-                                model: ["WUP install", "Homebrew (.wuhb)"]
-                                currentIndex: app.outputFormat === "homebrew" ? 1 : 0
-                                onActivated: function(index) { app.setOutputFormat(index === 1 ? "homebrew" : "wup") }
+                                readonly property var formats: ["wup", "wup-update", "homebrew"]
+                                model: ["WUP install", "WUP update", "Homebrew (.wuhb)"]
+                                currentIndex: formats.indexOf(app.outputFormat)
+                                onActivated: function(index) { app.setOutputFormat(formats[index]) }
+                            }
+                        }
+                        CardRow {
+                            visible: app.outputFormat === "wup-update"
+                            label: "Update contents"
+                            sub: "Requires a matching base from this updated Builder. Keep the base game and saves."
+                            ComboBox {
+                                width: 240
+                                Accessible.name: "WUP update contents"
+                                model: ["Binary only", "Binary + shaders"]
+                                currentIndex: app.wupUpdateParts === "binary" ? 0 : 1
+                                onActivated: function(index) { app.setWupUpdateParts(index === 0 ? "binary" : "both") }
                             }
                         }
                         CardRow {
@@ -896,7 +909,7 @@ ApplicationWindow {
                             Pill { text: "Folder"; tone: "cyan"; onClicked: app.chooseKeys() }
                         }
                         CardRow {
-                            visible: app.outputFormat === "wup"
+                            visible: app.outputFormat !== "homebrew"
                             label: "Wii U otp.bin"; sub: app.otpText; light: app.otpOk ? "cyan" : "red"
                             Pill { text: "Info"; onClicked: app.explain("otp") }
                             Pill { text: "File"; tone: "cyan"; onClicked: app.chooseOtp() }

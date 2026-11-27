@@ -22,6 +22,7 @@ void save_dirty();
 void save_flush(bool now);
 long save_write(int fd, const void *data, u32 len, u64 at);
 void save_resize(int fd, u64 size);
+bool ensure_save_capacity(const std::string &file, u64 incoming);  // grow native WUP quota before a write; SD Homebrew unchanged
 const std::string &save_account_dir();  // the player's storage, /vol/save/<persistent id>, or empty without one
 bool save_dir_lacks(const std::string &path, const char *first, const char *second);  // confirmed by a complete listing
 bool save_pending();                     // saved by the game and not flushed yet

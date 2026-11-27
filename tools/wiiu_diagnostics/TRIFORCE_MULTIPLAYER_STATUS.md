@@ -82,8 +82,13 @@ is available to every game; command compatibility is not universal.
 
 ## Remaining test gaps
 
-Full on-console multiplayer gameplay, three-player synchronization, normal-exit
-and interrupted-session cleanup, scan cancellation, reconnection and compatibility
+The application now stops the room worker before process cleanup, with a bounded
+wait and callbacks suppressed during shutdown. Mario Kart 7 was observed joining
+a live room and returning successfully to the real Wii U Menu. This is one normal
+exit test; repeated exits and interrupted-session cleanup still need coverage.
+
+Full on-console multiplayer gameplay, three-player synchronization,
+scan cancellation, reconnection and compatibility
 across other games still need testing. Some service waits synchronously block the
 resumable dispatcher until completion or timeout. Do not use save states during
 multiplayer sessions: live network peers are not part of a checkpoint.

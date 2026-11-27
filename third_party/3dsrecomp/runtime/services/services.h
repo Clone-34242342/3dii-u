@@ -28,6 +28,9 @@ void register_gsp();
 void register_hid();
 void register_dsp();
 void register_misc();
+#ifdef __WIIU__
+void shutdown_room_uds();
+#endif
 void register_ro();
 bool ro_has_modules();  // whether ldr:ro maps a static or dynamic module where the game says
 
