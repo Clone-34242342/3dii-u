@@ -482,7 +482,10 @@ def pack(title, out_dir):
         while candidate in used_ids: candidate=((candidate+1)&0x7fffffff)|0x80000000
         used_ids.add(candidate)
         content.content_id=candidate
-    if title_id>>32 == 0x0005000e:
+    # Native base reinstalls need fresh content identities too: a new base
+    # manifest must not be hidden by the installer's same-version content cache.
+    changing_ids = title_id>>32 == 0x0005000e or ((title_id & 0xff000000)==0x1d000000)
+    if changing_ids:
         for content in contents[1:]:
             update_content_id(content)
             for suffix in ('.app','.h3'):
@@ -491,7 +494,7 @@ def pack(title, out_dir):
 
     fst = build_fst(contents, tree, offsets, base_links)
     contents[0].size, contents[0].digest = len(fst), sha1(fst)
-    if title_id>>32 == 0x0005000e: update_content_id(contents[0])
+    if changing_ids: update_content_id(contents[0])
     with open(os.path.join(out_dir, f'{contents[0].content_id:08X}.app'), 'wb') as f:
         f.write(cbc(title_key, content_iv(0), fst))
 

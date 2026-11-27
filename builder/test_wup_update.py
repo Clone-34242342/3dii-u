@@ -75,6 +75,19 @@ class UpdateTests(unittest.TestCase):
     self.assertIn('round trip verified',result.stdout)
     u.make_update(base,out,parts,base_manifest=manifest,contract='a'*64)
 
+ def test_native_base_reinstall_changes_content_ids(self):
+  import subprocess
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);base,manifest=self.fixture(root)
+   def pack():
+    result=subprocess.run([sys.executable,str(Path(__file__).resolve().parents[1]/'phase0/tools/pack_wup.py'),str(base),str(root/'wup')],input='00'*16+'\n',capture_output=True,text=True)
+    self.assertEqual(result.returncode,0,result.stderr)
+    return {p.name for p in (root/'wup').glob('*.app')}
+   old=pack()
+   (base/'content/new-data.bin').write_bytes(b'a changed full base')
+   u.remember_base(manifest,base,0x000500001d054500,contract='a'*64)
+   self.assertNotEqual(old,pack())
+
  def test_settings_clear_old_presence_flags_and_shortcuts(self):
   with tempfile.TemporaryDirectory() as d:
    root=Path(d);base,manifest=self.fixture(root)
