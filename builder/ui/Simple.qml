@@ -127,6 +127,13 @@ ApplicationWindow {
                 onActivated: function(index) { app.setWupUpdateParts(index === 0 ? "binary" : "both") }
             }
         }
+        PathRow {
+            visible: app.outputFormat === "wup-update"
+            label: "Matching base manifest..."
+            text: app.wupBaseText
+            onChoose: app.chooseWupBase()
+        }
+        Button { visible: app.outputFormat === "wup-update" && app.hasWupBase; text: "Use last full base build"; onClicked: app.clearWupBase() }
         Label {
             visible: app.outputFormat === "wup-update"
             Layout.fillWidth: true

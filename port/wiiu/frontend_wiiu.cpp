@@ -47,6 +47,7 @@
 #include "kernel.h"
 #include "loader.h"
 #include "menu_shortcut.h"
+#include "wup_update_guard.h"
 #include "motion_input.h"
 #include "service.h"
 #include "services/services.h"
@@ -1282,6 +1283,9 @@ int main(int argc, char **argv) {
     OSEnableHomeButtonMenu(TRUE);
     stage("mounting save storage");
     wiiu::save_mount();
+    const auto update_match = wiiu::wup_update::check(CONTENT_DIR);
+    if (update_match == wiiu::wup_update::Match::Invalid || update_match == wiiu::wup_update::Match::WrongBase)
+        report_stuck("This WUP update does not match the installed base. Install the matching full base and update on the same device. Your saves have not been replaced.");
     start_mark(last_note);  // what the save storage said
     stage("system up");
     // A physical SD marker enables the lightweight console independently of the
@@ -1333,7 +1337,7 @@ int main(int argc, char **argv) {
             wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
     }
     struct stat no_menu;
-    if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
+    if (!wiiu::wup_update::menu_enabled(CONTENT_DIR, stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) != 0)) wiiu::menu_disable();
     else load_overlay_combo();
     rt_log_open(log_path());
     perf_trace = wiiu::debug_flag("perftrace");

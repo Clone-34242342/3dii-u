@@ -82,6 +82,12 @@ try:
         assert state.outputFormat == 'wup-update' and state.wupUpdateParts == parts
         saved = json.load(open(settings))
         assert saved['output_format'] == 'wup-update' and saved['wup_update_parts'] == parts
+    with mock.patch.object(gui.QFileDialog, 'getOpenFileName', return_value=(os.path.join(base,'original.base.json'),'')):
+        state.chooseWupBase()
+    assert state.hasWupBase and state.wupBaseText.endswith('original.base.json')
+    assert json.load(open(settings))['wup_base_manifest'].endswith('original.base.json')
+    state.clearWupBase()
+    assert not state.hasWupBase and 'wup_base_manifest' not in json.load(open(settings))
     state.setOutputFormat('wup')
     settle('returning to WUP')
     # Selected save folders must remain readable, including names with no spaces.
@@ -755,11 +761,13 @@ try:
             for parts in ('binary', 'both'):
                 state.setOutputFormat('wup-update')
                 state.setWupUpdateParts(parts)
+                state.st['wup_base_manifest'] = 'matching.base.json'
                 enqueue('Native update')
                 job = state.jobs[0]
                 assert job.output.endswith(os.path.normcase('Native update_NativeWUP_Update'))
                 assert job.argv[job.argv.index('--output-format') + 1] == 'wup-update'
                 assert job.argv[job.argv.index('--wup-update-parts') + 1] == parts
+                assert job.argv[job.argv.index('--wup-base-manifest') + 1] == 'matching.base.json'
                 assert '--otp' in job.argv and '--homebrew-parts' not in job.argv
                 state.setOutputFormat('wup')
                 with mock.patch.object(gui.subprocess, 'Popen', return_value=worker):

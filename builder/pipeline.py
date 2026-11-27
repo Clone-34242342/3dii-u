@@ -316,6 +316,7 @@ def main():
     ap.add_argument('--otp')
     ap.add_argument('--output-format', choices=('wup','wup-update','homebrew'), default='wup')
     ap.add_argument('--wup-update-parts', choices=wup_update.PARTS, default='both')
+    ap.add_argument('--wup-base-manifest', help='matching .base.json saved beside the original full WUP build')
     ap.add_argument('--homebrew-parts', choices=homebrew.PARTS, default='full')
     ap.add_argument('--card', help='an SD card: WUPs go in install, full Homebrew in wiiu/apps, update exports in wiiu/3dii-u/updates')
     ap.add_argument('--out', help='a folder to put the selected output in instead')
@@ -474,10 +475,18 @@ def build(a):
             info['folder'] += '_NativeWUP'
             print(f'Native WUP title ID: {original_id:016X} -> {native_id:016X}. Existing legacy installs remain separate.',flush=True)
 
-    base_inventory = None
+    input_summary = dict(program_id=f'{game.title_id:016X}', game_version=getattr(game,'version',0),
+                         update=dict(title_id=f'{update.title_id:016X}',version=update.version) if update else None,
+                         dlc=dict(title_id=f'{dlc.title_id:016X}',version=dlc.version) if dlc else None)
     inventory_path = os.path.join(WORK_GAMES, '_wup', 'base-inventories', info['title_id'] + '.json')
-    if is_update and a.wup_update_parts == 'binary':
-        try: base_inventory = wup_update.base_shaders(inventory_path, int(info['title_id'], 16))
+    selected_manifest = getattr(a, 'wup_base_manifest', None) or inventory_path
+    if is_update:
+        try:
+            base_record = wup_update.read_manifest(selected_manifest, int(info['title_id'],16))
+            if input_summary != base_record['inputs']:
+                fail('The game/update/DLC selection differs from the selected base build. Choose its matching inputs or build a new full WUP base.')
+            if a.wup_update_parts == 'binary' and wup_update.shader_contract(ROOT) != base_record['shader_contract']:
+                fail('Shader code changed since the selected base. Choose Binary + shaders.')
         except ValueError as error: fail(str(error))
 
     child_id = None
@@ -706,6 +715,11 @@ def build(a):
             saves.pack(a.save, os.path.join(out, 'title', 'content'))
         except (saves.SaveError, OSError) as e:
             fail(f"The 3DS save couldn't be packed in: {e}")
+    os.makedirs(os.path.join(out,'title','content'),exist_ok=True)
+    with open(os.path.join(out,'title','content','menu_enabled.txt'),'w',encoding='ascii') as f:
+        f.write('0\n' if a.no_menu else '1\n')
+    with open(os.path.join(out,'title','content','menu_shortcut.txt'),'w',encoding='ascii') as f:
+        f.write(((a.menu_shortcut or '') if not a.no_menu else '') + '\n')
     if a.no_menu:  # the game looks for it as it starts (frontend_wiiu.cpp)
         open(os.path.join(out, 'title', 'content', 'no_menu'), 'wb').close()
     elif a.menu_shortcut:
@@ -752,14 +766,21 @@ def build(a):
         if base_version>version:
             fail('This base version exceeds the fixed native update version. Use a matching base made with this Builder.')
         update_title = os.path.join(out,'update')
-        wup_update.make_update(title,update_title,a.wup_update_parts,version,now,base_shader_files=base_inventory)
+        try:
+            wup_update.make_update(title,update_title,a.wup_update_parts,version,now,base_manifest=selected_manifest,inputs=input_summary,contract=wup_update.shader_contract(ROOT))
+        except (ValueError,OSError) as error: fail('WUP update refused: '+str(error))
         wup += '_Update_' + now.strftime('%Y%m%d_%H%M%S') + f'_v{version}'
         title = update_title
         print(f'Native WUP update: {base_id}, version {version}, built {now.isoformat()}',flush=True)
 
+    if not is_update:
+        pending_manifest = os.path.join(out,'base-manifest.json')
+        base_record = wup_update.remember_base(pending_manifest,title,int(info['title_id'],16),inputs=input_summary,root=ROOT)
     pack_wup(a.otp, title, wup)
     if not is_update:
-        wup_update.remember_base(inventory_path, title, int(info['title_id'], 16))
+        wup_update.write_manifest(inventory_path,base_record)
+        wup_update.write_manifest(wup+'.base.json',base_record)
+        print('Base build manifest: '+wup+'.base.json',flush=True)
 
     where = wup
     if a.card:
@@ -771,6 +792,7 @@ def build(a):
             if shutil.disk_usage(install).free < size + (64 << 20):
                 fail(f'The SD card needs {size >> 20} MB free for this game.')
             where = copy_to(wup, install)
+            if not is_update: wup_update.write_manifest(where+'.base.json',base_record)
         except OSError as e:  # the WUP stays in the work folder, as with a folder build
             fail(card_error(e) + f' The game is built: it is in {wup}.')  # one line: the window reads @error lines
         if not a.out:

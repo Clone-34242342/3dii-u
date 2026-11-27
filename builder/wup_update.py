@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import tempfile
 from pathlib import Path
 import json
+import hashlib
 import os
 import shutil
 import xml.etree.ElementTree as ET
@@ -41,36 +42,108 @@ def native_base_id(title_id, program_id=None):
 
 
 SHADER_FILES = ('shaders.gsh', 'shaders.idx', 'fallback-shaders.bin')
+OPTIONS = ('language.txt', 'menu_enabled.txt', 'menu_shortcut.txt', 'no_menu')
+BASE_MARKER = '3dii-base-id.txt'
+UPDATE_MARKER = '3dii-update-base-id.txt'
+MANIFEST_VERSION = 2
 
 
-def remember_base(path, title, base_id):
-    """Remember shader sizes for binary-only FST links, outside extraction cleanup."""
-    native_base_id(base_id)
+def _digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as source:
+        for block in iter(lambda: source.read(4 << 20), b''): digest.update(block)
+    return dict(size=Path(path).stat().st_size, sha256=digest.hexdigest())
+
+
+def _content(title):
     content = Path(title)/'content'
-    files = {name: (content/name).stat().st_size for name in SHADER_FILES if (content/name).is_file()}
-    if not all(name in files for name in SHADER_FILES[:2]):
-        raise ValueError('The base shader files are missing; no binary-only update inventory was saved')
+    result = {}
+    for file in sorted(content.rglob('*')):
+        if file.is_symlink(): raise ValueError('Title content must not contain symbolic links')
+        if file.is_file():
+            name = file.relative_to(content).as_posix()
+            if name not in (*OPTIONS, BASE_MARKER, UPDATE_MARKER, '3dii-update.json'):
+                result[name] = _digest(file)
+    return result
+
+
+def shader_contract(root=None):
+    root = Path(root or os.environ.get('THREEDII_ROOT') or Path(__file__).resolve().parents[1])
+    names = ['port/wiiu/fs_key.inc', 'port/wiiu/shadergen.h', 'port/wiiu/shadergen.cpp',
+             'port/wiiu/gx2_backend.cpp', 'port/wiiu/latte_program.h', 'port/wiiu/uber_family.h',
+             'third_party/3dsrecomp/runtime/gpu/gpu.h', 'third_party/3dsrecomp/runtime/gpu/pica.h',
+             'third_party/3dsrecomp/runtime/fallback.h', 'tools/shadergen_main.cpp',
+             'tools/shadergen_lists.cpp', 'tools/fallbackgen.cpp']
+    digest = hashlib.sha256(b'3dii-shader-contract-v1')
+    for name in names:
+        digest.update(name.encode()+b'\0')
+        digest.update((root/name).read_bytes())
+    return digest.hexdigest()
+
+
+def _identity(record):
+    fields = {key:record[key] for key in ('format','base_title_id','content','shader_contract','inputs')}
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, separators=(',',':')).encode()).hexdigest()
+
+
+def write_manifest(path, record):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as out:
         temporary = Path(out.name)
-        json.dump(dict(base_title_id=f'{base_id:016X}', files=files), out, indent=2)
+        json.dump(record, out, indent=2, sort_keys=True)
         out.write('\n')
     try: os.replace(temporary, path)
     finally: temporary.unlink(missing_ok=True)
 
 
-def base_shaders(path, base_id):
+def remember_base(path, title, base_id, *, inputs=None, contract=None, root=None):
+    """Register the actual assets and base shaders; call before packing the base."""
+    native_base_id(base_id)
+    content = _content(title)
+    if not all(name in content for name in ('code.bin','exheader.bin','romfs.bin',*SHADER_FILES[:2])):
+        raise ValueError('The full base game assets and shaders are required for an update manifest')
+    record = dict(format=MANIFEST_VERSION, base_title_id=f'{base_id:016X}', content=content,
+                  inputs=inputs or {}, shader_contract=contract or shader_contract(root))
+    record['identity'] = _identity(record)
+    (Path(title)/'content'/BASE_MARKER).write_text(record['identity']+'\n', encoding='ascii')
+    write_manifest(path, record)
+    return record
+
+
+def read_manifest(path, base_id):
     try:
-        info = json.loads(Path(path).read_text(encoding='utf-8'))
-        files = info['files']
-        if int(info['base_title_id'], 16) != base_id or not isinstance(files, dict): raise ValueError()
-        if not all(name in files for name in SHADER_FILES[:2]): raise ValueError()
-        for name, size in files.items():
-            if name not in SHADER_FILES or type(size) is not int or not 0 <= size <= 0xffffffff: raise ValueError()
-        return files
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise ValueError('Binary-only WUP updates need the matching base shader inventory. Build the matching full WUP install once on this PC with the same build folder, or choose Binary + shaders.') from error
+        record = json.loads(Path(path).read_text(encoding='utf-8'))
+        if record['format'] != MANIFEST_VERSION or int(record['base_title_id'],16) != base_id: raise ValueError()
+        content = record['content']
+        if not isinstance(content,dict) or not content: raise ValueError()
+        for name, info in content.items():
+            if (not isinstance(name,str) or not name or name.startswith('/') or '\\' in name or ':' in name
+                    or any(part in ('','.','..') for part in name.split('/'))
+                    or name in (*OPTIONS,BASE_MARKER,UPDATE_MARKER,'3dii-update.json')
+                    or type(info['size']) is not int or not 0 <= info['size'] <= 0xffffffff
+                    or len(info['sha256'])!=64 or any(c not in '0123456789abcdef' for c in info['sha256'])): raise ValueError()
+        if not all(n in content for n in ('code.bin','exheader.bin','romfs.bin',*SHADER_FILES[:2])): raise ValueError()
+        if not isinstance(record['inputs'],dict) or record['identity'] != _identity(record): raise ValueError()
+        return record
+    except (OSError,ValueError,KeyError,TypeError) as error:
+        raise ValueError('Choose the matching .base.json saved beside a full WUP build made with this Builder. Older shader-size inventories cannot verify a base; rebuild the full base once.') from error
+
+
+def verify_base(title, record, parts, *, inputs=None, contract=None):
+    if inputs is not None and inputs != record['inputs']:
+        raise ValueError('The game/update/DLC selection differs from the base build. Choose its matching inputs or make a new full WUP base.')
+    current = _content(title)
+    assets = lambda files: {n:v for n,v in files.items() if n not in SHADER_FILES and not n.startswith('save_import/')}
+    expected, actual = assets(record['content']), assets(current)
+    differences = sorted(n for n in expected.keys()|actual.keys() if expected.get(n)!=actual.get(n))
+    if differences:
+        raise ValueError('These assets differ from the base build: '+', '.join(differences[:6])+'. Use the same game/update/DLC/mods or rebuild the full base.')
+    if parts == 'both' and 'fallback-shaders.bin' in record['content'] and 'fallback-shaders.bin' not in current:
+        raise ValueError('The updated shader pack is missing its fallback shaders; regenerate the complete shader pack.')
+    if parts == 'binary' and (contract or shader_contract()) != record['shader_contract']:
+        raise ValueError('Shader code changed since the base build. Choose Binary + shaders instead of reusing incompatible base shaders.')
+    return record
 
 
 def update_build_info(now=None):
@@ -104,7 +177,7 @@ def title_output(destination, update_id):
                 raise
 
 
-def make_update(source, destination, parts='both', version=None, now=None, base_shader_files=None):
+def make_update(source, destination, parts='both', version=None, now=None, *, base_manifest, inputs=None, contract=None):
     if parts not in PARTS: raise ValueError('Choose binary or binary + shaders')
     now = now or datetime.now(timezone.utc)
     if version is None: version=UPDATE_VERSION
@@ -123,14 +196,8 @@ def make_update(source, destination, parts='both', version=None, now=None, base_
     if not list((source/'code').glob('*.rpx')): raise ValueError('The updated executable is missing')
     if parts=='both' and not all((source/'content'/n).is_file() for n in ('shaders.gsh','shaders.idx')):
         raise ValueError('A shader update requires both shaders.gsh and shaders.idx')
-    if parts == 'binary' and base_shader_files is None:
-        base_shader_files = {name: (source/'content'/name).stat().st_size for name in SHADER_FILES if (source/'content'/name).is_file()}
-    if parts == 'binary':
-        if not all(name in base_shader_files for name in SHADER_FILES[:2]):
-            raise ValueError('Binary-only updates require links to the matching base shader files')
-        for name, size in base_shader_files.items():
-            if name not in SHADER_FILES or type(size) is not int or not 0 <= size <= 0xffffffff:
-                raise ValueError('Invalid base shader inventory')
+    record = read_manifest(base_manifest, base)
+    verify_base(source, record, parts, inputs=inputs, contract=contract)
     update = base | (0xe<<32)
     now = now or datetime.now(timezone.utc)
     with title_output(destination,update) as new:
@@ -153,19 +220,22 @@ def make_update(source, destination, parts='both', version=None, now=None, base_
             for name in ('shaders.gsh','shaders.idx','fallback-shaders.bin'):
                 file=source/'content'/name
                 if file.is_file(): shutil.copy2(file,out/'content'/name)
-        # Nonempty content also carries a diagnostic identity; never copies a ROM,
-        # save import, user settings, or shaders into a binary-only update.
+        # Options belong to this update, including explicit defaults that can
+        # override an old base's presence-only no_menu flag or custom shortcut.
+        for name in ('language.txt','menu_shortcut.txt'):
+            file = source/'content'/name
+            (out/'content'/name).write_bytes(file.read_bytes() if file.exists() else (b'-1\n' if name=='language.txt' else b'\n'))
+        enabled = source/'content/menu_enabled.txt'
+        (out/'content/menu_enabled.txt').write_bytes(enabled.read_bytes() if enabled.exists() else (b'0\n' if (source/'content/no_menu').exists() else b'1\n'))
+        if (out/'content/menu_enabled.txt').read_bytes().strip() not in (b'0',b'1'):
+            raise ValueError('Invalid menu enabled setting')
+        (out/'content'/UPDATE_MARKER).write_text(record['identity']+'\n',encoding='ascii')
         details=dict(base_title_id=f'{base:016X}',update_title_id=f'{update:016X}',version=version,
-                     built_at=now.isoformat(),parts=parts,version_policy='fixed')
+                     built_at=now.isoformat(),parts=parts,version_policy='fixed',base_identity=record['identity'])
         (out/'content/3dii-update.json').write_text(json.dumps(details,indent=2)+'\n')
-        links={}
-        for file in sorted((source/'content').rglob('*')):
-            if file.is_symlink(): raise ValueError('Base content must not contain symbolic links')
-            if file.is_file():
-                name=file.relative_to(source/'content').as_posix()
-                if not (out/'content'/name).exists(): links[name]=file.stat().st_size
-        if parts == 'binary':
-            links.update(base_shader_files)
+        links={name:info['size'] for name,info in record['content'].items()
+               if not (out/'content'/name).exists()}
+        links[BASE_MARKER] = 65
         # PC-only input to the packer. These names become native FST link records,
         # not payload copies. Nintendo's update installer links them to the base.
         (out/'.3dii-base-links.json').write_text(json.dumps(dict(base_title_id=f'{base:016X}',files=links),indent=2)+'\n')

@@ -371,6 +371,8 @@ class App(QObject):
     buildText, buildCustom = _p(str, 'buildText'), _p(bool, 'buildCustom')
     outputFormat, homebrewParts = _p(str, 'outputFormat'), _p(str, 'homebrewParts')
     wupUpdateParts = _p(str, 'wupUpdateParts')
+    wupBaseText = _p(str, 'wupBaseText')
+    hasWupBase = _p(bool, 'hasWupBase')
     target, destText, cards = _p(str, 'target'), _p(str, 'destText'), _p('QVariantList', 'cards')
     building, view = _p(bool, 'building'), _p(str, 'view')
     buildName = _p(str, 'buildName')
@@ -416,7 +418,7 @@ class App(QObject):
                        menuShortcut=shortcut if pipeline.valid_menu_shortcut(shortcut) else '',
                        note='Pick one of your 3DS games to start. The builder reads its name and icon, and asks about its update and DLC.',
                        updateText='None', hasUpdate=False, dlcText='None', hasDlc=False, modText='None', hasMod=False, artText=NO_ART, hasArt=False, artUrl='', artOwn=False, iconText=NO_ART, hasIconArt=False, iconArtUrl='', tileUrl='', bezelText=NO_BEZEL, hasBezel=False, padArtText=NO_PAD_ART, hasPadArt=False, gameSoundText=NO_GAME_SOUND, hasGameSound=False, saveText=NO_SAVE, hasSave=False, artKeySet=bool(self.st.get('sgdb_key')), soundSet=os.path.isfile(BOOT_SOUND), artStyle=self.st.get('art_style', 'console'), gameMenu=self.st.get('game_menu', True) is not False, library=[], keysOk=False, keysNeeded=False, keysText='', otpOk=False,
-                       otpText='', sysOk=False, sysText='', outputFormat=self.st.get('output_format', 'wup') if self.st.get('output_format') in ('wup','wup-update','homebrew') else 'wup', homebrewParts=self.st.get('homebrew_parts', 'full') if self.st.get('homebrew_parts') in ('full','binary','shaders','both') else 'full', wupUpdateParts=self.st.get('wup_update_parts','both') if self.st.get('wup_update_parts') in ('binary','both') else 'both', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
+                       otpText='', sysOk=False, sysText='', outputFormat=self.st.get('output_format', 'wup') if self.st.get('output_format') in ('wup','wup-update','homebrew') else 'wup', homebrewParts=self.st.get('homebrew_parts', 'full') if self.st.get('homebrew_parts') in ('full','binary','shaders','both') else 'full', wupBaseText=self.st.get('wup_base_manifest') or 'Last full base built in this work folder', hasWupBase=bool(self.st.get('wup_base_manifest')), wupUpdateParts=self.st.get('wup_update_parts','both') if self.st.get('wup_update_parts') in ('binary','both') else 'both', target=self.st.get('target', 'card'), destText='', cards=[], building=False, view='form', stages=[],
                        stage=-1, failed=False, progress=0.0, detail='', log='', resultText='', where='', dialog=None, version=VERSION,
                        buildName='', queueItems=[], queuePending=0, queueRunning=False,
                        rootOk=bool(pipeline.ROOT) and os.path.isfile(os.path.join(pipeline.ROOT, 'tools', 'win', 'build3ds.py')),
@@ -1098,6 +1100,23 @@ class App(QObject):
         self.set(wupUpdateParts=value)
         save_settings(self.st)
 
+    @Slot()
+    def chooseWupBase(self):
+        if self._s['building']: return
+        path = QFileDialog.getOpenFileName(None, 'Choose the matching full WUP base manifest',
+                       os.path.dirname(self.st.get('wup_base_manifest','')), 'WUP base manifests (*.base.json);;JSON files (*.json)')[0]
+        if path:
+            self.st['wup_base_manifest'] = path
+            self.set(wupBaseText=path, hasWupBase=True)
+            save_settings(self.st)
+
+    @Slot()
+    def clearWupBase(self):
+        if self._s['building']: return
+        self.st.pop('wup_base_manifest',None)
+        self.set(wupBaseText='Last full base built in this work folder',hasWupBase=False)
+        save_settings(self.st)
+
     @Slot(str)
     def setHomebrewParts(self, value):
         if self._s['building'] or value not in ('full','binary','shaders','both'): return
@@ -1385,7 +1404,9 @@ class App(QObject):
         argv += ['--game', self.game.path, '--output-format', self._s['outputFormat'],
                  '--card' if self._s['target'] == 'card' else '--out', dest, '--keys', self.st['keys']]
         if self._s['outputFormat'] != 'homebrew': argv += ['--otp', self.st['otp']]
-        if self._s['outputFormat'] == 'wup-update': argv += ['--wup-update-parts', self._s['wupUpdateParts']]
+        if self._s['outputFormat'] == 'wup-update':
+            argv += ['--wup-update-parts', self._s['wupUpdateParts']]
+            if self.st.get('wup_base_manifest'): argv += ['--wup-base-manifest', self.st['wup_base_manifest']]
         elif self._s['outputFormat'] == 'homebrew': argv += ['--homebrew-parts', self._s['homebrewParts']]
         system = self.st.get('system', '')
         if system:

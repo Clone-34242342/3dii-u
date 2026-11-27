@@ -866,7 +866,7 @@ ApplicationWindow {
                         CardRow {
                             visible: app.outputFormat === "wup-update"
                             label: "Update contents"
-                            sub: "Requires a matching base from this updated Builder. Keep the base game and saves."
+                            sub: "Binary only reuses the original base shaders. Both options require a matching full base build."
                             ComboBox {
                                 width: 240
                                 Accessible.name: "WUP update contents"
@@ -874,6 +874,13 @@ ApplicationWindow {
                                 currentIndex: app.wupUpdateParts === "binary" ? 0 : 1
                                 onActivated: function(index) { app.setWupUpdateParts(index === 0 ? "binary" : "both") }
                             }
+                        }
+                        CardRow {
+                            visible: app.outputFormat === "wup-update"
+                            label: "Matching base"
+                            sub: app.wupBaseText
+                            Pill { text: "Choose manifest"; onClicked: app.chooseWupBase() }
+                            Pill { text: "Use last build"; visible: app.hasWupBase; onClicked: app.clearWupBase() }
                         }
                         CardRow {
                             visible: app.outputFormat === "homebrew"

@@ -45,13 +45,31 @@ The builder uses a distinct `_NativeWUP` output folder and leaves existing insta
 and saves intact. Move saves using a save manager when changing title IDs; the
 builder does not silently migrate console data. Homebrew identity is unchanged.
 
-Binary-only updates omit shader payloads and ROM assets. Build the matching full WUP install once on this PC first,
-using the same Builder work folder: the Builder retains a small shader-size inventory after packing the base.
-It uses that inventory for native links to the installed shaders, without compiling or copying them again.
-A missing inventory stops the binary-only build with instructions instead of producing an update with missing files.
-Binary + shaders includes both shader files and an optional fallback pack.
-Use the same ROM, 3DS update, DLC and mod inputs as the installed base. Changes to game assets require a new full base package, not an executable/shader update.
-The binary-only path has passed a repeated real Wii U install test; binary + shaders still needs a hardware comparison.
+Every full WUP build now writes a matching `.base.json` beside its installer
+folder and keeps a copy in the Builder work folder. In **WUP update → Matching
+base**, choose that file, or use the last full base from the same work folder.
+Both update modes require this manifest. Old size-only inventories are rejected;
+make a full base with this Builder once to register its assets. Keep the manifest
+when moving a base build to another PC.
+
+The PC checks the selected 3DS update/DLC versions and the resulting game assets,
+including applied mods, against that base. Changes require a full base rebuild.
+Binary-only updates also check the shader code contract, then link the ORIGINAL
+base shaders without compiling/copying them. If graphics code changed, choose
+**Binary + shaders**. A binary-only update does not retain shaders from an earlier
+shader update: native update packages replace each other.
+
+Language defaults, menu enabled/disabled and menu shortcuts are copied as update
+content, with explicit defaults so old base flags do not win. Saved per-user
+language preferences still take precedence over the build's default language.
+A tiny startup marker check rejects an update paired with a different installed
+base before loading game content. It does not scan or checksum ROM assets on Wii U;
+asset comparisons run on the PC. Base reinstallations keep the same corrected
+native title ID, so this change does not require another ID migration.
+
+The preceding binary-only path passed repeated real Wii U installation tests.
+The new manifest/startup guard and binary + shader path still need a hardware
+comparison; host tests cover matching/mismatched assets and native update layout.
 
 Native update version stays fixed at **5**. Date/time labels identify the build folder and are recorded in the package metadata;
 there is no build counter, clock-derived version or rollover. Changed contents receive new content IDs, so a manually installed
