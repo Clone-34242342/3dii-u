@@ -24,6 +24,9 @@ class CompilerPolicy(unittest.TestCase):
             profile = json.load(f)['0004000000033500']
         self.assertTrue(profile['mixed'])
         engine = self.root / 'engine'
+        (engine/'builder').mkdir(parents=True)
+        (engine/'builder/multiplayer-defaults.json').write_text(
+            Path(__file__).with_name('multiplayer-defaults.json').read_text())
         fake_builder = engine / 'tools/win/build3ds.py'
         fake_builder.parent.mkdir(parents=True)
         fake_builder.with_name('gcc.exe').touch()

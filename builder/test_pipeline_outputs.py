@@ -147,6 +147,9 @@ pipeline.copy_to(sys.argv[1], sys.argv[2])
         engine, build = self.root / 'engine', self.root / 'build'
         fake_builder = engine / 'tools' / 'win' / 'build3ds.py'
         fake_builder.parent.mkdir(parents=True)
+        (engine/'builder').mkdir(parents=True)
+        (engine/'builder/multiplayer-defaults.json').write_text(
+            Path(__file__).with_name('multiplayer-defaults.json').read_text())
         (fake_builder.parent / 'gcc.exe').touch()
         fake_builder.write_text('''
 import os, threading
@@ -220,6 +223,9 @@ def build_shaders(*args): pass
         engine = self.root / 'engine'
         fake_builder = engine / 'tools/win/build3ds.py'
         fake_builder.parent.mkdir(parents=True)
+        (engine/'builder').mkdir(parents=True)
+        (engine/'builder/multiplayer-defaults.json').write_text(
+            Path(__file__).with_name('multiplayer-defaults.json').read_text())
         fake_builder.with_name('gcc.exe').touch()
         fake_builder.write_text('''
 import os, threading

@@ -449,7 +449,7 @@ def link_setup():
 
 def runtime_flags(extra):
     return ['-std=c++20', '-O2', '-g0', '-w', '-mcpu=750', '-meabi', '-mhard-float', '-ffunction-sections', '-fno-strict-aliasing', '-fno-exceptions', '-fno-if-conversion',
-            '-fno-if-conversion2', '-D__WIIU__', '-D__WUT__', '-DESPRESSO', f'-I{PORT}/wiiu', f'-I{PORT}', f'-I{RT}', f'-I{RT}/audio', f'-I{RT}/gpu', f'-I{RT}/services',
+            '-fno-if-conversion2', '-D__WIIU__', '-D__WUT__', '-DESPRESSO', f'-I{ROOT}/third_party/3ds-link/include', f'-I{PORT}/wiiu', f'-I{PORT}', f'-I{RT}', f'-I{RT}/audio', f'-I{RT}/gpu', f'-I{RT}/services',
             f'-I{CAFEGLSL_PPC}/include',
             '-isystem', f'{WUT}/include', '-include', f'{PORT}/wiiu/shim.h'] + (['-DRECOMP_MEASURE'] if MEASURE else []) + extra
 
@@ -464,7 +464,13 @@ def runtime_sources(host=False):
         skip.add('profile.cpp')
     folders = [RT, RT + '/services', RT + '/gpu', RT + '/audio']
     folders += [PORT + '/pc', PORT + '/pc/win'] if host else [PORT + '/wiiu']
-    return [s.replace('\\', '/') for folder in folders for s in sorted(glob.glob(folder + '/*.cpp')) if os.path.basename(s) not in skip]
+    sources = [s.replace('\\', '/') for folder in folders for s in sorted(glob.glob(folder + '/*.cpp')) if os.path.basename(s) not in skip]
+    if not host:
+        sources += sorted(glob.glob(ROOT + '/third_party/3ds-link/src/*.cpp'))
+        sources += sorted(glob.glob(ROOT + '/third_party/3ds-link/src/*.c'))
+        sources += [s for s in sorted(glob.glob(ROOT + '/third_party/3ds-link/enet/*.c'))
+                    if os.path.basename(s) in {'callbacks.c', 'compress.c', 'host.c', 'list.c', 'packet.c', 'peer.c', 'protocol.c', 'wiiu.c'}]
+    return sources
 
 
 def build_runtime(g, args):
@@ -512,7 +518,11 @@ def build_runtime(g, args):
         obj = f'{obj_dir}/{obj_name(s)}'
         if only and base not in only and os.path.exists(obj):
             continue
-        items.append((name, real, obj, [BIN + 'g++.exe'] + flags))
+        compiler = BIN + 'g++.exe'
+        if s.endswith('.c'):
+            compiler = BIN + 'gcc.exe'
+            flags = [f for f in flags if f != '-std=c++20'] + ['-std=gnu11', '-DHAS_FCNTL=1', '-DHAS_SOCKLEN_T=1']
+        items.append((name, real, obj, [compiler] + flags))
     compile_all(items, args.jobs, 'runtime', args.force)
     return obj_dir
 

@@ -18,6 +18,7 @@ How each part reaches you decides what its licence asks of whoever distributes i
 
 | Component | Version | Authors | Licence | Copyleft | How it's used |
 |---|---|---|---|---|---|
+| [3DS-Link](https://github.com/gionko/3DS-Link), derived from Azahar/Citra | bd09ca (adapted) | gionko and Azahar/Citra contributors | GPL-2.0-or-later; bundled ENet is MIT | yes (GPL) | room transport and Download Play in `third_party/3ds-link`, app source and games; licences in that directory |
 | [3dsrecomp](https://github.com/nathsou/3dsrecomp) | upstream `8737b72` + this project's changes | Nathan Soufflet (nathsou) | EUPL-1.2 | yes (EUPL) | repository (`third_party/3dsrecomp`), app, games |
 | [devkitPPC](https://devkitpro.org/): GCC | 16.2.0 (devkitPPC build) | Free Software Foundation, Inc. and the GCC contributors; packaged by devkitPro | GPL-3.0-or-later; libgcc and libstdc++ under GPL-3.0 with the GCC Runtime Library Exception 3.1 | yes (tool only) | app (build tool); its runtime libraries in the games under the exception |
 | devkitPPC: GNU Binutils | 2.47 | Free Software Foundation, Inc. and contributors | GPL-3.0-or-later | yes (tool only) | app (build tool) |
@@ -68,9 +69,6 @@ None of these projects' code is in 3Dii U:
 
 - **[NUSPacker](https://github.com/Maschell/NUSPacker)** by Maschell (GPL-3.0). The WUP layout `phase0/tools/pack_wup.py`
   writes was learned from it.
-- **[Citra](https://github.com/citra-emu/citra)** and **[Azahar](https://github.com/azahar-emu/azahar)** (GPL-2.0-or-later).
-  Comments in `third_party/3dsrecomp` compare behaviour with theirs. The builder can read *your own* 3DS system files
-  from their user folders.
 - **[3dbrew](https://www.3dbrew.org/)** and **[WiiUBrew](https://wiiubrew.org/)**: hardware and system documentation.
 - **shinyquagsire23's homebrew titles**: the field layout of `app.xml`, `cos.xml` and `meta.xml`.
 - **[Cemu](https://github.com/cemu-project/Cemu)** (MPL-2.0): developers test builds in it. It isn't shipped.

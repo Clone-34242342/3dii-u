@@ -10,6 +10,9 @@
 #include "../loader.h"
 #include "../service.h"
 #include "services.h"
+#ifdef __WIIU__
+#include "uds_service.h"
+#endif
 
 // The host's microphone: silence, unless a port provides one
 __attribute__((weak)) void mic_host_start() {}
@@ -197,13 +200,20 @@ struct Ac : Service {
         case 0x0005:  // GetConnectResult
             ipc.result(0xE0A09D2E);  // not connected
             break;
-        case 0x000D:  // GetStatus
-        case 0x000F:  // GetWifiStatus
+        case 0x000C:  // GetStatus
         case 0x003E:  // IsConnected
             ipc.ok(2);
             ipc.set(2, 0);
             break;
-        case 0x000E:  // GetLastErrorCode
+        case 0x000D:  // GetWifiStatus
+            ipc.ok(2);
+#ifdef __WIIU__
+            ipc.set(2, room_wireless_available() ? 1 : 0);
+#else
+            ipc.set(2, 0);
+#endif
+            break;
+        case 0x000A:  // GetLastErrorCode
             ipc.ok(2);
             ipc.set(2, 0);
             break;
@@ -1120,6 +1130,9 @@ void register_misc() {
     register_service(std::make_shared<Mic>("mic:u"));
     register_service(std::make_shared<Ir>("ir:USER"));
     register_service(std::make_shared<Iru>("ir:u"));
+#ifdef __WIIU__
+    if (!register_room_uds())
+#endif
     register_service(std::make_shared<Uds>("nwm::UDS"));
     register_service(std::make_shared<Am>("am:app"));  // was Generic: NSMB2's Coin Rush read its own request back as thousands of DLC tickets (2026-11-07)
     register_service(std::make_shared<DlpSrvr>("dlp:SRVR"));
@@ -1129,6 +1142,10 @@ void register_misc() {
     for (const char *n : {"news:u", "soc:U", "http:C", "dlp:FKCL",
                           "pxi:dev", "act:u", "nim:aoc", "qtm:u", "csnd:SND", "nfc:u"})
         register_service(std::make_shared<Generic>(n));
+#ifdef __WIIU__
+    register_room_dlp();
+    start_room_uds();
+#endif
 }
 
 void register_all_services() {

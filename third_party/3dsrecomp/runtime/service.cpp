@@ -3,6 +3,10 @@
 #include "loader.h"
 
 #include <set>
+#ifdef __WIIU__
+#include <coreinit/debug.h>
+namespace kernel { bool room_wireless_available(); }
+#endif
 
 namespace kernel {
 
@@ -76,7 +80,26 @@ u32 service_request(std::shared_ptr<Session> s, Thread *t, Lock &lk) {
 #ifdef RECOMP_RESUMABLE
     ++checkpoint_calls[s->service.get()];
 #endif
+#ifdef __WIIU__
+    const auto &service_name = s->service->name;
+    static std::map<std::pair<std::string, u32>, u32> wireless_counts;
+    const bool wireless_service = g_verbose && (g_game.program_id == 0x0004000000176f00ULL ||
+        g_game.program_id == 0x0004000000030800ULL) &&
+        (service_name.rfind("ac:", 0) == 0 || service_name.rfind("nwm:", 0) == 0 ||
+         service_name.rfind("ndm:", 0) == 0 || service_name.rfind("dlp:", 0) == 0 ||
+         service_name.rfind("APT:", 0) == 0 || service_name.rfind("cfg:", 0) == 0);
+    const u32 count = wireless_service ? ++wireless_counts[{service_name, cmd}] : 0;
+    const bool wireless_trace = wireless_service && (count <= 4 || (count & 255) == 0);
+    if (wireless_trace)
+        OSReport("[wireless-ipc] %s request=%08x arg1=%08x arg2=%08x guest-thread=%u\n",
+            service_name.c_str(), cmd, ipc[1], ipc[2], t->id);
+#endif
     s->service->handle(ipc);
+#ifdef __WIIU__
+    if (wireless_trace || (wireless_service && (r32(ipc.buf + 4) & 0x80000000)))
+        OSReport("[wireless-ipc] %s reply=%08x result=%08x value=%08x room-ready=%u\n",
+            service_name.c_str(), r32(ipc.buf), r32(ipc.buf + 4), r32(ipc.buf + 8), room_wireless_available());
+#endif
     const u32 reply_result = r32(ipc.buf + 4);
     if (g_verbose && (reply_result & 0x80000000))
         LOG("[ipc] %s cmd %08x -> error %08x\n", s->service->name.c_str(), cmd, reply_result);

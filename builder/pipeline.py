@@ -648,6 +648,15 @@ def build(a):
         if os.path.isfile(gsl):
             shutil.copyfile(gsl, os.path.join(learned, 'dvlb.gsl'))
 
+    # Every game and packaging mode uses the same optional SD-root file.
+    import multiplayer
+    try:
+        room_file = multiplayer.write_config(a.card or a.out,
+                         os.path.join(ROOT, 'builder', 'multiplayer-defaults.json'))
+        print(f'Shared multiplayer settings: {room_file} (copy 3dii-u to the SD root)', flush=True)
+    except (OSError, ValueError, KeyError) as e:
+        fail(f'Multiplayer configuration could not be written: {e}')
+
     if partial:
         PROGRESS.stage('Exporting Homebrew update')
         guide = os.path.join(HERE, 'HOMEBREW_GUIDE.txt')

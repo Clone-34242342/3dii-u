@@ -217,6 +217,13 @@ def unanswered():
     return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-w', '-static', ROOT + '/tools/test_unanswered.cpp', '-lpthread', '-o', exe], [exe]]
 
 
+def room_wire():
+    exe = build3ds.WORK + '/selftest/test_uds_wire.exe'
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    return [build3ds.HOST_CXX + ['-std=c++20', '-O1', '-static', '-I' + ROOT + '/third_party/3ds-link/include',
+            ROOT + '/tools/tests/test_uds_wire.cpp', ROOT + '/third_party/3ds-link/src/room_proto.cpp', '-o', exe], [exe]]
+
+
 def uds_room():
     exe = build3ds.WORK + '/selftest/test_uds_room.exe'
     os.makedirs(os.path.dirname(exe), exist_ok=True)
@@ -269,6 +276,10 @@ def main():
         'module memory ownership': [[py, '-B', ROOT + '/tools/test_module_memory.py'],
                                     [py, '-B', ROOT + '/tools/test_cro_modules.py']],
         'offline UDS IPC': uds_room(),
+        'room packet encoding': room_wire(),
+        'Wii U UDP adapter': [[py, ROOT + '/tools/test_room_udp.py']],
+        'multiplayer configuration': [[py, ROOT + '/builder/test_multiplayer.py']],
+        'Builder package inventory': [[py, ROOT + '/builder/test_package_audit.py']],
         'relative callbacks': [[py, ROOT + '/tools/test_relative_callbacks.py']],
         'multiply wrap': [[py, ROOT + '/tools/test_multiply_wrap.py']],
         'object cache safety': [[py, ROOT + '/tools/test_objcache_safety.py']],
@@ -290,6 +301,8 @@ def main():
         'Wii U Mii database and picker': [[py, ROOT + '/tools/test_wiiu_miis.py']],
         'native shader cache': shader_native_cache() + [[py, ROOT + '/tools/test_shader_cache_check.py'],
                                                        [py, ROOT + '/tools/test_shader_install.py']],
+        'draw-state cache eviction': [[py, ROOT + '/tools/test_draw_state_cache.py']],
+        'fragment cache transitions': [[py, ROOT + '/tools/test_fragment_requests.py']],
         'shader learning': [[py, ROOT + '/tools/test_shader_learning.py']],
         'shader budget': [[py, ROOT + '/tools/test_shader_budget.py']],
         'memory fills': memory_fills(),

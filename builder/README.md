@@ -259,3 +259,10 @@ payload checks, and includes the Aroma module with corresponding GPL source.
 This is Proton validation, not a native Windows test or a full game build through
 the GUI. Test exports should use the same base game, update, mods and shader
 revision as their original WUHB; rebuild the full game when those assets change.
+
+## Experimental room networking
+
+Every output format supplies a blank `3dii-u/multiplayer-room.txt` template for the SD root.
+Homebrew and WUP runtimes read that same optional SD file; absent or blank hosts
+leave networking disabled. Existing card settings are preserved. See
+[configuration and tested compatibility](../tools/wiiu_diagnostics/TRIFORCE_MULTIPLAYER_STATUS.md).

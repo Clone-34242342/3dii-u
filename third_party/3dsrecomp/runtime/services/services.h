@@ -66,6 +66,9 @@ void register_cam();
 bool gsp_gx_pending();
 struct GxStats { u64 cmdlists, gpu_ns, transfers; };
 extern GxStats gx_stats;
+#ifdef __WIIU__
+void gsp_report_frame_gap();
+#endif
 // hid
 void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty);  // (host thread, lock not held)
 void hid_motion(const s16 *accel, const s16 *gyro);                        // (the thread that calls hid_update) x, y, z in the 3DS's units

@@ -10,6 +10,8 @@ CONTRIBUTORS = 'sennecaelen, Clone-34242342, creeper88-boy, Mertoxx07, matte-oss
 
 # (what, by whom, licence, where): the projects whose code is in the app or in the games it makes
 UPSTREAM = [
+    ('3DS-Link room transport and Download Play, derived from Azahar/Citra', 'gionko and contributors',
+     'GPL-2.0-or-later', 'https://github.com/gionko/3DS-Link'),
     ('RPXLoadingModule with generic Homebrew updates', "wiiu-env and this fork's contributors", 'GPL-3.0',
      'https://github.com/wiiu-env/RPXLoadingModule'),
     ('3dsrecomp, the recompiler and runtime 3Dii U is built on', 'Nathan Soufflet (nathsou)', 'EUPL-1.2',

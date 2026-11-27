@@ -69,3 +69,14 @@ WUP INSTALLS
 Output: WUP remains the installed-title workflow and requires your own otp.bin.
 Copy its output folder into sd:/install/ and use WUP Installer GX2. WUP titles
 use their NAND/USB save storage; the .wuhb.dev instructions apply to Homebrew.
+
+Experimental multiplayer settings (Homebrew and WUP)
+-------------------------------------------------
+All rebuilt titles read SD:/3dii-u/multiplayer-room.txt. The Builder supplies
+an empty-host template under 3dii-u alongside the output, or directly at the
+SD root when building to a card. Existing settings are preserved. Set host
+and port for your chosen room, then relaunch the game. A missing file or blank
+host disables room networking. No server address is built into the defaults.
+Shared configuration does not mean multiplayer is implemented for every game.
+Do not use save states during multiplayer. Implementation and current test
+limits: tools/wiiu_diagnostics/TRIFORCE_MULTIPLAYER_STATUS.md in the source.
