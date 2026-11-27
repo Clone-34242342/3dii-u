@@ -17,6 +17,7 @@ import threading
 import time
 
 from runtime_channel import RuntimeReceiver
+from discovery import discover
 
 BEACON = b"WIIU_TCP_SYSLOG_BEACON_V1"
 UDP_PORT, TCP_PORT = 4445, 7965
@@ -771,7 +772,7 @@ def gui(controller, hotkey_enabled):
     host_row.pack(anchor="w", before=buttons, pady=(8, 0))
     ttk.Label(host_row, text="Wii U IP: ").pack(side="left")
     host_value = tk.StringVar(value=controller.console)
-    host_entry = ttk.Entry(host_row, textvariable=host_value, width=20)
+    host_entry = ttk.Combobox(host_row, textvariable=host_value, width=18, values=[])
     host_entry.pack(side="left")
     def apply_host():
         try:
@@ -791,6 +792,60 @@ def gui(controller, hotkey_enabled):
             message.set(str(exc))
     ttk.Button(host_row, text="Apply IP", command=apply_host).pack(side="left", padx=8)
     ttk.Button(host_row, text="Open logs folder", command=lambda: open_logs_folder(controller.recorder.directory)).pack(side="left")
+    scanning = False
+    discovery_results = queue.SimpleQueue()
+    auto_scan = tk.BooleanVar(value=bool(read_preferences(controller.preferences_path).get('auto_discover', False)) if controller.preferences_path else False)
+    def save_auto_scan():
+        try:
+            if controller.preferences_path:
+                values = read_preferences(controller.preferences_path)
+                values['auto_discover'] = auto_scan.get()
+                controller.preferences_path.parent.mkdir(parents=True, exist_ok=True)
+                controller.preferences_path.write_text(json.dumps(values))
+        except OSError as exc:
+            message.set(str(exc))
+    def scan():
+        nonlocal scanning
+        if scanning: return
+        state = controller.recorder.status()
+        if state['recording']:
+            message.set('Stop recording before scanning; manual IP and Connect remain available.')
+            return
+        if controller.target != 'wiiu':
+            message.set('Select Wii U before scanning; Cemu uses its own address.')
+            return
+        scanning = True
+        scan_button.state(['disabled'])
+        message.set('Scanning the local network for Aroma or FTPiiU...')
+        preferred = controller.console
+        def worker():
+            try: discovery_results.put((discover(preferred), None))
+            except Exception as exc: discovery_results.put(([], str(exc)))
+        threading.Thread(target=worker, daemon=True).start()
+        root.after(100, finish_scan)
+    def finish_scan():
+        nonlocal scanning
+        try: addresses, error = discovery_results.get_nowait()
+        except queue.Empty:
+            root.after(100, finish_scan)
+            return
+        scanning = False
+        scan_button.state(['!disabled'])
+        host_entry.configure(values=addresses)
+        if error: message.set('Scan failed: ' + error + '. Enter the IP manually.')
+        elif len(addresses) == 1:
+            host_value.set(addresses[0])
+            apply_host()
+            message.set('Wii U found and address saved: ' + addresses[0] + '. Click Connect.')
+        elif addresses: message.set('Multiple Wii Us found. Choose an IP from the list, then Apply IP.')
+        else: message.set('No Wii U found. Enable Aroma TCP logging or FTPiiU, or enter its IP manually.')
+    discovery_row = ttk.Frame(panel)
+    discovery_row.pack(anchor='w', before=buttons, pady=(5, 0))
+    scan_button = ttk.Button(discovery_row, text='Scan for Wii U', command=scan)
+    scan_button.pack(side='left')
+    ttk.Checkbutton(discovery_row, text='Auto-detect on startup', variable=auto_scan, command=save_auto_scan).pack(side='left', padx=10)
+    if auto_scan.get(): root.after(400, scan)
+
     keys = Hotkeys(pending.put) if hotkey_enabled and os.name != "nt" else None
     if os.name == "nt":
         root.bind('<F8>', lambda event: pending.put('toggle'))

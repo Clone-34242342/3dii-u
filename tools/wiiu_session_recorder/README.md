@@ -198,3 +198,20 @@ pixel offset in hundredths, and `set nudge 100` restores the automatic policy.
 These are temporary developer controls, not persistent display settings.
 Manual screenshots remain separate from timing windows. Automatic capture is
 not enabled by any debug/state action.
+
+
+### Find and remember a Wii U
+
+The address field accepts an editable IPv4 address (four numbers, each 0–255).
+**Apply IP** remembers it for the next launch. **Scan for Wii U** tries Aroma's
+standard UDP logging beacon, then bounded read-only FTP checks on nearby local
+IPv4 subnets. An open FTP port alone is insufficient: the scan checks for the
+Aroma SD layout. If multiple consoles respond, choose one from the address list
+and apply it. **Auto-detect on startup** is optional and remembered separately.
+Scanning does not start recording or screenshots, and is blocked during a
+recording so it cannot interrupt a capture. Manual addressing remains available
+when logging/FTP is disabled, broadcast traffic is filtered, or a network's
+subnet layout is outside the scan's bounded range.
+
+The discovery path found the user's real Wii U in under one second during the
+November 27, 2026 test. This does not establish detection on every router/VLAN.
