@@ -14,7 +14,8 @@
 // The host's microphone: silence, unless a port provides one
 __attribute__((weak)) void mic_host_start() {}
 __attribute__((weak)) void mic_host_stop() {}
-__attribute__((weak)) void mic_host_read(s16 *out, u32 n, u32 rate) { memset(out, 0, n * 2); }
+__attribute__((weak)) void mic_host_read(s16 *out, u32 n, u32 rate) { memset(out, 0, n * sizeof(*out)); }
+__attribute__((weak)) u32 mic_host_read_available(s16 *out, u32 n, u32 rate) { mic_host_read(out, n, rate); return n; }
 
 namespace kernel {
 
@@ -44,7 +45,7 @@ bool mii_3ds(const std::array<u8, 0x60> &h, std::array<u8, 0x60> &m) {
         for (size_t at = 0x18; at < 0x5C; at += 2)
             if (at != 0x2E) std::swap(m[at], m[at + 1]);  // height and build are a byte each
     }
-    if (m[0] != 3 || !(m[0x0C] | m[0x0D] | m[0x0E] | m[0x0F])) return false;  // not version 3, or no Mii id (an empty slot)
+    if (m[0] != 3 || mii_id_empty(m.data() + 0x0C)) return false;  // not version 3, or no Mii id (an empty slot)
     m[0x01] |= 1;
     // Born on a console that came after the 3DS (4: a Wii U, as its accounts' Miis are), it is said to be a 3DS's: Super Mario 3D Land's Mii
     // library, of 2011, counts no such Mii in Mii Maker ("You don't have any Mii characters") and drops its face from a save file at the
@@ -69,8 +70,11 @@ struct ConsoleMiis {
             if (!mii_3ds(g_host_miis[i], m)) continue;
             size_t at = 0;
             while (at < list.size() && memcmp(&list[at][0x0C], &m[0x0C], 10)) at++;  // the same Mii: its id and the console that made it
-            if ((int)i == g_host_my_mii) mine = (int)at;
             if (at == list.size()) list.push_back(m);
+            if ((int)i == g_host_my_mii) {
+                mine = (int)at;
+                list[at] = m;
+            }
         }
     }
 };
@@ -85,18 +89,18 @@ const std::vector<std::array<u8, 0x60>> &console_miis(int *mine) {
 // The player's Mii: the current account's (the console's first, if that account has none a game can take), naming the place it has in
 // Mii Maker's database (fs.cpp). With no Mii on the console at all, a plain male Mii named "Mario" (made-up console and Mii ids and a
 // placeholder MAC; games mostly check the flags and the checksum).
+std::array<u8, 0x60> console_mii(u32 n) {
+    std::array<u8, 0x60> mii = console_miis(nullptr)[n];
+    if (const int place = mii_maker_place(n); place >= 0) mii[0x02] = (u8)(place / 10 | place % 10 << 4);
+    const u16 crc = mii_crc16(mii.data(), 0x5E);
+    mii[0x5E] = (u8)(crc >> 8);
+    mii[0x5F] = (u8)crc;
+    return mii;
+}
+
 std::array<u8, 0x60> player_mii() {
     int mine;
-    const auto &miis = console_miis(&mine);
-    if (!miis.empty()) {
-        const u32 n = mine < 0 ? 0 : (u32)mine;
-        std::array<u8, 0x60> mii = miis[n];
-        if (const int place = mii_maker_place(n); place >= 0) mii[0x02] = (u8)(place / 10 | place % 10 << 4);
-        const u16 crc = mii_crc16(mii.data(), 0x5E);
-        mii[0x5E] = (u8)(crc >> 8);
-        mii[0x5F] = (u8)crc;
-        return mii;
-    }
+    if (!console_miis(&mine).empty()) return console_mii(mine < 0 ? 0 : (u32)mine);
     std::array<u8, 0x60> m{};
     auto be32 = [&](size_t o, u32 v) { m[o] = (u8)(v >> 24); m[o + 1] = (u8)(v >> 16); m[o + 2] = (u8)(v >> 8); m[o + 3] = (u8)v; };
     auto be16 = [&](size_t o, u16 v) { m[o] = (u8)(v >> 8); m[o + 1] = (u8)v; };
@@ -396,6 +400,7 @@ struct Boss : Service {
 // they have got (3dbrew: MIC Shared Memory).
 struct Mic : Service {
     using Service::Service;
+    static constexpr u64 tick_period = 10000000;
 #ifdef RECOMP_RESUMABLE
     bool persistent_supported() const override { return true; }
     bool capture(checkpoint::Image &im) override {
@@ -411,7 +416,7 @@ struct Mic : Service {
             else if (!sampling && saved_sampling) mic_host_start();
         });
         im.take(buf_full); im.take(mem);
-        im.take(start); im.take(end); im.take(pos); im.take(rate); im.take(generation);
+        im.take(next_tick); im.take(start); im.take(end); im.take(pos); im.take(rate); im.take(generation);
         im.take(encoding); im.take(gain); im.take(power); im.take(clamp);
         im.take(loop); im.take(sampling);
         return true;
@@ -422,7 +427,8 @@ struct Mic : Service {
 #endif
     std::shared_ptr<Event> buf_full = make_event(ONESHOT, "mic");
     std::shared_ptr<SharedMem> mem;
-    u32 start = 0, end = 0, pos = 0, rate = 32730, generation = 0;
+    u64 next_tick = 0;
+    u32 start = 0, end = 0, pos = 0, rate = 32728, generation = 0, sample_remainder = 0;
     u8 encoding = 0, gain = 0, power = 0, clamp = 0;
     bool loop = false, sampling = false;
 
@@ -442,25 +448,28 @@ struct Mic : Service {
     void tick(u32 g) {
         if (g != generation || !sampling) return;
         s16 in[512];
-        const u32 n = rate / 100, step = encoding & 1 ? 2 : 1;
-        mic_host_read(in, n, rate);
+        const u32 budget = rate + sample_remainder, step = encoding & 1 ? 2 : 1;
+        sample_remainder = budget % 100;
+        const u32 n = mic_host_read_available(in, budget / 100, rate);
         for (u32 i = 0; i < n && sampling; i++) {
-            if (pos + step > end) {
-                buf_full->signal();
-                if (!loop) {
-                    stop();
-                    break;
-                }
-                pos = start;
-            }
+            if (end - pos < step) pos = start;
             store(mem->backing + pos, in[i]);
             pos += step;
+            if (end - pos < step) {
+                buf_full->signal();
+                if (!loop) stop();
+            }
         }
         w32(mem->backing + mem->size - 4, pos);
-        if (sampling) add_timeout(now_ns() + 10000000, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
+        if (sampling) {
+            // Keep the sampling clock across a late callback, with bounded catch-up after a long pause.
+            const u64 now = now_ns(), catch_up = 9 * tick_period;
+            next_tick = std::max(next_tick + tick_period, now > catch_up ? now - catch_up : 0);
+            add_timeout(next_tick, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
+        }
     }
     void handle(IPC &ipc) override {
-        static const u32 rates[4] = {32730, 16360, 10910, 8180};
+        static const u32 rates[4] = {32728, 16364, 10909, 8182};
         switch (ipc.cmd()) {
         case 0x0001:  // MapSharedMemory(size, handle)
             mem = get<SharedMem>(ipc[3]);
@@ -473,17 +482,23 @@ struct Mic : Service {
             break;
         case 0x0003:  // StartSampling(encoding, rate, offset, size, loop)
             stop();
-            if (mem) {
+            if (mem && mem->size > 4 && ipc[3] < mem->size - 4) {
                 encoding = (u8)ipc[1] & 3;
                 rate = rates[ipc[2] & 3];
                 start = pos = ipc[3];
-                end = std::min(start + ipc[4], mem->size - 4);
+                end = start + std::min(ipc[4], mem->size - 4 - start);
+                if (end - start < (encoding & 1 ? 2u : 1u)) {
+                    ipc.ok();
+                    break;
+                }
                 loop = ipc[5] & 1;
                 sampling = true;
+                sample_remainder = 0;
                 LOG("[mic] sampling at %u Hz, encoding %u, %u bytes%s\n", rate, encoding, end - start, loop ? ", looped" : "");
                 mic_host_start();
                 const u32 g = generation;
-                add_timeout(now_ns() + 10000000, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
+                next_tick = now_ns() + tick_period;
+                add_timeout(next_tick, [this, g] { tick(g); } STATE_TIMEOUT(TimeoutKind::Service, nullptr, shared_from_this(), g));
             }
             ipc.ok();
             break;
@@ -822,25 +837,60 @@ struct Iru : Service {
     }
 };
 
+// Offline local wireless: games can obtain their status/bind events and scan, but there is no transport or peer.
+// Command IDs and reply layouts: Azahar nwm_uds.cpp / nwm_uds.h, commit11eceda5e0e682a1f44e396bf954a1b9137097ca.
 struct Uds : Service {
+    SERVICE_CHECKPOINT(Uds, status, bind)
     using Service::Service;
     std::shared_ptr<Event> status = make_event(ONESHOT, "uds status");
+    // shortcut: one offline bind event; use per-bind events when a transport is added.
+    std::shared_ptr<Event> bind = make_event(ONESHOT, "uds bind");
+    // CTR Result fields: UDS module68; Status/InvalidState/NotAuthorized, and Permanent/NotSupported/NotImplemented.
+    static constexpr u32 NOT_CONNECTED = 0xC8A113EA;
+    static constexpr u32 UNSUPPORTED = 0xD8C113F4;
+
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
+        case 0x0001:  // Initialize (deprecated)
         case 0x001B:  // InitializeWithVersion
+            status->clear();
+            bind->clear();
             ipc.ok(1, 2);
             ipc.handles(2, {status});
             break;
-        case 0x000B:  // GetConnectionStatus
+        case 0x0004:  // BeginHostingNetwork (deprecated)
+        case 0x0009:  // ConnectToNetwork (deprecated)
+        case 0x001D:  // BeginHostingNetwork
+        case 0x001E:  // ConnectToNetwork
+            unimplemented(ipc, false);
+            ipc.result(UNSUPPORTED);  // Cannot create a working host/client without a transport.
+            break;
+        case 0x0005:  // EjectClient: only a host can eject, and node1 is never ejectable.
+            ipc.result((u16)ipc[1] == 1 ? 0xE10113EA : 0xE0A113EA);
+            break;
+        case 0x0006:  // EjectSpectators: no spectators exist.
+        case 0x0007:  // UpdateNetworkAttribute: no network exists to update.
+            ipc.ok();
+            break;
+        case 0x0008:  // DestroyNetwork: Status / InvalidState / UDS / WrongStatus490
+            ipc.result(0xC8A111EA);
+            break;
+        case 0x000A:  // DisconnectNetwork: remains offline, but notify status waiters.
+            ipc.ok();
+            status->signal();
+            break;
+        case 0x000B:  // GetConnectionStatus: result +0x30-byte ConnectionStatus, all zero except NotConnected3.
             ipc.ok(13);
-            ipc.set(2, 3);  // not connected
+            ipc.set(2, 3);
             for (int i = 3; i < 14; i++) ipc.set(i, 0);
             break;
-        case 0x000D:  // GetNodeInformation: no such node
-            ipc.result(0xC90113FA);
+        case 0x000D:  // GetNodeInformation: no peer node is known.
+            ipc.result(0xC90113FA);  // Status / WrongArgument / UDS / NotFound
             break;
-        case 0x000F: {  // RecvBeaconBroadcastData(size, ..., mapped buffer): no beacons. Header: size of the buffer, bytes used, entries
+        case 0x000F: {  // RecvBeaconBroadcastData: max buffer size, bytes used, entries (little endian).
             const u32 desc = ipc[19], buf = ipc[20];
+            const u32 error = ipc[1] < 12 ? RES_INVALID_COMBINATION : ipc.mapped_output_error(19, ipc[1]);
+            if (error) { ipc.result(error); break; }
             w32(buf, ipc[1]);
             w32(buf + 4, 12);
             w32(buf + 8, 0);
@@ -849,20 +899,44 @@ struct Uds : Service {
             ipc.set(3, buf);
             break;
         }
-        case 0x0012:  // Bind: an event for packets that never come (New Super Mario Bros. 2's Coin Rush)
+        case 0x0011:  // GetApplicationData: no network/application data; return an empty static buffer.
+            ipc.ok(2, 2);
+            ipc.set(2, 0);
+            ipc.static_desc(3, 0, 0);
+            break;
+        case 0x0012:  // Bind: a local packet event; packets never arrive while offline.
+            if (!ipc[1] || !(u8)ipc[3]) { ipc.result(0xE10113EA); break; }
+            if (ipc[2] < 0x5F4) { ipc.result(0xE10113E9); break; }
+            bind->clear();
             ipc.ok(1, 2);
             ipc.handles(2, {bind});
             break;
         case 0x0003:  // Shutdown
-        case 0x000A:  // DisconnectNetwork
-        case 0x0013:  // Unbind
+            status->clear();
+            bind->signal();  // Release a guest waiting for a packet, as Unbind does.
             ipc.ok();
             break;
+        case 0x0013:  // Unbind: result, bind ID, three reserved words.
+            if (!ipc[1]) { ipc.result(0xE10113EA); break; }
+            bind->signal();  // Release a guest waiting on the local binding being cancelled.
+            ipc.ok(5);
+            ipc.set(2, ipc[1]);
+            for (int i = 3; i < 6; i++) ipc.set(i, 0);
+            break;
+        case 0x0014:  // PullPacket
+        case 0x0017:  // SendTo
+            ipc.result(NOT_CONNECTED);
+            break;
+        case 0x001A:  // GetChannel: zero when NotConnected.
+            ipc.ok(2);
+            ipc.set(2, 0);
+            break;
         default:
-            unimplemented(ipc);
+            // Includes deprecated/modern DecryptBeaconData0xE/0x1F and SetApplicationData0x10.
+            unimplemented(ipc, false);
+            ipc.result(UNSUPPORTED);
         }
     }
-    std::shared_ptr<Event> bind = make_event(ONESHOT, "uds bind");
 };
 
 struct Generic : Service {
@@ -878,10 +952,12 @@ struct Ssl : Service {
     using Service::Service;
     void handle(IPC &ipc) override {
         if (ipc.cmd() != 0x0011) return unimplemented(ipc);
+        const u32 error = ipc.mapped_output_error(2, ipc[1]);
+        if (error) return ipc.result(error);
         // GenerateRandomData(size, [buffer]): the clock and the tick it's first asked at, stirred (splitmix64)
         static u64 state = (u64)time(nullptr) << 32 ^ system_tick();
         u64 z = 0;
-        for (u32 i = 0; i < std::min(ipc[1], ipc[2] >> 4); i++) {  // (no further than the buffer it names)
+        for (u32 i = 0; i < ipc[1]; i++) {
             if (i % 8 == 0) {
                 z = (state += 0x9E3779B97F4A7C15ull);
                 z = (z ^ z >> 30) * 0xBF58476D1CE4E5B9ull;
@@ -894,9 +970,8 @@ struct Ssl : Service {
     }
 };
 
-// dlp:SRVR: Download Play's server side. A game asks it whether it was itself started as a Download Play child; the answer word left out
-// (as an unimplemented command returns) read as "yes" from what the last request left there: Luigi's Mansion: Dark Moon then started in
-// its Thrill Tower multiplayer, as a child looking for its host ("Connection error", "Waiting for player"), not at its title screen.
+// Download Play children are a separate 3DS title category. Use the current guest
+// program ID so retail games take their normal startup path.
 struct DlpSrvr : Service {
     SERVICE_CHECKPOINT(DlpSrvr)
     using Service::Service;
@@ -904,7 +979,7 @@ struct DlpSrvr : Service {
         switch (ipc.cmd()) {
         case 0x000E:  // IsChild(process id)
             ipc.ok(2);
-            ipc.set(2, 0);
+            ipc.set(2, (g_game.program_id >> 32) == 0x00040001);
             break;
         default:
             unimplemented(ipc);

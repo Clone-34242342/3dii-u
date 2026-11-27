@@ -16,11 +16,13 @@ games/<folder>/good_shots/<game>/<leg>: a game fails when, against the nearest g
 the other (pictures()), and so also when it draws nothing where a good run drew. A game with no good run says so. --bless runs nothing: it keeps
 the last run's pictures as a good run, for once they've been looked at (tools/contact_sheet.py lays them out, a sheet per game).
 A game also fails on a crash, code the translation missed, a vertex shader that wasn't compiled, a failed save flush, a save that formats itself twice, a save in common storage
-instead of the player's, or files not going straight to the file system. Fragment misses and frame rates are reported, not judged: Cemu has no real GPU. Shaders a run missed go to shader_logs, for the next build. Exit code 0 if all passed.
+instead of the player's, or files not going straight to the file system. By default fragment misses and frame rates are reported, not judged.
+--strict requires --measure and approved reference pictures; CPU shader fallback, fragment misses and missing execution counters also fail.
+This validates the exercised route, never complete gameplay or console performance. Shaders a run missed go to shader_logs, for the next build. Exit code 0 if all passed.
 --cold checks what a tester gets from a game nobody has built before: sources.json's games built with none of this PC's lists of their code and
 shaders (pipeline.py --cold), run the same way and held to the usual builds' good pictures. The usual check passed for weeks while testers' games,
 of other regions and versions than this PC's, crashed on code only this PC's lists named (2026-11-12).
-Cemu is a private copy in build_win/cemu (a renamed exe, so other sessions' scripts leave it alone), run by tools/win/cemu_run.ps1.
+Cemu runs from a temporary profile made from the emulator in build_win/cemu, with its own save storage for each check.
 """
 import argparse
 import binascii
@@ -30,20 +32,24 @@ import json
 import os
 import re
 import shutil
-import struct
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import dataclass, field
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from test_routes import GENERIC, ROUTES
+from dvlb_to_log import log_spans
+from test_routes import GENERIC, ROUTE_CHECKPOINTS, ROUTES
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))).replace('\\', '/')
 CEMU = ROOT + '/build_win/cemu'
 GAMES = {'sticker_star': '77', 'nsmb2': '78', 'dream_team': '79', 'paper_jam': '80', 'superstar_saga': '83', 'bowsers_inside': '84', 'layton_azran': '85', 'layton_mask': '86', 'tomodachi': '67'}
 OUT = {'layton_mask': 'build_layton/layton_mask', 'layton_azran': 'build_layton/layton_azran', 'tomodachi': 'build'}
 MEASURE = False  # --measure: the measuring kind of build, which build3ds.py and the builder's pipeline keep in folders of their own
+STRICT = False   # --strict: shader slow paths/misses block release validation too
 COLD = False     # --cold: built as a game nobody has built before, under <name>_cold
 SOURCES = ROOT + '/games/sources.json'
 # A console's account always has a Mii, and Cemu's is a placeholder the runtime turns down, so a run had the games find none: a state no
@@ -69,19 +75,74 @@ def wiiu_order(mii):
 
 
 def mii_maker_db():
-    """Mii Maker's database as frontend_wiiu.cpp reads it: two more made-up Miis, one in each order, as either may be what a console's file
-    holds, with a slot nobody uses between them, and a slot that holds no Mii (a name of control characters), which has to stay out"""
-    def another(n, name):
+    """A complete Wii U FFL_ODB, with sparse slots, a camera Mii and an invalid name."""
+    def another(n, name, version=3):
         m = bytearray(ACCOUNT_MII[:0x5C])
+        m[0] = version
         m[0x0F] = n  # its own Mii id
         m[0x1A:0x2E] = name.encode('utf-16-le').ljust(20, b'\0')
-        return bytes(m)
-    return b'FFOC' + bytes(4) + another(3, 'Maker One') + bytes(0x5C) + wiiu_order(another(4, 'Maker Two'))[:0x5C] + another(5, '\x01\x02\x03')
+        return wiiu_order(m)[:0x5C]
+    db = bytearray(0x43840)
+    db[:4] = b'FFOC'
+    for slot, data in ((0, another(3, 'Maker One')), (2, another(5, '\x01\x02\x03')), (2999, another(4, 'Maker Two', 0))):
+        offset = 8 + slot * 0x5C
+        db[offset:offset + 0x5C] = data
+    db[-2:] = binascii.crc_hqx(db[:-2], 0).to_bytes(2, 'big')
+    return db
 # A scene is a port run once more with switches of the runtime set (env.txt in its data folder, frontend_wiiu.cpp): a level a route can't reach
 # by playing, loaded in place of the one it enters. NSMB2's files: <world>-14 is a world's tower, -16 its castle, -12 its ghost house.
 SCENES = {'nsmb2_tower': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-14.sarc'}),
           'nsmb2_castle': ('nsmb2', {'RECOMP_ROMFS_SWAP': 'Course/1-1.sarc=Course/1-16.sarc'})}
-CRASH =r'FATAL|no recompiled code at|\[crash\]'  # the game's log on a crash of its own
+CRASH = r'FATAL(?!: no recompiled code at)|\[crash\]'  # the game's log on a crash of its own
+UNSUPPORTED = r'unsupported (?:(?:ARM|Thumb) )?(?:opcode|instruction)|undefined instruction'
+MISSING_SERVICE = (r'\[[^\]\r\n]+\] unimplemented command 0x[0-9a-f]+ \(failing\)'
+                   r'|\[svc\] unimplemented SVC 0x[0-9a-f]+')
+SHADER_READY = r'\[glsl\] (?:compiler (?:[^\r\n]+ up|thread ready)|(?:vertex|pixel) [0-9a-f]{16} restored from native cache)'
+
+FAILURE_CATEGORIES = (
+    'missing code',
+    'unsupported instruction',
+    'missing service command',
+    'shader fallback',
+    'save failure',
+    'no useful frames',
+    'cemu validation',
+    'crash',
+    'other',
+)
+
+
+def categorize_fault(fault: str) -> str:
+    """Classifies a failure into distinct, rankable categories across games.
+    Explicitly tags Cemu emulator artifacts to keep them separate from real Wii U behavior."""
+    m = fault.lower()
+    if "cemu can't decode vertex data" in m:
+        return 'cemu validation'
+    if 'cemu stopped:' in m:
+        return 'crash'
+    if '[lazy] no code' in m or 'code the translation missed' in m or 'no recompiled code at' in m or 'fallback function(s) executed' in m:
+        return 'missing code'
+    if re.search(UNSUPPORTED, m, re.IGNORECASE):
+        return 'unsupported instruction'
+    if ('unimplemented service command' in m or 'unimplemented command' in m or 'unimplemented svc' in m or
+            '[srv] unhandled' in m or 'unknown service' in m):
+        return 'missing service command'
+    if ('vertex shaders the pack lacks' in m or 'unresolved vertex shader' in m or 'shader fallback' in m or
+            'console compiler' in m or
+            '[glsl]' in m or
+            'fragment misses' in m):
+        return 'shader fallback'
+    if 'save flush failed' in m or 'formatted the save again' in m or 'saved in common storage' in m:
+        return 'save failure'
+    if ('nothing drawn' in m or 'no pictures of the' in m or 'insufficient visual coverage' in m or
+            'unverified rendering' in m or
+            'no new drawing while the guest stayed busy' in m or 'route ended before completing' in m or
+            'design strokes missing' in m or 'unreadable' in m or
+            'pictures not compared' in m or 'invalid reference pictures' in m):
+        return 'no useful frames'
+    if 'crash' in m or 'fatal' in m or 'pagefault' in m or 'panic' in m:
+        return 'crash'
+    return 'other'
 
 
 @dataclass
@@ -96,14 +157,19 @@ class Target:
     like: str = ''        # a cold build: the usual build of the game, whose good pictures it's held to
     env: dict = field(default_factory=dict)  # a scene's switches (SCENES)
     save: str = ''        # the save a run starts from, in place of a blank one (sources.json's "save")
+    cemu_root: str = ''   # the check's private copy, kept for both legs
+
+    @property
+    def cemu_dir(self):
+        return self.cemu_root or CEMU
 
     @property
     def common(self):
-        return f'{CEMU}/portable/mlc01/usr/save/00050000/{self.low}/user/common'
+        return f'{self.cemu_dir}/portable/mlc01/usr/save/00050000/{self.low}/user/common'
 
     @property
     def player(self):  # the player's own storage, where the game's saves go (save_storage.cpp): Cemu's first account
-        return f'{CEMU}/portable/mlc01/usr/save/00050000/{self.low}/user/80000001'
+        return f'{self.cemu_dir}/portable/mlc01/usr/save/00050000/{self.low}/user/80000001'
 
     @property
     def rpx(self):
@@ -137,11 +203,25 @@ def build_port(game):
     return t if 'no problems' in r.stdout else 'RPX check: ' + r.stdout[-300:]
 
 
+def title_files(out):
+    title = Path(out) / 'title'
+    return {file.relative_to(title).as_posix(): file.stat().st_size for file in title.rglob('*') if file.is_file()}
+
+
 def built_from_dump(name, since=0):
     """the builder's work folder for a game of sources.json, if it's there (and newer than since)"""
     for out in sorted(glob.glob(ROOT + '/builder_work/*/' + ('out_measure' if MEASURE else 'out')), key=os.path.getmtime, reverse=True):
+        if Path(out).parent.name.endswith('_cold') != name.endswith('_cold'):
+            continue
         mark = os.path.dirname(out) + '/check_name.txt'
         if os.path.exists(mark) and open(mark).read() == name and os.path.getmtime(out) >= since and os.path.exists(out + '/title/code/app.xml'):
+            manifest = Path(out) / 'check_title_files.json'
+            if manifest.is_file():
+                try:
+                    if json.loads(manifest.read_text(encoding='utf-8')) != title_files(out):
+                        continue
+                except (OSError, ValueError):
+                    continue
             tid = re.search(r'00050000([0-9A-Fa-f]{8})', open(out + '/title/code/app.xml').read())
             slug = os.path.basename(os.path.dirname(out))
             return Target(name, tid.group(1).lower(), out.replace('\\', '/'), f'{ROOT}/games/{re.sub(r"(_v[0-9]+)?(_cold)?$", "", slug)}')
@@ -153,9 +233,13 @@ def mark_built(name, started, said):
     of the game the pipeline said it built (its first line has the title ID): another game's build may be going beside this one, and each
     marked the other's folder as its own (Ultra Sun and Ultra Moon, 2026-11-13)."""
     built = re.search(r'\(([0-9A-F]{16})\)', said)
-    for out in glob.glob(ROOT + '/builder_work/*/out*'):
+    for out in glob.glob(ROOT + '/builder_work/*/' + ('out_measure' if MEASURE else 'out')):
+        if Path(out).parent.name.endswith('_cold') != name.endswith('_cold'):
+            continue
         info = os.path.dirname(out) + '/info.json'
         if built and os.path.getmtime(out) >= started and os.path.exists(info) and json.load(open(info))['program_id'][8:] == built.group(1)[8:]:
+            if os.path.isdir(out + '/title'):
+                (Path(out) / 'check_title_files.json').write_text(json.dumps(title_files(out)), encoding='utf-8')
             with open(os.path.dirname(out) + '/check_name.txt', 'w') as f:
                 f.write(name)
 
@@ -178,27 +262,42 @@ def build_from_dump(name, src, otp):
 SHOTS = 6  # pictures of each screen a leg (--shots): more of them follow a transition step by step
 
 
-def cemu(t, seconds, interp):
-    ps = ['powershell', '-NoProfile', '-File', ROOT + '/tools/win/cemu_run.ps1', '-Rpx', t.rpx, '-Low', t.low, '-Seconds', str(seconds), '-Shots', str(SHOTS), '-Out', t.data + '/shots/cemu']
+class CemuRunError(Exception):
+    pass
+
+
+def file_stamp(path):
+    try:
+        info = os.stat(path)
+        return info.st_ino, info.st_mtime_ns, info.st_size
+    except FileNotFoundError:
+        return None
+
+
+def cemu(t, seconds, interp, shots=None, captures=None, *, after_command=0):
+    ps = ['powershell', '-NoProfile', '-File', ROOT + '/tools/win/cemu_run.ps1', '-Rpx', t.rpx, '-Low', t.low, '-Seconds', str(seconds), '-Shots', str(SHOTS if shots is None else shots), '-Out', captures or t.data + '/shots/cemu']
     if interp:
         ps.append('-Interpreter')
-    return run(*ps).stdout
+    if after_command:
+        ps += ['-CaptureAfterCommand', str(after_command)]
+    ps += ['-CemuDir', t.cemu_dir]
+    guest, emulator = t.common + '/log.txt', t.cemu_dir + '/portable/log.txt'
+    old_guest, old_emulator = file_stamp(guest), file_stamp(emulator)
+    result = run(*ps)
+    if result.returncode:
+        raise CemuRunError(f'Cemu runner exited with status {result.returncode}: {result.stdout.strip()[-300:]}')
+    if old_guest is not None and file_stamp(guest) == old_guest:
+        raise CemuRunError('Cemu runner left the previous game log in place.')
+    stamp = file_stamp(emulator)
+    if stamp is None or stamp == old_emulator:
+        raise CemuRunError('Cemu runner produced no fresh emulator log.')
+    return result.stdout
 
 
 def gsx_misses(path):
     """the "GSX " records of a run's miss list: geometry shaders' draws the pack had no shader for, which the CPU drew (gx2_backend.cpp)"""
-    d, p, n = open(path, 'rb').read(), 0, 0
-    while p + 8 <= len(d):
-        tag = d[p:p + 4]
-        if tag in (b'GSX ', b'FS  '):
-            n += tag == b'GSX '
-            p += 8 + struct.unpack_from('<I', d, p + 4)[0]
-        elif tag == b'VS  ':
-            _, nc, ns = struct.unpack_from('<III', d, p + 4)
-            p += 16 + (nc + ns) * 4 + 56
-        else:
-            break
-    return n
+    with open(path, 'rb') as f:
+        return sum(tag == b'GSX ' for tag, _, _ in log_spans(f.read()))
 
 
 def learn_missed(t):
@@ -215,6 +314,15 @@ def learn_missed(t):
         with open(learned, 'w', newline='\n') as f:
             f.write('\n'.join(sorted(have | new)) + '\n')
     return len(new)
+
+
+def learn_shaders(t, misses):
+    """Keep this title's programs and shareable fragment states; cold checks never change learned inputs."""
+    if t.like:
+        return
+    os.makedirs(t.data + '/shader_logs', exist_ok=True)
+    out = f'{t.data}/shader_logs/cemu_{time.strftime("%m%d_%H%M%S")}.bin'
+    run(sys.executable, 'tools/misses_to_log.py', misses, out, out[:-4] + '_fs.bin')
 
 
 UNLIKE = 45  # mean difference per colour channel, of 255, between two pictures shrunk to 64x36: a frame of the same scene a moment apart
@@ -237,6 +345,31 @@ def small(path):
     return b''.join(bytes(img.constScanLine(y))[:64 * 3] for y in range(36))
 
 
+def black(path):
+    """Test full-size RGB pixels: shrinking can round a visible detail to black."""
+    from PySide6.QtGui import QImage
+    img = QImage(path).convertToFormat(QImage.Format_RGB888)
+    return not img.isNull() and not any(any(bytes(img.constScanLine(y))[:img.width() * 3]) for y in range(img.height()))
+
+
+def design_strokes_visible(path):
+    from PySide6.QtGui import QImage
+    img = QImage(path)
+    scale = img.height() / 240
+    left = (img.width() - 320 * scale) / 2
+    if img.isNull() or left < 0:
+        return False
+
+    def matches(x, y, rgb):
+        pixel = img.pixelColor(int(left + x * scale), int(y * scale)).getRgb()[:3]
+        return all(abs(actual - expected) <= 8 for actual, expected in zip(pixel, rgb))
+
+    # Three strokes in the blank T-shirt from the kept-save route. Check before saving.
+    return (all(matches(x, y, (255, 170, 136)) for x, y in
+                ((125, 71), (145, 71), (185, 71), (135, 111), (185, 111), (125, 155), (195, 155))) and
+            matches(90, 50, (255, 255, 255)) and matches(225, 190, (255, 255, 255)))
+
+
 def unlike(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
@@ -246,32 +379,49 @@ def strangers(mine, theirs):
     return sum(1 for m in mine if all(unlike(m, g) > UNLIKE for g in theirs))
 
 
-def pictures(t, leg):
+def pictures(t, leg, minimum_pairs=1, captures=None):
     """Keeps the leg's screenshots, of both screens, and says what's wrong with them against the good runs: (fault or None, note or None)"""
     mine, good = f'{kept(t, "check_shots")}/{leg}', f'{t.data}/good_shots/{t.like or t.name}/{leg}'
     shutil.rmtree(mine, ignore_errors=True)
     os.makedirs(mine)
-    for f in glob.glob(t.data + '/shots/cemu/*.png'):  # tv_NN.png and pad_NN.png (cemu_run.ps1)
+    for f in glob.glob((captures or t.data + '/shots/cemu') + '/*.png'):  # tv_NN.png and pad_NN.png (cemu_run.ps1)
         shutil.move(f, mine)
-    count = {s: len(glob.glob(f'{mine}/{s}_*.png')) for s in ('tv', 'pad')}
+    captures = {s: {os.path.basename(p).split('_', 1)[1] for p in glob.glob(f'{mine}/{s}_*.png')} for s in ('tv', 'pad')}
+    count = {s: len(names) for s, names in captures.items()}
+    pairs = len(captures['tv'] & captures['pad'])
+    if minimum_pairs > 1 and pairs < minimum_pairs:
+        return f'{leg}: insufficient visual coverage: {pairs} TV/GamePad capture pairs; at least {minimum_pairs} needed to compare rendering', None
     for screen, name in (('tv', 'TV'), ('pad', 'GamePad')):
         if not count[screen]:
             return f'{leg}: no pictures of the {name}', None
-    runs = glob.glob(good + '/*/')
-    if not runs:
-        return None, f'{leg}: no good pictures to compare with yet'
     try:
-        shrunk = {s: [x for x in map(small, sorted(glob.glob(f'{mine}/{s}_*.png'))) if x] for s in count}
-
+        shrunk = {s: list(map(small, sorted(glob.glob(f'{mine}/{s}_*.png')))) for s in count}
+        for screen in count:
+            if any(image is None for image in shrunk[screen]):
+                return f'{leg}: unreadable {"TV" if screen == "tv" else "GamePad"} picture', None
+        if pairs >= 2 and all(black(f'{mine}/tv_{n}') and black(f'{mine}/pad_{n}') for n in captures['tv'] & captures['pad']):
+            return f'{leg}: nothing drawn: every captured TV/GamePad pair is entirely black', None
+        if leg != 'restart' and (t.route or t.name) == 'acnl_design':
+            latest = max(captures['pad'], key=lambda name: int(name.split('.')[0]))
+            pad = f'{mine}/pad_{latest}'
+            if not design_strokes_visible(pad):
+                return f'{leg}: design strokes missing in the final GamePad capture', None
+        runs = glob.glob(good + '/*/')
+        if not runs:
+            return None, f'{leg}: no good pictures to compare with yet'
         def apart(run):  # the most pictures of one screen that this run or that good one has and the other hasn't
             n = 0
             for s in count:
-                theirs = [x for x in map(small, glob.glob(f'{run}/{s}_*.png')) if x]
+                theirs = list(map(small, glob.glob(f'{run}/{s}_*.png')))
+                if not theirs or any(image is None for image in theirs):
+                    raise ValueError(f'invalid reference pictures: missing or unreadable {s} images in {run}')
                 n = max(n, strangers(shrunk[s], theirs), strangers(theirs, shrunk[s]))
             return n
         nearest = min(map(apart, runs))
     except ImportError:
-        return None, f'{leg}: pictures not compared (PySide6 is not installed)'
+        return f'{leg}: pictures not compared (PySide6 is not installed)', None
+    except ValueError as error:
+        return f'{leg}: {error}', None
     if nearest >= 2:
         return f'{leg}: {nearest} pictures of a screen are in this run or the nearest good run and not in the other (see {mine})', None
     return None, f'{leg}: pictures like a good run\'s'
@@ -301,6 +451,13 @@ def until(lines, seconds):
     return out
 
 
+def route_checkpoint_reached(route, script, action, text):
+    index = route.index(action)
+    # Starting the planned next command proves the previous input was released.
+    return (script[index:index + 2] == route[index:index + 2] and
+            re.search(rf'\[live\] command {index + 2} starts \(', text) is not None)
+
+
 def save_files(t):
     got = {}
     base = t.player + '/save'
@@ -310,18 +467,103 @@ def save_files(t):
     return got
 
 
+def quit_fault(text):
+    if '[quit] audio thread still running' in text:
+        return 'audio thread still running at quit'
+    if '[quit] sound system shut down' not in text:
+        return 'the game did not close when it was quit'
+    return None
+
+
+def shader_faults(text):
+    """Strict release evidence: CPU fallback and missing shaders cannot count as a native pass."""
+    faults = []
+    cpu_counts = re.findall(r'(\d+) on CPU', text)
+    fragment_counts = re.findall(r'(\d+) fragment misses', text)
+    if not cpu_counts or not fragment_counts:
+        faults.append('shader fallback validation lacks complete execution counters')
+    final = re.findall(r'\[gx2 final\] native draws (\d+), CPU batches (\d+), fragment misses (\d+), immediate native draws (\d+), immediate CPU runs (\d+)', text)
+    if not final:
+        faults.append('shader fallback validation lacks final GPU execution counters')
+    cpu = max(sum(map(int, cpu_counts)), max((int(row[1]) for row in final), default=0))
+    fragments = max([int(value) for value in fragment_counts] + [int(row[2]) for row in final], default=0)
+    immediate = max([int(value) for value in re.findall(r'\[gx2 immediate\] native draws \d+, CPU shader runs (\d+)', text)] +
+                    [int(row[4]) for row in final], default=0)
+    geometry = sum(map(int, re.findall(r'(\d+) geometry shaders.*drawn by the CPU', text)))
+    if cpu or geometry or immediate:
+        faults.append(f'shader fallback: {cpu} CPU draw batches, {geometry} geometry shader fallbacks, {immediate} immediate CPU shader runs')
+    if fragments:
+        faults.append(f'shader fallback: {fragments} fragment misses')
+    return faults
+
+
+def vertex_misses(text):
+    missing = set(re.findall(r'\[gx2\] no compiled vertex shader ([0-9a-f]{16}),', text))
+    ready = set(re.findall(r'\[glsl\] vertex ([0-9a-f]{16}) (?:compiled in|restored from native cache)', text))
+    return missing - ready, missing & ready
+
+
+def render_stall_seconds(text):
+    """Time spent busy with no GPU progress at the end of a route that drew earlier."""
+    samples = re.findall(r'\[wiiu\] frame (\d+): gx lists (\d+), transfers (\d+), guest threads idle (\d+)%', text)
+    previous_frame = stalled = 0
+    previous_work = None
+    for frame, lists, transfers, idle in (map(int, sample) for sample in samples):
+        work = (lists, transfers) if (lists or transfers) and idle == 0 else None
+        elapsed = frame - previous_frame
+        stalled = stalled + elapsed if work and work == previous_work and 0 < elapsed <= 600 else 0
+        previous_frame, previous_work = frame, work
+    return stalled // 60
+
+
+def cemu_profile(scratch):
+    target = scratch.replace('\\', '/') + '/cemu'
+    os.makedirs(target + '/portable')
+    shutil.copyfile(CEMU + '/CemuMario.exe', target + '/CemuMario.exe')
+    for folder in ('resources', 'gameProfiles', 'graphicPacks', 'portable/controllerProfiles', 'portable/gameProfiles', 'portable/graphicPacks'):
+        if os.path.isdir(CEMU + '/' + folder):
+            shutil.copytree(CEMU + '/' + folder, target + '/' + folder)
+    try:
+        settings = ET.parse(CEMU + '/portable/settings.xml')
+    except FileNotFoundError:
+        settings = ET.ElementTree(ET.Element('content'))
+    mlc = settings.getroot().find('mlc_path')
+    if mlc is None:
+        mlc = ET.SubElement(settings.getroot(), 'mlc_path')
+    mlc.text = os.path.abspath(target + '/portable/mlc01')
+    # Cemu's asynchronous compiler can skip a first-use draw while its pipeline is being built.
+    graphics = settings.getroot().find('Graphic')
+    if graphics is None:
+        graphics = ET.SubElement(settings.getroot(), 'Graphic')
+    async_compile = graphics.find('AsyncCompile')
+    if async_compile is None:
+        async_compile = ET.SubElement(graphics, 'AsyncCompile')
+    async_compile.text = 'false'
+    settings.write(target + '/portable/settings.xml', encoding='utf-8', xml_declaration=True)
+    return target
+
+
 def judge(t, seconds, flags, measured=False):
+    with tempfile.TemporaryDirectory(prefix='3diiu-cemu-') as scratch:
+        try:
+            profile = cemu_profile(scratch)
+        except (OSError, ET.ParseError) as e:
+            return [f'could not prepare the Cemu check profile: {e}'], []
+        try:
+            return judge_runs(replace(t, cemu_root=profile), seconds, flags, measured, scratch)
+        except CemuRunError as e:
+            return [str(e)], []
+
+
+def judge_runs(t, seconds, flags, measured, scratch):
     faults, notes = [], []
     d = t.common
-    shutil.rmtree(d, ignore_errors=True)
-    shutil.rmtree(t.player, ignore_errors=True)
     if t.save:
         shutil.copytree(t.save, t.player + '/save')
-    # a run stopped while Cemu wrote its shader cache leaves a file that crashes the next start
-    for f in glob.glob(f'{CEMU}/portable/shaderCache/transferable/00050000{t.low}_*'):
-        os.remove(f)
     os.makedirs(d)
-    route = ROUTES.get(t.route or t.name, GENERIC)
+    route_name = t.route or t.name
+    route = ROUTES.get(route_name, GENERIC)
+    checkpoint = ROUTE_CHECKPOINTS.get(route_name)
     for flag in ['cemu'] + flags:  # cemu: the runtime's word that it isn't a console running it (gx2_backend.cpp); name=text for a file with something in it
         with open(f'{d}/{flag.split("=")[0]}', 'w') as f:
             f.write(flag.partition('=')[2])
@@ -336,31 +578,38 @@ def judge(t, seconds, flags, measured=False):
     interp = t.interp
     # a scene is its level alone, and a kept save its place in the game: a restart would stop before the route is back there
     for name, secs in (('kept save' if t.save else 'blank save', seconds), ('restart', max(40, seconds // 4)))[:1 if t.env or t.save else 2]:
-        read_log = lambda: open(log, 'rb').read().decode('utf-8', 'replace') if os.path.exists(log) else ''
+        def attempt():
+            captures = tempfile.mkdtemp(dir=scratch)
+            said = cemu(t, secs * slow(), interp, shots=SHOTS * slow(), captures=captures)
+            try:
+                with open(log, encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+            except FileNotFoundError:
+                text = ''
+            return said, text, captures
         # The restart ends as a player ends a game, quit from its menu (a route's KEY quit), not killed: closing is where consoles have hung
-        closing = name == 'restart'
+        closing = name == 'restart' or STRICT
+        script = until(route, secs - 15) + ['KEY quit'] if closing else route
         with open(d + '/live.txt', 'w', newline='\n') as f:
-            f.write('\n'.join(until(route, secs - 15) + ['KEY quit'] if closing else route) + '\n')
+            f.write('\n'.join(script) + '\n')
         saved_before = bool(save_files(t))
         # Cemu's interpreter, taken after its recompiler failed, runs a game at a third of its speed or less (Luigi's Mansion 2): a leg in it gets
         # longer, and the restart's quit, at its route's end, still comes before the time is up
+        # Scale captures too: the extra allowance must not delay them past an early guest quit.
         slow = lambda: (3 if closing else 2) if interp and not t.interp else 1  # noqa: E731
-        said = cemu(t, secs * slow(), interp)
-        text = read_log()
+        said, text, captures = attempt()
         if 'exited by itself' in said and not text.strip():
             # Cemu died before the game wrote a line: one of its own caches for the title, left damaged by the run before, which can happen even
             # when that run closed as asked (NSMB2's restart, 2026-11-11). cemu_run.ps1 has dropped them, so the same again starts clean.
             notes.append(f'{name}: Cemu died as it started; run again on fresh caches')
-            said = cemu(t, secs * slow(), interp)
-            text = read_log()
-        elif not text.strip() and not glob.glob(t.data + '/shots/cemu/tv_*.png'):
+            said, text, captures = attempt()
+        elif not text.strip() and not glob.glob(captures + '/tv_*.png'):
             # Or it stayed up and never started the game: no line on the game's log and not one picture (A Link Between Worlds' restart,
             # 2026-11-11, right after Kirby's died the other way). The same caches, which cemu_run.ps1 only drops when Cemu exits or won't close.
             notes.append(f'{name}: Cemu never started the game; run again on fresh caches')
-            for f in glob.glob(f'{CEMU}/portable/shaderCache/transferable/00050000{t.low}_*'):
+            for f in glob.glob(f'{t.cemu_dir}/portable/shaderCache/transferable/00050000{t.low}_*'):
                 os.remove(f)
-            said = cemu(t, secs * slow(), interp)
-            text = read_log()
+            said, text, captures = attempt()
         crashed = bool(re.search(CRASH, text))
         if not interp and (crashed or 'exited by itself' in said):
             # Cemu's recompiler can run a game's code wrongly, at the start or minutes in: it dies with nothing on the game's own log (3D Land,
@@ -369,34 +618,43 @@ def judge(t, seconds, flags, measured=False):
             notes.append(f"{name}: " + ("the game crashed in Cemu's recompiler" if crashed else "Cemu's recompiler died with nothing on the game's log")
                          + '; run with its interpreter')
             interp = True
-            said = cemu(t, secs * slow(), interp)
-            text = read_log()
+            said, text, captures = attempt()
         if 'exited by itself' in said:
             faults.append(f'{name}: Cemu stopped: ' + said.strip()[-120:])
         if text:  # each leg's log is kept: the next leg starts the game's own log over
             os.makedirs(kept(t, 'check_logs'), exist_ok=True)
             with open(f'{kept(t, "check_logs")}/{name.replace(" ", "_")}.txt', 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)
-        if closing and '[quit] sound system shut down' not in text:
-            faults.append(f'{name}: the game did not close when it was quit')
+        if closing and (fault := quit_fault(text)):
+            faults.append(f'{name}: {fault}')
+        if name != 'restart' and checkpoint and not route_checkpoint_reached(route, script, checkpoint[0], text):
+            faults.append(f'{name}: route ended before completing its required input: {checkpoint[0]}')
         for k, v in t.env.items():
             if f'[test] {k} is {v}' not in text or (k == 'RECOMP_ROMFS_SWAP' and '[fs] romfs swap' not in text):
                 faults.append(f'{name}: {k} did not take: this is not the scene')
-        for pat, what in ((CRASH, 'crash'), (r'\[lazy\] no code', 'code the translation missed')):
-            n = len(re.findall(pat, text))
+        for pat, what in (
+            (r'\[lazy\] no code|no recompiled code at', 'code the translation missed'),
+            (UNSUPPORTED, 'unsupported instruction'),
+            (MISSING_SERVICE, 'unimplemented service command'),
+            (CRASH, 'crash'),
+        ):
+            n = len(re.findall(pat, text, re.IGNORECASE))
             if n:
-                faults.append(f'{name}: {what} ({n}): ' + next(l for l in text.split('\n') if re.search(pat, l))[:120])
+                faults.append(f'{name}: {what} ({n}): ' + next(l for l in text.split('\n') if re.search(pat, l, re.IGNORECASE))[:120])
+        fallbacks = len(re.findall(r'\[fallback\] executed missed function', text))
+        if fallbacks:
+            faults.append(f'{name}: {fallbacks} fallback function(s) executed; needs recompile in functions.txt')
         if 'every file call goes straight' not in text:
             faults.append(f'{name}: files not direct: ' + ' / '.join(l[:90] for l in text.split('\n') if '[fs] ' in l)[:200])
         # A vertex shader the pack lacks is compiled by the console, and its draws are the CPU's until it's there: a fault only if it never came
-        lacked, came = len(re.findall(r'no compiled vertex shader', text)), len(re.findall(r'\[glsl\] vertex [0-9a-f]+ compiled', text))
-        if lacked > came:
-            faults.append(f'{name}: {lacked - came} vertex shaders the pack lacks and the console did not compile')
-        elif lacked:
-            notes.append(f'{name}: {lacked} vertex shaders the pack lacked, compiled by the console')
+        missing, recovered = vertex_misses(text)
+        if missing:
+            faults.append(f'{name}: {len(missing)} unresolved vertex shader miss(es): {", ".join(sorted(missing))}')
+        if recovered:
+            notes.append(f'{name}: {len(recovered)} vertex shader miss(es) recovered at runtime')
         # A vertex attribute in a layout Cemu has no decoder for is left out, with nothing on the game's log, and the pictures then show what no
         # console draws: NSMB2's world map without its ground, Superstar Saga's backgrounds as stripes (2026-11-11). Cemu's own log says so.
-        with open(CEMU + '/portable/log.txt', encoding='utf-8', errors='replace') as f:
+        with open(t.cemu_dir + '/portable/log.txt', encoding='utf-8', errors='replace') as f:
             undecoded = sorted(set(re.findall(r'Unsupported fmt \w+ nfa \d+ signed \d+ endian \d+', f.read())))
         if undecoded:
             faults.append(f"{name}: Cemu can't decode vertex data this game drew with, so these aren't a console's pictures: " + '; '.join(undecoded))
@@ -414,7 +672,7 @@ def judge(t, seconds, flags, measured=False):
             faults.append(f"{name}: {miis[-1]} of the console's {MIIS} Miis reached the game's Mii Maker")
         made = re.findall(r'\[glsl\] (?:pixel|vertex) [0-9a-f]+ compiled in (\d+) ms', text)
         bad = re.findall(r'\[glsl\] (?:pixel|vertex) [0-9a-f]+ failed', text)
-        if 'compiler' not in text or '[glsl] off' in text:
+        if not re.search(SHADER_READY, text) or '[glsl] off' in text:
             faults.append(f'{name}: the console compiler is not running')
         if bad:
             faults.append(f'{name}: the console compiler failed {len(bad)} times')
@@ -424,24 +682,32 @@ def judge(t, seconds, flags, measured=False):
         fps = [float(x) for x in re.findall(r'\[gx2\] ([0-9.]+) fps', text)]
         ps = re.findall(r'(\d+) fragment misses', text)
         cpu = re.findall(r'(\d+) on CPU', text)
+        if STRICT:
+            faults.extend(f'{name}: {fault}' for fault in shader_faults(text))
+            stall = render_stall_seconds(text)
+            if stall >= 30:
+                faults.append(f'{name}: no new drawing while the guest stayed busy for at least {stall} seconds')
         if fps:
             s = sorted(fps)
             notes.append(f'{name}: {s[len(s) // 2]:.0f} fps (low {s[0]:.0f}), {ps[-1] if ps else 0} fragment misses, {sum(map(int, cpu))} draws shaded by the CPU, {len(flushes)} flushes')
         elif measured:
             faults.append(f'{name}: nothing drawn')
-        fault, note = pictures(t, name.replace(' ', '_'))
+        fault, note = pictures(t, name.replace(' ', '_'), minimum_pairs=2 if SHOTS > 1 else 1, captures=captures)
         if fault:
             faults.append(fault)
         if note:
             notes.append(note)
+            if STRICT and 'no good pictures to compare with' in note:
+                faults.append(f'{name}: unverified rendering: no approved reference pictures')
         misses = d + '/shader_misses.bin'
         if os.path.exists(misses) and os.path.getsize(misses):
+            shutil.copyfile(misses, f'{kept(t, "check_logs")}/{name.replace(" ", "_")}_shader_misses.bin')
             gsx = gsx_misses(misses)
             if gsx:
                 notes.append(f"{name}: {gsx} geometry shaders' draws the pack lacked a shader for, drawn by the CPU")
-            if not t.like:  # what a cold build missed stays out of the lists the usual builds are made from
-                os.makedirs(t.data + '/shader_logs', exist_ok=True)
-                run(sys.executable, 'tools/misses_to_log.py', misses, f'{t.data}/shader_logs/cemu_{time.strftime("%m%d_%H%M%S")}.bin')
+                if STRICT:
+                    faults.append(f'{name}: shader fallback: {gsx} geometry shader records need native compilation')
+            learn_shaders(t, misses)
             os.remove(misses)
     found = learn_missed(t)
     if found:
@@ -458,15 +724,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('games', nargs='*', default=['all'])
     p.add_argument('--no-build', action='store_true')
-    p.add_argument('--seconds', type=int, default=200)
+    p.add_argument('--seconds', type=int, help='seconds per main run (default: 200 or the route\'s longer allowance)')
     p.add_argument('--flag', action='append', default=[], help='a debug file in the data folder, like top1080, or with what it holds: "gxtrace=3000 400"')
     p.add_argument('--route', help="a route of test_routes.py for every game named, instead of its own: nsmb2_stand to time a level's first screen")
     p.add_argument('--bless', action='store_true', help="runs nothing: the pictures the last run kept become a good run, once they've been looked at")
     p.add_argument('--measure', action='store_true', help="the measuring kind of build (build3ds.py's THREEDII_MEASURE): frame rates and costs on the log, and the scenes")
     p.add_argument('--shots', type=int, default=6, help='pictures of each screen a leg; more than the usual six are for looking at, and fail the comparison with a good run')
     p.add_argument('--cold', action='store_true', help="sources.json's games as a tester's first build of a game nobody has built: none of this PC's lists of its code and shaders")
+    p.add_argument('--strict', action='store_true', help='CPU shader fallback and fragment misses block release validation')
     args = p.parse_args()
+    if args.strict and not args.measure:
+        p.error('--strict requires --measure so fallback execution counters are available')
     SHOTS = args.shots
+    global STRICT
+    STRICT = args.strict
     global COLD
     COLD = args.cold
     if args.measure:
@@ -478,13 +749,14 @@ def main():
     built = args.no_build or args.bless
     bad = 0
     ports_built = set()
+    game_gaps = {}
     for game in games:
         started = time.time()
-        if game in SCENES and not args.measure:
+        if not COLD and game in SCENES and not args.measure:
             t = 'a scene needs --measure: its switches reach the game through the measuring build alone'
         elif COLD and game not in src['games']:
             t = f'--cold builds a game from its dump: only the games in {SOURCES}'
-        elif game in GAMES or game in SCENES:
+        elif not COLD and (game in GAMES or game in SCENES):
             of, env = SCENES.get(game, (game, {}))
             t = port(of) if built or of in ports_built else build_port(of)  # a scene's port as this run has built it already
             if not isinstance(t, str):
@@ -500,7 +772,7 @@ def main():
             elif save and not os.path.isdir(save):
                 t = f'the save it starts from is not there: {save}'
             else:
-                t = (built_from_dump(name) or 'not built yet') if built or of in ports_built else build_from_dump(name, src['games'][of], src['otp'])
+                t = (built_from_dump(name) or 'no complete cached build') if built or of in ports_built else build_from_dump(name, src['games'][of], src['otp'])
             if not isinstance(t, str):
                 ports_built.add(of)
                 t.name, t.save = game + '_cold' * COLD, save
@@ -514,17 +786,33 @@ def main():
         else:
             t = f'no such game: not one of the ports and not in {SOURCES}'
         if not isinstance(t, str) and game in src['games']:
-            t.route = src['games'][game].get('route', '')
+            t.route = src['games'][game].get('route') or t.route or game
         if args.route and not isinstance(t, str):
             t.route = args.route
         if args.bless and not isinstance(t, str):
             print(f'{game}: {bless(t)}', flush=True)
             continue
-        faults, notes = ([t], []) if isinstance(t, str) else judge(t, args.seconds, args.flag, args.measure)
+        if isinstance(t, str):
+            faults, notes = [t], []
+        else:
+            seconds = args.seconds if args.seconds is not None else ROUTE_CHECKPOINTS.get(t.route or t.name, ('', 200))[1]
+            faults, notes = judge(t, seconds, args.flag, args.measure)
         bad += bool(faults)
         print(f'{"FAIL" if faults else "ok  "} {game} ({int(time.time() - started)} s): ' + '; '.join(notes), flush=True)
         for f in faults:
-            print('     ' + f, flush=True)
+            cat = categorize_fault(f)
+            game_gaps.setdefault(cat, set()).add(game)
+            print(f'     [{cat}] {f}', flush=True)
+    if bad:
+        print('\n--- Cold-Build Runtime Gaps by Category ---' if COLD else '\n--- Runtime Gaps by Category ---', flush=True)
+        ranked = sorted(
+            [(cat, games_in_cat) for cat, games_in_cat in game_gaps.items() if games_in_cat],
+            key=lambda x: len(x[1]),
+            reverse=True
+        )
+        for cat, games_in_cat in ranked:
+            note = ' (Cemu emulation artifact; not console hardware behavior)' if cat == 'cemu validation' else ''
+            print(f'  {cat:24s}: {len(games_in_cat)} title(s){note} -> {", ".join(sorted(games_in_cat))}', flush=True)
     sys.exit(1 if bad else 0)
 
 

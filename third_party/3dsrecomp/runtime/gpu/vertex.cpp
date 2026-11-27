@@ -330,7 +330,9 @@ const gs_native *gs_native_find(const ShaderProgram *p, const ShaderSetup &s, u3
 void gs_native_emit(void *ctx, unsigned vid, unsigned prim, unsigned wind) {
     ShaderUnit &u = *(ShaderUnit *)ctx;
     static u32 sampled;
-    const bool timed = cpu_timing_enabled() && (sampled++ & 15) == 0;
+    // Parallel emitters have private buffers and must not update this shared
+    // sampled timing accumulator. Their whole job is timed on the GPU thread.
+    const bool timed = cpu_timing_enabled() && u.emitter && u.emitter->emit_prim == gs_emit_prim && (sampled++ & 15) == 0;
     const double t0 = timed ? now_ms() : 0;
     if (Emitter *e = u.emitter) {
         e->vertex_id = vid;
@@ -407,6 +409,9 @@ bool gs_run_shared(const V4 *vs_out, u32 n) {
     const ShaderProgram *p = shader_get_program(g.gs);
     const gs_native *t = gs_native_find(p, g.gs, g.regs[R::GS + R::SH_ENTRY] & 0xffff);
     if (!t || !t->independent || (g.gs_emitter.output_mask & ~t->outmask)) return false;
+    static bool reported;
+    if (!reported) { reported=true; LOG("[vtx] independent geometry shared across %u workers, %u invocations\n",pool_threads(),n/per); }
+    const double started = cpu_timing_enabled() ? now_ms() : 0;
     const u32 runs = n / per;
     constexpr u32 kRuns = 16;
     const u32 chunks = (runs + kRuns - 1) / kRuns;
@@ -450,11 +455,18 @@ bool gs_run_shared(const V4 *vs_out, u32 n) {
     if (declined) return false;  // its bools say another path: nothing has reached the assembler yet
     for (u32 c = 0; c < chunks; c++)
         for (const GsPrim &pr : made[c]) {
+            if (cpu_timing_enabled()) vtx_cpu.geometry_prims++;
             if (pr.winding) g.pa.winding = true;
             for (u32 i = 0; i < 3; i++) pa_submit(pr.v[i]);
         }
+    // Serial submission leaves the last complete primitive's inputs in the
+    // shared GS uniforms. Later draws and checkpoints must see the same data.
+    for (u32 v = 0; v < per; v++)
+        for (u32 k = 0; k < vs_out_num; k++)
+            g.gs.f[begin + v * vs_out_num + k] = vs_out[(size_t)((runs - 1) * per + v) * 16 + k];
     g.gs.b[15] = true;
     for (u32 i = runs * per; i < n; i++) gs_submit_vertex(vs_out + (size_t)i * 16);  // the start of a primitive the next draw goes on with
+    if (started) vtx_cpu.geometry_gs_ms += now_ms() - started;
     return true;
 }
 
@@ -534,12 +546,14 @@ void vtx_reset_immediate() {
     g.imm_n = 0;
 }
 
-void vtx_immediate_vertex() {
+u64 vtx_immediate_cpu_runs;
+static void immediate_cpu_vertex(const V4 *inputs) {
     vtx_finish_jobs();
     cur_ds = draw_state();
     static ShaderUnit u;
     shader_unit_init(u, g.vs);
-    load_inputs(u, R::VS, g.imm_vertex);
+    load_inputs(u, R::VS, inputs);
+    ++vtx_immediate_cpu_runs;
     shader_run(shader_get_program(g.vs), u, g.vs, g.regs[R::VS + R::SH_ENTRY] & 0xffff);
     V4 buf[16];
     gather_outputs(u, g.regs[R::VS + R::SH_OUTMASK] & 0xffff, buf);
@@ -580,6 +594,73 @@ void vtx_report_hotspots() {
     if(fallback_hotspot_dropped)LOG("[fallback-hot] bounded report omitted %u task samples\n",fallback_hotspot_dropped);
     fallback_hotspot_count=fallback_hotspot_dropped=0;
 }
+
+#ifdef __WIIU__
+namespace {
+V4 immediate_inputs[96][16];
+u32 immediate_count;
+}
+#endif
+
+void vtx_flush_immediate() {
+#ifdef __WIIU__
+    const u32 count = immediate_count;
+    if (!count) return;
+    immediate_count = 0;
+    vtx_finish_jobs();  // older CPU jobs precede the native draw
+    cur_ds = draw_state();
+    if (g.imm_reset_gs) {
+        gs_reconfigure();
+        g.imm_reset_gs = false;
+    }
+    u32 done = 0;
+    const u32 whole = count / 3 * 3;
+    if (whole && !cur_ds->skip && !cur_ds->shadow_mode && !cur_ds->gas && cur_ds->rt.color_addr &&
+        pptr(cur_ds->rt.color_addr) && !(cur_ds->rt.color_fmt & 0x80)) {
+        Gx2Draw d{};
+        d.num_attr = 16;  // the whole immediate latch, including attributes not sent by this vertex
+        d.in_maxi = g.regs[R::VS + R::SH_INPUT_CFG] & 0xf;
+        d.in_map = (u64)g.regs[R::VS + R::SH_PERM_LO] | (u64)g.regs[R::VS + R::SH_PERM_HI] << 32;
+        d.topology = g.pa.topology;
+        d.count = whole;
+        d.prog = shader_get_program(g.vs);
+        d.entry = g.regs[R::VS + R::SH_ENTRY] & 0xffff;
+        d.ds = cur_ds;
+        OutMap om;
+        setup_outmap(om);
+        u32 out_reg[16], nout = 0;
+        const u32 mask = g.regs[R::VS + R::SH_OUTMASK] & 0xffff;
+        for (u32 r = 0; r < 16; r++) if (mask & (1u << r)) out_reg[nout++] = r;
+        for (u32 i = 0; i < 24; i++) {
+            const s32 s = om.slot_src[i];
+            d.slot_src[i] = s >= 0 && (u32)(s >> 2) < nout ? (s8)(out_reg[s >> 2] * 4 + (s & 3)) : -1;
+        }
+        const bool flip = g.pa.topology == 3 && g.pa.winding;
+        if (flip) std::swap(immediate_inputs[0], immediate_inputs[1]);
+        const bool taken = gx2_draw(d, immediate_inputs[0]);
+        if (flip) std::swap(immediate_inputs[0], immediate_inputs[1]);
+        if (taken) {
+            done = whole;
+            if (g.pa.topology == 3) g.pa.winding = false;
+        }
+    }
+    // A continuation needs shaded outputs from the old state, before the pending register write.
+    for (u32 i = done; i < count; i++) immediate_cpu_vertex(immediate_inputs[i]);
+#endif
+}
+
+void vtx_immediate_vertex() {
+#ifdef __WIIU__
+    const bool gs_active = g.imm_reset_gs ? (g.regs[R::GS_MISC] & 3) == 2 : gsp.active;
+    if (!gs_active && (g.pa.topology == 0 || g.pa.topology == 3) && g.pa.index == 0 && !g.pa.strip_ready) {
+        memcpy(immediate_inputs[immediate_count++], g.imm_vertex, sizeof g.imm_vertex);
+        if (immediate_count == 96) vtx_flush_immediate();
+        return;
+    }
+#endif
+    immediate_cpu_vertex(g.imm_vertex);
+}
+
 
 // ---------------------------------------------------------------- deferred draws
 // Draws without a geometry shader are recorded as jobs (with a snapshot of everything the vertex

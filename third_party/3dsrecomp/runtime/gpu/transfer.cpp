@@ -154,9 +154,6 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
 void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap,
                   u32 flags) {
     (void)flags;
-#ifdef __WIIU__
-    if (gx2_skip_copies) return;
-#endif
     ensure_init();
     raster_flush();
     metal_poll();

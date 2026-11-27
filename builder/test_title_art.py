@@ -39,6 +39,22 @@ with tempfile.TemporaryDirectory() as tmp:
     assert title.smdh_names(icon) == ('Some Game Name', 'Maker'), title.smdh_names(icon)
     assert title.smdh_names(japanese) == ('ゲーム', 'P-ja'), title.smdh_names(japanese)
 
+    # The common bands leave the game's own image visible, in the right orientation, for any SMDH.
+    quadrants = [[((255, 0, 0) if x < 24 else (0, 255, 0)) if y < 24 else
+                  ((0, 0, 255) if x < 24 else (255, 255, 0)) for x in range(48)] for y in range(48)]
+    framed = title.vc_icon_pixels(quadrants)
+    assert (len(framed), len(framed[0])) == (128, 128)
+    assert [framed[y][x] for x, y in ((16, 40), (112, 40), (16, 88), (112, 88))] == [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+    assert 0 < framed[2][2][0] < 255 and 0 < framed[126][126][0] < 255, 'both bands must darken the game art'
+    assert any(min(pixel) > 220 for row in framed[109:120] for pixel in row), 'the footer label is missing'
+    assert any(min(pixel) > 200 for row in framed[6:13] for pixel in row[9:68]), 'the NINTENDO label is missing'
+    # The game's 48 pixels become 128 more sharply than Qt's smooth scaling took them (its steepest step on this edge was 48), and
+    # nothing rings past the edge: every pixel stays between the two greys
+    edge = [pixel[0] for pixel in title.sharp_icon([[(64,) * 3 if x < 24 else (192,) * 3 for x in range(48)] for _ in range(48)])[64]]
+    assert max(abs(b - a) for a, b in zip(edge, edge[1:])) >= 56, edge[56:72]
+    assert edge[:60] == [64] * 60 and edge[68:] == [192] * 60, f'the edge rings: {edge[56:72]}'
+
     # a picture of any other size fills its frame whole: 344 wide, as tall as its shape asks within 200-300, centred in the band
     cover = os.path.join(tmp, 'cover.png')
     picture = QImage(300, 400, QImage.Format_RGB888)
@@ -52,6 +68,20 @@ with tempfile.TemporaryDirectory() as tmp:
     assert near(tv[10][10], (247, 247, 247), 12), tv[10][10]          # the background above it
     assert near(tv[700][400], (214, 214, 214), 16), tv[700][400]      # and below
     assert near(pad[248][163], BLUE), pad[248][163]                    # the GamePad's is the TV's, smaller
+    assert sum(tv[78][844]) < sum(tv[78][400]) - 30, (tv[78][844], tv[78][400])  # the console behind it on the right, its lid's face
+
+    # a title screen as libretro keeps it, both screens one above the other (top_screen): the top one alone fills the frame, 344x206
+    stacked = os.path.join(tmp, 'stacked.png')
+    picture = QImage(512, 614, QImage.Format_RGB888)
+    picture.fill(QColor(*BLUE))
+    paint = QPainter(picture)
+    paint.fillRect(0, 307, 512, 307, QColor(*GREEN))
+    paint.end()
+    assert picture.save(stacked)
+    tv = title.console_screens(stacked, icon, top_screen=True)['bootTvTex.tga']
+    for y in (372 - 98, 372, 372 + 98):
+        assert near(tv[y][244], BLUE), (y, tv[y][244])
+    assert near(tv[372 - 110][244], WHITE, 12) and near(tv[372 + 110][244], WHITE, 12), 'the frame is not the top screen\'s shape'
 
     # a GameTDB case scan (768x680, case_scan): its white strip down the right is left out, the whole height stays (the green foot, where a
     # logo can sit), and it shows whole in its frame, 344 across and as tall as its shape asks
@@ -123,7 +153,7 @@ with tempfile.TemporaryDirectory() as tmp:
     for d in (os.path.join(game, 'exefs'), shaders, archives):
         os.makedirs(d, exist_ok=True)
     every, own = struct.pack('>II', 2, 0) + b'EVRY' * 4, struct.pack('>II', 2, 0) + b'OWN!' * 4  # a boot sound's head, then samples
-    for f, body in (('game/exheader.bin', b''), ('game/code.bin', b''), ('game/romfs.bin', b''), ('game/exefs/icon.bin', bytes(0x36C0)),
+    for f, body in (('game/exheader.bin', b''), ('game/code.bin', b''), ('game/romfs.bin', b''), ('game/exefs/icon.bin', smdh('Some Game', 'Maker')),
                     ('g.rpx', b'rpx'), ('shaders/shaders.gsh', b''), ('shaders/shaders.idx', b''), ('boot_sound.btsnd', every),
                     ('own.btsnd', own), ('bad.btsnd', b'not a sound')):
         with open(os.path.join(tmp, f), 'wb') as fh:
@@ -141,10 +171,10 @@ with tempfile.TemporaryDirectory() as tmp:
         pictures[name] = os.path.join(tmp, name + '.png')
         assert img.save(pictures[name])
 
-    def made(style, pad_art=None, boot_sound=None):
+    def made(style, pad_art=None, boot_sound=None, icon_art=None, art='red'):
         out = os.path.join(tmp, 'title')
         title.make_title(out, game, os.path.join(tmp, 'g.rpx'), shaders, '0005000010334455', 'A game', 'WUP-N-ABCD', archives,
-                         pictures['red'], None, style, pad_art=pad_art, boot_sound=boot_sound)
+                         pictures.get(art, art), icon_art, style, pad_art=pad_art, boot_sound=boot_sound)
         middle = {}
         for tga, w, h in (('bootTvTex.tga', 1280, 720), ('bootDrcTex.tga', 854, 480)):
             data = open(os.path.join(out, 'meta', tga), 'rb').read()
@@ -152,13 +182,33 @@ with tempfile.TemporaryDirectory() as tmp:
             middle[tga] = tuple(data[at + 2:at - 1:-1])
         return middle, open(os.path.join(out, 'meta', 'bootSound.btsnd'), 'rb').read()
 
+    def menu_pixel(x, y):
+        data = open(os.path.join(tmp, 'title', 'meta', 'iconTex.tga'), 'rb').read()
+        assert struct.unpack_from('<HHBB', data, 12) == (128, 128, 32, 8)
+        assert len(data) == 18 + 128 * 128 * 4 + len(title.TGA_FOOTER) and data.endswith(title.TGA_FOOTER)
+        at = 18 + ((127 - y) * 128 + x) * 4
+        b, g, r, a = data[at:at + 4]
+        assert a == 255
+        return r, g, b
+
     middle, sound = made('picture')
     assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, (middle, sound)
+    assert menu_pixel(64, 64) == (0, 255, 0), 'bootscreen art must not replace the default SMDH icon'
+    assert 0 < menu_pixel(2, 2)[1] < 255, 'the default menu icon has no VC band'
+    made('picture', icon_art=pictures['red'])
+    assert menu_pixel(64, 64) == (255, 0, 0) and menu_pixel(2, 2) == (0, 0, 0), 'a custom icon was framed or replaced'
+    made('picture', icon_art=os.path.join(tmp, 'bad.png'))
+    assert menu_pixel(64, 64) == (0, 255, 0) and 0 < menu_pixel(2, 2)[1] < 255, 'invalid custom art must fall back to the framed SMDH'
     middle, sound = made('picture', pictures['green'], os.path.join(tmp, 'own.btsnd'))
     assert near(middle['bootTvTex.tga'], (255, 0, 0)) and near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == own, (middle, sound)
     middle, sound = made('console', pictures['green'], os.path.join(tmp, 'gone.btsnd'))
     assert near(middle['bootTvTex.tga'], (255, 255, 255), 12), ("the TV lost the Virtual Console's layout", middle)  # its white band
     assert near(middle['bootDrcTex.tga'], (0, 255, 0)) and sound == every, ('the GamePad picture laid out, or a lost sound kept', middle, sound)
+    for missing in (None, os.path.join(tmp, 'bad.png')):
+        middle, _ = made('console', art=missing)
+        assert all(near(pixel, (255, 255, 255), 12) for pixel in middle.values()), 'missing art removed the VC layout'
+    middle, _ = made('picture', art=None)
+    assert all(near(pixel, (0, 255, 0)) for pixel in middle.values()), 'Picture style lost its icon fallback'
     middle, sound = made('picture', os.path.join(tmp, 'bad.png'), os.path.join(tmp, 'bad.btsnd'))
     assert near(middle['bootDrcTex.tga'], (255, 0, 0)) and sound == every, ("a picture or sound that can't be used wasn't left out", middle, sound)
     sound = made('picture', boot_sound=os.path.join(tmp, 'start.wav'))[1]

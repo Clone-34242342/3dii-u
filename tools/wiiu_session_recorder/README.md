@@ -53,6 +53,12 @@ The integrated runtime client accepts only status, thread-list and bounded memor
 
 Validation: real TCP integration tests cover both channels in one folder, markers with both offsets, start/stop and session rotation, runtime reconnect, persistent-owner snapshot requests, operation with an unavailable runtime channel, and disconnect after the Aroma receiver has stopped. A live Cemu test also captured native thread addresses/names and read the running build stamp through the integrated receiver.
 
+## Force fallback rendering
+
+The unchecked-by-default **Force fallback rendering** checkbox routes fragment draws through the generic fallback for visual comparisons. It is a temporary diagnostic switch, can be very slow, and does not persist as a preference. It does not enable screenshots. Compare the same scene with the switch on and off; restore it to off after testing. A queued request is not proof that the console applied it: confirm the runtime acknowledgement.
+
+Python can request the same switch with `control("fallback-rendering", "on")` or `control("fallback-rendering", "off")`. The console must be connected and running a compatible runtime. This controls fragment shading; it does not force CPU vertex rendering.
+
 ## Explicit renderer experiments
 
 The `runtime` action stays read-only, including the one-shot `stats` performance report. A separate `renderer` action accepts only `set cpuvs 0|1`, `set vtxcache 0|1`, `set cpuattr 0..15`, `set drawtrace 0|1`, and `set trace 0..256`, `set gputime 0|1`, `set cputime 0|1`, and `set toplevel 0..2`. Each request is logged before the runtime sends it. These temporary live switches require a compatible 3Dii U runtime; they are for developer A/B tests, not an automatic graphics repair. Restore `cpuvs 0` and `vtxcache 1` after testing unless a deliberately chosen experiment requires otherwise.
@@ -186,7 +192,9 @@ before submitting the next. To reverse a successful edit, compare against the
 replacement value and write the old value back. Patching data is not a renderer
 fix and must remain an explicitly recorded diagnostic experiment.
 
-Additional recorded A/B controls include `set lightguard 0|1` and
-`set copyrect 0|1`. These are explicit temporary developer controls.
+Additional recorded A/B controls include `set lightguard 0|1`,
+`set copyrect 0|1`, and `set gsshared 0|1`. `set nudge 0..50` selects a viewport
+pixel offset in hundredths, and `set nudge 100` restores the automatic policy.
+These are temporary developer controls, not persistent display settings.
 Manual screenshots remain separate from timing windows. Automatic capture is
 not enabled by any debug/state action.

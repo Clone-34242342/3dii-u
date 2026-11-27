@@ -58,9 +58,11 @@ movable.sed
 /phase0/title*/code/*.rpx
 /phase0/title*/meta/*.tga
 
-# Only the recompiler is tracked. The CafeGLSL compilers are downloads, or built by tools/win/build_cafeglsl.ps1.
+# Only the recompiler and stb_truetype (the in-game menu's text) are tracked. The CafeGLSL compilers are downloads, or built by
+# tools/win/build_cafeglsl.ps1.
 /third_party/*
 !/third_party/3dsrecomp/
+!/third_party/stb/
 
 # Only devkitPro's public signing keys. aac_ppc is built by tools/aac_build.sh.
 /toolchain/*

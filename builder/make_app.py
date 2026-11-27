@@ -10,13 +10,14 @@ Run: python builder/make_app.py [--release <tag>] (needs the toolchain installed
 --release: this build's tag, like builder-1.0-beta-2026-11-13. The app carries it and its zip is named after it, which is how an app out
 there knows a newer build from its own, whichever release the zip is put under, and hands over to one it downloaded (updater.py); a build
 without it never updates itself."""
-import glob
 import json
 import os
 import shutil
 import sys
+import tempfile
 import time
 import types
+import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # python -P leaves the script's folder off the path
@@ -26,7 +27,7 @@ ROOT = os.path.dirname(HERE)
 OUT = os.path.join(HERE, 'dist')
 DEVKITPRO = 'C:/devkitPro/opt/devkitpro'
 ENGINE_DIRS = ('tools', 'phase0/tools', 'phase0/title_code', 'port','third_party/3dsrecomp/runtime', 'third_party/3dsrecomp/tools', 'third_party/3dsrecomp/games',
-               'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
+               'third_party/stb', 'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
 ENGINE_FILES = ('third_party/cafeglsl/glslcompiler.exe', 'third_party/cafeglsl/libwinpthread-1.dll', 'third_party/cafeglsl/zlib1.dll',
                 'third_party/3dsrecomp/LICENSE')
 WORK = os.path.join(HERE, 'build_app')  # PyInstaller's own work folder, gone afterwards
@@ -89,6 +90,7 @@ def bundle_logs(src, dst):
     if os.path.isfile(catalog): shutil.copy2(catalog, out)
     dvlb = os.path.join(logs, 'dvlb.bin')
     progs = shaderlogs.programs(dvlb) if os.path.isfile(dvlb) else set()
+    stale = progs and not os.path.isfile(os.path.join(logs, 'dvlb.gsl'))  # a dvlb.bin from before dvlb_to_log.py kept geometry programs whole
     recipes, shipped = 0, set()
     for f in [f for f in os.listdir(logs) if f.endswith('.vsf')]:
         shutil.copy2(os.path.join(logs, f), os.path.join(out, f))
@@ -96,20 +98,39 @@ def bundle_logs(src, dst):
         shutil.copy2(os.path.join(logs, f), os.path.join(out, f))
         with open(os.path.join(logs, f), 'rb') as h:
             made = list(shaderlogs.recipes(h.read()))
-        shipped |= {fp for _, fp, *_ in made}
+        shipped.update((entry, fp, tail) for entry, fp, tail, _, _ in made)
         recipes += len(made)
     srcs, cache, left = shaderlogs.sources(src), {}, 0  # a tested game's own code.bin and romfs.bin
     for f in os.listdir(logs):
         if not f.endswith('.bin') or f in ('dvlb.bin', 'neighborhood_fs.bin') or f.startswith('other_'):
             continue
         with open(os.path.join(logs, f), 'rb') as h:
-            frag, vsf, vsr, missing = shaderlogs.split(h.read(), progs, srcs, cache)
-        recipes += sum(1 for _ in shaderlogs.recipes(vsr))
-        left += sum(1 for code, swz in missing if shaderlogs.fingerprint(code, swz) not in shipped)
+            d = h.read()
+        if stale and any(r[0] == 'gsx' for r in shaderlogs.records(d)):
+            print(f'{os.path.basename(src)}: its geometry shader records ship cut short (no dvlb.gsl beside its dvlb.bin): build the game again')
+            stale = False
+        frag, vsf, vsr, missing = shaderlogs.split(d, progs, srcs, cache, covered=shipped)
+        made = list(shaderlogs.recipes(vsr))
+        recipes += len(made)
+        shipped.update((entry, fp, tail) for entry, fp, tail, _, _ in made)
+        left += len(missing)
         for name, data in ((f, frag), (f[:-4] + '.vsf', vsf), (f[:-4] + '.vsr', vsr)):
             if data:
                 with open(os.path.join(out, name), 'wb') as h:
                     h.write(data)
+    for f in os.listdir(logs):
+        if not f.endswith('.vsf') or f.startswith('other_'):
+            continue
+        with open(os.path.join(logs, f), 'rb') as h:
+            captured = list(shaderlogs.fingerprint_records(h.read()))
+        if not captured:
+            continue
+        path = os.path.join(out, f)
+        if os.path.isfile(path):
+            with open(path, 'rb') as h:
+                captured = [*shaderlogs.fingerprint_records(h.read()), *captured]
+        with open(path, 'wb') as h:
+            h.write(b''.join(dict.fromkeys(captured)))
     shaderlogs.close(srcs)
     return recipes, left
 
@@ -139,7 +160,9 @@ def bundle_engine(engine):
         if os.path.isdir(os.path.join(src, 'shader_logs')):
             made, missing = bundle_logs(src, dst)
             recipes, left = recipes + made, left + missing
-    print(f'shader logs: {recipes} vertex records as recipes, {left} left out, their programs in no file of the dump to find them by')
+            if missing:
+                print(f'{g}: {missing} unresolved vertex records')
+    print(f'shader logs: {recipes} vertex records as recipes, {left} unresolved; source data absent or unmatched')
     # libstdc++'s policy-based data structures: nothing here uses them, and theirs are the deepest paths, past what Windows can copy in a deep folder.
     # binutils' bfd-plugins: nm and ld load each file there as a DLL, and its libdep.a (a static library) made Windows stop a build with a
     # "bad image" box on a tester's PC (issue 1); the builds use no plugin
@@ -200,6 +223,20 @@ def release_tag(argv, version):
     return tag
 
 
+def archive_app(name):
+    # Keep the existing release in place until its replacement opens and passes ZIP's CRC checks.
+    with tempfile.TemporaryDirectory(prefix='.3diiu-zip-', dir=OUT) as staging:
+        made = shutil.make_archive(os.path.join(staging, 'app'), 'zip', OUT, NAME)
+        with zipfile.ZipFile(made) as archive:
+            if f'{NAME}/{NAME}.exe' not in archive.namelist():
+                raise ValueError('The new Builder ZIP is missing its executable.')
+            if bad := archive.testzip():
+                raise ValueError(f'The new Builder ZIP did not verify: {bad}.')
+        target = os.path.join(OUT, name + '.zip')
+        os.replace(made, target)
+        return target
+
+
 def main():
     import PyInstaller.__main__
     import gui
@@ -229,7 +266,17 @@ def main():
         args += ['--hidden-import', m]
     for m in EXCLUDE:
         args += ['--exclude-module', m]
-    PyInstaller.__main__.run(args)
+    # Match Windows' DLL search order: a tool on PATH (such as Poppler) can carry
+    # an incompatible icuuc.dll that PyInstaller otherwise bundles instead of using Windows' own.
+    previous_path = os.environ.get('PATH')
+    os.environ['PATH'] = os.path.join(os.environ['WINDIR'], 'System32') + os.pathsep + (previous_path or '')
+    try:
+        PyInstaller.__main__.run(args)
+    finally:
+        if previous_path is None:
+            os.environ.pop('PATH', None)
+        else:
+            os.environ['PATH'] = previous_path
     shutil.rmtree(WORK, ignore_errors=True)
     freed = prune(os.path.join(OUT, NAME, '_internal', 'PySide6'))
     engine = bundle_engine(os.path.join(OUT, NAME, 'engine'))
@@ -262,10 +309,8 @@ def main():
     files = sum(len(fs) for _, _, fs in os.walk(app)) + 1  # and files.txt, which app.py checks by that a tester unzipped the whole app
     with open(os.path.join(app, '_internal', 'files.txt'), 'w') as f:
         f.write(str(files))
-    for old in glob.glob(os.path.join(OUT, '*.zip')):  # one zip, this build's
-        os.remove(old)
     # a release's zip is named after its tag, which is how the updater knows the build (updater.NAMED), with no spaces for GitHub to change
-    z = shutil.make_archive(os.path.join(OUT, release.replace('builder-', '3Dii-U-Builder-', 1) if release else f'{NAME} {gui.VERSION} beta'), 'zip', OUT, NAME)
+    z = archive_app(release.replace('builder-', '3Dii-U-Builder-', 1) if release else f'{NAME} {gui.VERSION} beta')
     print(f'for testers: {z} ({os.path.getsize(z) >> 20} MB)')
 
 

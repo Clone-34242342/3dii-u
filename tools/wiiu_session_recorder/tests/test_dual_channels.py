@@ -227,11 +227,30 @@ class DualChannelTests(unittest.TestCase):
         self.connect()
         self.controller.command('start')
         with self.assertRaises(ValueError): self.controller.command('runtime', 'set cpuvs 1')
-        for command in ['set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1', 'set gputime 0', 'set gputime 1', 'set cputime 1', 'set cputime 0', 'set avtime 0', 'set avtime 1', 'set toplevel 0', 'set toplevel 1', 'set toplevel 2']:
+        for command in ['set uberall 0', 'set uberall 1', 'set cpuvs 1', 'set cpuvs 0', 'set vtxcache 0', 'set trace 64', 'set cpuattr 15', 'set drawtrace 1', 'set inkrefresh 0', 'set inkrefresh 1', 'set gputime 0', 'set gputime 1', 'set cputime 1', 'set cputime 0', 'set avtime 0', 'set avtime 1', 'set toplevel 0', 'set toplevel 1', 'set toplevel 2']:
             self.controller.command('renderer', command)
             wait_for(lambda: command.encode() in self.server.commands)
-        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'set gputime 2', 'set cputime 2', 'set avtime 2', 'set toplevel 3', 'fw 1', 'relaunch', 'set uberall 1']:
+        for command in ['set trace 257', 'set cpuattr 16', 'set drawtrace 2', 'set cpuvs 2', 'set inkrefresh 2', 'set gputime 2', 'set cputime 2', 'set avtime 2', 'set toplevel 3', 'fw 1', 'relaunch extra', 'set uberall 2']:
             with self.assertRaises(ValueError): self.controller.command('renderer', command)
+
+    def test_explicit_lifecycle_and_bounded_input_controls(self):
+        self.connect()
+        for action,note,expected in [('game-menu','',b'quit'),('game-relaunch','',b'relaunch'),
+                                     ('game-input','A 6',b'in A 6'),('game-input','B 4',b'in B 4')]:
+            result=self.controller.command(action,note)
+            self.assertEqual(result['runtime_command_queued'],expected.decode())
+            wait_for(lambda: expected in self.server.commands)
+        for note in ('A 0','A 601','A 6\nquit','POKE8 1'):
+            with self.assertRaises(ValueError):self.controller.command('game-input',note)
+        with self.assertRaises(ValueError):self.controller.command('runtime','in A 6')
+
+    def test_fallback_rendering_control(self):
+        self.connect()
+        for note,expected in [('on',b'set uberall 1'),('off',b'set uberall 0')]:
+            result=self.controller.command('fallback-rendering',note)
+            self.assertEqual(result['runtime_command_queued'],expected.decode())
+            wait_for(lambda: expected in self.server.commands)
+        with self.assertRaises(ValueError): self.controller.command('fallback-rendering','maybe')
 
     def test_discovers_split_mutex_banner_and_captures_owner(self):
         self.connect()

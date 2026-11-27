@@ -40,6 +40,7 @@ class Game:
         self.upstream_functions = os.path.dirname(BIN.rstrip(os.sep)) + '/upstream.txt'
         self.pipelines = 'upstream pipelines'
     def mixed(self): self.mixed_called, self.mode = True, 'abi'
+def prepare_vertex_logs(*args): pass
 def prepare_logs(*args): pass
 def build_shadergen(*args): return 'unused'
 def build_code(g, args):
@@ -88,7 +89,7 @@ def build_shaders(*args): pass
                 with ExitStack() as stack:
                     for owner, name, value in ((pipeline, 'ROOT', str(engine)), (pipeline, 'WORK', str(engine)),
                             (pipeline, 'BUILD', str(build)), (pipeline, 'WORK_GAMES', str(build / 'builder_work')),
-                            (pipeline, 'ARCHIVES', str(build / 'archives')), (pipeline.sys, 'argv', argv)):
+                            (pipeline, 'ARCHIVES', str(build / 'archives')), (pipeline.sys, 'argv', argv), (pipeline.sys, 'platform', 'win32')):
                         stack.enter_context(mock.patch.object(owner, name, value))
                     for owner, name, value in ((pipeline, 'profile_for', profile), (pipeline.user_files, 'check_otp', None),
                             (pipeline.dumps, 'have_system_archives', True), (pipeline.dumps, 'archives_named', []),

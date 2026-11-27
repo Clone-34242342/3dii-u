@@ -10,18 +10,22 @@ come before the ones it used once. Getting none, as such a game used to, left ev
 fs_variants.py <output.bin> [--max N] <fragment log>...
 fs_variants.py --self-check"""
 import heapq
+import os
 import struct
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from collections import Counter
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dvlb_to_log import fragment_keys  # noqa: E402
+
 MOST_RANKED = 4_000_000  # combinations worth walking through to rank; past it the rarest parts are left out first
 
 
 def keys(path):
     from tev_to_log import records
-    for key in records(path):
+    for key in records(path, allow_partial=True):
         yield struct.unpack(f'<{len(key) // 4}I', key)
 
 

@@ -139,7 +139,7 @@ class Mixer {
 public:
     void reset() { st = {}; frame = {}; }
     void tick(DspConfig &cfg, const IntermediateMix (&read)[2], IntermediateMix (&write)[2],
-              const std::array<QuadFrame, 3> &input);
+              const std::array<QuadFrame, 3> &input, bool fresh = true);
     const StereoFrame &output() const { return frame; }
 
 private:
@@ -156,6 +156,7 @@ private:
         std::array<float, 3> volume{};
         std::array<bool, 2> aux_enable{};
         std::array<QuadFrame, 3> mix{};
+        std::array<QuadFrame, 2> aux_return{};
         Delay delay[2];
         u16 output_format = 1;
     };

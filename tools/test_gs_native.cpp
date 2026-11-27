@@ -134,6 +134,13 @@ int main(int argc, char **argv) {
                         // Dependent programs still need all output lanes checked. Their
                         // independence mask can be zero because they read input registers.
                         e.output_mask = native.independent ? native.outmask : 0xffff;
+                        if (way == 2) {
+                            // Independent invocations must not consume a prior
+                            // invocation's unfilled emitter vertex slots either.
+                            const unsigned nout=__builtin_popcount(e.output_mask);
+                            for(auto &vertex:e.buf) for(unsigned o=0;o<nout;o++)
+                                for(float &lane:vertex[o].v) lane=(float)(rng()%1000)-500.0f;
+                        }
                         e.emit_prim = capture;
                         u.emitter = &e;
                         sink = way ? &got : &want;

@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 try:
     from pyctr.type.cci import CCIReader
@@ -124,6 +125,12 @@ def convert_and_decrypt(cia_path, out_3ds_path=None, makerom_path=None):
     if out_3ds_path is None:
         out_dir = os.path.dirname(cia_path)
         out_3ds_path = os.path.join(out_dir, clean_game_name(cia_path))
+    out_3ds_path = os.path.abspath(out_3ds_path)
+    makerom_path = os.path.abspath(shutil.which(makerom_path) or makerom_path)
+    if os.path.normcase(cia_path) == os.path.normcase(out_3ds_path) or (
+            os.path.exists(out_3ds_path) and os.path.samefile(cia_path, out_3ds_path)):
+        print('[!] The output must be a different file from the source CIA.')
+        return False
 
     print(f"\n=======================================================")
     print(f"Input:  {os.path.basename(cia_path)}")
@@ -132,13 +139,25 @@ def convert_and_decrypt(cia_path, out_3ds_path=None, makerom_path=None):
 
     # Step 1: Repackage CIA to CCI container using makerom
     print("[1/3] Converting CIA container to CCI (.3ds)...")
-    cmd = [makerom_path, "-ciatocci", cia_path, "-o", out_3ds_path, "-target", "p"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=0x08000000 if os.name == "nt" else 0)
-    if proc.returncode != 0:
-        print(f"[!] makerom failed: {proc.stderr or proc.stdout}")
+    try:
+        # makerom opens narrow filenames on Windows; pass ASCII names relative to its working directory.
+        with tempfile.TemporaryDirectory(prefix='ciatocci-', dir=os.path.dirname(out_3ds_path)) as work:
+            source = os.path.join(work, 'input.cia')
+            shutil.copyfile(cia_path, source)
+            staged = os.path.join(work, 'output.3ds')
+            cmd = [makerom_path, '-ciatocci', 'input.cia', '-o', 'output.3ds', '-target', 'p']
+            proc = subprocess.run(cmd, cwd=work, capture_output=True, text=True, errors='replace',
+                                  creationflags=0x08000000 if os.name == 'nt' else 0)
+            if proc.returncode != 0 or not os.path.isfile(staged) or os.path.getsize(staged) < 0x200:
+                print(f'[!] makerom did not produce a CCI: {proc.stderr or proc.stdout}')
+                return False
+            if not (decrypt_in_place(staged) and verify(staged)):
+                return False
+            os.replace(staged, out_3ds_path)
+        return True
+    except OSError as e:
+        print(f'[!] Conversion failed: {e}')
         return False
-
-    return decrypt_in_place(out_3ds_path) and verify(out_3ds_path)
 
 def main():
     makerom = find_makerom()

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """Differential test of the ARM lowering: random instruction blocks run through the generated C and Unicorn.
 
-usage: .venv/bin/python -m tools.test_cpu [count] [seed] [class,...]
+usage: python tools/test_cpu.py [count] [seed] [class,...]
+Optional TEST_CPU_CC is a JSON compiler argv; default clang. TEST_CPU_WORK and TEST_CPU_REPORT select artifact locations.
+Generated C runs on the host, not PowerPC; skipped oracle cases and any full FPSCR mismatch fail.
+Memory/VFP use one instruction per block; directed edge cases honor the selected classes.
 """
+from collections import Counter
+import json
 import os
 import random
 import struct
@@ -10,7 +15,9 @@ import subprocess
 import sys
 import tempfile
 
-from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM, UC_HOOK_CODE
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from unicorn import Uc, UC_ARCH_ARM, UC_MODE_ARM
 from unicorn import arm_const as A
 
 from tools.recomp import arm, thumb
@@ -75,6 +82,9 @@ def fix_dp(w):
     op = (w >> 21) & 15
     if op in (8, 9, 10, 11):
         w |= 1 << 20  # TST/TEQ/CMP/CMN must set flags (S=0 is misc space)
+        w &= ~(15 << 12)  # unused destination must be zero
+    if op in (13, 15):
+        w &= ~(15 << 16)  # MOV/MVN have no Rn operand
     return w
 
 
@@ -84,6 +94,8 @@ def g_mul(r):
     if op >= 2:
         while rn == rd:
             rn = reg(r)
+    if op == 0:
+        rn = 0  # MUL has no accumulator
     S = r.randrange(2) if op != 2 else 0
     return (cond(r) << 28) | (op << 21) | (S << 20) | (rd << 16) | (rn << 12) | (reg(r) << 8) | 0x90 | reg(r)
 
@@ -101,7 +113,10 @@ def g_misc(r):
         if op == 2:
             while ra == rd:
                 ra = reg(r)
-        return (c << 28) | 0x01000080 | (op << 21) | (rd << 16) | (ra << 12) | (reg(r) << 8) | (r.randrange(4) << 5) | reg(r)
+        xy = r.randrange(4)
+        if op == 3 or (op == 1 and xy & 1):
+            ra = 0  # SMULxy/SMULWy have no accumulator
+        return (c << 28) | 0x01000080 | (op << 21) | (rd << 16) | (ra << 12) | (reg(r) << 8) | (xy << 5) | reg(r)
     if k == 3:  # MRS
         return (c << 28) | 0x010F0000 | (reg(r) << 12)
     if k == 4:  # MSR cpsr_f reg
@@ -184,8 +199,11 @@ def g_mem(r):
             rd = 4
         imm = r.randrange(0, 0x40) & ~7
         lo = imm & 15 if I else reg(r, 0, 3)
+        high = (imm >> 4) & 15 if I else 0
+        if sh >= 2 and not L and not P:
+            Wb = 0  # doubleword post-index encoding requires W=0
         return (c << 28) | (P << 24) | (U << 23) | (I << 22) | (Wb << 21) | (L << 20) | (rn << 16) | (rd << 12) | (
-            ((imm >> 4) & 15) << 8) | 0x90 | (sh << 5) | lo
+            high << 8) | 0x90 | (sh << 5) | lo
     if k == 3:  # LDM/STM
         P, U, Wb, L = r.randrange(2), r.randrange(2), r.randrange(2), r.randrange(2)
         lst = r.getrandbits(13) | (1 << r.randrange(13))
@@ -318,12 +336,8 @@ def acceptable(w, i):
 # ---------------------------------------------------------------- reference: unicorn
 def run_unicorn(words, regs, flags, vregs, fpscr, mem, is_thumb=False):
     uc = Uc(UC_ARCH_ARM, UC_MODE_ARM)
-    try:
-        from unicorn import UC_CTL_CPU_MODEL
-        from unicorn.arm_const import UC_CPU_ARM_1176
-        uc.ctl_set_cpu_model(UC_CPU_ARM_1176)
-    except Exception:
-        pass
+    from unicorn.arm_const import UC_CPU_ARM_1176
+    uc.ctl_set_cpu_model(UC_CPU_ARM_1176)
     uc.mem_map(CODE, 0x10000)
     uc.mem_map(SCRATCH, SCRATCH_SIZE)
     code = b''.join(struct.pack('<H' if is_thumb else '<I', w) for w in words)
@@ -377,16 +391,91 @@ def c_function(name, insts):
     return '\n'.join(lines)
 
 
+def nan_equivalent(words, insts, actual, expected, register):
+    """Allow payload/sign variation only in a typed arithmetic NaN destination.
+
+    VFP cases contain one instruction, so raw moves, integer conversions and
+    finite double halves can never be mistaken for single-precision NaNs.
+    """
+    if len(words) != 1:
+        return False
+    note, word = insts[0].note, words[0]
+    arithmetic = {'vadd', 'vsub', 'vmul', 'vnmul', 'vmla', 'vmls', 'vnmla', 'vnmls', 'vsqrt'}
+    conversions = {'vcvt.f32.f64', 'vcvt.f64.f32'}
+    if note.split('.')[0] not in arithmetic and note not in conversions:
+        return False
+    double = (note.endswith('.f64') and note != 'vcvt.f32.f64') or note == 'vcvt.f64.f32'
+    if double:
+        low = 2 * ((word >> 12) & 15)
+        if register not in (low, low + 1):
+            return False
+        def is_nan(values):
+            lo, hi = values[low:low + 2]
+            return (hi & 0x7ff00000) == 0x7ff00000 and bool((hi & 0xfffff) or lo)
+    else:
+        low = 2 * ((word >> 12) & 15) + ((word >> 22) & 1)
+        if register != low:
+            return False
+        def is_nan(values):
+            bits = values[low]
+            return (bits & 0x7f800000) == 0x7f800000 and bool(bits & 0x7fffff)
+    return is_nan(actual) and is_nan(expected)
+
+
+def add_edges(cases, classes, ctx):
+    """Small deterministic defined cases, restricted to the selected classes."""
+    words = {
+        'dp': [0xe0910002, 0xe0b10002, 0xe0510002, 0xe0d10002, 0xe1b00211, 0xe1b00231, 0xe1b00251, 0xe1b00271],
+        'mul': [0xe0100291, 0xe0910392, 0xe0b10392, 0xe0d10392, 0xe0f10392],
+        'misc': [0xe16f0f11, 0xe1020051, 0xe1220051, 0xe1420051, 0xe1620051],
+        'mem': [0xe5980000, 0xe5880004, 0xe1d800b0, 0xe1c800b0, 0xe1d800f0, 0xe1c800d0],
+        'thumb': [0x1888, 0x1a88, 0x4148, 0x4188, 0x4088, 0x40c8, 0x4108, 0x41c8, 0x4348],
+    }
+    rng = random.Random(314159)
+    for cls in ('media', 'vfp'):
+        if cls not in classes:
+            continue
+        words[cls], notes = [], set()
+        while len(words[cls]) < 6:
+            word = GENS[cls](rng)
+            ins = arm.decode(CODE, word, ctx)
+            if acceptable(word, ins) and ins.note not in notes:
+                words[cls].append(word)
+                notes.add(ins.note)
+    values = [0, 1, 31, 32, 33, 255, 256, 0x7fffffff, 0x80000000, 0xffffffff, 0x80008000, 0x7fff7fff]
+    count = 0
+    for cls, instructions in words.items():
+        if cls not in classes:
+            continue
+        for word in instructions:
+            ins = thumb.decode(CODE, word, 0, ctx) if cls == 'thumb' else arm.decode(CODE, word, ctx)
+            assert acceptable(word, ins), (cls, hex(word), ins.note)
+            for index, value in enumerate(values):
+                regs = [values[(index + k) % len(values)] for k in range(15)]
+                regs[0] = regs[1] = value
+                regs[2], regs[3] = values[(index + 1) % len(values)], 0xffffffff
+                for k in range(8, 13):
+                    regs[k] = SCRATCH + 0x1000 * (k - 7)
+                regs[13] = SCRATCH + 0x8000
+                vregs = [fbits(FSPECIAL[(index + k) % len(FSPECIAL)]) for k in range(32)]
+                mem = bytearray((k + index) & 255 for k in range(256)) * (SCRATCH_SIZE // 256)
+                cases.append((cls, [word], [ins], regs, (index * 73) & 511, vregs, 0, mem))
+                count += 1
+    return count
+
+
 def main():
     count = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     classes = sys.argv[3].split(',') if len(sys.argv) > 3 else list(GENS)
+    if count < 1 or not classes or any(c not in GENS for c in classes):
+        raise SystemExit("positive count and known instruction classes required")
     r = random.Random(seed)
     ctx = arm.Ctx(None)
     cases = []
     while len(cases) < count:
         cls = r.choice(classes)
-        n = r.randint(1, 4)
+        n = 1 if cls in ('mem', 'vfp') else r.randint(1, 4)
         words, insts = [], []
         while len(words) < n:
             w = GENS[cls](r)
@@ -413,42 +502,60 @@ def main():
         mem = bytearray(r.getrandbits(8) for _ in range(256)) * (SCRATCH_SIZE // 256)
         cases.append((cls, words, insts, regs, flags | (ge << 5), vregs, fpscr, mem))
 
-    tmp = tempfile.mkdtemp()
-    src = ['#include "cpu.h"', '#include <stdio.h>', '#include <stdlib.h>', '#include <sys/mman.h>', 'u8 *g_mem;',
+    edge_count = add_edges(cases, classes, ctx)
+    tmp = tempfile.mkdtemp(prefix='cpu_', dir=os.environ.get('TEST_CPU_WORK'))
+    src = ['#include "cpu.h"', '#include <stdio.h>', '#include <stdlib.h>', '#ifdef _WIN32', '#include <windows.h>', '#else', '#include <sys/mman.h>', '#ifndef MAP_NORESERVE', '#define MAP_NORESERVE 0', '#endif', '#endif', 'u8 *g_mem;',
            'void rt_dispatch(CPU *c, u32 u) {} void rt_svc(CPU *c, u32 i) {} void rt_undefined(CPU *c, u32 a, u32 w) {}']
     for k, (cls, words, insts, regs, flags, vregs, fpscr, mem) in enumerate(cases):
         src.append(c_function('t%d' % k, insts))
     src.append('typedef void (*TF)(CPU *); static TF tests[] = {%s};' % ','.join('t%d' % k for k in range(len(cases))))
     src.append(r'''
 int main(int argc, char **argv) {
+    if (argc != 3) return 20;
+#ifdef _WIN32
+    g_mem = (u8 *)VirtualAlloc(0, (1ull << 32) + 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+    if (!g_mem || !VirtualAlloc(g_mem + 0x10000, 0x10000, MEM_COMMIT, PAGE_READWRITE)) return 21;
+#else
     g_mem = mmap(0, (1ull << 32) + 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (g_mem == MAP_FAILED) return 21;
+#endif
     FILE *in = fopen(argv[1], "rb"); FILE *out = fopen(argv[2], "wb");
+    if (!in || !out) return 22;
     for (int k = 0; k < (int)(sizeof tests / sizeof *tests); k++) {
         CPU c; memset(&c, 0, sizeof c);
         u32 buf[15 + 1 + 32 + 1];
-        fread(buf, 4, 49, in);
+        if (fread(buf, 4, 49, in) != 49) return 23;
         for (int i = 0; i < 15; i++) c.r[i] = buf[i];
         u32 f = buf[15];
         c.nf = (f >> 4) & 1; c.zf = (f >> 3) & 1; c.cf = (f >> 2) & 1; c.vf = (f >> 1) & 1; c.qf = f & 1; c.ge = (f >> 5) & 15;
         memcpy(c.s, buf + 16, 128);
         c.fpscr = buf[48];
-        fread(g_mem + 0x10000, 1, 0x10000, in);
+        if (fread(g_mem + 0x10000, 1, 0x10000, in) != 0x10000) return 23;
         tests[k](&c);
         for (int i = 0; i < 15; i++) buf[i] = c.r[i];
         buf[15] = (c.nf << 4) | (c.zf << 3) | (c.cf << 2) | (c.vf << 1) | c.qf | (c.ge << 5);
         memcpy(buf + 16, c.s, 128);
         buf[48] = c.fpscr;
-        fwrite(buf, 4, 49, out);
-        fwrite(g_mem + 0x10000, 1, 0x10000, out);
+        if (fwrite(buf, 4, 49, out) != 49) return 24;
+        if (fwrite(g_mem + 0x10000, 1, 0x10000, out) != 0x10000) return 24;
     }
-    fclose(out);
+    fclose(in);
+    if (fclose(out)) return 24;
     return 0;
 }''')
     cpath = os.path.join(tmp, 't.c')
     with open(cpath, 'w') as f:
         f.write('\n'.join(src))
-    exe = os.path.join(tmp, 't')
-    subprocess.check_call(['clang', '-O1', '-w', '-ffp-contract=off', '-I', os.path.join(ROOT, 'runtime'), cpath, '-o', exe, '-lm'])
+    exe = os.path.join(tmp, 't.exe' if os.name == 'nt' else 't')
+    cc = json.loads(os.environ['TEST_CPU_CC']) if os.environ.get('TEST_CPU_CC') else ['clang']
+    if not isinstance(cc, list) or not cc or not all(isinstance(a, str) for a in cc):
+        raise SystemExit('TEST_CPU_CC must be a nonempty JSON list of compiler arguments')
+    includes = ['-I', os.path.join(ROOT, 'runtime')]
+    port = os.path.abspath(os.path.join(ROOT, '..', '..', 'port'))
+    if os.path.isfile(os.path.join(port, 'cpu.h')):
+        includes = ['-I', port] + includes
+    subprocess.check_call(cc + ['-O1', '-w', '-ffp-contract=off', '-fno-strict-aliasing',
+                               '-MD', '-MF', os.path.join(tmp, 'dependencies.d')] + includes + [cpath, '-o', exe])
     inp = os.path.join(tmp, 'in.bin')
     outp = os.path.join(tmp, 'out.bin')
     with open(inp, 'wb') as f:
@@ -461,9 +568,13 @@ int main(int argc, char **argv) {
     subprocess.check_call([exe, inp, outp])
     data = open(outp, 'rb').read()
     rec = 49 * 4 + SCRATCH_SIZE
+    if len(data) != rec * len(cases):
+        raise RuntimeError('native output size mismatch: %d, expected %d' % (len(data), rec * len(cases)))
     fails = 0
-    from collections import Counter
-    failcls = Counter()
+    generated = Counter(case[0] for case in cases)
+    executed, skipped, reasons, failcls = Counter(), Counter(), Counter(), Counter()
+    nan_cases = nan_words = 0
+    failures = []
     for k, (cls, words, insts, regs, flags, vregs, fpscr, mem) in enumerate(cases):
         d = data[k * rec:(k + 1) * rec]
         c_regs = list(struct.unpack_from('<15I', d, 0))
@@ -474,7 +585,10 @@ int main(int argc, char **argv) {
         try:
             u_regs, u_flags, u_ge, u_v, u_fps, u_mem = run_unicorn(words, regs, flags, vregs, fpscr, mem, cls == 'thumb')
         except Exception as e:
+            skipped[cls] += 1
+            reasons[type(e).__name__ + ': ' + str(e)] += 1
             continue
+        executed[cls] += 1
         diffs = []
         for x in range(15):
             if c_regs[x] != u_regs[x]:
@@ -483,11 +597,16 @@ int main(int argc, char **argv) {
             diffs.append('nzcvq c=%s uc=%s' % (format(c_flags & 0x1F, '05b'), format(u_flags, '05b')))
         if (c_flags >> 5) != u_ge:
             diffs.append('ge c=%x uc=%x' % (c_flags >> 5, u_ge))
+        waived = False
         for x in range(32):
-            if c_v[x] != u_v[x]:
+            if c_v[x] != u_v[x] and nan_equivalent(words, insts, c_v, u_v, x):
+                nan_words += 1
+                waived = True
+            elif c_v[x] != u_v[x]:
                 a, b = c_v[x], u_v[x]
                 diffs.append('s%d c=%08x uc=%08x' % (x, a, b))
-        if (c_fps & 0xF0000000) != (u_fps & 0xF0000000):
+        nan_cases += int(waived)
+        if c_fps != u_fps:
             diffs.append('fpscr c=%08x uc=%08x' % (c_fps, u_fps))
         if c_mem != u_mem:
             off = next(j for j in range(len(c_mem)) if c_mem[j] != u_mem[j])
@@ -496,14 +615,25 @@ int main(int argc, char **argv) {
             fails += 1
             failcls[cls] += 1
             if fails <= 25:
+                failures.append(dict(case=k, cls=cls, words=words, notes=[i.note for i in insts],
+                                     registers=regs, flags=flags, vfp=vregs, fpscr=fpscr, differences=diffs))
                 print('FAIL %s:' % cls)
                 for w, i in zip(words, insts):
                     print('   %08x  %s' % (w, i.note))
                 print('   in: ' + ' '.join('%08x' % x for x in regs) + ' flags=%s' % format(flags, '09b'))
                 for dd in diffs[:8]:
                     print('   ' + dd)
-    print('%d/%d cases failed %s' % (fails, len(cases), dict(failcls)))
+    report = dict(seed=seed, classes=classes, requested_random_blocks=count, edge_cases=edge_count,
+                  generated=dict(generated), executed=dict(executed), skipped=dict(skipped), skip_reasons=dict(reasons),
+                  mismatches=fails, mismatch_classes=dict(failcls), typed_nan_cases=nan_cases, typed_nan_words=nan_words,
+                  fpscr_compared_mask='0xffffffff', failures=failures, temporary_case_dir=tmp,
+                  memory_and_VFP_single_instruction=True, native_output_record_bytes=rec)
+    report_path = os.environ.get('TEST_CPU_REPORT', os.path.join(tmp, 'report.json'))
+    with open(report_path, 'w', encoding='utf-8') as stream:
+        json.dump(report, stream, indent=2)
+    print(json.dumps(report, sort_keys=True))
+    return 1 if fails or skipped else 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

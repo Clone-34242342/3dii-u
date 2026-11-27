@@ -2,6 +2,7 @@
 #include "../third_party/3dsrecomp/runtime/cpu.h"
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 
 static u32 reference(int kind, int sub, u32 a, u32 b, u32 *ge) {
     u32 out = 0;
@@ -44,8 +45,14 @@ int main() {
     u32 seed=0x87bc9012;
     auto next=[&] { seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5; return seed; };
     for (int i=0;i<500000;++i) { u32 a=next(), b=next(), ge=next()&15; check(a,b,ge); }
-    u32 ge=9,q=1;
-    (void)pas_uqadd8(~0u,~0u,&ge,&q);
-    if (ge!=9 || q!=1) return 3;
+    const auto operations = {pas_uadd8, pas_usub8, pas_uqadd8, pas_uqsub8, pas_uhadd8, pas_uhsub8};
+    for (auto operation : operations) {
+        for (u32 initial : {0u, 1u}) {
+            u32 ge = 9, q = initial;
+            (void)operation(~0u, ~0u, &ge, &q);
+            (void)operation(0, ~0u, &ge, &q);
+            if (q != initial) return 3;
+        }
+    }
     std::puts("Passed: 631072 packed-word cases, all 12 byte operations, GE preservation, and all SEL masks");
 }

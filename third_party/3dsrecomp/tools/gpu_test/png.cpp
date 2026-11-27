@@ -23,7 +23,7 @@ static void put32(std::vector<uint8_t> &v, uint32_t x) {
     v.push_back(x);
 }
 
-static void chunk(FILE *f, const char *type, const std::vector<uint8_t> &data) {
+static bool chunk(FILE *f, const char *type, const std::vector<uint8_t> &data) {
     std::vector<uint8_t> buf;
     put32(buf, (uint32_t)data.size());
     size_t start = buf.size();
@@ -31,7 +31,7 @@ static void chunk(FILE *f, const char *type, const std::vector<uint8_t> &data) {
     buf.insert(buf.end(), data.begin(), data.end());
     uint32_t c = crc(buf.data() + start, buf.size() - start) ^ 0xffffffffu;
     put32(buf, c);
-    fwrite(buf.data(), 1, buf.size(), f);
+    return fwrite(buf.data(), 1, buf.size(), f) == buf.size();
 }
 
 bool write_png(const char *path, uint32_t w, uint32_t h, const uint32_t *pixels) {
@@ -43,7 +43,7 @@ bool write_png(const char *path, uint32_t w, uint32_t h, const uint32_t *pixels)
     FILE *f = fopen(path, "wb");
     if (!f) return false;
     static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
-    fwrite(sig, 1, 8, f);
+    bool ok = fwrite(sig, 1, 8, f) == 8;
     std::vector<uint8_t> ihdr;
     put32(ihdr, w);
     put32(ihdr, h);
@@ -52,7 +52,7 @@ bool write_png(const char *path, uint32_t w, uint32_t h, const uint32_t *pixels)
     ihdr.push_back(0);
     ihdr.push_back(0);
     ihdr.push_back(0);
-    chunk(f, "IHDR", ihdr);
+    ok = chunk(f, "IHDR", ihdr) && ok;
     // raw scanlines
     std::vector<uint8_t> raw;
     raw.reserve((size_t)h * (w * 4 + 1));
@@ -89,8 +89,7 @@ bool write_png(const char *path, uint32_t w, uint32_t h, const uint32_t *pixels)
         pos += n;
     } while (pos < raw.size());
     put32(z, (b << 16) | a);
-    chunk(f, "IDAT", z);
-    chunk(f, "IEND", {});
-    fclose(f);
-    return true;
+    ok = chunk(f, "IDAT", z) && ok;
+    ok = chunk(f, "IEND", {}) && ok;
+    return fclose(f) == 0 && ok;
 }

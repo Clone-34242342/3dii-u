@@ -22,7 +22,7 @@ static void expect(bool ok, const char *what) {
 // ---- PICA instructions (shader.cpp's decode_one has the layouts)
 static u32 mov(u32 out, u32 in) { return 0x13u << 26 | out << 21 | in << 12; }  // o<out> = v<in>, with operand descriptor 0
 static u32 flow(u32 op, u32 bid, u32 dst, u32 num) { return op << 26 | bid << 22 | dst << 10 | num; }
-enum : u32 { NOP = 0x21u << 26, END = 0x22u << 26, CALLU = 0x26, IFU = 0x27, LOOP = 0x29, JMPU = 0x2d };
+enum : u32 { NOP = 0x21u << 26, END = 0x22u << 26, CALLU = 0x26, IFU = 0x27, IFC = 0x28, LOOP = 0x29, JMPU = 0x2d };
 
 // Bools 0 to `bools` - 1 each decide something: an if, an if with an else, a call, a jump taken when its bool is clear, then plain ifs.
 static std::vector<u32> program(u32 bools) {
@@ -112,6 +112,25 @@ int main() {
     ShaderProgram *l = shader_decode(onto.data(), 4, swizzle);
     expect(gen_vs_glsl(l, 0, 1u << 0, iu, slots, &inputs).empty() && !gen_vs_glsl(l, 0, 0, iu, slots, &inputs).empty(),
            "a jump onto a loop's end isn't written as the loop's end");
+
+    std::vector<u32> deep(512, NOP);
+    for (u32 i = 0; i < 8; i++) deep[i] = flow(IFU, 0, 20 - i, 0);
+    deep[8] = flow(IFU, 1, 11, 0);
+    deep[21] = END;
+    ShaderProgram *nested = shader_decode(deep.data(), 22, swizzle);
+    expect(!shader_glsl_spec(nested, 0, 1, iu, &inputs).empty(), "a ninth false IFU does not push the IF stack");
+    expect(shader_glsl_spec(nested, 0, 3, iu, &inputs).empty(), "a ninth taken IFU still exceeds the IF stack");
+    shader_free(nested);
+
+    std::vector<u32> alternatives(512, NOP);
+    for (u32 i = 0; i < 9; i++) {
+        const u32 at = 2 * i, dst = at + 2, end = 34 - at;
+        alternatives[at] = flow(IFC, 0, dst, end - dst);
+    }
+    alternatives[34] = END;
+    ShaderProgram *else_chain = shader_decode(alternatives.data(), 35, swizzle);
+    expect(!shader_glsl_spec(else_chain, 0, 0, iu, &inputs).empty(), "nested ELSE paths do not keep the IF stack slots");
+    shader_free(else_chain);
 
     printf(failures ? "open bools: %d failed\n" : "open bools: ok\n", failures);
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;

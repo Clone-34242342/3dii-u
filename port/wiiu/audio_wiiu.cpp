@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 #include "audio/host.h"
 #include "audio_iface.h"
@@ -20,8 +21,10 @@ s16 *ring[2];
 AXVoice *voice[2];
 u32 write_pos;
 bool playing;
+bool initialized;
 std::atomic<float> gain{1.0f};
 u32 queue_min = RING, queue_max, wrapped_reads, low_recoveries, wrapped_recoveries;
+std::mutex output_mutex;
 
 void start_voices() {
     for (int c = 0; c < 2; c++) {
@@ -37,21 +40,46 @@ u32 play_pos() {
     AXGetVoiceOffsets(voice[0], &off);
     return off.currentOffset % RING;
 }
+
+// The caller owns output_mutex, including rollback from partially completed startup.
+void cleanup_locked() {
+    playing = false;
+    AXVoice *const mine[2] = {voice[0], voice[1]};
+    voice[0] = voice[1] = nullptr;
+    for (AXVoice *v : mine)
+        if (v) AXFreeVoice(v);
+    if (initialized) AXQuit();
+    initialized = false;
+    for (s16 *&buffer : ring) {
+        free(buffer);
+        buffer = nullptr;
+    }
+    write_pos = 0;
+}
 }  // namespace
 
 namespace audio {
 void init() {
+    std::lock_guard lock(output_mutex);
+    if (initialized) return;
     AXInitParams params{};
     params.renderer = AX_INIT_RENDERER_48KHZ;
     params.pipeline = AX_INIT_PIPELINE_SINGLE;
     AXInitWithParams(&params);
+    initialized = true;
     for (int c = 0; c < 2; c++) {
         ring[c] = (s16 *)memalign(64, RING * 2);
+        if (!ring[c]) {
+            LOG("[audio] cannot allocate ring buffer\n");
+            cleanup_locked();
+            return;
+        }
         memset(ring[c], 0, RING * 2);
         DCFlushRange(ring[c], RING * 2);
         voice[c] = AXAcquireVoice(31, nullptr, nullptr);
         if (!voice[c]) {
             LOG("[audio] no voice available\n");
+            cleanup_locked();
             return;
         }
         AXVoiceBegin(voice[c]);
@@ -91,6 +119,7 @@ void checkpoint_clear_output() {
 
 // silence while the HOME Menu is up: the voices would otherwise repeat what's in the ring
 void pause(bool on) {
+    std::lock_guard lock(output_mutex);
     if (!playing || !voice[0] || !voice[1]) return;
     for (int c = 0; c < 2; c++) {
         AXVoiceBegin(voice[c]);
@@ -100,16 +129,13 @@ void pause(bool on) {
 }
 // Safe with the audio thread still running: host_output and pause do nothing once the voices are gone
 void shutdown() {
-    playing = false;  // first: nothing asks a voice where it is after this
-    AXVoice *const mine[2] = {voice[0], voice[1]};
-    voice[0] = voice[1] = nullptr;
-    for (AXVoice *v : mine)
-        if (v) AXFreeVoice(v);
-    AXQuit();
+    std::lock_guard lock(output_mutex);
+    cleanup_locked();
 }
 
 namespace hle {
 void host_output(const Sample *samples, size_t n) {
+    std::lock_guard lock(output_mutex);
     if (!voice[0] || !voice[1]) return;
     if (playing) {
         // keep a steady distance: on an underrun or a pile-up, jump to where the cushion should be
@@ -145,6 +171,7 @@ void host_output(const Sample *samples, size_t n) {
     if (!playing && write_pos >= CUSHION * 2) start_voices();
 }
 int host_queued() {
+    std::lock_guard lock(output_mutex);
     if (!playing) return -1;
     const u32 raw = audio_ring::distance(write_pos, play_pos(), RING);
     const u32 ready = audio_ring::queued(raw, RING);

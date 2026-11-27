@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <numbers>
 #include <cstdio>
 #include <functional>
 #include <thread>
@@ -188,7 +189,7 @@ static void test_adpcm() {
     // in two pieces (state carried over) must equal decoding at once.
     {
         std::vector<s16> pcm(14 * 200);
-        for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (s16)(12000 * std::sin(i * 2 * M_PI * 440 / 32728));
+        for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (s16)(12000 * std::sin(i * 2 * std::numbers::pi * 440 / 32728));
         std::vector<u8> enc = encode_adpcm(pcm, kCoeffs);
         std::vector<Sample> dec(pcm.size());
         AdpcmState st;
@@ -347,7 +348,7 @@ static void test_interp() {
     // Polyphase (cubic) resampling of a smooth sine is closer to the ideal than linear.
     {
         const float rate = 0.6f;
-        const double w = 2 * M_PI * 1000.0 / 32728 / rate;  // 1 kHz output tone at a 0.6 rate
+        const double w = 2 * std::numbers::pi * 1000.0 / 32728 / rate;  // 1 kHz output tone at a 0.6 rate
         std::vector<Sample> in(1000);
         for (size_t i = 0; i < in.size(); i++) {
             s16 v = (s16)std::lround(16000 * std::sin(w * i));
@@ -453,6 +454,47 @@ static void setup_master(SharedMemory &m) {
     m.dsp_config.dirty |= CFG_MASTER_VOLUME_DIRTY | CFG_OUTPUT_FORMAT_DIRTY;
 }
 
+// A late or duplicate submission must not consume settings or overwrite guest-owned buffers.
+static void test_submission_ownership() {
+    dsp_init();
+    App app;
+    setup_master(app.next());
+    CHECK(app.submit());
+    app.cur ^= 1;
+    auto &rd = R(app.cur);
+    auto &wr = app.out();
+    rd.frame_counter = ++app.counter;
+    rd.dsp_config.dirty = CFG_MASTER_VOLUME_DIRTY | CFG_AUX_BUS_ENABLE0_DIRTY;
+    rd.dsp_config.master_volume = 0.5f;
+    rd.dsp_config.aux_bus_enable[0] = 1;
+    rd.source_config[0].dirty = SRC_RATE_DIRTY;
+    rd.source_config[0].rate_multiplier = 0.75f;
+    memset(&wr.intermediate, 0x5a, sizeof(wr.intermediate));
+    memset(&wr.final_samples, 0x5a, sizeof(wr.final_samples));
+    SharedMemory before_read = rd, before_write = wr;
+    bool fresh = true;
+    CHECK(audio::tick(false, &fresh));
+    CHECK(!fresh);
+    CHECK(!memcmp(&rd, &before_read, sizeof(rd)));
+    CHECK(!memcmp(&wr, &before_write, sizeof(wr)));
+    CHECK(audio::tick(true, &fresh));
+    CHECK(fresh);
+    CHECK_EQ(rd.dsp_config.dirty, 0);
+    CHECK_EQ(rd.source_config[0].dirty, 0);
+    rd.dsp_config.dirty = CFG_MASTER_VOLUME_DIRTY;
+    rd.source_config[0].dirty = SRC_RATE_DIRTY;
+    before_read = rd; before_write = wr;
+    CHECK(audio::tick(true, &fresh));
+    CHECK(!fresh);
+    CHECK(!memcmp(&rd, &before_read, sizeof(rd)));
+    CHECK(!memcmp(&wr, &before_write, sizeof(wr)));
+    dsp_init();
+    R(0).frame_counter = app.counter;  // reuse the last counter across a component restart
+    CHECK(audio::tick(true, &fresh));
+    CHECK(fresh);
+    set_state(1);
+}
+
 static void test_pipes_and_state() {
     CHECK_EQ(audio::recv_data(0), 1);
     CHECK(!audio::tick(true));
@@ -479,11 +521,78 @@ static void test_pipes_and_state() {
     CHECK_EQ(audio::pipe_readable(2), 0);
 }
 
+static void test_unpublished_playback() {
+    Mixer mixer;
+    DspConfig cfg{};
+    IntermediateMix read[2]{}, write[2]{};
+    std::array<QuadFrame, 3> input{};
+    cfg.aux_bus_enable[0] = 1;
+    cfg.aux_return_volume[0] = 1.0f;
+    cfg.output_format = 1;
+    cfg.delay[0].dirty = cfg.delay[0].enable = 1;
+    cfg.delay[0].frame_count = 1;
+    cfg.delay[0].a = 128;
+    cfg.dirty = CFG_AUX_BUS_ENABLE0_DIRTY | CFG_AUX_RETURN_VOLUME0_DIRTY |
+                CFG_OUTPUT_FORMAT_DIRTY | CFG_DELAY0_DIRTY;
+    read[0].pcm32[0][7] = 3000;
+    mixer.tick(cfg, read, write, input);
+    CHECK_EQ(mixer.output()[7][0], 0);
+    read[0].pcm32[0][7] = 9000;  // unfinished return must not enter the delay line
+    cfg.aux_return_volume[0] = 0;
+    cfg.dirty = CFG_AUX_RETURN_VOLUME0_DIRTY;
+    for (int i = 0; i < 2; ++i) {
+        mixer.tick(cfg, read, write, input, false);
+        CHECK_EQ(mixer.output()[7][0], 3000);
+        CHECK_EQ(cfg.dirty, CFG_AUX_RETURN_VOLUME0_DIRTY);
+    }
+    cfg.aux_return_volume[0] = 1;
+    mixer.tick(cfg, read, write, input);
+    CHECK_EQ(mixer.output()[7][0], 3000);
+    mixer.tick(cfg, read, write, input, false);
+    CHECK_EQ(mixer.output()[7][0], 9000);
+
+    // Skipping publication must advance a playing voice exactly as ordinary ticks do.
+    auto run = [](bool skip) {
+        dsp_init();
+        App app;
+        auto &m = app.next();
+        setup_master(m);
+        constexpr u32 pa = 0x20300000;
+        for (int i = 0; i < 2000; ++i) ((s16 *)phys(pa))[i] = (s16)(i + 1);
+        auto &c = m.source_config[0];
+        c.enable = 1;
+        c.rate_multiplier = 1;
+        c.interpolation_mode = (u8)Interp::None;
+        c.gain[0][0] = 1;
+        c.flags1 = 1 | ((u16)Format::PCM16 << 2);
+        c.paddr.set(pa);
+        c.length.set(2000);
+        c.dirty = SRC_ENABLE_DIRTY | SRC_RATE_DIRTY | SRC_INTERP_DIRTY |
+                  SRC_GAIN0_DIRTY | SRC_FORMAT_DIRTY | SRC_EMBEDDED_DIRTY;
+        CHECK(app.submit());
+        for (int i = 0; i < 2; ++i) {
+            if (skip) {
+                bool fresh = true;
+                CHECK(audio::tick(false, &fresh));
+                CHECK(!fresh);
+            } else CHECK(app.submit());
+        }
+        CHECK(app.submit());
+        return std::pair{app.out().source_status[0].buffer_position.get(),
+                         (s16)app.out().final_samples[100][0]};
+    };
+    const auto ordinary = run(false), unpublished = run(true);
+    CHECK(ordinary.first > 0 && ordinary.second > 0);
+    CHECK_EQ(unpublished.first, ordinary.first);
+    CHECK_EQ(unpublished.second, ordinary.second);
+    set_state(1);
+}
+
 static constexpr u32 kSinePA = 0x20100000;
 
 static std::vector<s16> make_sine(size_t n, double freq, double amp) {
     std::vector<s16> v(n);
-    for (size_t i = 0; i < n; i++) v[i] = (s16)std::lround(amp * std::sin(2 * M_PI * freq * i / kSampleRate));
+    for (size_t i = 0; i < n; i++) v[i] = (s16)std::lround(amp * std::sin(2 * std::numbers::pi * freq * i / kSampleRate));
     return v;
 }
 
@@ -782,7 +891,7 @@ static void test_adpcm_source_and_rate() {
     // 22050 Hz ADPCM sine resampled to 32728 Hz with polyphase
     const double fs = 22050;
     std::vector<s16> pcm(14 * 300);
-    for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (s16)(15000 * std::sin(2 * M_PI * 500 * i / fs));
+    for (size_t i = 0; i < pcm.size(); i++) pcm[i] = (s16)(15000 * std::sin(2 * std::numbers::pi * 500 * i / fs));
     auto enc = encode_adpcm(pcm, kCoeffs);
     const u32 pa = 0x20400000;
     memcpy(phys(pa), enc.data(), enc.size());
@@ -816,7 +925,7 @@ static void test_adpcm_source_and_rate() {
     double err = 0, sig = 0;
     for (size_t k = 200; k + 200 < std::min<size_t>(out.size(), (size_t)expect); k++) {
         double t = (k * (fs / kSampleRate) - 2) / fs;
-        double ideal = 15000 * std::sin(2 * M_PI * 500 * t);
+        double ideal = 15000 * std::sin(2 * std::numbers::pi * 500 * t);
         err += (out[k] - ideal) * (out[k] - ideal);
         sig += ideal * ideal;
 
@@ -1070,6 +1179,8 @@ int main(int argc, char **argv) {
         {"interp", test_interp},
         {"filters", test_filters},
         {"pipes_and_state", test_pipes_and_state},
+        {"submission_ownership", test_submission_ownership},
+        {"unpublished_playback", test_unpublished_playback},
         {"embedded_sine", test_embedded_sine},
         {"buffer_queue_and_gains", test_buffer_queue_and_gains},
         {"stream_resume", test_stream_resume_without_extra_blank},

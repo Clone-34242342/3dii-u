@@ -88,6 +88,8 @@ void reset_pipes(Dsp &d) {
 }
 
 void initialize(Dsp &d) {
+    d.last_counter = 0;
+    d.fresh = false;
     memset(dsp_ram(), 0, kDspRamSize);
     d.mixer.reset();
     for (auto &s : d.sources) s.reset();
@@ -144,7 +146,7 @@ StereoFrame generate_frame(Dsp &d, bool seen) {
     for (int i = 0; i < kNumSources; i++) {
         s16 coeffs[16];
         for (int c = 0; c < 16; c++) coeffs[c] = rd.adpcm_coeffs[i][c];
-        SourceStatus s = d.sources[i].tick(rd.source_config[i], coeffs, seen, d.fresh);
+        SourceStatus s = d.sources[i].tick(rd.source_config[i], coeffs, d.fresh, d.fresh);
         if (d.fresh) memcpy(&wr.source_status[i], &s, sizeof(s));
         for (int m = 0; m < 3; m++) d.sources[i].mix_into(mixes[m], m);
     }
@@ -178,12 +180,12 @@ StereoFrame generate_frame(Dsp &d, bool seen) {
         }
     }
 
-    d.mixer.tick(rd.dsp_config, rd.intermediate, wr.intermediate, mixes);
+    d.mixer.tick(rd.dsp_config, rd.intermediate, wr.intermediate, mixes, d.fresh);
     DspStatusBlock status{};
     if (d.fresh) memcpy(&wr.dsp_status, &status, sizeof(status));
 
     StereoFrame out = d.mixer.output();
-    for (int f = 0; f < kFrameSamples; f++) {
+    for (int f = 0; d.fresh && f < kFrameSamples; f++) {
         wr.final_samples[f][0] = out[f][0];
         wr.final_samples[f][1] = out[f][1];
     }

@@ -1,42 +1,59 @@
-"""Exercise the actual pool claim/wait code with Wii U's no-spin policy."""
+"""Check the production worker's Wii U idle and work publication paths on the host."""
 from pathlib import Path
-import subprocess,tempfile
-root=Path(__file__).resolve().parents[1]
-s=(root/'third_party/3dsrecomp/runtime/gpu/gpu.cpp').read_text()
-a=s.index('namespace {\nstd::vector<std::thread> workers;');b=s.index('#ifdef __WIIU__\n// One worker',a)
-shared=s[a:b]
-a=s.index('void parallel_for(u32 n,');b=s.index('// ---------------------------------------------------------------- uniform / program upload',a)
-loop=s[a:b]
-code='''#include <atomic>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <functional>
-#include <vector>
+import subprocess
+import sys
+import tempfile
+
+from test_vertex_cache import function
+
+root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(root / 'tools/win'))
+import build3ds
+
+source = (root / 'third_party/3dsrecomp/runtime/gpu/gpu.cpp').read_text()
+start = source.index('namespace {\nstd::vector<std::thread> workers;')
+end = source.index('#ifdef __WIIU__\n// One worker', start)
+pool = source[start:end]
+pool = pool.replace(function(pool, 'inline void cpu_relax()'), 'inline void cpu_relax() { ++relaxes; }')
+parallel = function(source, 'void parallel_for(u32 n,')
+
+harness = r'''
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstdlib>
-using u32=unsigned;using u64=unsigned long long;
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <vector>
+using u32 = unsigned;
+using u64 = unsigned long long;
 #define __WIIU__ 1
-std::atomic<bool> g_pool_idle_spin{false};
-'''+shared+'''\nu32 pool_threads(){return 2;}
-'''+loop+'''
-int main(){
- std::thread(worker_main,1).detach();
- // More than 65535 publications exercises generation rollover and late wakeup.
- for(unsigned gen=0;gen<70000;++gen){
-  std::atomic<unsigned> seen[7]{};
-  parallel_for(7,[&](unsigned item,unsigned tid){assert(item<7&&tid<2);seen[item].fetch_add(1);});
-  for(auto &n:seen)assert(n==1);
- }
- // No new publication: the worker must eventually park instead of spin.
- for(unsigned i=0;i<1000000&&!pool_sleepers.load();++i)std::this_thread::yield();
- assert(pool_sleepers.load()==1);
- std::_Exit(0); // pool is intentionally process-lifetime state
+static std::atomic<u32> relaxes{0};
+''' + pool + '\nu32 pool_threads() { return 2; }\n' + parallel + r'''
+int main() {
+    std::thread(worker_main, 1).detach();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!pool_sleepers.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    assert(pool_sleepers.load() == 1);
+    assert(relaxes.load() == 0 && "idle Wii U worker should park without spinning");
+    for (u32 publication = 0; publication < 70000; ++publication) {
+        std::atomic<u32> seen[7]{};
+        parallel_for(7, [&](u32 item, u32 tid) {
+            assert(item < 7 && tid < 2);
+            ++seen[item];
+        });
+        for (auto &count : seen) assert(count == 1);
+    }
+    std::_Exit(0);  // Detached workers intentionally live until process exit.
 }
 '''
-with tempfile.TemporaryDirectory() as t:
- p=Path(t);(p/'test.cpp').write_text(code)
- subprocess.run(['c++','-std=c++20','-O2','-pthread',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
- subprocess.run([str(p/'test')],check=True,timeout=60)
-print('PASS: 70000 no-spin publications, exactly-once execution, generation rollover, idle worker parks')
+
+with tempfile.TemporaryDirectory(prefix='3dii-pool-idle-') as directory:
+    temp = Path(directory)
+    src, exe = temp / 'test.cpp', temp / 'test.exe'
+    src.write_text(harness)
+    subprocess.run([*build3ds.HOST_CXX, '-std=c++20', '-O2', '-static', str(src), '-lpthread', '-o', str(exe)], check=True)
+    subprocess.run([str(exe)], check=True, timeout=30)
+print('Wii U vertex pool parked without spinning and executed 70,000 publications exactly once.')

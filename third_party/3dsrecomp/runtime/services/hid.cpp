@@ -142,7 +142,8 @@ LiveCmd parse_live(const std::string &line) {
     return c;
 }
 
-void live_line(const std::string &line) {
+void live_line(std::string line) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();  // Windows line endings also reach the Wii U unchanged
     if (line == "DUMP") dump_threads();  // right away: the state of every thread in the log
     else if (line.rfind("POKE8 ", 0) == 0) {  // right away: "POKE8 <address> <value>" writes a byte of guest memory
         unsigned a = 0, v = 0;

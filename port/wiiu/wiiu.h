@@ -23,14 +23,19 @@ void save_flush(bool now);
 long save_write(int fd, const void *data, u32 len, u64 at);
 void save_resize(int fd, u64 size);
 const std::string &save_account_dir();  // the player's storage, /vol/save/<persistent id>, or empty without one
+bool save_dir_lacks(const std::string &path, const char *first, const char *second);  // confirmed by a complete listing
 bool save_pending();                     // saved by the game and not flushed yet
 bool save_copy_tree(const std::string &from, const std::string &to);
+bool save_migrate_common(const std::string &from, const std::string &to);
+void save_finish_migration(const std::string &to);  // confirm a published account save if its previous tree still exists
 extern volatile u32 files_copied;  // by save_copy_tree: the watchdog counts them as work while a game starts
 // a 3DS save packed into the game by the builder, taken in once before it starts (save_storage.cpp)
 void save_from_content(const std::string &packed, const std::string &save, const std::string &done);
 extern volatile bool settings_due;  // the options menu changed settings.ini's values: the card thread writes the file
 // (input thread) the right stick is held in: the microphone hears blowing
 void mic_blow(bool on);
+void camera_pause(bool on);
+void camera_shutdown();
 // a line in trace.txt, which survives a forced power-off, and the last one is on the screen if the game freezes: for first uses of what Cemu can't test
 void note(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 // takes turns with every other file operation once the game runs; a frozen game reports what's been going on for how long
@@ -60,6 +65,7 @@ bool gfx_ready();
 // (GPU thread) present the screens if a new VBlank arrived, service in-game overlay
 void gfx_pump(bool quiet);  // quiet: the GPU thread had nothing to do for its whole wait
 void gfx_shutdown();
+void gfx_report_final();  // GPU thread completion, after the final drain; logging only
 void gfx_reacquire();  // (GPU thread) back from the HOME Menu
 void gfx_note_busy(u32 us);
 // (main thread) a VBlank passed: present what is ready
@@ -85,14 +91,16 @@ bool video_conversion_worker(void (*work)(void *), void *context);
 void touch_to_bottom(u16 x, u16 y, bool &touch, u16 &tx, u16 &ty);
 // (input thread) the menu overlay takes input while it is open
 void input_override(u32 &buttons, bool &touch, u16 &tx, u16 &ty);
-// the options menu (click the left stick)
-void menu_input(u32 pressed);
+// the options menu
+void menu_input(u32 pressed, bool toggle);  // the GamePad's buttons (VPAD_BUTTON_*), from either controller
 bool menu_open();
-void menu_disable();  // a game built with the Builder's "In-game menu: Off" (content/no_menu): the click does nothing
+void menu_disable();  // a game built with the Builder's "In-game menu: Off" (content/no_menu)
 int game_speed();  // percent
 bool menu_wants_quit();
 void menu_quit_now();  // as choosing Quit there: a test route's "KEY quit", so a run in Cemu ends the way a player ends one
-// the game's software keyboard (GamePad pixels)
+// the game's software keyboard and Mii selector (GamePad pixels)
 void keyboard_input(u32 pressed, bool touch_began, u16 x, u16 y);
 bool keyboard_open();
+void mii_selector_input(u32 pressed, bool touch_began, u16 x, u16 y);
+bool mii_selector_open();
 }  // namespace wiiu

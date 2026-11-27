@@ -17,15 +17,24 @@ def checked_command(command, allow_renderer=False):
         if 0 < size <= 4096 and address + size <= 0x100000000:
             return command
     if allow_renderer:
+        if command in {'quit', 'relaunch'}: return command
+        match = re.fullmatch(r'in (A|B|X|Y|L|R|ZL|ZR|START|SELECT|DUP|DDOWN|DLEFT|DRIGHT|CUP|CDOWN|CLEFT|CRIGHT|WAIT)(?:\+(A|B|X|Y|L|R|ZL|ZR|START|SELECT|DUP|DDOWN|DLEFT|DRIGHT|CUP|CDOWN|CLEFT|CRIGHT))* ([0-9]{1,3})', command)
+        if match and 1 <= int(command.rsplit(' ', 1)[1]) <= 600: return command
+        if re.fullmatch(r'set fbfast [0123]', command): return command
+        if re.fullmatch(r'set (fbuv|fbextra) [01]', command): return command
         match = re.fullmatch(r'ram (read|write) ([0-9a-fA-F]{1,8})(?: ([0-9a-fA-F]{1,8}) ([0-9a-fA-F]{1,8}))?', command)
         if match and int(match[2],16) % 4 == 0 and ((match[1]=='read' and match[3] is None) or (match[1]=='write' and match[3] is not None)): return command
         if command in {'state save', 'state save-ram', 'state load', 'state load-file'}: return command
         if re.fullmatch(r'set speed (100|200|400)', command): return command
+        if re.fullmatch(r'set uberall [01]', command): return command
+        if re.fullmatch(r'set indexcache [0-3]', command): return command
+        match = re.fullmatch(r'set nudge ([0-9]{1,3})', command)
+        if match and (int(match[1]) <= 50 or int(match[1]) == 100): return command
 
         if re.fullmatch(r'set diag [0-3]', command): return command
         match = re.fullmatch(r'set diagthread ([0-9]{1,5})', command)
         if match and int(match[1]) <= 65535: return command
-        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy|vssimd|poolspin|pause|lightguard|copyrect) [01]', command): return command
+        if re.fullmatch(r'set (cpuvs|vtxcache|drawtrace|inkrefresh|gputime|cputime|avtime|videoworker|bulkcopy|vssimd|poolspin|pause|lightguard|copyrect|gsshared|indexcache) [01]', command): return command
         if re.fullmatch(r'set toplevel [012]', command): return command
         match = re.fullmatch(r'set cpuattr ([0-9]{1,2})', command)
         if match and int(match[1]) <= 15: return command

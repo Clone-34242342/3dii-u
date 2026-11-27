@@ -8,6 +8,7 @@ STUBS = r'''#include <cstdint>
 #include <cstring>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <cassert>
 #include <cstdio>

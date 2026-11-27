@@ -1,6 +1,7 @@
 """Self-check for covers.steamgriddb and covers.released against a stand-in for the site on this PC, answering as its API description says it does
 (steamgriddb.com/api/v2): which game, banner and icon it takes, that each is fetched once, that the key doesn't follow a redirect, and
-what a wrong key, an unknown game and no connection give, and the year a game came out from GameTDB's list, kept once it is a whole zip. Nothing leaves this PC. Run: python builder/test_covers.py"""
+what a wrong key, an unknown game and no connection give, the year a game came out from GameTDB's list, kept once it is a whole zip, and the
+title screen libretro's list names for the game. Nothing leaves this PC. Run: python builder/test_covers.py"""
 import http.server
 import io
 import json
@@ -22,6 +23,10 @@ GAMES = {'pokemon ultra': [{'id': 7, 'name': 'Pokémon Ultra Moon'}, {'id': 8, '
          "luigi's mansion: dark": [{'id': 8, 'name': "Luigi's Mansion: Dark Moon"}]}
 asked = []
 cut = []  # when set, GameTDB's list comes short: this many bytes of it, and a length that promises all
+# libretro's title screens, as its server's index lists them (No-Intro's names; "&" written "_")
+TITLES = ['Legend of Zelda, The - Ocarina of Time 3D (Europe) (En,Fr,De,Es,It).png', 'Legend of Zelda, The - Ocarina of Time 3D (USA) (En,Fr,Es) (Rev 1).png',
+          'Legend of Zelda, The - Ocarina of Time 3D (USA) (En,Fr,Es).png', "Luigi's Mansion - Dark Moon (USA) (En,Fr,Es).png",
+          'Mario _ Luigi - Paper Jam (USA).png']
 
 
 class Site(http.server.BaseHTTPRequestHandler):
@@ -36,6 +41,11 @@ class Site(http.server.BaseHTTPRequestHandler):
         here = f'http://127.0.0.1:{self.server.server_port}'
         if path.startswith('/img/'):
             return self.send(200, JPG if path.endswith('wide') else PNG, 'image/png')
+        if path == '/titles/':  # libretro's list of title screens: its server's index page
+            links = ''.join('<a href="%s">%s</a>\n' % (urllib.parse.quote(n, safe=",'()"), n) for n in TITLES)
+            return self.send(200, ('<html><a href="?C=N;O=D">Name</a><a href="/parent/">Parent</a>\n' + links).encode(), 'text/html')
+        if path.startswith('/titles/') and path.endswith('.png'):
+            return self.send(200, PNG, 'image/png')
         if path == '/short.zip':  # a whole body of a zip's first bytes, no more
             return self.send(200, b'PK' + bytes(20), 'application/zip')
         if path == '/3dstdb.zip':  # GameTDB's list of 3DS games, as a zip of its XML
@@ -137,6 +147,20 @@ with tempfile.TemporaryDirectory() as tmp:
     # the game's names in the other regions, North America's first, its own left out, each once, none without an English title
     assert covers.other_names('CTR-P-AGGP', tmp, tdb) == ["Luigi's Mansion: Dark Moon", 'Luigi Mansion 2'], covers.other_names('CTR-P-AGGP', tmp, tdb)
     assert covers.other_names('CTR-P-AMKE', tmp, tdb) == [] and covers.other_names('x', tmp, tdb) == []
+    # the title screen: by the game's name with libretro's "The" moved back to the front, where it was sold, an original before a revision,
+    # another region's name where the game's own finds none, "&" as libretro writes it; its list fetched once, each picture once
+    titles = base + '/titles/'
+    zelda = covers.title_screen('CTR-P-AQEE', ['The Legend of Zelda: Ocarina of Time 3D'], tmp, titles)
+    assert zelda == os.path.join(tmp, 'title_AQEE.png') and '/titles/Legend of Zelda, The - Ocarina of Time 3D (USA) (En,Fr,Es).png' in asked, asked[-3:]
+    assert covers.title_screen('CTR-P-AQEP', ['The Legend of Zelda: Ocarina of Time 3D'], tmp, titles) == os.path.join(tmp, 'title_AQEP.png')
+    assert asked[-1] == '/titles/Legend of Zelda, The - Ocarina of Time 3D (Europe) (En,Fr,De,Es,It).png', asked[-1]
+    assert covers.title_screen('CTR-P-AGGP', ["Luigi's Mansion 2", "Luigi's Mansion: Dark Moon"], tmp, titles) == os.path.join(tmp, 'title_AGGP.png')
+    assert covers.title_screen('CTR-P-AYNE', ['Mario & Luigi: Paper Jam'], tmp, titles) == os.path.join(tmp, 'title_AYNE.png')
+    before = len(asked)
+    assert covers.title_screen('CTR-P-AQEE', ['The Legend of Zelda: Ocarina of Time 3D'], tmp, titles) == zelda and len(asked) == before  # kept
+    assert covers.title_screen('CTR-P-AMKE', ['Mario Kart 7'], tmp, titles) is None and covers.title_screen('x', ['Mario Kart 7'], tmp, titles) is None
+    assert asked.count('/titles/') == 1, asked.count('/titles/')
+    assert covers.title_screen('CTR-P-AQEE', ['The Legend of Zelda: Ocarina of Time 3D'], os.path.join(tmp, 'none'), base + '/nothing/') is None
     server.shutdown()
     server.server_close()
     assert covers.steamgriddb('bare', 'good', tmp, 'offline', base) is None  # no connection, nothing kept

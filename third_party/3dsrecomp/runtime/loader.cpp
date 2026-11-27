@@ -1,6 +1,7 @@
 // Loads an extracted game (exheader + code.bin) into guest memory and sets up the kernel pages.
 #include "loader.h"
 
+#include <algorithm>
 #include <ctime>
 #include <fstream>
 #include <vector>
@@ -15,6 +16,30 @@ static std::vector<u8> read_file(const std::string &path) {
 }
 
 GameInfo g_game;
+
+// Missing, empty or malformed ACLs can be extraction placeholders; they cannot release module space.
+static bool exheader_may_load_modules(const std::vector<u8> &ex) {
+    if (ex.size() < 0x400) return true;
+    bool any = false, loader = false;
+    for (u32 slot = 0; slot < 34; ++slot) {
+        const u8 *name = ex.data() + 0x250 + slot * 8;
+        u32 length = 0;
+        bool padding = false;
+        for (u32 i = 0; i < 8; ++i) {
+            const u8 ch = name[i];
+            if (!ch) { padding = true; continue; }
+            if (padding || ch < 0x21 || ch > 0x7E || ch == '*') return true;
+            ++length;
+        }
+        any |= length != 0;
+        loader |= length == 6 && memcmp(name, "ldr:ro", 6) == 0;
+    }
+    return !any || loader;
+}
+
+u32 code_memory_lend_begin(u32 clear, bool generated_modules) {
+    return generated_modules || g_game.may_load_modules ? std::max(clear, 0x04000000u) : clear;
+}
 
 static void init_config_mem() {
     u32 c = mem::CONFIG_MEM;
@@ -129,8 +154,11 @@ static u32 smdh_regions(const std::string &path) {
 }
 
 void load_game(const std::string &dir) {
+    g_game.may_load_modules = true;
     g_game.dir = dir;
     auto ex = read_file(dir + "/exheader.bin");
+    if (ex.size() < 0x210) FATAL("exheader is too short: %s\n", dir.c_str());
+    g_game.may_load_modules = exheader_may_load_modules(ex);
     auto code = read_file(dir + "/code.bin");
     auto rd = [&](size_t o) { u32 v; memcpy(&v, &ex[o], 4); return le32(v); };
     g_game.title = std::string((const char *)&ex[0], strnlen((const char *)&ex[0], 8));

@@ -8,6 +8,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+
+from check_ports import gsx_misses
+from dvlb_to_log import MAX_UNPACKED, framed_records, vertex_records
+from fs_variants import keys
+from gsx_to_gsl import gs_records
+from tev_to_log import TEV_REGS, encode, materials, records
+from win.play_pc import merge
 
 
 def cmd(reg, *values, mask=0xF, group=False):
@@ -87,6 +95,29 @@ def romfs(files):
     return (struct.pack('<10I', 0x28, 0, 0, 0, 0, 0, 0, 0x28, len(table), base) + table).ljust(base, b'\0') + data
 
 
+def shader_binary(code, swizzles):
+    instructions = struct.pack(f'<{len(code)}I', *code)
+    table = b''.join(struct.pack('<II', word, 0) for word in swizzles)
+    program = struct.pack('<4s4x4I', b'DVLP', 24, len(code), 24 + len(instructions), len(swizzles))
+    program += instructions + table
+    entry = bytearray(56)
+    entry[:4] = b'DVLE'
+    struct.pack_into('<IIHHB', entry, 40, 48, 1, 0, 0, 0xF)
+    return struct.pack('<4sII', b'DVLB', 1, 12 + len(program)) + program + entry
+
+
+def crilayla(data):
+    """A CRILAYLA stream with literals and a three-byte back-reference."""
+    assert len(data) > 256
+    data += b'ABCABC'
+    body = data[256:][::-1]
+    bits = ''.join(f'{byte:09b}' for byte in body[:3]) + '1' + '0' * 15
+    bits += ''.join(f'{byte:09b}' for byte in body[6:])
+    bits += '0' * (-len(bits) % 8)
+    packed = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8))[::-1]
+    return b'CRILAYLA' + struct.pack('<II', len(data) - 256, len(packed)) + packed + data[:256]
+
+
 FILLER = cmd(0x229, 0, mask=1) + cmd(0x200, *[0xEAD0FEAD] * 150, mask=0) + cmd(0x244, 0, mask=1)  # what a list has before its program: no part of it
 
 # A: bools written whole and then one byte of them, the four ints and the output map as groups, outputs 0, 1 and 3; ends in its jump
@@ -148,4 +179,107 @@ with tempfile.TemporaryDirectory() as tmp:
     assert r.returncode == 0 and '4 from command lists' in r.stdout, r.stdout
     with open(os.path.join(game, 'shader_logs', 'dvlb.bin'), 'rb') as f:
         assert f.read() == want_a + want_b + want_c + want_e, 'dvlb.bin does not hold the records'
+
+    endings = ([0x88000000], [0x4E000000, 0x88000000])
+    programs = [crilayla(bytes(260) + shader_binary(code, [0x1234])) for code in endings]
+    broken = programs[1][:20]
+    cri = b'CPK '.ljust((1 << 20) - 3, b'\0') + programs[1]
+    Path(game, 'romfs.bin').write_bytes(romfs([('flat.cmp', programs[0]), ('archive.bin', cri), ('truncated.cmp', broken)]))
+    r = subprocess.run([sys.executable, tool, game, '--lists', sys.argv[1]], capture_output=True, text=True, errors='replace')
+    assert r.returncode == 0 and '2 shader binaries, 2 vertex programs' in r.stdout, r.stdout + r.stderr
+    expected = b''.join(record(0, code, [0x1234], 0, [0] * 4, {n: n for n in range(4)}) for code in endings)
+    assert Path(game, 'shader_logs/dvlb.bin').read_bytes() == expected
+
+    garc_shader = shader_binary(endings[0], [0x1234])
+    ga, _ = lz11(garc_shader)
+    Path(game, 'romfs.bin').write_bytes(romfs([('archive.garc', garc([[(0, ga)]]))]))
+    discovered = Path(tmp, 'garc-dvlb.bin')
+    subprocess.run([sys.argv[1], '--lists', out, '--dvlb', str(discovered), str(Path(game, 'romfs.bin'))], capture_output=True, check=True)
+    assert list(framed_records(discovered, MAX_UNPACKED)) == [garc_shader]
+    r = subprocess.run([sys.executable, tool, game, '--lists', sys.argv[1]], capture_output=True, text=True, errors='replace')
+    assert r.returncode == 0 and '1 vertex programs, 0 from command lists' in r.stdout, r.stdout + r.stderr
+    assert Path(game, 'shader_logs/dvlb.bin').read_bytes() == record(0, endings[0], [0x1234], 0, [0] * 4, {n: n for n in range(4)})
+
+    tev = b''.join(cmd(reg, 0x00030003 if i == 0 else 0x000F000F, 0, 0, 0, 0, group=True) for i, reg in enumerate(TEV_REGS))
+    prefix = bytearray(b'CGFX'.ljust(260, b'\0'))
+    prefix[8:12] = b'MTOB'
+    struct.pack_into('<I', prefix, 8 + 0x14, 0x10)
+    struct.pack_into('<I', prefix, 264 - 0x20, 5)
+    body = bytes(prefix) + tev + cmd(0x104, 0x61)
+    cri = b'CPK ' + crilayla(body)
+    lz, _ = lz11(body)
+    Path(game, 'romfs.bin').write_bytes(romfs([('archive.cpk', cri), ('archive.garc', garc([[(0, lz)]]))]))
+    stream = Path(tmp, 'materials.raw')
+    subprocess.run([sys.executable, tool, game, '--lists', sys.argv[1], '--materials', str(stream)], capture_output=True, check=True)
+    frames = list(framed_records(stream, MAX_UNPACKED))
+    plain = list(materials(body))
+    assert len(plain) == 1 and plain[0][2:] == (0x10, 5)
+    assert len(frames) == 2 and all(frame.startswith(b'MTEV') and len(frame) < len(body) for frame in frames)
+    assert [list(materials(frame)) for frame in frames] == [plain, plain]
+
+    context = dict(head=1025, tex=[1, 0, 0], tev=[], light=0, fogat=0, blend=3 << 24, mask=0)
+    seed = encode(context)
+    expected_tev = dict(si=0, csrc=[3, 0, 0], asrc=[3, 0, 0], cmod=[0] * 3, amod=[0] * 3,
+                        cop=0, aop=0, cmul=1, amul=1, urgb=0, ua=0)
+    Path(game, 'shader_logs/fs_log.bin').write_bytes(struct.pack('<I', len(seed)) + seed)
+    model_log = Path(game, 'shader_logs/models_fs.bin')
+    tev_tool = Path(__file__).with_name('tev_to_log.py')
+    subprocess.run([sys.executable, str(tev_tool), game], capture_output=True, check=True)
+    assert records(model_log) == []
+    subprocess.run([sys.executable, str(tev_tool), game, '--materials', str(stream)], capture_output=True, check=True)
+    assert records(model_log) == [encode(dict(context, tev=[expected_tev], fogat=52))]
+
+    Path(game, 'romfs.bin').write_bytes(romfs([('archive.garc', garc([[(0, body)]]))]))
+    subprocess.run([sys.argv[1], '--lists', out, '--materials', str(stream), str(Path(game, 'romfs.bin'))], capture_output=True, check=True)
+    assert list(framed_records(stream, MAX_UNPACKED)) == [frames[-1]]
+
+with tempfile.TemporaryDirectory() as tmp:
+    work = Path(tmp)
+    logs = work / 'logs'
+    logs.mkdir()
+    pipelines = work / 'pipelines.bin'
+    fragment = struct.pack('<II', 4, 0)
+    first = fragment + want_e
+    geometry = b'GS  ' + want_e[4:-56]
+    tails = (want_a[:11], want_a[:-1], fragment[:-1], b'FS  ', b'FS  ' + fragment[:-1],
+             b'GSX ' + struct.pack('<I', 8) + bytes(8), b'GSX ' + struct.pack('<I', 132) + bytes(40), geometry[:-1])
+    for i, tail in enumerate(tails):
+        data = geometry + first + tail
+        log = logs / f'{i}.bin'
+        log.write_bytes(data)
+        assert list(vertex_records(data)) == list(vertex_records(first))
+        assert list(keys(log)) == [(0,)]
+        assert records(log, allow_partial=True) == [bytes(4)]
+    pipelines.write_bytes(bytes(8) + fragment + fragment[:-1])
+    out = work / 'out'
+    result = subprocess.run([sys.argv[1], str(pipelines), str(logs), str(out), '-'], capture_output=True, text=True, errors='replace')
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f'{len(tails) + 1} fragment keys (1 shipped), {len(tails)} vertex records' in result.stdout, result.stdout
+    generated = (out / 'shaders.idx').read_bytes()
+    for log in logs.glob('*.bin'):
+        log.write_bytes(first)
+    pipelines.write_bytes(bytes(8) + fragment)
+    subprocess.run([sys.argv[1], str(pipelines), str(logs), str(out), '-'], capture_output=True, check=True)
+    assert (out / 'shaders.idx').read_bytes() == generated
+
+    misses, converted, fragments = (work / name for name in ('misses.bin', 'converted.bin', 'fragments.bin'))
+    tool = Path(__file__).with_name('misses_to_log.py')
+    for pending in (*tails[:2], *tails[3:]):
+        misses.write_bytes(b'FS  ' + fragment + want_e + geometry + pending)
+        subprocess.run([sys.executable, str(tool), str(misses), str(converted), str(fragments)], capture_output=True, check=True)
+        assert converted.read_bytes() == first
+        assert fragments.read_bytes() == fragment
+        assert converted.with_suffix('.gsl').read_bytes() == geometry
+
+    combined = b'GSX ' + struct.pack('<I11I', 136, 0, 0, 0, 3, 1, 0, 0, 0, 0, 0, 0) + bytes(4 + 88)
+    for pending in (combined[:-1], *tails):
+        data = combined + pending
+        misses.write_bytes(data)
+        assert gsx_misses(misses) == 1
+        assert gs_records([data]) == (b'GS  ' + struct.pack('<4I', 3, 1, 0, 0), 1)
+
+    converted.write_bytes(fragment + want_e[:-1])
+    misses.write_bytes(fragment + want_e + want_e + want_a[:11])
+    assert merge(misses, converted) == 1 and converted.read_bytes() == first
+    assert merge(misses, converted) == 0 and converted.read_bytes() == first
 print('ok')

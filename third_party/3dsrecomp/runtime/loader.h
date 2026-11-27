@@ -12,12 +12,14 @@ struct GameInfo {
     u32 stack_size = 0;
     int priority = 0x30;
     u32 system_mode = 0, app_memory = 0x04000000;  // the memory mode its header asks for, and the application memory that mode gives
+    bool may_load_modules = true;  // unknown ACLs retain the guest module region
     int region = -1;  // from the SMDH region lockout: 0 JPN, 1 USA, 2 EUR, 3 AUS, 4 CHN, 5 KOR, 6 TWN; -1 region free
     u32 regions = 0;  // all of its region lockout bits, as region numbers them (cfg.cpp tells the game one of them)
 };
 extern GameInfo g_game;
 
 void load_game(const std::string &dir);
+u32 code_memory_lend_begin(u32 clear, bool generated_modules);
 std::string smdh_title(const std::string &path);  // an SMDH's English (else Japanese) short title, as UTF-8
 std::vector<u32> smdh_icon(const std::string &path);  // its 48x48 icon as RGBA (empty without one)
 void update_shared_page_time();

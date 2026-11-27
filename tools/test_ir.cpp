@@ -251,5 +251,18 @@ int main() {
     for(u32 a=0x3000;a<0x4000;++a) assert(memory[a]==0xcc);
     for(u32 a=0x5000;a<memory.size();++a) assert(memory[a]==0xcc);
     assert(live_keys.empty() && live_texts.empty() && live_dumps==0 && g_winshot_request==0 && !live.f);
+    for (const char *ending : {"", "\r"}) {
+        live = {};
+        live_feed(ending);  // empty LF/CRLF line
+        live_feed((std::string("DUMP")+ending).c_str());
+        live_feed((std::string("KEY quit")+ending).c_str());
+        live_feed((std::string("TEXT  value ")+ending).c_str());
+        live_feed((std::string("WINSHOT")+ending).c_str());
+        for(g_frame=100;g_frame<140;++g_frame) hid_update(0,0,0,false,0,0);
+        assert(live.queue.size()==3 && live_keys.back()=="quit" && live_texts.back()==" value ");
+        assert(g_winshot_request.exchange(0)==1);
+    }
+    assert(live_keys.size()==2 && live_texts.size()==2 && live_dumps==2);
     puts("IR: actual IPC, bounded shared rings, CRC/calibration, malformed sends, events, reinit and weak callback lifetime passed");
+    puts("Live commands: LF/CRLF keys, text spaces, screenshot, immediate dump and empty lines passed");
 }

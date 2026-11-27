@@ -12,6 +12,14 @@ namespace gpu {
 void init();
 // Execute a PICA command list (register writes, draws, command-buffer jumps).
 void process_command_list(u32 paddr, u32 size_bytes);
+// Finish immediate inputs before their shader or raster state can change.
+void vtx_flush_immediate();
+extern u64 vtx_immediate_cpu_runs;
+#ifdef __WIIU__
+struct V4;
+struct Gx2Draw;
+bool gx2_draw(const Gx2Draw &draw, const V4 *immediate);
+#endif
 // GX MemoryFill. control: bit0 start, bit8 24-bit fill, bit9 32-bit fill (else 16-bit).
 void memory_fill(u32 start_paddr, u32 end_paddr, u32 value, u32 control);
 // GX DisplayTransfer (tiled<->linear, format conversion, downscale, flip), hw register layout.

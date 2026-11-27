@@ -33,10 +33,11 @@ struct Settings {
     int tex_filter = 0;       // texture upscaling (gpu::texture_filter_name)
     int language = -1;        // from the game's next start (services/languages.h): 0 Japanese .. 11; -1 the console's own
     int tv_layout = 0;        // Wii U: what the TV shows (gx2_backend.cpp tv_rect): 0 the top screen, 1 side by side, 2 stacked, 3 the top large and
-                              // the bottom small, 4 the bottom screen, 5 the bottom large and the top small
-    int pad_layout = 0;       // Wii U: what the GamePad shows (gx2_backend.cpp pad_rect): 0 the bottom screen, 1 the top screen, 2 both, top above bottom
-    int resolution = 720;     // Wii U: the rows the top screen is drawn at (gx2_backend.cpp rt_scale), 720 or 480, from the game's next start
-    int wiiu_render_mode = 2; // new known-title Wii U profiles default to Fast; saved per-game choices take precedence
+                              // the bottom small, 4 the bottom screen, 5 the bottom large and the top small, 6 the top stretched to fill the TV
+    int pad_layout = 0;       // Wii U: what the GamePad shows (screen_layouts.h pad_rect): 0 the bottom screen, 1 the top screen, 2 both, top above bottom,
+                              // 3 both side by side, 4 the top stretched to fill the GamePad
+    int resolution = 720;     // Wii U: the rows the top screen is drawn at (gx2_backend.cpp rt_scale), 240, 440, 480 or 720, from the game's next start
+    int wiiu_render_mode = 2; // retain local Fast default; saved per-game choices take precedence
     bool stack_items = false;  // stacks in the pockets, for games whose profile has them (runtime/stacks.mm)
 };
 

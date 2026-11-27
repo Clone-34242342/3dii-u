@@ -34,7 +34,10 @@ void Service::unimplemented(IPC &ipc, bool succeed) {
     if (seen.insert({name, ipc.word(0)}).second)
         LOG("[%s] unimplemented command 0x%08x (%s)\n", name.c_str(), ipc.word(0), succeed ? "returning success" : "failing");
     if (succeed) {
+        // A query it answers this way reads as zero (no, none, empty), never as the words its own request left in the buffer: read as an
+        // answer, those started Luigi's Mansion: Dark Moon as a Download Play child (dlp:SRVR IsChild, misc.cpp)
         ipc.ok(1);
+        for (int i = 2; i < 64; i++) ipc.set(i, 0);
     } else {
         ipc.result(0xD900182F);
     }
@@ -74,8 +77,9 @@ u32 service_request(std::shared_ptr<Session> s, Thread *t, Lock &lk) {
     ++checkpoint_calls[s->service.get()];
 #endif
     s->service->handle(ipc);
-    if (g_verbose && (ipc.word(1) & 0x80000000))
-        LOG("[ipc] %s cmd %08x -> error %08x\n", s->service->name.c_str(), cmd, ipc.word(1));
+    const u32 reply_result = r32(ipc.buf + 4);
+    if (g_verbose && (reply_result & 0x80000000))
+        LOG("[ipc] %s cmd %08x -> error %08x\n", s->service->name.c_str(), cmd, reply_result);
     return RES_OK;
 }
 

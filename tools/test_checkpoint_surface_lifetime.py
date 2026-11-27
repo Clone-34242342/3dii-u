@@ -14,15 +14,19 @@ source = r'''
 #include <cstdlib>
 #include <memory>
 #include <vector>
+#include "surface_readback.h"
 using u32=uint32_t; using u64=uint64_t;
 #define RECOMP_RESUMABLE
 struct Surface {
- u32 checkpoint_pins=0; u64 last_use=0;
+ u32 checkpoint_pins=0,addr=0; u64 last_use=0,drawn=0,written_after=0;
+ bool guest_newer=false,first_use=false; surface_readback::Spans written; u32 bytes()const{return 16;}
  bool in_list=false, shared_depth=false, depth=true, gpu_newer=false, mem1=false;
  void *image() {return nullptr;}
 };
 std::vector<std::unique_ptr<Surface>> surfaces;
-Surface *cur_color, *cur_depth;
+Surface *cur_color, *cur_depth, *depth_owner;
+size_t next_surface_retirement;
+bool transfer_source(const Surface&){return false;}
 u64 use_counter=2000;
 bool state_sent_valid=true,state_lost=false;
 void (*GfxHeapFreeMEM1)(void*);
@@ -49,6 +53,6 @@ int main() {
 '''.replace('PIN', pin).replace('EVICT', evict)
 with tempfile.TemporaryDirectory(prefix='checkpoint-surface-') as tmp:
  p=Path(tmp);(p/'test.cpp').write_text(source)
- subprocess.run(['c++','-std=c++20','-O2','-Wall','-Werror',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+ subprocess.run(['c++','-std=c++20','-O2','-Wall','-Werror','-I'+str(root/'port/wiiu'),str(p/'test.cpp'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
 print('PASS: saved surfaces survive idle eviction; other surfaces retire; final pin release and failed capture permit reclamation')

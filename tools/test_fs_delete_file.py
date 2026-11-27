@@ -36,7 +36,7 @@ struct LowPath { std::string str() const { return requested; } };
 LowPath read_path(u32, u32, u32) { return {}; }
 std::string sanitize(const std::string &s) { return s; }
 void save_changed(const std::string &) { ++changed; }
-#define SAVE_SETTLE(path, forget) (++settled, forgotten += (forget))
+#define SAVE_SETTLE(path, forget) (++settled, forgotten += (forget), true)
 #define LOG(...) (++errors)
 struct IPC {
     u32 value = 99;

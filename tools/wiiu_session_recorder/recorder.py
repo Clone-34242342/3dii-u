@@ -505,12 +505,18 @@ class Controller:
 
     def command(self, action, note=""):
         with self.lock:
-            if action in ('state-save', 'state-load', 'state-status', 'game-pause', 'game-resume', 'game-speed'):
+            if action in ('state-save', 'state-load', 'state-status', 'game-pause', 'game-resume', 'game-speed', 'fallback-rendering', 'game-input', 'game-menu', 'game-relaunch'):
                 if not self.runtime_receiver or not self.runtime_receiver.is_alive() or not self.recorder.runtime_connected:
                     raise RuntimeError("Connect to the running game's debugger first.")
                 commands = {'state-save': 'state save', 'state-load': 'state load', 'state-status': 'state status',
-                            'game-pause': 'set pause 1', 'game-resume': 'set pause 0'}
-                command = ('set speed ' + note) if action == 'game-speed' else commands[action]
+                            'game-pause': 'set pause 1', 'game-resume': 'set pause 0',
+                            'game-menu': 'quit', 'game-relaunch': 'relaunch'}
+                if action == 'game-speed': command = 'set speed ' + note
+                elif action == 'game-input': command = 'in ' + note
+                elif action == 'fallback-rendering':
+                    if note not in ('on', 'off'): raise ValueError('Use fallback-rendering on or off')
+                    command = 'set uberall ' + ('1' if note == 'on' else '0')
+                else: command = commands[action]
                 self.recorder.runtime_event('debug_control_requested', action=action, command=command)
                 action, note = 'renderer', command
             if action == "diagnose":
@@ -704,8 +710,8 @@ def gui(controller, hotkey_enabled):
 
     root = tk.Tk()
     root.title("Wii U Session Recorder")
-    root.geometry("900x490")
-    root.minsize(850, 460)
+    root.geometry("900x525")
+    root.minsize(850, 495)
     panel = ttk.Frame(root, padding=18)
     panel.pack(fill="both", expand=True)
     target_row = ttk.Frame(panel)
@@ -771,6 +777,17 @@ def gui(controller, hotkey_enabled):
         try: controller.command('game-speed', speed_choice.get()); message.set('Game speed request queued; see runtime log.')
         except (OSError, ValueError, RuntimeError) as exc: message.set(str(exc))
     speed_box.bind("<<ComboboxSelected>>", change_speed)
+    fallback_choice = tk.BooleanVar(value=False)
+    def toggle_fallback():
+        requested = fallback_choice.get()
+        try:
+            controller.command('fallback-rendering', 'on' if requested else 'off')
+            message.set('Forced fallback rendering request queued.' if requested else 'Normal rendering request queued.')
+        except (OSError, ValueError, RuntimeError) as exc:
+            fallback_choice.set(not requested)
+            message.set(str(exc))
+    ttk.Checkbutton(panel, text='Force fallback rendering (diagnostic; may be slow or show wrong colours)',
+                    variable=fallback_choice, command=toggle_fallback).pack(anchor='w', pady=(0, 4))
     aroma_choice = tk.BooleanVar(value=controller.aroma_enabled)
     def toggle_aroma():
         try: controller.command('aroma', 'on' if aroma_choice.get() else 'off')
@@ -846,7 +863,7 @@ def main():
     parser.add_argument("--output", type=Path, default=DEFAULT_DIR)
     parser.add_argument("--no-hotkeys", action="store_true")
     parser.add_argument("--no-screenshots", action="store_true")
-    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma", "target", "diagnose", "screenshots", "state-save", "state-load", "state-status", "game-pause", "game-resume", "game-speed"))
+    parser.add_argument("--control", choices=("status", "connect", "disconnect", "start", "stop", "toggle", "mark", "runtime", "renderer", "aroma", "target", "diagnose", "screenshots", "state-save", "state-load", "state-status", "game-pause", "game-resume", "game-speed", "fallback-rendering", "game-input", "game-menu", "game-relaunch"))
     parser.add_argument("--note", default="")
     args = parser.parse_args()
     if args.control:

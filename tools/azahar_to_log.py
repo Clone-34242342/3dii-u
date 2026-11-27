@@ -134,7 +134,17 @@ def key_from_config(c):
             uses[L['bump_sel'] & 3] = True
         if L['shadow']:
             uses[L['sh_sel'] & 3] = True
+        else:  # as fs_normal(): disabled shadows are 1, so nothing else about them is read
+            L.update(sh_sel=0, sh_inv=0, sh_prim=0, sh_sec=0, sh_alpha=0)
 
+    if len(tev_list) > 1:
+        first, nxt = tev[tev_list[0]], tev[tev_list[1]]
+        na = 0 if nxt['cop'] == 7 or nxt['aop'] in (6, 7) else operands_norm(nxt['aop'])
+        external = not any(tev[i]['upd_rgb'] or tev[i]['upd_a'] for i in tev_list)
+        external &= not any(x in (13, 15) for x in nxt['csrc'][:operands_norm(nxt['cop'])] + nxt['asrc'][:na])
+        if external and first['cop'] != 7 and first['aop'] not in (6, 7):
+            first['cop'] = first['aop'] = 0
+            first['cmul'] = first['amul'] = 1
     words = []
     put = words.append
     # textures, as setup_texunit then fs_normal leave them
@@ -189,11 +199,12 @@ def key_from_config(c):
         for name, sampler in (('d0', 0), ('d1', 1), ('sp', 8), ('fr', 3), ('rb', 4), ('rg', 5), ('rr', 6)):
             raw = az[name][0]
             en = bool(raw & 1) and sampler_supported(L['config'], sampler)
-            put(int(en) | ((raw >> 1) & 1) << 1 | ((raw >> 2) & 7) << 2 if en else 0)
+            inp = (raw >> 2) & 7
+            put(int(en) | ((raw >> 1) & 1) << 1 | inp << 2 if en else 0)
         for i in range(L['num']):
             lt = lights[i]
             put((lt & 7) | ((lt >> 3) & 1) << 3 | ((lt >> 4) & 1) << 4 | ((lt >> 7) & 1) << 5 | ((lt >> 8) & 1) << 6 | ((lt >> 5) & 1) << 7 |
-                ((lt >> 6) & 1) << 8 | ((lt >> 9) & 1) << 9)
+                ((lt >> 6) & 1) << 8 | ((lt >> 9) & 1 if L['shadow'] else 0) << 9)
     fog = fog_mode == 5
     at = alpha_test
     put(int(fog) | (int(fog_flip) if fog else 0) << 1 | int(at) << 2 | (alpha_func if at else 0) << 3)
@@ -201,7 +212,7 @@ def key_from_config(c):
     put(0)  # colour mask
     if shadow_rendering:
         return None  # a shadow map pass: our runtime draws those its own way
-    return struct.pack(f'<{len(words)}I', *words)
+    return normalize_logged(struct.pack(f'<{len(words)}I', *words))
 
 
 def normalize_logged(k):
@@ -239,7 +250,16 @@ def normalize_logged(k):
     n = w[p]
     p += 1
     out.append(n)
-    for _ in range(n):
+    dead_first = False
+    if n > 1:
+        first_op, next_op = w[p + 4], w[p + 9]
+        nc = operands_norm(next_op & 15)
+        na = 0 if next_op & 15 == 7 or next_op >> 4 & 15 in (6, 7) else operands_norm(next_op >> 4 & 15)
+        external = not any(w[p + 5 * i + 4] & (3 << 16) for i in range(n))
+        external &= not any(w[p + 6 + j] & 15 in (13, 15) for j in range(nc))
+        external &= not any(w[p + 6 + j] >> 4 & 15 in (13, 15) for j in range(na))
+        dead_first = external and first_op & 15 != 7 and first_op >> 4 & 15 not in (6, 7)
+    for stage_index in range(n):
         si = w[p]
         srcs = w[p + 1:p + 4]
         opw = w[p + 4]
@@ -249,6 +269,9 @@ def normalize_logged(k):
         cm = [(s >> 8) & 15 for s in srcs]
         am = [(s >> 12) & 7 for s in srcs]
         cop, aop = opw & 15, (opw >> 4) & 15
+        if stage_index == 0 and dead_first:
+            cop = aop = 0
+            opw = (opw & ~0xff00) | 0x1100
         nc = operands_norm(cop)
         na = 0 if cop == 7 or aop in (6, 7) else operands_norm(aop)
         for j in range(3):
@@ -268,13 +291,20 @@ def normalize_logged(k):
     if lighting:
         lw = w[p]
         p += 1
+        shadows = lw & (1 << 15)
+        if not shadows:  # as fs_normal(): disabled shadows are 1, so nothing else about them is read
+            lw &= ~(3 << 12 | 15 << 16)
         out.append(lw)
-        for _ in range(7):
-            s = w[p]
-            p += 1
-            out.append(s if s & 1 else 0)
+        sels = [s if s & 1 else 0 for s in w[p:p + 7]]
+        out.extend(sels)
+        p += 7
         for _ in range(lw & 15):
-            out.append(w[p])
+            light = w[p] & ~256
+            if not shadows or not lw & ((1 << 17) | (1 << 18)):
+                light &= ~512
+            if not light & 128 and not sels[2] & 1:
+                light &= ~7
+            out.append(light)
             p += 1
     fw = w[p]
     fog, flip, at, af = fw & 1, (fw >> 1) & 1, (fw >> 2) & 1, (fw >> 3) & 7

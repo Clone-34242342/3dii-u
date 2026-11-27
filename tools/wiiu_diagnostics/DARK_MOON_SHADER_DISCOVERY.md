@@ -398,94 +398,203 @@ save/load navigation and cutscene synchronization remain hardware test items;
 a near-30 FPS lab test does not establish perfect timing throughout the game.
 
 
-## Later shader coverage and fallback correctness
+## Later gameplay, fallback shadows and Fast-mode seam candidates
 
-Mixed shader logs now distinguish vertex, legacy geometry, GSX and fragment
-records, reject truncated/oversized records, and avoid reading geometry words
-as fragment-key lengths. Bounded prediction includes observed fog settings and
-shadow-light type/direction alternatives while preserving material alpha tests.
-Earlier inputs produce 73 of 183 examined later miss states, versus zero with
-the previous predictor. These states guided development; this is development
-coverage, not an independent holdout result or complete material discovery.
+The long November 25 recording includes multiple launches and idle menu time;
+frame numbers repeat. The later gameplay must be selected by launch/record order,
+not by averaging the whole recording. Continuous screenshots subsequently
+captured the Front Yard sky alternating between flat green and normal dark sky,
+alongside new fragment compilations and 5–11 FPS shown in individual images.
+This supports a first-use/fallback investigation, not proof of a particular sky
+shader. Screenshot/FTP work perturbs timing and is labelled separately.
 
-The fallback now recognizes type-2 shadow textures instead of displaying their
-packed GBA depth as RGBA colour. It uses the specialized path's depth decode,
-bias and orthographic/perspective comparison. Its zero-distance lighting guard
-preserves attenuation-independent Fresnel alpha. Generator revision is 9, so
-executables and shader packs must match. Native/source checks pass; this does
-not establish an isolated hardware FPS gain or complete fallback coverage.
+Code inspection found that the fallback sampled a type-2 shadow map as ordinary
+RGBA. Its GBA channels contain packed depth, not material colour. The candidate
+uses the same depth decode, bias and perspective/orthographic comparison as the
+specialized shader, and applies the zero-distance guard while retaining the
+Fresnel-alpha exception. Generator/native shader checks pass; the corrected
+fallback's hardware picture and speed remain unverified. Cache revision is 9.
 
-The tested private pack retains the earlier 2,379 fragment mappings, 120 vertex
-keys and the 183 examined later states. A local repack removed speculative
-mappings to fit 16 MiB; it is not a general builder-budget implementation and
-neither it nor generated game shader payloads are published here.
+The marked lab image also contains a dark row at 120 of the 240-row top image.
+The user describes a vertical Fast-mode line; that specific observation still
+needs confirmation on hardware. The candidate corrects both raster-scissor axes:
+round the endpoints of adjacent rectangles instead of independently truncating
+the start and width. A fractional-scale fixture reproduces an uncovered pixel
+with the old arithmetic. The candidate keeps Fast's scale and uses the existing
+copyrect switch for an A/B comparison. Host coverage tests are not proof that
+this removes every visible line.
 
-## Native rain geometry from assets
+PC configuration prediction now varies shadow-light direction/type and combines
+observed fog settings without replacing material alpha tests. Earlier inputs
+produce 73 of the 183 examined later miss states, versus zero with the preceding
+predictor. Those examined misses guided rule development, so this is development
+coverage rather than an independent unseen-scene validation. New material
+combiners still require recognized asset decoding or additional observations.
+Mixed-log readers now skip legacy CPU geometry records instead of treating them
+as fragment lengths, and reject truncated/oversized records.
 
-Two stationary outdoor hardware samples showed 13.6–13.8 presents/s and two
-CPU geometry draws processing 2,088 vertices per frame. Geometry work cost
-39.86–39.87 ms/frame, including 34.63 ms running the geometry program. The build
-had no native geometry table: asset discovery retained vertex entries but did
-not export declared geometry entries for native translation.
+The private hardware candidate retains all 2,379 earlier fragment lookup keys,
+all 120 vertex keys and the 183 examined later fragment states. The initial
+expanded pack was 32,036,520 bytes, above the 16 MiB resident threshold. A local
+bounded repack retains protected mappings and removes only speculative mappings;
+its GFD is 16,777,072 bytes, with 2,099 pixel and 80 vertex programs. Native
+validation reports maxima of 28 pixel and 28 vertex registers. This local repack
+is not yet a general PC-builder budget policy. Reused earlier specialized
+binaries were allowed only after checking that specialized generation and key
+normalization were unchanged; the modified fallback programs come from the new
+compilation. Real-console regression testing is pending.
 
-Code builds now discover those geometry entries in recognized base/update
-DVLB assets before linking, including code-only exports. Shared DVLP instruction
-memory is retained rather than truncated to 512 words. The existing native
-translator rejects unsupported control flow, and the runtime matches entry,
-instruction and swizzle hashes before using a function. Existing user `.gsl`
-logs remain intact. This translates the game's own rain code; it does not
-replace or reduce the rain effect, change its density, or remove lighting.
+The regular profile/settings and a completed 112,604,400-byte checkpoint were
+backed up privately on the PC. No save or generated shader payload is published.
 
-On the console, the log confirmed entry 505 running as native code. Comparable
-stationary samples reached 19.8–20.1 presents/s and 18.00–18.15 ms/frame for
-geometry, including 13.33–13.44 ms in geometry execution. The user confirmed an
-improvement, but the scene remains below full speed. These are scene samples,
-not a deterministic input replay or a guarantee of 30 FPS throughout the game.
-No texture uploads or fragment misses occurred during the measured intervals.
 
-Generated geometry functions compile at `-O2` independently of resumable game
-code's `-O1`, with strict arithmetic and contraction disabled. Differential
-checks include 2,000 real-program runs and 42,000 synthetic conditional/loop
-runs, including extreme loop counts. The `-O2` follow-up changed measured
-geometry time only slightly and did not establish a meaningful further FPS
-gain; the major gain comes from replacing interpretation with native execution.
+## Outdoor geometry discovery (2026-11-25, hardware candidate)
 
-## Fast-mode seam correction
+With continuous screenshots disabled, two consecutive stable outdoor samples
+reported 13.6–13.8 presents/s, roughly 437 draws/flip and two CPU geometry draws
+processing 2,088 vertices/flip. Those geometry draws cost 39.86–39.87 ms/flip,
+including 34.63 ms in geometry execution and 3.62 ms in vertex execution. No
+textures uploaded in these intervals. The reported zero primitive count comes
+from native emission instrumentation; it does not count interpreter emissions
+and must not be read as proof that these draws produce nothing. GPU timestamps
+around presentation can include upstream starvation; they are not independent
+costs to add to the CPU breakdown.
 
-Fresh-launch GamePad captures confirm the observed thin line across the middle
-of the top image is gone. Surface inspection showed black padding entering the
-assembled image at a slice edge. Floor-scaled copy extents had been reused for
-raster scissors, excluding a pixel whose centre lay inside the transformed
-window. Raster scissors now use `ceil(edge*scale+viewport_offset-0.5)`, clamped
-to their target; stored copy rectangles retain their shared floor endpoints.
-Resolution, rain density and effects are unchanged by this correction.
+The active executable lacked a native geometry table. Asset discovery previously
+kept vertex entries from DVLB but never exported declared geometry entries for
+native CPU translation. Code builds now extract those entries from recognized
+base/update asset binaries into a derived `assets_geometry.gsl` before compiling
+native functions. This applies to code-only exports too. Shared instruction
+memory is retained rather than truncated to 512 words. Runtime instruction and
+swizzle hashes still select the function, and unsupported programs retain the
+interpreter. Existing user-recorded `.gsl` files are preserved.
 
-With the observed scale 0.96153846 and viewport offset 0.25, pixel centre 230.5
-belongs inside the clip but was excluded by `floor(240*scale)`. The fixture
-checks that case, adjacent coverage and integer/fractional scales. In matching
-camera captures, the middle-row brightness deficit fell from 11.34 to 0.59
-(8-bit channels). This verifies the reported seam in that scene, not all possible
-clipping cases in every title.
+Dark Moon's asset-extracted entry 505 matches the hardware-recorded native lookup
+key. The existing differential harness compared 2,000 randomized runs and 49,684
+emitted primitives with zero differences. Synthetic discovery checks cover stage,
+entries beyond 512 words, deduplication, updates, malformed inputs and stale
+output replacement. Conditional-translator regressions pass 42,000 comparisons.
+The RPX links with externally visible native table/count symbols. This is a
+validated candidate; its outdoor FPS benefit still requires a matched hardware
+sample after installation. Geometry extracted through this recognized asset
+format does not cover every game's dynamically assembled programs.
 
-| Before | After fresh launch |
-| --- | --- |
-| ![Dark seam before correction](evidence/darkmoon-fast-seam-before.png) | ![Corrected top-screen join](evidence/darkmoon-fast-seam-after.png) |
 
-The visible FPS counters are individual screenshot moments, not benchmarks.
+### Native outdoor hardware result and next candidate
 
-Fast is the user-requested default for newly created per-game settings. Existing
-settings.ini choices remain authoritative. Only recognized title profiles use
-this field (currently the tested USA Dark Moon ID). Fast retains its existing
-uncapped rate and scale; Balanced and Sharp remain selectable. It can run above
-the original game's rate in lighter scenes.
+The console logged entry 505 running as native code. Two post-warmup samples
+reported 20.1/19.8 presents/s (19.7/19.8 top-screen picture swaps/s), with roughly
+433–438 draws/flip and 2,070–2,088 CPU geometry vertices. Geometry processing
+fell to 18.00–18.15 ms/flip, including 13.33–13.44 ms in the native geometry runs
+and 3.34–3.36 ms in vertex execution. This agrees with the user's report of an
+improvement, while leaving the outdoor scene below full speed. These scene
+samples are not a controlled input replay. No fragment misses or texture uploads
+occurred in the measured intervals, so cache compilation is not the current
+steady-scene explanation.
 
-## Measured exclusions and remaining work
+The next candidate compiles generated native geometry functions at `-O2`,
+independently of resumable ARM game code's `-O1`. It preserves strict arithmetic,
+disables floating-point contraction, and does not change game execution mode.
+The geometry differential harness now tests that optimization level too: 2,000
+Dark Moon comparisons plus 42,000 synthetic conditional/loop comparisons passed
+with zero differences. The RPX grows by 2,965 bytes. Hardware performance of
+this second change remains unverified until the next matched outdoor sample.
 
-Parallel rain execution measured 19.7/18.5/19.7 FPS off/on/off and was restored
-off. Exact-byte index-range reuse did not produce a meaningful gain; its
-validation overhead removed the expected saving. Those performance experiments
-are not included in this PR update. No reduced rain density, removed effects,
-additional resolution reductions or unchecked stale-index assumptions are
-introduced as optimizations. Further outdoor CPU work and cutscene synchronization
-remain open. GPU pass timestamps can include upstream starvation, so their
-labels are not independent CPU-free costs to add to the CPU breakdown.
+
+### Follow-up outdoor probes and remote debugger controls
+
+The `-O2` native candidate measured 19.9–20.0 presents/s, with CPU geometry
+17.90–17.96 ms versus the prior 18.00–18.15 ms. This is a small timing difference
+without a meaningful frame-rate gain; it is not evidence of another substantial
+optimization. Live Fast/full/Fast probes returned 20.0/19.2/19.9 presents/s.
+Lightguard off/on returned 19.7/19.8 presents/s. These tests retained the same
+outdoor camera and restored Fast + lightguard afterward. Screenshots were off
+during timing. The GPU pass timestamps move idle time between pass labels and
+must not be interpreted as independent CPU-free shader execution costs.
+
+A subsequent manual GamePad capture confirms a left-to-right dark seam near
+the middle of the top image. The scissor-endpoint correction did not fully
+resolve this observation. The next uploaded debugger candidate adds a live
+viewport-nudge switch for image comparisons, retaining the automatic default.
+No claim of a seam fix is made yet. The completed outdoor checkpoint was
+retrieved privately for repeatable tests.
+
+The new runtime queues network save/load requests through the existing
+checkpoint pump. Remote pause opens the normal options menu; speed selects its
+existing 100/200/400% modes. Explicit guest word reads and compare/write edits
+execute under the checkpoint barrier, validate guest mappings and permissions,
+and invalidate mapped GPU data after writes. They do not provide host-native
+instruction stepping or hardware watchpoints. The recorder exposes state/menu
+controls and records explicit renderer/RAM commands. Its automatic screenshot
+setting remains disabled. Unit/integration checks pass; these added controls
+still require the first live-console verification.
+
+
+### User-selected default policy
+
+New per-game settings default to Fast (`wiiu_render_mode=2`), as requested by
+the hardware tester. Existing settings.ini choices remain authoritative.
+Only titles with a recognized profile use this field; the tested Dark Moon
+profile currently matches USA 0004000000055f00. Fast retains its existing
+resolution policy and uncapped rate; it can exceed the original game's rate
+in light scenes. Balanced and Sharp remain selectable. This default change
+is independent of the experimental parallel-geometry switch.
+
+
+### Scissor-centre and parallel-rain candidate (hardware pending)
+
+Manual nudge 0/default/0.5/default captures retained the dark row; the nudge
+setting was restored. Disabling exact copy rectangles made the row darker,
+so that change was retained. Native surface captures show the half-slice's
+column 230 and later as black, and a darkened column in the assembled LCD.
+Raster clipping previously used floor-scaled copy extents. With the observed
+0.96153846 scale and 0.25 viewport offset, pixel centre 230.5 belongs inside
+the raster window; floor(240*scale) excludes it. The candidate uses
+ceil(edge*scale+offset-0.5) for raster scissors, preserving floor endpoints for
+stored copy rectangles and clamping scissors to their target. Host fixtures
+check pixel-centre coverage and shared boundaries. Resolution is unchanged.
+The user's fresh-launch hardware image still needs checking.
+
+Native geometry dependency analysis previously declined every loop. The
+candidate conservatively models structured loop bank parity and returns to
+END, while rejecting prior scratch/condition values, b15 and unmodelled IFs.
+It also requires all three emitted vertices to belong to the current invocation.
+Dirty-register/emitter and extreme-loop differential checks pass for the actual
+rain program; synthetic positive/negative fixtures pass. The parallel path now
+preserves the last complete primitive's input uniforms and avoids updating
+shared emission timing accumulators from worker threads. Its enable switch
+remains off by default, and is an experimental live comparison, not a verified
+FPS gain or a general promise about all games' cross-program scratch behavior.
+
+Remote pause/resume and a guest RAM read/compare-write command were observed on
+hardware (the write test retained the same word). Remote persistent load also
+succeeded in 9055 ms for a private test copy whose timestamp-only build identity
+was adjusted after checking the serialized format was unchanged. The original
+checkpoint and payload were preserved, and normal compatibility guards remain.
+This private diagnostic rebind is not release compatibility across arbitrary
+builds. At the user's subsequent request, the next test will use a normal fresh
+launch without loading any checkpoint; an optional checkpoint transfer was
+cancelled after the executable and shaders had been published successfully.
+
+
+### Fresh-launch seam result and rejected parallel experiment
+
+The fresh-launch manual GamePad capture no longer shows the middle dark row.
+In the same camera view, average row brightness (8-bit channels, x235..619)
+changed from 27.76/16.86/28.64 across rows 119..121 to 27.07/26.94/28.00.
+The middle-row deficit fell from 11.34 to 0.59. This confirms the observed seam
+in that scene, not every possible fractional clip in every title.
+
+Actual shared-rain A/B/A reported 19.7/18.5/19.7 presents/s and geometry
+18.09/20.83/18.14 ms. The switch was restored off. Shared emission buffering
+and merging made this path slower; the dependency proof is not itself a
+performance gain. CPU/GPU timers were disabled afterward.
+
+The next opt-in candidate reuses mesh-index bounds after an exact comparison
+of the current source bytes. It does not depend on guest cache flushes, so an
+unannounced write or state restore is detected on the next lookup. Auxiliary
+storage is bounded to 2 MiB plus entry metadata and one temporary <=64 KiB
+replacement allocation; allocation failure keeps the normal scan. It defaults
+off until the hardware A/B comparison. Host sanitizer tests cover modified
+interior indices, replayed bytes, cache collisions, empty/oversized records and
+storage limits. This has not yet demonstrated an FPS improvement.

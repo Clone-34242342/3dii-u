@@ -15,9 +15,11 @@
 #include <gx2/event.h>
 #include <proc_ui/procui.h>
 #include <sysapp/launch.h>
+#include <sysapp/title.h>
 #include <sys/stat.h>
 #include <malloc.h>
 #include <nn/act.h>
+#include <nn/save/save.h>
 #include <padscore/kpad.h>
 #include <padscore/wpad.h>
 #include <unistd.h>
@@ -25,6 +27,7 @@
 #include <whb/gfx.h>
 #include <whb/proc.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <csetjmp>
@@ -43,9 +46,12 @@
 #include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
+#include "menu_shortcut.h"
+#include "motion_input.h"
 #include "service.h"
 #include "services/services.h"
 #include "settings.h"
+#include "save_backup.h"
 #include "wiiu.h"
 #include "physical_file.h"
 #include "shader_compile.h"
@@ -62,11 +68,33 @@ static char crash_msg[512];
 static OSTime trace_start;
 static const char *volatile trace_stage = "before main";
 
+// (measuring builds) the start, step by step, in sd:/3dii-u/<title id>/start.txt, each line written and closed at once from the first line of
+// main on, before the log is up: a title that stops starting (a console's error 199-9999 on a new title) still says how far it got
+static void start_mark(const char *what) {
+    static bool done;
+    if (!kMeasure || done) return;
+    static char path[80];
+    if (!path[0]) {
+        char dir[64];
+        snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
+        mkdir("fs:/vol/external01/3dii-u", 0777);
+        mkdir(dir, 0777);
+        snprintf(path, sizeof path, "%s/start.txt", dir);
+        remove(path);
+    }
+    if (FILE *f = fopen(path, "a")) {
+        fprintf(f, "%u ms %s\n", (u32)OSTicksToMilliseconds(OSGetSystemTime() - trace_start), what);
+        fclose(f);
+    }
+    done = !strcmp(what, "the game is drawing");
+}
+
 static void stage(const char *name) {
     trace_stage = name;
     const u32 elapsed = OSTicksToMilliseconds(OSGetSystemTime() - trace_start);
     OSReport("[3dii-u startup] %s at %u ms\n", name, elapsed);
     LOG("[stage] %s at %u ms\n", name, elapsed);
+    start_mark(name);
 }
 
 static char last_note[80];
@@ -87,9 +115,15 @@ static volatile u32 file_op;
 static volatile OSTime file_since;
 
 void wiiu::fs_begin(u32 op) {
+    const OSTime wait_started = kMeasure ? OSGetSystemTime() : 0;
     OSLockMutex(&file_m);
-    file_since = OSGetSystemTime();
+    const OSTime acquired = OSGetSystemTime();
+    file_since = acquired;
     file_op = op;
+    if (kMeasure) {
+        const u32 waited = (u32)OSTicksToMilliseconds(acquired - wait_started);
+        if (waited >= 16) LOG("[fs] operation %04x waited %u ms for storage\n", op, waited);
+    }
 }
 
 void wiiu::fs_end() {
@@ -125,7 +159,7 @@ void frontend_live_text(const std::string &) {}
 // itself, as if the system had said so: what a game does as it closes then runs in a check too.
 static volatile bool route_quit;
 void frontend_live_key(const std::string &key) {  // a route's "KEY <name>"
-    if (key == "menu") wiiu::menu_input(VPAD_BUTTON_STICK_L);  // as a click of the left stick: opens the options menu, or closes it
+    if (key == "menu") wiiu::menu_input(0, true);
     if (key != "quit") return;
     if (wiiu::debug_flag("cemu")) route_quit = true;
     else wiiu::menu_quit_now();
@@ -150,7 +184,7 @@ static OSThread *spawn(OSThreadEntryPointFn fn, int core, int prio, u32 stack_si
     return t;
 }
 
-static volatile bool quitting, gpu_parked, audio_parked, gfx_may_close;
+static volatile bool quitting, gpu_parked, audio_parked, gfx_may_close, gpu_done;
 static OSEvent video_job, video_done;
 static OSMutex video_mutex;
 static void (*video_work)(void *);
@@ -198,6 +232,7 @@ static volatile int home_release_ms = -1;
 // This runs on the GPU thread's core with a higher priority than WHB's own callback, which frees the screens' memory and waits for the GPU from a thread that can stop the GPU thread
 // anywhere, even in the middle of a command. On a console both used to run while the game kept drawing, and the GPU thread was still at it when GX2 went away a second later.
 static uint32_t on_release(void *) {
+    wiiu::camera_pause(true);
     const OSTime t0 = OSGetSystemTime();
     foreground_back = false;
     kernel::gx_hold = true;
@@ -212,6 +247,7 @@ static uint32_t on_release(void *) {
 }
 
 static uint32_t on_acquire(void *) {
+    wiiu::camera_pause(false);
     foreground_back = true;
     return 0;
 }
@@ -272,6 +308,7 @@ static int gpu_thread(int, void *) {
     wiiu::gfx_thread_init();
     stage("gpu thread ready");
     setjmp(gpu_restart);
+    bool drained = false;
     while (!quitting) {
         const OSTime deadline = diagnostics_deadline.load();
         if (deadline && OSGetSystemTime() >= deadline) {
@@ -283,13 +320,14 @@ static int gpu_thread(int, void *) {
         }
         if (gpu_pause) {
             if (gpu_tripped) LOG("[home] the GPU thread was still drawing when GX2 went away\n");
-            else wiiu::gfx_shutdown();
+            else { wiiu::gfx_shutdown(); drained = true; }
             gpu_tripped = false;
             gpu_parked = true;
             while (gpu_pause && !quitting) OSSleepTicks(OSMillisecondsToTicks(2));
             if (quitting) break;
             wiiu::gfx_reacquire();
             gpu_parked = false;
+            drained = false;
             continue;
         }
         // quiet: two milliseconds went by with nothing asked of the GPU, and nothing came in at the last moment either, which is when a
@@ -317,11 +355,13 @@ static int gpu_thread(int, void *) {
             }
         }
     }
-    if (!gpu_parked) wiiu::gfx_shutdown();
+    if (!gpu_parked) { wiiu::gfx_shutdown(); drained = true; }
+    if (kMeasure && drained) wiiu::gfx_report_final();
     gpu_parked = true;
     // GX2 has to close on the core it started on, once the system has taken the foreground back
     while (!gfx_may_close) OSSleepTicks(OSMillisecondsToTicks(2));
     WHBGfxShutdown();
+    gpu_done = true;
     return 0;
 }
 
@@ -343,12 +383,21 @@ static u32 map_pro(u32 h, bool z_too) {
     return b;
 }
 
-// its presses as the GamePad's, for the options menu (menu_input): the left stick in to open it, the D-pad, A and B
+// Its buttons as the GamePad's for the options menu, keyboard and Mii selector.
 static u32 pro_as_gamepad(u32 t) {
     u32 v = 0;
     if (t & WPAD_PRO_BUTTON_STICK_L) v |= VPAD_BUTTON_STICK_L;
+    if (t & WPAD_PRO_BUTTON_STICK_R) v |= VPAD_BUTTON_STICK_R;
+    if (t & WPAD_PRO_TRIGGER_ZL) v |= VPAD_BUTTON_ZL;
+    if (t & WPAD_PRO_TRIGGER_ZR) v |= VPAD_BUTTON_ZR;
+    if (t & WPAD_PRO_TRIGGER_L) v |= VPAD_BUTTON_L;
+    if (t & WPAD_PRO_TRIGGER_R) v |= VPAD_BUTTON_R;
     if (t & WPAD_PRO_BUTTON_A) v |= VPAD_BUTTON_A;
     if (t & WPAD_PRO_BUTTON_B) v |= VPAD_BUTTON_B;
+    if (t & WPAD_PRO_BUTTON_X) v |= VPAD_BUTTON_X;
+    if (t & WPAD_PRO_BUTTON_Y) v |= VPAD_BUTTON_Y;
+    if (t & WPAD_PRO_BUTTON_PLUS) v |= VPAD_BUTTON_PLUS;
+    if (t & WPAD_PRO_BUTTON_MINUS) v |= VPAD_BUTTON_MINUS;
     if (t & WPAD_PRO_BUTTON_UP) v |= VPAD_BUTTON_UP;
     if (t & WPAD_PRO_BUTTON_DOWN) v |= VPAD_BUTTON_DOWN;
     if (t & WPAD_PRO_BUTTON_LEFT) v |= VPAD_BUTTON_LEFT;
@@ -356,8 +405,34 @@ static u32 pro_as_gamepad(u32 t) {
     return v;
 }
 
-// 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y. ZL and ZR are L and R as well (z_too), but for a game
-// that reads the Circle Pad Pro a New 3DS answers with: they are its own ZL and ZR then (kernel::hid_extra_pad).
+static u32 overlay_combo;
+
+static void load_overlay_combo() {
+    constexpr menu_shortcut::Button buttons[] = {
+        {"L", VPAD_BUTTON_L}, {"R", VPAD_BUTTON_R}, {"ZL", VPAD_BUTTON_ZL}, {"ZR", VPAD_BUTTON_ZR},
+        {"L Stick", VPAD_BUTTON_STICK_L}, {"R Stick", VPAD_BUTTON_STICK_R},
+        {"A", VPAD_BUTTON_A}, {"B", VPAD_BUTTON_B}, {"X", VPAD_BUTTON_X}, {"Y", VPAD_BUTTON_Y},
+        {"Plus", VPAD_BUTTON_PLUS}, {"Minus", VPAD_BUTTON_MINUS}, {"D-Pad Up", VPAD_BUTTON_UP},
+        {"D-Pad Down", VPAD_BUTTON_DOWN}, {"D-Pad Left", VPAD_BUTTON_LEFT}, {"D-Pad Right", VPAD_BUTTON_RIGHT},
+    };
+    if (FILE *f = fopen((std::string(CONTENT_DIR) + "/menu_shortcut.txt").c_str(), "rb")) {
+        char data[40];
+        const size_t size = fread(data, 1, sizeof data, f);
+        if (!ferror(f) && size < sizeof data) {
+            std::string_view chord(data, size);
+            while (!chord.empty() && (chord.back() == '\n' || chord.back() == '\r')) chord.remove_suffix(1);
+            overlay_combo = menu_shortcut::parse(chord, buttons);
+        }
+        fclose(f);
+    }
+}
+
+static bool overlay_pressed(u32 down, u32 held) {
+    if (overlay_combo) return menu_shortcut::pressed(overlay_combo, down, held);
+    return (down & VPAD_BUTTON_STICK_L) || menu_shortcut::pressed(VPAD_BUTTON_ZL | VPAD_BUTTON_ZR, down, held);
+}
+
+// 3DS button bits as hid.cpp expects them: A B Select Start Right Left Up Down R L X Y
 static u32 map_buttons(u32 h, bool z_too) {
     u32 b = 0;
     if (h & VPAD_BUTTON_A) b |= 1u << 0;
@@ -375,6 +450,12 @@ static u32 map_buttons(u32 h, bool z_too) {
     return b;
 }
 
+// whether the last read found a GamePad, which the keyboard and the Mii list are drawn on
+static std::atomic<bool> gamepad_there{true};
+
+// Without a GamePad the game gets the player's Mii at once, as it does from ports without a list (services/apt.cpp)
+bool mii_select_shown() { return gamepad_there; }
+
 static int hid_thread(int, void *) {
     wiiu::profile_this_core();
     // Debug aid: with a file named "autoplay" in the data folder, presses A and taps around the bottom screen by itself
@@ -389,6 +470,7 @@ static int hid_thread(int, void *) {
         fclose(f);
         kernel::g_live_path = live_path.c_str();
     }
+    const bool hold_mii_picker = wiiu::debug_flag("hold_mii_picker");  // scripted capture of the picker itself
     // Pro Controllers beside the GamePad: what either holds counts, and the stick pushed further is the circle pad
     KPADInit();
     WPADEnableURCC(TRUE);
@@ -404,31 +486,32 @@ static int hid_thread(int, void *) {
     u16 tx = 0, ty = 0;
     for (;;) {
         u32 presses = 0;  // the GamePad's way, from either, for the options menu
-        const bool z_too = !kernel::extra_pad_connected();
+        bool toggle_menu = false;
+        bool tap = false;  // a touch on the GamePad began, at px, py
+        u16 px = 0, py = 0;
         VPADReadError err = VPAD_READ_SUCCESS;
         VPADRead(VPAD_CHAN_0, &st, 1, &err);
+        gamepad_there = err != VPAD_READ_INVALID_CONTROLLER;
         if (err == VPAD_READ_INVALID_CONTROLLER) {  // no GamePad: nothing held on it
             pad_held = 0;
             pad_x = pad_y = pad_rx = pad_ry = 0;
-            touch = false;
+            touch = touch_was = false;
+            wiiu::mic_blow(false);
         }
         if (err == VPAD_READ_SUCCESS) {
             pad_held = st.hold;
             pad_rx = st.rightStick.x;
             pad_ry = st.rightStick.y;
             presses |= st.trigger;
+            toggle_menu = overlay_pressed(st.trigger, st.hold);
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
             pad_x = st.leftStick.x;
             pad_y = st.leftStick.y;
-            // The GamePad's sensors in the 3DS's frame: y comes out of the screen and z towards the player. 512 is 1g; 14.375 is a degree a second, and the GamePad's 1.0 is a turn a second.
-            auto to_s16 = [](float v) { return (s16)std::clamp(v, -32767.0f, 32767.0f); };
-            const VPADVec3D &ac = st.accelerometer.acc;
-            const s16 accel[3] = {to_s16(ac.x * 512), to_s16(ac.z * 512), to_s16(-ac.y * 512)};
-            const s16 gyro[3] = {to_s16(st.gyro.x * 5175), to_s16(st.gyro.z * 5175), to_s16(-st.gyro.y * 5175)};
+            s16 accel[3], gyro[3];
+            wiiu::motion_input(st.accelerometer.acc, st.gyro, accel, gyro);
             kernel::hid_motion(accel, gyro);
             touch = false;
             bool down = false;
-            u16 px = 0, py = 0;
             if (st.tpNormal.touched && !st.tpNormal.validity) {
                 VPADGetTPCalibratedPoint(VPAD_CHAN_0, &cal, &st.tpNormal);
                 px = (u16)(cal.x * 854 / 1280);
@@ -436,9 +519,10 @@ static int hid_thread(int, void *) {
                 down = true;
                 wiiu::touch_to_bottom(px, py, touch, tx, ty);
             }
-            wiiu::keyboard_input(st.trigger, down && !touch_was, px, py);
+            tap = down && !touch_was;
             touch_was = down;
         }
+        const bool z_too = !kernel::extra_pad_connected();
         buttons = map_buttons(pad_held, z_too);
         float sx = pad_x, sy = pad_y;
         for (int ch = 0; ch < 4; ch++) {
@@ -451,7 +535,9 @@ static int hid_thread(int, void *) {
                 pro_y[ch] = ks.pro.leftStick.y;
                 pro_rx[ch] = ks.pro.rightStick.x;
                 pro_ry[ch] = ks.pro.rightStick.y;
-                presses |= pro_as_gamepad(ks.pro.trigger);
+                const u32 down = pro_as_gamepad(ks.pro.trigger);
+                presses |= down;
+                toggle_menu |= overlay_pressed(down, pro_as_gamepad(pro_hold[ch]));
             } else if (read || kerr == KPAD_ERROR_INVALID_CONTROLLER) {  // another kind of controller there, or none
                 pro_hold[ch] = 0;
                 pro_x[ch] = pro_y[ch] = pro_rx[ch] = pro_ry[ch] = 0;
@@ -475,7 +561,13 @@ static int hid_thread(int, void *) {
         }
         cx = (s16)(sx * 156.0f);
         cy = (s16)(sy * 156.0f);
-        wiiu::menu_input(presses);
+        const bool menu_was_open = wiiu::menu_open();
+        wiiu::menu_input(presses, toggle_menu);
+        const bool menu_took_input = menu_was_open || wiiu::menu_open();
+        if (!menu_took_input) {
+            wiiu::keyboard_input(presses, tap, px, py);
+            wiiu::mii_selector_input(presses, tap, px, py);
+        }
         if (!leaving && wiiu::menu_wants_quit()) {
             leaving = true;
             SYSLaunchMenu();
@@ -483,9 +575,10 @@ static int hid_thread(int, void *) {
         if (autoplay || kernel::g_live_path || wiiu::test_run()) {
             tick++;
             if (tick % 500 == 0 && wiiu::keyboard_open()) {
-                wiiu::keyboard_input(0, true, 107 + 64 * 8 + 10, 150 + 62 * 4 + 10);  // OK, with what's typed
-                if (wiiu::keyboard_open()) wiiu::keyboard_input(0, true, 107 + 10, 150 + 62 * 2 + 10);  // or type something first
+                wiiu::keyboard_input(VPAD_BUTTON_PLUS, false, 0, 0);
+                if (wiiu::keyboard_open()) wiiu::keyboard_input(0, true, 117, 250);  // a letter or the first digit
             }
+            if (!hold_mii_picker && wiiu::mii_selector_open()) wiiu::mii_selector_input(VPAD_BUTTON_A, false, 0, 0);
         }
         if (autoplay) {
             const u32 phase = tick % 468;
@@ -499,7 +592,12 @@ static int hid_thread(int, void *) {
             }
         }
         wiiu::input_override(buttons, touch, tx, ty);
-        if (wiiu::menu_open()) kernel::hid_extra_pad(0, 0, false, false, false);
+        if (menu_took_input) {
+            buttons = 0;
+            cx = cy = 0;
+            touch = false;
+            kernel::hid_extra_pad(0, 0, false, false, false);
+        }
         else kernel::hid_extra_pad(rx, ry, zl, zr, r);
         kernel::hid_update(buttons, cx, cy, touch, tx, ty);
         if (kMeasure) {
@@ -573,6 +671,8 @@ static int audio_thread(int, void *) {
             away = making = 0;
             gaps_logged = now;
         }
+        // Give the guest time to submit between frames when AX needs several at once.
+        OSSleepTicks(OSMillisecondsToTicks(1));
     }
     audio_parked = true;
     return 0;
@@ -708,7 +808,7 @@ static int watchdog_thread(int, void *) {
         asked = asking;
         if (++seconds >= 41 && !drawn && (quiet >= 30 || seconds >= 180) && !wiiu::net_connected()) report_stuck("The game got stuck starting up.");
         const u64 lists = kernel::gx_stats.cmdlists;
-        if (lists != last || gpu_pause || wiiu::menu_open() || wiiu::keyboard_open()) {
+        if (lists != last || gpu_pause || wiiu::menu_open() || wiiu::keyboard_open() || wiiu::mii_selector_open()) {
             if (lists && !drawn) {
                 drawn = true;
                 stage("the game is drawing");
@@ -731,6 +831,23 @@ static int watchdog_thread(int, void *) {
 }
 
 volatile bool wiiu::settings_due;
+wiiu::save_backup::Requests wiiu::save_backup::requests;
+
+// The log of a measuring build played on a console: on the SD card, sd:/3dii-u/<title id>/log.txt, for the PC to read, kept up to date every
+// 10 s (card_thread) so a freeze leaves what led up to it. In storage of its own in a test run the PC drives (live.txt), or with no card to write.
+static std::string log_path() {
+    const std::string own = wiiu::data_dir() + "/log.txt";
+    struct stat st;
+    if (!kMeasure || stat((wiiu::data_dir() + "/live.txt").c_str(), &st) == 0) return own;
+    char dir[64];
+    snprintf(dir, sizeof dir, "fs:/vol/external01/3dii-u/%016llx", (unsigned long long)OSGetTitleID());
+    wiiu::fs_begin(0xC00D);
+    mkdir("fs:/vol/external01/3dii-u", 0777);
+    mkdir(dir, 0777);
+    const bool there = stat(dir, &st) == 0;
+    wiiu::fs_end();
+    return there ? std::string(dir) + "/log.txt" : own;
+}
 
 // Slow work for later, at the lowest priority on its core: flushing saves, and the log, which only reaches storage when the game ends: the PC and the report on the screen don't need it.
 static int card_thread(int, void *) {
@@ -738,6 +855,13 @@ static int card_thread(int, void *) {
         OSSleepTicks(OSMillisecondsToTicks(200));
         checkpoint::Scope state_lock(checkpoint::gate());
         wiiu::gfx_report_draw_trace();
+        const auto backup = wiiu::save_backup::requests.take();
+        if (backup != wiiu::save_backup::Action::None) {
+            std::string message;
+            const bool ok = backup == wiiu::save_backup::Action::Export ? wiiu::save_backup::export_to_card(message) : wiiu::save_backup::stage_restore(message);
+            LOG("[save backup] %s: %s\n", ok ? "done" : "not completed", message.c_str());
+            wiiu::save_backup::requests.complete(message);
+        }
         if (want_hang_dump) {
             const u32 seconds = want_hang_dump - 1;
             want_hang_dump = 0;
@@ -762,7 +886,7 @@ static int card_thread(int, void *) {
         }
         wiiu::save_flush(false);
         // a live.txt means a test run, likely in Cemu, which gets killed rather than quit
-        if (want_log_sync || (kernel::g_live_path && pass % 150 == 0)) {
+        if (want_log_sync || (kernel::g_live_path && pass % 150 == 0) || (kMeasure && pass % 50 == 0)) {
             const bool leaving = want_log_sync;
             want_log_sync = false;
             wiiu::fs_begin(0xC001);
@@ -897,36 +1021,77 @@ static void let_card_catch_up() {
 }
 
 // Whether what a database slot held, as a 3DS game would read it, is a Mii: a name of printable characters, an author's name of them, the
-// padding empty, a birthday and a favourite colour that exist, a height and a build within their 127
+// padding empty, a birthday and a favourite colour that exist, a height and a build within their 128
 static bool looks_like_mii(const std::array<u8, 0x60> &m) {
     const u32 about = m[0x18] | m[0x19] << 8;
-    if (m[0x16] || m[0x17] || (about >> 1 & 15) > 12 || (about >> 10 & 15) > 11 || m[0x2E] > 127 || m[0x2F] > 127) return false;
+    if (m[0x16] || m[0x17] || (about >> 1 & 15) > 12 || (about >> 10 & 15) > 11 || m[0x2E] > 128 || m[0x2F] > 128) return false;
     for (u32 name : {0x1Au, 0x48u})
         for (u32 at = name; at < name + 20; at += 2) {
             const u32 c = m[at] | m[at + 1] << 8;
             if (!c) break;
-            if (c < 0x20 || (c >= 0xD800 && c < 0xE000) || c >= 0xFFFE) return false;
+            if (c < 0x20 || (c >= 0xDC00 && c < 0xE000) || c >= 0xFFFE) return false;
+            if (c >= 0xD800 && c < 0xDC00) {
+                if (at + 2 == name + 20) return false;
+                at += 2;
+                const u32 low = m[at] | m[at + 1] << 8;
+                if (low < 0xDC00 || low >= 0xE000) return false;
+            }
         }
     return m[0x1A] || m[0x1B];
 }
 
-// Mii Maker's Miis out of its database (FFL_ODB.dat: "FFOC", a version, then 3000 slots of 0x5C bytes, an unused one with no Mii id), each
-// with the checksum a Mii carries everywhere else. services/misc.cpp turns them into what a 3DS game reads, whichever way round the
-// console keeps their fields, and fs.cpp puts as many as fit into the game's own Mii Maker. That layout is what the 3DS's own database
-// suggests and no console's file has been read yet: so a slot is only taken if what it holds looks like a Mii, as the checksum, made
-// here, vouches for nothing.
-static void read_mii_maker(FILE *f) {
-    u8 head[8];
-    if (fread(head, 1, sizeof head, f) != sizeof head || memcmp(head, "FFOC", 4)) return;
-    std::array<u8, 0x60> m{}, as_3ds;
-    for (u32 slot = 0; slot < 3000 && fread(m.data(), 1, 0x5C, f) == 0x5C; slot++) {
-        if (!(m[0x0C] | m[0x0D] | m[0x0E] | m[0x0F])) continue;
-        m[0x5C] = m[0x5D] = 0;
+// FFLiDatabaseFileOfficial: big-endian FFOC, 3000 Official records, a regular-Mii list and a checksum at EOF.
+// https://github.com/aboood40091/ffl/blob/master/include/nn/ffl/FFLiDatabaseFileOfficial.h
+static bool read_mii_maker(FILE *f) {
+    constexpr long size = 0x43840;
+    if (fseek(f, 0, SEEK_END) != 0 || ftell(f) != size || fseek(f, 0, SEEK_SET) != 0) return false;
+    std::vector<u8> db(size);
+    if (fread(db.data(), 1, db.size(), f) != db.size() ||
+        memcmp(db.data(), "FFOC", 4) || kernel::mii_crc16(db.data(), db.size()) != 0)
+        return false;
+    for (u32 slot = 0; slot < 3000; slot++) {
+        std::array<u8, 0x60> m{};
+        memcpy(m.data(), db.data() + 8 + slot * 0x5C, 0x5C);
+        if (kernel::mii_id_empty(m.data() + 0x0C) || (m[0x0C] & 0x20)) continue;
+        // Camera-created Wii U Miis can carry version 0. The 3DS expects version 3.
+        if (m[3] != 3 && !(m[3] == 0 && (m[0] & 0x70) == 0x40)) continue;
+        std::reverse(m.begin(), m.begin() + 4);
+        m[0] = 3;
+        for (size_t at = 0x18; at < 0x5C; at += 2)
+            if (at != 0x2E) std::swap(m[at], m[at + 1]);  // height and build are bytes
+        if (!looks_like_mii(m)) continue;
         const u16 crc = kernel::mii_crc16(m.data(), 0x5E);
         m[0x5E] = (u8)(crc >> 8);
         m[0x5F] = (u8)crc;
-        if (kernel::mii_3ds(m, as_3ds) && looks_like_mii(as_3ds)) kernel::g_host_miis.push_back(m);
+        kernel::g_host_miis.push_back(m);
     }
+    return true;
+}
+
+static void read_console_mii_maker() {
+    // Resolve the shared path as FFL does. save_mount() has already initialized nn_save.
+    const u64 maker = _SYSGetSystemApplicationTitleId(SYSTEM_APP_ID_MII_MAKER);
+    OSDynLoad_Module save;
+    if (!maker || OSDynLoad_Acquire("nn_save.rpl", &save) != OS_DYNLOAD_OK) return;
+    decltype(&SAVEGetSharedSaveDataPath) shared_path = nullptr;
+    OSDynLoad_FindExport(save, OS_DYNLOAD_EXPORT_FUNC, "SAVEGetSharedSaveDataPath", (void **)&shared_path);
+    if (shared_path) {
+        for (const char *name : {"db/FFL_ODB.dat", "db/FFL_ODB_OLD.dat"}) {
+            char path[256] = "fs:";
+            if (shared_path(maker, name, path + 3, sizeof path - 3) != SAVE_STATUS_OK || path[3] != '/') continue;
+            if (FILE *f = fopen(path, "rb")) {
+                const size_t before = kernel::g_host_miis.size();
+                const bool valid = read_mii_maker(f);
+                fclose(f);
+                if (valid) {
+                    LOG("[wiiu] %s: %zu Mii(s) read\n", name, kernel::g_host_miis.size() - before);
+                    break;
+                }
+                LOG("[wiiu] %s: invalid Mii database\n", name);
+            }
+        }
+    }
+    OSDynLoad_Release(save);
 }
 
 void frontend_run() {
@@ -1021,7 +1186,10 @@ void frontend_run() {
     wiiu::profile_stop();
     quitting = true;
     gfx_may_close = true;
-    OSJoinThread(gpu, nullptr);
+    // A GPU thread stuck in a draw kept the game from closing at all (Nintendogs' check, 2026-11-17: blocked in the vertex pool's lock). It gets
+    // 2 s, as the sound does, and the game closes either way; GX2 then goes with the process, as when HOME gives up on it (on_release).
+    for (int i = 0; i < 1000 && !gpu_done; i++) OSSleepTicks(OSMillisecondsToTicks(2));
+    if (gpu_done) OSJoinThread(gpu, nullptr);
 #ifdef RECOMP_RESUMABLE
     checkpoint::finish_pending_write();
 #endif
@@ -1032,6 +1200,7 @@ void frontend_run() {
     for (int i = 0; i < 1000 && !audio_parked; i++) OSSleepTicks(OSMillisecondsToTicks(2));
     LOG("[quit] audio thread %s after %d ms\n", audio_parked ? "stopped" : "still running", (int)OSTicksToMilliseconds(OSGetSystemTime() - audio_asked));
     audio::shutdown();
+    wiiu::camera_shutdown();
     LOG("[quit] sound system shut down\n");
     OSReport("[3dii-u quit] entering final log sync\n");
     wiiu::fs_begin(0xC001);
@@ -1099,10 +1268,12 @@ int main(int argc, char **argv) {
         OSFatal(m);
     };
     host_threads[0] = OSGetCurrentThread();
+    start_mark(g_build_stamp);
     stage("starting the watchdog");
     spawn(watchdog_thread, 0, 13, 64 << 10, "watchdog");
     stage("initializing system libraries");
     WHBProcInit();
+    start_mark("system libraries up");
     // WHB registers its own at priority 100 from the GPU thread, on core 2. Each core has its own list, highest first: the GPU stops before WHB's goes, and starts after WHB's has made the screens again.
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_RELEASE, on_release, nullptr, 1000, 2);
     ProcUIRegisterCallbackCore(PROCUI_CALLBACK_ACQUIRE, on_acquire, nullptr, 50, 2);
@@ -1110,6 +1281,7 @@ int main(int argc, char **argv) {
     OSEnableHomeButtonMenu(TRUE);
     stage("mounting save storage");
     wiiu::save_mount();
+    start_mark(last_note);  // what the save storage said
     stage("system up");
     // A physical SD marker enables the lightweight console independently of the
     // per-frame profiling counters controlled by RECOMP_MEASURE.
@@ -1147,11 +1319,22 @@ int main(int argc, char **argv) {
     recovery_prepare();
     spawn(recovery_thread, -1, 12, 128 << 10, "safety guard");
     std::filesystem::create_directories(kernel::save_root(), no_save);
-    if (!wiiu::test_run())  // services/fs.cpp's folder for the game's save (archive_dir)
-        wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
+    if (!wiiu::test_run()) {  // before services/guest file handles, including cached save files
+        std::string message;
+        const auto restored = wiiu::save_backup::take_staged_restore(message);
+        if (!message.empty()) {
+            LOG("[save backup] %s\n", message.c_str());
+            wiiu::save_backup::requests.complete(message);
+        }
+        if (restored == wiiu::save_backup::Restore::Unsafe) report_stuck(message.c_str());
+        // A pending explicit restore keeps the current save. A successful one marks save_imported.
+        if (restored == wiiu::save_backup::Restore::None)
+            wiiu::save_from_content(std::string(CONTENT_DIR) + "/save_import", kernel::save_root() + "/savedata", kernel::save_root() + "/save_imported");
+    }
     struct stat no_menu;
     if (stat((std::string(CONTENT_DIR) + "/no_menu").c_str(), &no_menu) == 0) wiiu::menu_disable();  // built with "In-game menu: Off"
-    rt_log_open(wiiu::data_dir() + "/log.txt");
+    else load_overlay_combo();
+    rt_log_open(log_path());
     perf_trace = wiiu::debug_flag("perftrace");
     // An immutable diagnostic release can enable timing before its opening
     // movie, without relying on a PC command arriving after boot.
@@ -1222,7 +1405,7 @@ int main(int argc, char **argv) {
     }
     // Test aid: a Mii's store data (0x60 bytes) in a file named "test_mii.bin" in the data folder is taken as the current account's,
     // for Cemu, whose own account Mii is a placeholder
-    if (FILE *f = fopen((wiiu::data_dir() + "/test_mii.bin").c_str(), "rb")) {
+    if (FILE *f = wiiu::debug_flag("cemu") ? fopen((wiiu::data_dir() + "/test_mii.bin").c_str(), "rb") : nullptr) {
         std::array<u8, 0x60> m;
         if (fread(m.data(), 1, 0x60, f) == 0x60) {
             kernel::g_host_my_mii = (int)kernel::g_host_miis.size();
@@ -1231,18 +1414,12 @@ int main(int argc, char **argv) {
         }
         fclose(f);
     }
-    // The rest of the console's Miis, after the accounts': Mii Maker's own database, in its save, whichever region's Mii Maker the console
-    // has (Japan's, America's, Europe's). The same test aid first: a "test_mii_maker.bin" in the data folder is read as that database.
-    if (FILE *f = fopen((wiiu::data_dir() + "/test_mii_maker.bin").c_str(), "rb")) {
+    // The rest of the console's Miis are in Mii Maker's shared save. Cemu checks can supply a fixture using the same file format.
+    if (FILE *f = wiiu::debug_flag("cemu") ? fopen((wiiu::data_dir() + "/test_mii_maker.bin").c_str(), "rb") : nullptr) {
         read_mii_maker(f);
         fclose(f);
     }
-    if (!wiiu::debug_flag("nowiimiis"))
-        for (const char *maker : {"1004a000", "1004a100", "1004a200"})
-            if (FILE *f = fopen((std::string("fs:/vol/storage_mlc01/usr/save/00050010/") + maker + "/user/common/db/FFL_ODB.dat").c_str(), "rb")) {
-                read_mii_maker(f);
-                fclose(f);
-            }
+    if (!wiiu::debug_flag("nowiimiis")) read_console_mii_maker();
     kernel::init_services();
     stage("services up");
     frontend_init();
@@ -1252,6 +1429,7 @@ int main(int argc, char **argv) {
     stage("game started");
     frontend_run();
     WHBProcShutdown();
+    if (route_quit) OSExitThread(0);  // Cemu 2.6 spins in process exit, which prevents the runner from closing it.
     _exit(0);
     return 0;
 }

@@ -16,12 +16,16 @@ STUBS = r'''
 #include <functional>
 #include <cassert>
 #include <cstdio>
-using u8=uint8_t; using u16=uint16_t; using s16=int16_t; using u32=uint32_t; using s32=int32_t;
+using u64=uint64_t; using u8=uint8_t; using u16=uint16_t; using s16=int16_t; using u32=uint32_t; using s32=int32_t;
+#define SERVICE_CHECKPOINT(...)
 #define LOG(...) ((void)0)
 #define VLOG(...) ((void)0)
 std::array<u8,16384> memory{};
 u8 *gptr(u32 at){assert(at<memory.size());return memory.data()+at;}
 void gsp_cpu_wrote(u32,u32){}
+void gsp_cache_op(u32,u32,bool){}
+bool guest_writable(u32 at,u32 n){return at<=memory.size() && n<=memory.size()-at;}
+constexpr u32 RES_INVALID_ADDRESS=0xd9001814;
 namespace kernel {
 struct Event {void signal(){}};
 constexpr int ONESHOT=0;
@@ -77,7 +81,7 @@ int main(){
  s.y={128,64,8,0};s.u={256,16,4,0};s.v={384,16,4,0};s.out={1024,256,32,0};
  memset(gptr(256),128,16);memset(gptr(384),128,16);
  for(u8 luma:{u8(16),u8(235)}){
-  memset(gptr(128),luma,64);s.convert();
+  memset(gptr(128),luma,64);s.convert(s.output_span());
   for(u32 px=0;px<64;px++){
    const u8* p=gptr(1024+px*4);assert(p[0]==255);
    for(u32 c=1;c<4;c++)assert(p[c]==(luma==16?0:255));

@@ -14,6 +14,7 @@ namespace kernel {
 enum Irq { PSC0 = 0, PSC1 = 1, PDC0 = 2, PDC1 = 3, PPF = 4, P3D = 5, DMA = 6 };
 
 namespace {
+constexpr u32 CPU_WRITE = 0xFD, CPU_INVALIDATE = 0xFE, CPU_FLUSH = 0xFF;
 struct GspState {
     std::shared_ptr<SharedMem> shm;
     std::shared_ptr<Event> irq_event[4];
@@ -22,7 +23,10 @@ struct GspState {
     u32 next_thread = 0;
     // LCD registers: what is on screen
     FramebufferInfo fb[2] = {};
-    struct Lcd { u32 left[2], right[2], select; } lcd[2] = {};  // each screen's two buffers per eye (physical) and which is shown
+    struct Lcd {
+        u32 left[2], right[2], select;
+        u32 selected() const { return select & 1; }
+    } lcd[2] = {};  // each screen's two buffers per eye (physical) and which is shown
     // GX queue (guarded by its own mutex: the GPU thread consumes it without the kernel lock)
     std::mutex qm;
     std::condition_variable qcv;
@@ -76,10 +80,11 @@ static void lcd_record(int screen, u32 select, u32 left, u32 right) {
     swap_requests[screen]++;
     auto &l = gsp.lcd[screen];
     const u32 paddr = mem::vaddr_to_paddr(left);
-    if (l.select != (select & 1) || l.left[select & 1] != paddr) swapped |= 1u << screen;
-    l.select = select & 1;
-    l.left[l.select] = paddr;
-    l.right[l.select] = mem::vaddr_to_paddr(right);
+    const u32 slot = select & 1;
+    if (l.selected() != slot || l.left[slot] != paddr) swapped |= 1u << screen;
+    l.select = (l.select & ~1u) | slot;
+    l.left[slot] = paddr;
+    l.right[slot] = mem::vaddr_to_paddr(right);
 }
 
 u32 gsp_swaps(int screen) {
@@ -116,7 +121,9 @@ static void update_framebuffer(int screen) {
 
 // A service wrote guest memory the GPU may read: tell the GPU thread, in order with the GX commands.
 void gsp_cpu_wrote(u32 vaddr, u32 size) {
-    std::array<u32, 8> c{0xFFu, vaddr, size};
+    const u32 paddr = mem::vaddr_to_paddr(vaddr);
+    if (!paddr || !size) return;
+    std::array<u32, 8> c{CPU_WRITE, paddr, size};
     std::lock_guard<std::mutex> lk(gsp.qm);
     gsp.queue.push_back(c);
     gsp.busy++;
@@ -127,7 +134,7 @@ void gsp_cpu_wrote(u32 vaddr, u32 size) {
 void gsp_cache_op(u32 vaddr, u32 size, bool cpu_will_read) {
     VLOG("[gsp] cache %s %08x %x\n", cpu_will_read ? "invalidate" : "flush", vaddr, size);
     if (!size) return;
-    std::array<u32, 8> c{cpu_will_read ? 0xFEu : 0xFFu, vaddr, size};
+    std::array<u32, 8> c{cpu_will_read ? CPU_INVALIDATE : CPU_FLUSH, vaddr, size};
     std::lock_guard<std::mutex> lk(gsp.qm);
     gsp.queue.push_back(c);
     gsp.busy++;
@@ -300,10 +307,13 @@ void gsp_process_gx() {
             for (u32 i = 1; i + 1 < 8; i += 2)
                 if (u32 pa = c[i + 1] ? va2pa(c[i]) : 0) gpu::invalidate_memory(pa, c[i + 1]);
             break;
-        case 0xFF:  // (ours) the CPU wrote this range
+        case CPU_WRITE:  // A service wrote bytes, rather than just flushing a CPU cache.
+            gpu::service_written(c[1], c[2]);
+            break;
+        case CPU_FLUSH:
             if (u32 pa = va2pa(c[1])) gpu::invalidate_memory(pa, c[2]);
             break;
-        case 0xFE:  // (ours) the CPU is about to read this range
+        case CPU_INVALIDATE:
             if (u32 pa = va2pa(c[1])) {
                 gpu::invalidate_memory(pa, c[2]);
 #ifdef __WIIU__
@@ -336,47 +346,85 @@ struct GspGpu : Service {
     SERVICE_CHECKPOINT(GspGpu)
     using Service::Service;
     // GSP's register offsets count from 0x1EB00000: the LCDs' framebuffer registers are at 0x400400 (top screen) and 0x400500 (bottom)
-    void write_hw_regs(u32 reg, u32 size, u32 src) {
+    static u32 *lcd_register(u32 reg) {
+        if (reg < 0x400400 || reg >= 0x400600) return nullptr;
+        const u32 screen = (reg - 0x400400) >> 8;
+        auto &l = gsp.lcd[screen];
+        auto &f = gsp.fb[screen];
+        switch (reg & 0xff) {
+        case 0x68: return &l.left[0];
+        case 0x6C: return &l.left[1];
+        case 0x94: return &l.right[0];
+        case 0x98: return &l.right[1];
+        case 0x78: return &l.select;
+        case 0x70: return &f.format;
+        case 0x90: return &f.stride;
+        default: return nullptr;
+        }
+    }
+    static bool register_span(u32 reg, u32 size) {
+        return !((reg | size) & 3) && reg < 0x420000 && size <= 0x80 && size <= 0x420000 - reg;
+    }
+    void write_hw_regs(u32 reg, u32 size, u32 src, bool masked, u32 masks, u32 mask_size) {
+        if (!size) return;
         static u32 logged;
         if (g_verbose && reg < 0x400600 && reg + size > 0x400400 && logged++ < 40) VLOG("[gsp] LCD registers %x+%x: %08x %08x\n", reg, size, r32(src), size > 4 ? r32(src + 4) : 0);
         std::lock_guard<std::mutex> lk(fb_mutex);
         for (u32 i = 0; i < size; i += 4) {
-            const u32 v = r32(src + i);
-            for (int s = 0; s < 2; s++) {
-                auto &l = gsp.lcd[s];
-                FramebufferInfo &f = gsp.fb[s];
-                const u32 select = l.select, shown = l.left[l.select];
-                switch (reg + i - (0x400400 + s * 0x100)) {
-                case 0x68: l.left[0] = v; break;
-                case 0x6C: l.left[1] = v; break;
-                case 0x94: l.right[0] = v; break;
-                case 0x98: l.right[1] = v; break;
-                case 0x78: l.select = v & 1; break;
-                case 0x70: f.format = v; continue;
-                case 0x90: f.stride = v; continue;
-                default: continue;
-                }
-                if (l.select != select || l.left[l.select] != shown) swapped |= 1u << s;  // as lcd_record counts it
-                f.addr_left = mem::paddr_to_vaddr(l.left[l.select]);
-                f.addr_right = mem::paddr_to_vaddr(l.right[l.select]);
-                f.valid = f.addr_left != 0;
+            const u32 offset = reg + i;
+            u32 *const value = lcd_register(offset);
+            if (!value) continue;
+            const u32 screen = (offset - 0x400400) >> 8;
+            auto &l = gsp.lcd[screen];
+            auto &f = gsp.fb[screen];
+            const u32 selected = l.selected(), shown = l.left[selected];
+            u32 mask = ~0u;
+            if (masked) {
+                mask = 0;
+                for (u32 byte = 0; byte < 4 && i + byte < mask_size; ++byte)
+                    mask |= (u32)r8(masks + i + byte) << (byte * 8);
             }
+            *value = (*value & ~mask) | (r32(src + i) & mask);
+            if (value == &f.format || value == &f.stride) continue;
+            const u32 next = l.selected();
+            if (next != selected || l.left[next] != shown) swapped |= 1u << screen;
+            f.addr_left = mem::paddr_to_vaddr(l.left[next]);
+            f.addr_right = mem::paddr_to_vaddr(l.right[next]);
+            f.valid = f.addr_left != 0;
         }
     }
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
-        case 0x0001:  // WriteHWRegs(reg, size, static buffer)
-            write_hw_regs(ipc[1], ipc[2], ipc[4]);
+        case 0x0001:    // WriteHWRegs
+        case 0x0002: {  // WriteHWRegsWithMask
+            const bool masked = ipc.cmd() == 2;
+            const u32 reg = ipc[1], size = ipc[3] >> 14;
+            const u32 mask_size = masked ? std::min(size, ipc[5] >> 14) : 0;
+            if (!register_span(reg, size)) { ipc.result(RES_INVALID_COMBINATION); break; }
+            if ((size && !guest_readable_locked(ipc[4], size)) ||
+                (mask_size && !guest_readable_locked(ipc[6], mask_size))) {
+                ipc.result(RES_INVALID_ADDRESS);
+                break;
+            }
+            // The LCD mode reset request does not write the framebuffer registers.
+            if (!masked || reg != 0x400424 || size != 0x50)
+                write_hw_regs(reg, size, ipc[4], masked, ipc[6], mask_size);
             ipc.ok();
             break;
-        case 0x0002:  // WriteHWRegsWithMask
-            write_hw_regs(ipc[1], ipc[2], ipc[4]);
-            ipc.ok();
-            break;
+        }
         case 0x0004: {  // ReadHWRegs(reg, size) -> static buffer 0
-            u32 size = ipc[2];
-            u32 dst = ipc.static_buffer(0);
-            memset(gptr(dst), 0, size);
+            const u32 reg = ipc[1], size = std::min(ipc[2], 0x80u);
+            u32 capacity;
+            const u32 dst = ipc.static_buffer(0, &capacity);
+            if (!register_span(reg, size) || size > capacity) { ipc.result(RES_INVALID_COMBINATION); break; }
+            if (size && !guest_writable(dst, size)) { ipc.result(RES_INVALID_ADDRESS); break; }
+            {
+                std::lock_guard<std::mutex> lk(fb_mutex);
+                for (u32 i = 0; i < size; i += 4) {
+                    const u32 *value = lcd_register(reg + i);
+                    w32(dst + i, value ? *value : 0);
+                }
+            }
             ipc.ok(1, 2);
             ipc.static_desc(2, 0, size);
             break;
@@ -465,6 +513,7 @@ struct GspGpu : Service {
             n--;
             index = (index + 1) % 0xF;
             w32(cb, (hdr & 0xFFFF0000) | (n << 8) | index);
+            if ((c[0] & 0xFF) >= CPU_WRITE) continue;  // Internal notifications do not come from guest command memory.
             {
                 std::lock_guard<std::mutex> lk(gsp.qm);
                 gsp.queue.push_back(c);

@@ -3,12 +3,14 @@ With a SteamGridDB key (each user's own, from steamgriddb.com > Preferences > AP
 icon come from SteamGridDB, found by the game's name, or by its names in other regions where the site doesn't know this one: those names
 and the key are all it sends there. Without one, or where SteamGridDB has nothing, the cover comes from GameTDB (art.gametdb.com), by the
 four letters at the end of the game's product code (CTR-P-AMKE: AMKE), which are all it sends. GameTDB's list of 3DS games, fetched once for
-all, gives the year a game came out, for the Virtual Console's start-up screens, and its names in other regions. These are the only things
-the builder downloads."""
+all, gives the year a game came out, for the Virtual Console's start-up screens, and its names in other regions. For those screens the
+game's title screen comes from libretro's thumbnails (thumbnails.libretro.com): their list of 3DS title screens, fetched once, and the one
+picture found by the game's names, which are all it asks for. These are the only things the builder downloads."""
 import http.client
 import io
 import json
 import os
+import re
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -147,6 +149,71 @@ def other_names(product, folder, url=TDB):
         return []
     found = [(gid, (e.findtext("locale[@lang='EN']/title") or '').strip()) for gid, e in tdb_entries(code, folder, url) if gid[:4] != code]
     return list(dict.fromkeys(name for _, name in sorted(found, key=lambda f: f[0][3:4] != 'E') if name))
+
+
+TITLES = 'https://thumbnails.libretro.com/Nintendo%20-%20Nintendo%203DS/Named_Titles/'
+# where a game was sold, by the product code's last letter, in the words libretro's names use ("Mario Kart 7 (USA)")
+SOLD_IN = {'E': ('USA',), 'P': ('Europe',), 'J': ('Japan',), 'K': ('Korea',), 'W': ('Taiwan', 'China'), 'U': ('Australia',), 'D': ('Germany',),
+           'F': ('France',), 'I': ('Italy',), 'S': ('Spain',)}
+
+
+def article_first(name):
+    """a name in libretro's (No-Intro's) order as the game itself says it: "Legend of Zelda, The - Ocarina of Time 3D" is "The Legend of
+    Zelda - Ocarina of Time 3D" """
+    parts = name.split(' - ')
+    for i, part in enumerate(parts):
+        for article in ('The', 'A', 'An'):
+            if part.endswith(', ' + article):
+                parts[i] = article + ' ' + part[:-len(article) - 2]
+    return ' - '.join(parts)
+
+
+def title_names(folder, url=TITLES):
+    """libretro's pictures of 3DS title screens, by file name: their list, fetched into folder the first time; [] if it can't be had"""
+    path = os.path.join(folder, 'libretro_3ds_titles.txt')
+    if not os.path.isfile(path):
+        try:
+            page = fetch(url).decode('utf-8', 'replace')
+        except (OSError, http.client.HTTPException):  # no connection: nothing this time
+            return []
+        names = sorted({urllib.parse.unquote(h) for h in re.findall(r'href="([^"?/][^"]*\.png)"', page)})
+        if not names:  # not the list: the next build asks again
+            return []
+        os.makedirs(folder, exist_ok=True)
+        with open(path + '.part', 'w', encoding='utf-8') as f:
+            f.write('\n'.join(names))
+        os.replace(path + '.part', path)
+    with open(path, encoding='utf-8') as f:
+        return f.read().split('\n')
+
+
+def title_screen(product, names, folder, url=TITLES):
+    """The path of a picture of the game's title screen, as the Virtual Console's start-up screens show a game's: libretro's, found by the
+    game's names (its own, and other regions' from GameTDB), where it was sold first, and downloaded into folder once. libretro's pictures
+    hold both screens, the top one above, or the top one alone. None where libretro has none, or there's no connection."""
+    code = game_code(product)
+    if not code:
+        return None
+    stem = os.path.join(folder, 'title_' + code)
+    if kept(stem):
+        return kept(stem)
+    wanted = {plain(n) for n in names if n}
+    places = SOLD_IN.get(code[3], ()) + ('USA', 'Europe', 'Japan')
+    best = None
+    for name in title_names(folder, url):
+        base, _, tags = name[:-4].partition(' (')  # "Luigi's Mansion - Dark Moon (USA) (En,Fr,Es)": the name, then where and what
+        if not base or plain(article_first(base)) not in wanted:
+            continue
+        where = tags.split(')', 1)[0].split(', ')
+        rank = (next((i for i, place in enumerate(places) if place in where), len(places)), '(Rev ' in name, len(name))
+        if best is None or rank < best[0]:
+            best = (rank, name)
+    if not best:
+        return None
+    try:
+        return keep(fetch(url + urllib.parse.quote(best[1])), stem)
+    except (OSError, http.client.HTTPException):
+        return None
 
 
 def plain(name):

@@ -478,23 +478,47 @@ std::string save_folder() {
     if (in_test || left) save_flush(true);
     if (in_test) return folder;
     const std::string common = data_dir() + "/save";
-    if (save_account_dir().empty()) return common;
-    // Saves went in common storage until 2026-11-07, and it outlives a reinstall (a test marker written there did): the first boot with none of the player's own takes
-    // those over, copied, so the old one stays where it was
-    const std::string mine = save_account_dir() + "/save";
     // a game's own save is <program id>/savedata; the shared extdata a game makes at its first start doesn't count
+    enum class SaveProbe { Missing, Present, Unreadable };
     auto has_save = [](const std::string &dir) {
+        namespace fs = std::filesystem;
         std::error_code e;
-        for (const auto &d : std::filesystem::directory_iterator(dir, e))
-            if (std::filesystem::exists(d.path() / "savedata", e) && !std::filesystem::is_empty(d.path() / "savedata", e)) return true;
-        return false;
+        const auto root = fs::status(dir, e);
+        if (root.type() == fs::file_type::not_found && (!e || e == std::errc::no_such_file_or_directory)) return SaveProbe::Missing;
+        if (e || !fs::is_directory(root)) return SaveProbe::Unreadable;
+        for (fs::directory_iterator it(dir, e), end; !e && it != end; it.increment(e)) {
+            const bool directory = it->is_directory(e);
+            if (e) break;
+            if (!directory) continue;
+            const auto save = it->path() / "savedata";
+            const bool exists = fs::exists(save, e);
+            if (e) break;
+            if (!exists) continue;
+            if (!fs::is_directory(save, e) || e) return SaveProbe::Unreadable;
+            const bool empty = fs::is_empty(save, e);
+            if (e) break;
+            if (!empty) return SaveProbe::Present;
+        }
+        return e ? SaveProbe::Unreadable : SaveProbe::Missing;
     };
-    if (!has_save(mine) && has_save(common)) {
+    const auto checked = [&](const std::string &dir) {
+        const auto probe = has_save(dir);
+        if (probe == SaveProbe::Unreadable) FATAL("[save] Cannot read the save directory at %s.\n", dir.c_str());
+        return probe == SaveProbe::Present;
+    };
+    if (save_account_dir().empty()) {
+        checked(common);
+        return common;
+    }
+    // Copy older saves out of common storage only when the account has yet to make its own save.
+    const std::string mine = save_account_dir() + "/save";
+    if (checked(mine)) {
+        save_finish_migration(mine);
+    } else if (checked(common)) {
         const OSTime t = OSGetSystemTime();
-        const bool copied = save_copy_tree(common, mine);
-        if (!copied) std::filesystem::remove_all(mine, ec);  // half a save would hide the whole one from the next boot's try
-        save_flush(true);
+        const bool copied = save_migrate_common(common, mine);
         LOG("[save] the save in common storage copied to the player's: %s, %u ms\n", copied ? "done" : "FAILED", (u32)OSTicksToMilliseconds(OSGetSystemTime() - t));
+        if (!copied) return common;  // keep playing the intact legacy save until migration can succeed
     }
     return mine;
 }

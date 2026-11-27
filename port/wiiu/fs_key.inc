@@ -84,6 +84,23 @@ DrawState fs_normal(const DrawState &in) {
         if (t.type == 1 || t.type == 2 || t.type == 4) t.coord = t.wrap_s = t.wrap_t = 0;
     }
     auto operands = [](u32 op) { return op == 4 || op == 8 || op == 9 ? 3 : op == 1 || op == 2 || op == 3 || op == 5 || op == 6 || op == 7 ? 2 : 1; };
+    // Keep the buffer advances/stage indices; only dead first-stage arithmetic is replaced.
+    if (ds.tev_count > 1) {
+        TevStageState &first = ds.tev[ds.tev_list[0]];
+        const TevStageState &next = ds.tev[ds.tev_list[1]];
+        bool external = true;
+        for (u32 i = 0; i < ds.tev_count; i++) {
+            const TevStageState &t = ds.tev[ds.tev_list[i]];
+            external &= !t.upd_rgb && !t.upd_a;
+        }
+        const int nc = operands(next.cop), na = next.cop == 7 || next.aop == 6 || next.aop == 7 ? 0 : operands(next.aop);
+        for (int j = 0; j < nc; j++) external &= next.csrc[j] != 13 && next.csrc[j] != 15;
+        for (int j = 0; j < na; j++) external &= next.asrc[j] != 13 && next.asrc[j] != 15;
+        if (external && first.cop != 7 && first.aop != 6 && first.aop != 7) {
+            first.cop = first.aop = 0;
+            first.cmul = first.amul = 1;
+        }
+    }
     for (u32 i = 0; i < ds.tev_count; i++) {
         TevStageState &t = ds.tev[ds.tev_list[i]];
         const int nc = operands(t.cop), na = t.cop == 7 || t.aop == 6 || t.aop == 7 ? 0 : operands(t.aop);
@@ -94,6 +111,12 @@ DrawState fs_normal(const DrawState &in) {
         if (t.cop == 7 || t.aop == 6 || t.aop == 7) t.aop = t.cop == 7 ? 7 : 6;
     }
     if (ds.lighting) {
+        LightingState &l = ds.light;
+        if (!l.shadow_enable) {  // disabled shadows are 1: their map, invert, primary, secondary, alpha and each light's bit go unread
+            l.shadow_sel = 0;
+            l.shadow_invert = l.shadow_primary = l.shadow_secondary = l.shadow_alpha = false;
+            for (u32 i = 0; i < l.num_lights; i++) l.lights[i].shadow = false;
+        }
         LutSel *sels[7] = {&ds.light.d0, &ds.light.d1, &ds.light.sp, &ds.light.fr, &ds.light.rb, &ds.light.rg, &ds.light.rr};
         for (LutSel *s : sels)
             if (!s->enabled) s->abs = false, s->input = 0;

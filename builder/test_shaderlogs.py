@@ -9,9 +9,12 @@ import shutil
 import struct
 import sys
 import tempfile
+from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shaderlogs  # noqa: E402
+from make_app import bundle_logs  # noqa: E402
 
 
 def vs(entry, code, swz, tail):
@@ -23,6 +26,9 @@ other = ([0x33, 0x44], [0xC])  # one the DVLB scan never found
 tail = bytes(range(56))
 frag = struct.pack('<I', 3) + b'key' + b'FS  ' + struct.pack('<I', 2) + b'xy'
 log = vs(1, prog[0] + [0x99, 0x99], prog[1] + [0x77], tail) + frag + vs(0, *other, tail)  # memory: the program, then another's leftovers
+
+for pending in (b'VS  ' + bytes(7), vs(0, *other, tail)[:-1], frag[:6], b'FS  '):
+    assert list(shaderlogs.records(log + pending)) == list(shaderlogs.records(log)), 'keep only complete records'
 
 base = tempfile.mkdtemp()
 try:
@@ -49,24 +55,50 @@ def gsx(vprog, gprog, tail):  # a vertex shader and the geometry shader after it
 
 
 # a geometry shader record ships as both programs' fingerprints, after the vertex records, and comes back whole; one with a program the
-# game's DVLB lacks is left out
-gprog = ([0x55, 0x66, 0x88000000, 0x77], [0xD])
+# game's binaries lack is left out. The geometry program is its binary's whole code (dvlb_to_log.py's dvlb.gsl), which the vertex program's
+# first 512 words only start: the memory is named by the longest program that starts it, or it came back cut short
+gprog = (prog[0] + [0x55, 0x66, 0x88000000, 0x77], prog[1] + [0xD])
 gtail = bytes(range(88))
 base = tempfile.mkdtemp()
 try:
-    dvlb = vs(1, *prog, bytes(56)) + vs(0, *gprog, bytes(56))
-    progs = {r[2:4] for r in shaderlogs.records(dvlb) if r[0] == 'vs'}
+    with open(os.path.join(base, 'dvlb.bin'), 'wb') as f:
+        f.write(vs(1, *prog, bytes(56)))
+    with open(os.path.join(base, 'dvlb.gsl'), 'wb') as f:
+        f.write(shaderlogs._dvlb_tool().gs_record(2, gprog[0], gprog[1]))
+    progs = shaderlogs.programs(os.path.join(base, 'dvlb.bin'))
+    packed = lambda p: (struct.pack(f'<{len(p[0])}I', *p[0]), struct.pack(f'<{len(p[1])}I', *p[1]))  # noqa: E731
+    assert progs == {packed(prog), packed(gprog)}, 'the vertex program and the whole geometry program'
     log = gsx(prog, gprog, gtail) + vs(1, *prog, tail) + gsx(prog, other, gtail)
     shipped, vsf, vsr, left = shaderlogs.split(log, progs)
     assert not shipped and not vsr and not left and len(vsf) == shaderlogs.VSF + shaderlogs.GSF, len(vsf)
     assert vsf.startswith(b'VSF ') and vsf[shaderlogs.VSF:].startswith(b'GSF ') and b'\x55\x00\x00\x00' not in vsf, 'fingerprints, no code'
-    with open(os.path.join(base, 'dvlb.bin'), 'wb') as f:
-        f.write(dvlb)
+    assert shaderlogs.fingerprint(*packed(gprog)) in vsf, 'the geometry memory named by the whole program'
     with open(os.path.join(base, 'run.vsf'), 'wb') as f:
         f.write(vsf)
     assert shaderlogs.restore(base) == (2, 0)
     with open(os.path.join(base, 'run_vsf.bin'), 'rb') as f:
         assert f.read() == vs(1, *prog, tail) + gsx(prog, gprog, gtail), 'both records back as they were logged'
+
+    src, dst = Path(base) / 'source', Path(base) / 'bundled'
+    logs = src / 'shader_logs'
+    logs.mkdir(parents=True)
+    for name in ('dvlb.bin', 'dvlb.gsl'):
+        shutil.copyfile(Path(base) / name, logs / name)
+    extra = gsx(prog, gprog, b'\x01' + gtail[1:])
+    captured = shaderlogs.split(extra, progs)[1]
+    (logs / 'run.bin').write_bytes(log)
+    (logs / 'run.vsf').write_bytes(vsf + captured + b'GSF ')
+    (logs / 'standalone.vsf').write_bytes(captured)
+    assert bundle_logs(src, dst) == (0, 0)
+    bundled = dst / 'shader_logs'
+    assert (bundled / 'run.vsf').read_bytes() == vsf + captured
+    assert (bundled / 'standalone.vsf').read_bytes() == captured
+    assert not (bundled / 'dvlb.bin').exists()
+    for name in ('dvlb.bin', 'dvlb.gsl'):
+        shutil.copyfile(logs / name, bundled / name)
+    assert shaderlogs.restore(bundled) == (4, 0)
+    assert (bundled / 'run_vsf.bin').read_bytes() == vs(1, *prog, tail) + gsx(prog, gprog, gtail) + extra
+    assert (bundled / 'standalone_vsf.bin').read_bytes() == extra
 finally:
     shutil.rmtree(base)
 
@@ -75,6 +107,34 @@ rnd = random.Random(9)
 
 def words(n):
     return b''.join(struct.pack('<I', rnd.getrandbits(32)) for _ in range(n))
+
+
+with tempfile.TemporaryDirectory() as root:
+    src, dst = Path(root) / 'local', Path(root) / 'bundle'
+    logs = src / 'shader_logs'
+    logs.mkdir(parents=True)
+    first, second = (words(8), words(4)), (words(8), words(4))
+    code, swz = first[0] + second[0][-16:], first[1] + second[1][-8:]
+    captured = shaderlogs.vs_record(1, code, swz, tail)
+    choices = {first, second}
+    found = b''.join(shaderlogs.vs_record(0, *p, tail) for p in (first, second))
+    (src / 'code.bin').write_bytes(words(8))
+    (logs / 'dvlb.bin').write_bytes(found)
+    (logs / 'capture.bin').write_bytes(captured)
+    made, missed = shaderlogs.program_recipes(captured, choices)
+    assert len(list(shaderlogs.recipes(made))) == 1 and missed == 0
+    assert shaderlogs.program_recipes(captured, {first}) == (b'', 1)
+    assert shaderlogs.write_recipes(src, logs) == (1, 0)
+    assert (logs / 'recipes.vsr').read_bytes() == made
+    assert bundle_logs(src, dst) == (1, 0)
+    bundled = dst / 'shader_logs'
+    assert not (bundled / 'capture.vsf').exists(), 'a shorter prefix would discard live instructions'
+    (bundled / 'dvlb.bin').write_bytes(found)
+    assert shaderlogs.restore(bundled) == (1, 0)
+    assert (bundled / 'recipes_vsr.bin').read_bytes() == captured
+    (bundled / 'recipes.vsr').write_bytes(made)
+    (bundled / 'dvlb.bin').write_bytes(shaderlogs.vs_record(0, *first, tail))
+    assert shaderlogs.restore(bundled) == (0, 1)
 
 
 tmp = tempfile.mkdtemp(prefix='shaderlogs_test_')
@@ -103,7 +163,7 @@ try:
     frag, vsf, vsr, left = shaderlogs.split(log, set(), srcs)
     shaderlogs.close(srcs)
     got = list(shaderlogs.recipes(vsr))
-    assert left == [(stranger[:240], stranger[240:])] and len(got) == 1 and not vsf and frag.startswith(b'FS  '), (len(left), len(got))
+    assert left == [(0, stranger[:240], stranger[240:], tail)] and len(got) == 1 and not vsf and frag.startswith(b'FS  '), (len(left), len(got))
     entry, fp, t, pc, ps = got[0]
     assert entry == 3 and t == tail and fp == shaderlogs.fingerprint(code, swz)
     assert len(pc) <= 4 and len(ps) <= 4, (pc, ps)  # a few runs, not a word at a time
@@ -142,6 +202,88 @@ try:
     assert shaderlogs.restore(os.path.join(game2, 'shader_logs')) == (1, 0)
     assert open(os.path.join(game2, 'shader_logs', 'recipes_vsr.bin'), 'rb').read()[16:16 + 224] == packed_prog + packed_swz
 
+    # Harvest two overlapping logs: raw, compressed, mixed raw/compressed, and foreign memories.
+    # The old two-pass algorithm is the output oracle, including record order and duplicates.
+    raw_code, raw_swz = words(40), words(6)
+    unknown_code, unknown_swz = words(40), words(6)
+    with open(os.path.join(game2, 'code.bin'), 'wb') as f:
+        f.write(raw_code + words(10) + raw_swz)
+    memories = [(raw_code, raw_swz), (packed_prog, packed_swz),
+                (raw_code + packed_prog, raw_swz + packed_swz), (unknown_code, unknown_swz)]
+    harvest_log = b''.join(shaderlogs.vs_record(0, c, s, tail) for c, s in memories)
+    logs = os.path.join(game2, 'shader_logs')
+    # Ignore prior round-trip output by replacing it with this same known fixture.
+    for name in ('run.bin', 'recipes_vsr.bin'):
+        with open(os.path.join(logs, name), 'wb') as f:
+            f.write(harvest_log)
+    oracle = shaderlogs.sources(game2)
+    oracle._raw_runs = None  # original algorithm searched rather than memoizing raw runs
+    try:
+        missed = shaderlogs.split(harvest_log, set(), oracle)[3]
+        unpacked = oracle.holding([p for _, c, _, _ in missed for p in shaderlogs._probes(c)])
+        expected = shaderlogs.split(harvest_log, set(), oracle, unpacked=unpacked)
+        assert len(list(shaderlogs.recipes(expected[2]))) == 3 and len(expected[3]) == 1
+    finally:
+        shaderlogs.close(oracle)
+
+    opened, layouts, searches, probe_calls, holdings = [], [], [], [], []
+    real_sources, real_layout = shaderlogs.sources, shaderlogs._layout
+    real_anywhere, real_probes, real_holding = shaderlogs._run_anywhere, shaderlogs._probes, shaderlogs.Sources.holding
+
+    def track_sources(folder):
+        src = real_sources(folder)
+        opened.append(src)
+        return src
+
+    def track_layout(c, s, bufs, *args, **kwargs):
+        layouts.append((c, s, len(bufs)))
+        return real_layout(c, s, bufs, *args, **kwargs)
+
+    def track_search(buf, ws, i):
+        searches.append((id(buf), b''.join(ws), i))
+        return real_anywhere(buf, ws, i)
+
+    def track_probes(c):
+        probe_calls.append(c)
+        return real_probes(c)
+
+    def track_holding(src, probes):
+        holdings.append(list(probes))
+        return real_holding(src, probes)
+
+    with mock.patch.object(shaderlogs, 'sources', side_effect=track_sources), \
+         mock.patch.object(shaderlogs, '_layout', side_effect=track_layout), \
+         mock.patch.object(shaderlogs, '_run_anywhere', side_effect=track_search), \
+         mock.patch.object(shaderlogs, '_probes', side_effect=track_probes), \
+         mock.patch.object(shaderlogs.Sources, 'holding', track_holding):
+        assert shaderlogs.write_recipes(game2, logs) == (6, 2)
+    with open(os.path.join(logs, 'recipes.vsr'), 'rb') as f:
+        assert f.read() == expected[2] * 2, 'same recipes, fingerprints, order, and duplicates as the old two passes'
+    assert len(opened) == len(holdings) == 1, 'source mapping and unpacked-file search happen once'
+    assert all(layouts.count((c, s, 2)) == 1 for c, s in memories), 'each unique memory searches raw layout once'
+    assert len(layouts) == 6, 'only compressed and mixed memories need a combined layout; foreign probes match no file'
+    assert all(probe_calls.count(c) == 2 for c, _ in memories[1:]) and raw_code not in probe_calls
+    raw_ids = {id(buf) for buf in opened[0]}
+    raw_searches = [key for key in searches if key[0] in raw_ids]
+    assert len(raw_searches) == len(set(raw_searches)), 'combined retry reuses each raw whole-file search, including misses'
+    assert shaderlogs.restore(logs) == (6, 0), 'all retained and newly resolved recipes still reconstruct exactly'
+
+    # No match after unpacking must still remove an obsolete recipe, as before.
+    for name in ('run.bin', 'recipes_vsr.bin'):
+        with open(os.path.join(logs, name), 'wb') as f:
+            f.write(shaderlogs.vs_record(0, unknown_code, unknown_swz, tail))
+    with open(os.path.join(logs, 'recipes.vsr'), 'wb') as f:
+        f.write(expected[2])
+    assert shaderlogs.write_recipes(game2, logs) == (0, 2)
+    assert not os.path.exists(os.path.join(logs, 'recipes.vsr'))
+
+    # Many misses must not retain a separate near-full shader suffix for every word offset.
+    missing_code = words(512)
+    empty_sources = shaderlogs.Sources([bytes(64), bytes(64)])
+    assert shaderlogs.recipe(missing_code, words(6), empty_sources) is None
+    retained = {id(key[1]): key[1] for key in empty_sources._raw_runs}
+    assert len(empty_sources._raw_runs) > 2 and sum(map(len, retained.values())) <= len(missing_code)
+
     # a finished game's list (confirm): a build's fragment states once each, an earlier list's first, without a miss list's tags, the
     # vertex records, a file with another extension, or the last record of a log cut short
     def state(name):
@@ -173,5 +315,7 @@ try:
             continue
         raise AssertionError(why + ' was confirmed')
 finally:
+    assert os.path.dirname(os.path.realpath(tmp)) == os.path.realpath(tempfile.gettempdir())
+    assert os.path.basename(tmp).startswith('shaderlogs_test_')
     shutil.rmtree(tmp, ignore_errors=True)
 print('shaderlogs ok: fingerprints, recipes and a finished game\'s list')

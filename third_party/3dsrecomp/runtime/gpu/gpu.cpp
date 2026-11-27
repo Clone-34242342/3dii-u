@@ -176,17 +176,22 @@ void worker_main(u32 tid) {
     u32 seen = 0;
     for (;;) {
         u32 gen;
+#ifndef __WIIU__
         u32 spins = 0;
+#endif
         while ((gen = (u32)(pool_work.load(std::memory_order_acquire) >> 48)) == seen) {
-            if (++spins < (g_pool_idle_spin.load(std::memory_order_relaxed) ? 20000u : kIdleSpinLimit)) {
+            // On Wii U an idle worker's 64-bit polling uses a shared spinlock and stalls the shader compiler on core 0.
+#ifndef __WIIU__
+            if (++spins < 20000) {
                 cpu_relax();
-            } else {
-                std::unique_lock<std::mutex> lk(pool_mtx);
-                pool_sleepers.fetch_add(1);
-                pool_cv.wait(lk, [&] { return (u32)(pool_work.load() >> 48) != seen; });
-                pool_sleepers.fetch_sub(1);
-                spins = 0;
+                continue;
             }
+            spins = 0;
+#endif
+            std::unique_lock<std::mutex> lk(pool_mtx);
+            pool_sleepers.fetch_add(1);
+            pool_cv.wait(lk, [&] { return (u32)(pool_work.load() >> 48) != seen; });
+            pool_sleepers.fetch_sub(1);
         }
         seen = gen;
         run_items(gen, tid);
@@ -255,10 +260,10 @@ void parallel_for(u32 n, const std::function<void(u32, u32)> &fn) {
         pool_jobs[pool_gen & 1] = job;
         pool_done.store(0, std::memory_order_relaxed);
         pool_work.store((u64)pool_gen << 48 | (u64)cnt << 24, std::memory_order_release);
-        if (pool_sleepers.load()) {
-            std::lock_guard<std::mutex> lk(pool_mtx);
-            pool_cv.notify_all();
-        }
+        // Not under pool_mtx: on the Wii U that is an OSFastMutex, and Cemu's OSFastCond_Wait lets it go without the lock its OSFastMutex_Lock
+        // checks the owner under, so taking it here just as the worker went to sleep could wait for good (Nintendogs' quit, 2026-11-17). A
+        // worker that misses this wakes at the next job's; this thread runs every item itself meanwhile.
+        if (pool_sleepers.load()) pool_cv.notify_all();
         run_items(pool_gen, 0);
         while (pool_done.load(std::memory_order_acquire) != cnt) cpu_relax();
     }
@@ -557,6 +562,9 @@ void handle_special(u32 id, u32 value) {
 
 inline void write_reg(u32 id, u32 value, u32 mask) {
     if (id >= 0x300) return;
+#ifdef __WIIU__
+    if (id < R::FIXATTR_DATA || id >= R::FIXATTR_DATA + 3 || g.regs[R::FIXATTR_INDEX] != 15) vtx_flush_immediate();
+#endif
     const u32 m = expand_mask[mask];
     const u32 was = g.regs[id];
     g.regs[id] = (was & ~m) | (value & m);
@@ -587,6 +595,9 @@ inline void write_reg(u32 id, u32 value, u32 mask) {
 // at a time each went through write_reg and into handle_special to do one small thing. Here the register is looked at once for the
 // whole run. What write_reg does for each word is done for all of them at the end: none of these words reads the register it is written to.
 void write_run(u32 kind, u32 id, u32 first, const u32 *extra, u32 count) {
+#ifdef __WIIU__
+    vtx_flush_immediate();
+#endif
     const auto each = [&](auto word) {
         word(first);
         for (u32 i = 0; i < count; i++) word(le32(extra[i]));
@@ -639,7 +650,8 @@ void checked_run(u32 kind, u32 id, u32 first, const u32 *extra, u32 count) {
         LOG("FATAL: a run of %u words for register %03x (kind %u) left the GPU state different from the same words one at a time\n", count + 1, id, kind);
         abort();
     }
-    if (!(++checked & (checked - 1))) LOG("[gpu] %llu runs checked against the same words one at a time\n", (unsigned long long)checked);
+    ++checked;
+    if (!(checked & (checked - 1))) LOG("[gpu] %llu runs checked against the same words one at a time\n", (unsigned long long)checked);
 }
 #endif
 }  // namespace
@@ -714,6 +726,9 @@ void process_command_list(u32 paddr, u32 size_bytes) {
     static const double hitch_ms = getenv("GPU_HITCH_MS") ? atof(getenv("GPU_HITCH_MS")) : 0;
     const double t0 = g_stats || hitch_ms ? now_ms() : 0;
     cmd_run(paddr, size_bytes);
+#ifdef __WIIU__
+    vtx_flush_immediate();
+#endif
     raster_flush();
     if (hitch_ms) {
         // command lists that took long enough to delay a frame (GPU_HITCH_MS=<threshold>)
@@ -774,6 +789,43 @@ void state_fields(F &&f) {
 }
 }  // namespace
 
+// V1 stores native representations; it is only compatible with the same ABI/endianness.
+// Stage the existing state_fields spans, validate raw bytes, then touch live state exactly once.
+struct StateSpan { void *destination; size_t size, offset; };
+static bool valid_state_bytes(const std::vector<u8> &bytes, const std::vector<StateSpan> &spans) {
+    auto raw = [&](const void *field, size_t count) -> const u8 * {
+        const uintptr_t address = (uintptr_t)field;
+        for (const auto &span : spans) {
+            const uintptr_t base = (uintptr_t)span.destination;
+            if (address >= base && address - base <= span.size && count <= span.size - (address - base))
+                return bytes.data() + span.offset + (address - base);
+        }
+        return nullptr;
+    };
+    auto integer = [&](const u32 *field) {
+        const u8 *source = raw(field, sizeof(u32));
+        if (!source) return UINT32_MAX;
+        u32 value; memcpy(&value, source, sizeof value); return value;
+    };
+    auto boolean = [&](const bool *field) {
+        const bool zero = false, one = true;
+        const u8 *source = raw(field, sizeof(bool));
+        return source && (!memcmp(source, &zero, sizeof(bool)) || !memcmp(source, &one, sizeof(bool)));
+    };
+    for (const ShaderSetup *s : {&g.vs, &g.gs}) {
+        if (integer(&s->queue_n) >= sizeof(s->queue) / sizeof(s->queue[0]) ||
+            integer(&s->code_size) > sizeof(s->code) / sizeof(s->code[0]) ||
+            integer(&s->swizzle_size) > sizeof(s->swizzle) / sizeof(s->swizzle[0])) return false;
+        for (const bool &b : s->b) if (!boolean(&b)) return false;
+    }
+    if (integer(&g.imm_n) >= sizeof(g.imm_queue) / sizeof(g.imm_queue[0]) ||
+        integer(&g.imm_attr) >= sizeof(g.imm_vertex) / sizeof(g.imm_vertex[0]) || !boolean(&g.imm_reset_gs)) return false;
+    for (const bool &b : g.gs_unit.cond) if (!boolean(&b)) return false;
+    const u32 bank = integer(&g.gs_unit.out_bank), topology = integer(&g.pa.topology), index = integer(&g.pa.index);
+    return (bank == 0 || bank == 16) && topology < 4 && index < (topology == 1 || topology == 2 ? 2u : 3u) &&
+           boolean(&g.pa.strip_ready) && boolean(&g.pa.winding);
+}
+
 bool save_state(const char *path) {
     ensure_init();
     raster_flush();
@@ -781,30 +833,36 @@ bool save_state(const char *path) {
     FILE *fp = fopen(path, "wb");
     if (!fp) return false;
     const u32 hdr[2] = {STATE_MAGIC, STATE_VERSION};
-    fwrite(hdr, 4, 2, fp);
-    state_fields([&](void *p, size_t n) { fwrite(p, 1, n, fp); });
-    fclose(fp);
-    return true;
+    bool ok = fwrite(hdr, 4, 2, fp) == 2;
+    state_fields([&](void *p, size_t n) { if (ok) ok = fwrite(p, 1, n, fp) == n; });
+    ok = fclose(fp) == 0 && ok;
+    if (!ok) LOG("gpu: cannot save state file %s\n", path);
+    return ok;
 }
 
 bool load_state(const char *path) {
-    ensure_init();
     FILE *fp = fopen(path, "rb");
     if (!fp) return false;
+    std::vector<StateSpan> spans;
+    size_t total = 0;
+    state_fields([&](void *p, size_t n) { spans.push_back({p, n, total}); total += n; });
+    std::vector<u8> bytes(total);
     u32 hdr[2] = {};
     bool ok = fread(hdr, 4, 2, fp) == 2 && hdr[0] == STATE_MAGIC && hdr[1] == STATE_VERSION;
-    if (ok) {
-        raster_flush();
-        state_fields([&](void *p, size_t n) { ok &= fread(p, 1, n, fp) == n; });
-        g.vs.dirty = g.gs.dirty = true;
-        g.vs.prog = g.gs.prog = nullptr;
-        g.light_lut_dirty = g.fog_lut_dirty = g.pt_dirty = true;
-        g.regs_version++;
-        g.ds_version = 0;
-    }
-    fclose(fp);
-    if (!ok) LOG("gpu: bad state file %s\n", path);
-    return ok;
+    if (ok) ok = fread(bytes.data(), 1, total, fp) == total;
+    ok = fgetc(fp) == EOF && !ferror(fp) && ok;
+    ok = fclose(fp) == 0 && ok;
+    if (ok) ok = valid_state_bytes(bytes, spans);
+    if (!ok) { LOG("gpu: bad state file %s\n", path); return false; }
+    ensure_init();
+    raster_flush();
+    for (const auto &span : spans) memcpy(span.destination, bytes.data() + span.offset, span.size);
+    g.vs.dirty = g.gs.dirty = true;
+    g.vs.prog = g.gs.prog = nullptr;
+    g.light_lut_dirty = g.fog_lut_dirty = g.pt_dirty = true;
+    g.regs_version++;
+    g.ds_version = 0;
+    return true;
 }
 
 void flush() {

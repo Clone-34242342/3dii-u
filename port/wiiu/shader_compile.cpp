@@ -1,14 +1,16 @@
 #include <atomic>
 // Shaders the shipped set lacks are compiled on the console itself, on a thread of their own, with CafeGLSL's library for the Wii U
 // (third_party/cafeglsl_ppc: version 1.0, where the PC build runs 0.2, and its programs differ: latte_program.h). A miss draws with its
-// fallback meanwhile and takes the real shader once the GPU thread installs it (gfx_pump). The GLSL of every miss goes to the save folder,
-// so the next start compiles it again in the background before the game gets there. The first of the three things 3Dii U needs: no more
-// builds for new areas (2026-11-06).
+// fallback meanwhile and takes the real shader once the GPU thread installs it (gfx_pump). Validated native programs are restored on later
+// starts; the GLSL journal remains the recovery path when a native entry is missing, corrupt, or from another compiler/generator.
 #include <cafeglsl/CafeGLSLCompiler.h>
+#include <cafeglsl/gfd.h>
 #include <coreinit/mutex.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
+#include <gfd.h>
 #include <malloc.h>
+#include <sys/stat.h>
 
 #include <cctype>
 #include <dirent.h>
@@ -126,7 +128,7 @@ int compile_thread(int, void *) {
     const auto initialize = [&] {
         InitGLSLCompiler();
         LOG("[glsl] compiler %s up\n", GetGLSLCompilerVersion());
-        {  // two known small shaders first: whether compiling works here at all, how long one takes, and that a loop (r600's jump tracker) gets through: in
+        if (g_verbose >= 2) {  // two known small shaders first: whether compiling works here at all, how long one takes, and that a loop (r600's jump tracker) gets through: in
             // Cemu it only does with tools/win/patch_cafeglsl_traps.py applied to the library
             const std::string plain = gen_passthrough_vs();
             const std::string with_loop = "#version 450\nlayout(location = 0) in vec4 aPos;\nlayout(binding = 0, std140) uniform VS { vec4 f[96]; vec4 uDraw; ivec4 uInt[4]; };\n"
@@ -179,6 +181,7 @@ int compile_thread(int, void *) {
         const auto failed = [&](const char *why) { LOG("[glsl] %s %016llx failed in %u ms: %.400s\n", j.vs ? "vertex" : "pixel", (unsigned long long)j.key, ms, why); };
         if (mode == GLSL_SHADER_MODE_ERROR || (!d.vs_shader && !d.ps_shader)) {
             failed(info);
+            shader_compile_discard(d);
             continue;
         }
         LOG("[glsl] %s %016llx compiled in %u ms%s\n", j.vs ? "vertex" : "pixel", (unsigned long long)j.key, ms, j.cached ? ", from the cache" : "");
@@ -186,11 +189,14 @@ int compile_thread(int, void *) {
         // what it's given in its first second or so after starting, and the same source compiles properly afterwards (seen in Cemu,
         // 2026-11-10). One is never installed. It's tried again for a couple of seconds, and then given up, so that a later miss can ask
         // afresh; the CPU shades those draws meanwhile. Fewer inputs than the code reads is no sign of it: the compiler rightly drops an
-        // input that reaches no output, and the same shader comes back that way every time.
-        if (j.vs && (d.vs_shader->size <= 16 || (inputs_read(j.glsl) && !d.vs_shader->attribVarCount))) {
-            FreeVertexShader(d.vs_shader);
+        // input that reaches no output, and the same shader comes back that way every time. Pixel shaders can instead come back as
+        // one fully masked export (AC cold builds); alpha-NEVER draws are already skipped by raster.cpp, before requesting a shader.
+        const bool hollow = j.vs ? d.vs_shader->size <= 16 || (inputs_read(j.glsl) && !d.vs_shader->attribVarCount)
+                                 : latte::hollow_pixel_program(d.ps_shader->program, d.ps_shader->size);
+        if (hollow) {
+            shader_compile_discard(d);
             const bool again = ++j.tries < 8;
-            LOG("[glsl] vertex %016llx came back hollow: %s\n", (unsigned long long)j.key, again ? "trying again" : "given up");
+            LOG("[glsl] %s %016llx came back hollow: %s\n", j.vs ? "vertex" : "pixel", (unsigned long long)j.key, again ? "trying again" : "given up");
             if (again) OSSleepTicks(OSMillisecondsToTicks(250));
             OSLockMutex(&mutex);
             if (again) compile_queue::enqueue(jobs,std::move(j));
@@ -201,12 +207,16 @@ int compile_thread(int, void *) {
         // what this compiler writes that a real GPU may not take, put right before anything draws with the program (latte_program.h)
         u32 &resources = j.vs ? d.vs_shader->regs.sq_pgm_resources_vs : d.ps_shader->regs.sq_pgm_resources_ps;
         u32 registers = resources & 0xFF;
-        if (!fit_program(j.vs ? d.vs_shader->program : d.ps_shader->program, j.vs ? d.vs_shader->size : d.ps_shader->size, registers, j.vs ? kVertexRegisters : kPixelRegisters)) {
-            failed("its program isn't laid out as this GPU's are, or has no register to spare");
+        if (!fit_program(j.vs ? d.vs_shader->program : d.ps_shader->program, j.vs ? d.vs_shader->size : d.ps_shader->size, registers, shader_budget::kOrdinary)) {
+            char why[160];
+            snprintf(why, sizeof why, "invalid program/metadata or ordinary-register requirement exceeds %u (declared %u, %u bytes)",
+                     shader_budget::kOrdinary, resources & 255, j.vs ? d.vs_shader->size : d.ps_shader->size);
+            failed(why);
             shader_compile_discard(d);
             continue;
         }
         resources = (resources & ~0xFFu) | registers;
+        LOG("[glsl] %s %016llx requires %u ordinary registers\n", j.vs ? "vertex" : "pixel", (unsigned long long)j.key, registers);
         if (!j.cached) cache_append(j);
         OSLockMutex(&mutex);
         done.push_back(d);
@@ -251,6 +261,7 @@ void shader_compile_init() {
     OSSetThreadName(t, "glsl");
     compiler = t;
     OSResumeThread(t);
+    LOG("[glsl] compiler thread ready\n");
 }
 
 // (GPU thread) a compile that has run for 8 s, 16 s, 24 s, 32 s: every thread's state on the log, and the log on the file at once, since the
@@ -267,10 +278,14 @@ void shader_compile_watch() {
 // Prioritize demanded vertex work, then demanded pixels, then cache warm-up.
 // Repeated demand promotes a cached record without duplicating its compile.
 void shader_compile_request(bool vs, u64 key, std::string glsl, u32 inputs) {
+    static std::unordered_set<u64> reported_vs;  // at most one request diagnostic per vertex key, even if a caller repeats it
+    const char *disposition = "already known (no queued job)";
     OSLockMutex(&mutex);
+    const bool report = vs && reported_vs.insert(key).second;
     if (known.insert(key).second) {
         Job j{vs,false,key,inputs,std::move(glsl)};j.demanded=true;
         compile_queue::enqueue(jobs,std::move(j));
+        disposition = "queued";
     }
     else
         for (auto it = jobs.begin(); it != jobs.end(); ++it)
@@ -279,16 +294,19 @@ void shader_compile_request(bool vs, u64 key, std::string glsl, u32 inputs) {
                 jobs.erase(it);
                 j.demanded=true;
                 compile_queue::enqueue(jobs,std::move(j));
+                disposition = "promoted";
                 break;
             }
     OSUnlockMutex(&mutex);
+    if (report) LOG("[glsl] vertex %016llx request: %s\n", (unsigned long long)key, disposition);
 }
 
 void shader_compile_discard(CompileDone &d) {
-    if (d.vs_shader) FreeVertexShader(d.vs_shader);
-    if (d.ps_shader) FreePixelShader(d.ps_shader);
+    if (d.vs_shader) { if (d.from_gfd) { free(d.vs_shader->program); free(d.vs_shader); } else FreeVertexShader(d.vs_shader); }
+    if (d.ps_shader) { if (d.from_gfd) { free(d.ps_shader->program); free(d.ps_shader); } else FreePixelShader(d.ps_shader); }
     d.vs_shader = nullptr;
     d.ps_shader = nullptr;
+    d.from_gfd = false;
 }
 
 bool shader_compile_take(CompileDone &out) {

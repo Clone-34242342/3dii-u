@@ -26,28 +26,90 @@ LITERAL, PV, PS = 253, 254, 255
 
 
 def blocks(data):
-    if data[:4] != b'Gfx2':
+    if len(data) < 32 or data[:4] != b'Gfx2':
         raise ValueError('not a GFD file')
     p = struct.unpack('>I', data[4:8])[0]
+    if not 32 <= p <= len(data):
+        raise ValueError('invalid GFD file header')
     while p + 32 <= len(data) and data[p:p + 4] == b'BLK{':
         head, _, _, kind, size = struct.unpack('>5I', data[p + 4:p + 24])
+        if head < 32 or head > len(data) - p or size > len(data) - p - head:
+            raise ValueError(f'invalid GFD block at {p}')
         yield kind, data[p + head:p + head + size]
         p += head + size
 
 
 def programs(data):
     """(kind, registers, words) of every program: a header block's first word, low byte, then the program block that follows it"""
-    registers = 0
+    registers = {VS_PROG: None, PS_PROG: None}
     for kind, body in blocks(data):
         if kind in (VS_HEAD, PS_HEAD):
-            registers = struct.unpack('>I', body[:4])[0] & 255
+            if len(body) < 4:
+                raise ValueError('short shader header')
+            registers[VS_PROG if kind == VS_HEAD else PS_PROG] = struct.unpack('>I', body[:4])[0] & 255
         elif kind in (VS_PROG, PS_PROG):
-            yield 'vertex' if kind == VS_PROG else 'pixel', registers, struct.unpack(f'<{len(body) // 4}I', body[:len(body) // 4 * 4])
+            if registers[kind] is None or len(body) < 8 or len(body) % 8:
+                raise ValueError('missing shader header or invalid program size')
+            yield 'vertex' if kind == VS_PROG else 'pixel', registers[kind], struct.unpack(f'<{len(body) // 4}I', body)
+
+
+def layout_error(words):
+    """Bound every read before the rule checker traverses clauses and literals."""
+    first = len(words) // 2
+    if len(words) < 2 or len(words) % 2:
+        return 'invalid program size'
+    pc = 0
+    furthest_target = 0
+    while pc < first:
+        w0, w1 = words[2 * pc:2 * pc + 2]
+        if w1 & 1 << 29:
+            i = w0 & 0x3fffff
+            end = i + (w1 >> 18 & 127) + 1
+            if i <= pc or end > len(words) // 2:
+                return 'arithmetic clause outside program'
+            first = min(first, i)
+            literal, ended = 0, True
+            while i < end:
+                a0, a1 = words[2 * i:2 * i + 2]
+                sources = [(a0 & 511, a0 >> 10 & 3), (a0 >> 13 & 511, a0 >> 23 & 3)]
+                if a1 >> 15 & 7:
+                    sources.append((a1 & 511, a1 >> 10 & 3))
+                elif (a1 >> 7 & 0x7ff) in ONE_OPERAND:
+                    del sources[1]
+                literal = max([literal] + [c + 1 for s, c in sources if s == LITERAL])
+                i += 1
+                ended = bool(a0 >> 31)
+                if ended:
+                    i += (literal + 1) // 2
+                    literal = 0
+            if i != end or not ended:
+                return 'unterminated arithmetic group or truncated literals'
+        elif (w1 >> 23 & 127) in (1, 2, 3, 27, 28, 29):
+            count = (w1 >> 10 & 7 | (w1 >> 19 & 1) << 3) + 1
+            if w0 <= pc or w0 + 2 * count > len(words) // 2:
+                return 'fetch clause outside program'
+            first = min(first, w0)
+        if not w1 & 1 << 29:
+            kind = w1 >> 23 & 127
+            if 4 <= kind <= 17:  # Mesa's LOOP/BRANCH opcodes; WORD0 is a CF-instruction address
+                furthest_target = max(furthest_target, w0)
+            if kind in (18, 20) or (kind == 19 and (w0 or w1 & 63 << 13)):
+                return 'unsupported CALL/RET subroutine or noncanonical CALL_FS'
+        if not w1 & 1 << 29 and w1 & 1 << 21:
+            if furthest_target > pc:
+                return 'control-flow target escapes the validated prefix'
+            return None
+        pc += 1
+    return 'control flow has no END_OF_PROGRAM before clauses'
 
 
 def check(words, registers):
     """the rules one program breaks, each with how often"""
     found = collections.Counter()
+    error = layout_error(words)
+    if error:
+        found[error] += 1
+        return found
 
     def register(r, what):
         if r < 124 and r >= registers:
@@ -71,6 +133,9 @@ def check(words, registers):
                     sources.append((a1 & 0x1FF, a1 >> 10 & 3))
                 elif op in ONE_OPERAND:
                     del sources[1]
+                relative = [a0 >> 9 & 1, a0 >> 22 & 1, a1 >> 9 & 1]
+                if any(sel < 128 and relative[k] for k, (sel, _) in enumerate(sources)) or ((three or a1 & 16) and a1 & 1 << 28):
+                    found['relative arithmetic GPR reference cannot be bounded'] += 1
                 group.append((op, sources, a1 >> 21 & 0x7F, a1 >> 29 & 3, three or bool(a1 & 0x10)))
                 if not a0 >> 31:
                     continue
@@ -107,16 +172,28 @@ def check(words, registers):
             continue
         kind = w1 >> 23 & 0x7F
         if kind in (39, 40):  # exports: a register, and with a burst the ones after it; a swizzle of constants alone reads none
+            last = (w0 >> 15 & 0x7f) + (w1 >> 17 & 15)
+            if last > 127 or w0 & 1 << 22:
+                found['export register range is invalid or relative'] += 1
             if any((w1 >> 3 * k & 7) < 4 for k in range(4)):
-                register((w0 >> 15 & 0x7F) + (w1 >> 17 & 15), 'exports')
-        elif kind in (1, 2, 3):  # fetches, four words each
+                if last >= 124:
+                    found['exports a clause temporary outside its arithmetic clause'] += 1
+                register(last, 'exports')
+        elif kind in (1, 2, 3, 27, 28, 29):  # fetches, four words each
             for k in range((w1 >> 10 & 7 | (w1 >> 19 & 1) << 3) + 1):
                 f0, f1 = words[2 * (w0 + 2 * k)], words[2 * (w0 + 2 * k) + 1]
-                if f0 & 31 == 0:  # from a buffer (the others are texture samples, laid out differently)
-                    register(f0 >> 16 & 0x7F, 'fetches by')
-                    register(f1 & 0x7F, 'fetches into')
+                src, dst = f0 >> 16 & 0x7f, f1 & 0x7f
+                register(src, 'fetches by')
+                register(dst, 'fetches into')
+                if f0 & 31 == 1 or f0 & 1 << 23 or f1 & 1 << 7:
+                    found['semantic or relative fetch GPR reference cannot be bounded'] += 1
+                if src >= 124 or dst >= 124:
+                    found['fetch references a clause temporary outside its arithmetic clause'] += 1
+                if f0 & 31 == 0:  # TEX uses this bit for LOD bias, not VTX format selection
                     if f1 >> 21 & 1:
                         found['a fetch takes its data format from the buffer (USE_CONST_FIELDS)'] += 1
+        elif kind >= 30:
+            found[f'unsupported control-flow opcode {kind}; register references unvalidated'] += 1
         if w1 & 1 << 21:  # END_OF_PROGRAM
             break
     return found

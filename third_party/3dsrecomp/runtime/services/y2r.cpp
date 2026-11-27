@@ -63,19 +63,17 @@ struct DmaWriter {
     explicit DmaWriter(const Dma &d) : at(d.addr), left(d.unit), unit(d.unit), gap(d.gap), end(d.addr) {}
     void put(const u8 *p, u32 n) {
         while (n) {
+            if (unit && !left) {
+                at += gap;
+                left = unit;
+            }
             const u32 run = unit ? std::min(left, n) : n;
             memcpy(gptr(at), p, run);
             at += run;
             end = at;
             p += run;
             n -= run;
-            if (unit) {
-                left -= run;
-                if (!left) {
-                    at += gap;
-                    left = unit;
-                }
-            }
+            left -= unit ? run : 0;
         }
     }
 };
@@ -99,11 +97,16 @@ struct Y2rService : Service {
     bool warned_rotation = false;
     bool busy = false;  // a conversion is under way (StartConversion)
 
-    void convert() {
-        if (!width || (width & 7) || width > 1024 || !out.addr) {
-            LOG("[y2r] can't convert: width %u, output %08x\n", width, out.addr);
-            return;
-        }
+    u32 output_span() const {
+        if (!width || (width & 7) || width > 1024 || !lines) return 0;
+        const u32 bytes = output_format == 0 ? 4 : output_format == 1 ? 3 : 2;
+        const u32 payload = width * (block ? (lines + 7) & ~7u : lines) * bytes;
+        const u64 span = payload + (out.unit ? (u64)((payload - 1) / out.unit) * out.gap : 0);
+        if (payload > out.size || span > UINT32_MAX || !guest_writable(out.addr, (u32)span)) return 0;
+        return (u32)span;
+    }
+
+    void convert(u32 span) {
         VLOG("[y2r] convert %ux%u in %u out %u block %u rotation %u, from %08x/%08x (size %x) to %08x size %x unit %x gap %x\n", width, lines, input_format, output_format, block, rotation,
              yuyv.addr, y.addr, yuyv.size, out.addr, out.size, out.unit, out.gap);
         const u32 tiles_across = width / 8;
@@ -250,20 +253,14 @@ struct Y2rService : Service {
                 for (u32 row = 0; row < rows; row++) {
                     u8 *d = line.data();
                     for (u32 x = 0; x < width; x++, d += bytes) encode(tiles[(x / 8) * 64 + row * 8 + (x & 7)], d);
-                    // whole lines in one go, unless the DMA pattern is finer than that
-                    if (!out.unit || out.unit >= width * bytes) {
-                        w.put(line.data(), width * bytes);
-                    } else {
-                        for (u32 x = 0; x < width; x++) w.put(line.data() + x * bytes, bytes);
-                    }
+                    w.put(line.data(), width * bytes);
                 }
             }
         }
-        // the GPU may read this next
-        // DMA units describe byte chunks, not scanlines. Multiplying a unit
-        // by the image height invalidates unrelated memory when a unit spans
-        // several rows. Report only the span actually written, including gaps.
-        gsp_cpu_wrote(out.addr, w.end - out.addr);
+        // Invalidate the actual written span without claiming untouched DMA gaps.
+        const u32 written = w.end - out.addr;
+        if (out.unit && out.gap && written > out.unit) gsp_cache_op(out.addr, written, false);
+        else gsp_cpu_wrote(out.addr, written);
     }
 
     static Dma dma(IPC &ipc) {
@@ -338,10 +335,14 @@ struct Y2rService : Service {
             for (u32 i = 0; i < 8; i++) dither[i] = (u16)(ipc[1 + i / 2] >> (16 * (i & 1)));
             ipc.ok();
             break;
-        case 0x0026:  // StartConversion
+        case 0x0026: {  // StartConversion
             // A video frame takes tens of milliseconds to convert, and the game's other threads, its sound thread first, run meanwhile, as on
             // a 3DS, where the converter is hardware of its own (run_blocked). Done under the kernel lock, each frame of Kid Icarus's opening
             // video stopped them all for 25 to 120 ms (2026-11-11).
+            if (busy) { ipc.ok(); break; }
+            Y2rService conversion = *this;  // Guest threads can set up the next image once conversion releases the lock.
+            const u32 span = conversion.output_span();
+            if (!span) { ipc.result(RES_INVALID_ADDRESS); break; }
             busy = true;
             {
                 const auto began = std::chrono::steady_clock::now();
@@ -349,11 +350,13 @@ struct Y2rService : Service {
                 run_blocked(*ipc.lk, [&] {
                     const auto work = std::chrono::steady_clock::now();
 #ifdef __WIIU__
+                    struct Job { Y2rService *conversion; u32 span; } job{&conversion, span};
                     if (!wiiu::video_conversion_worker([](void *context) {
-                        static_cast<Y2rService *>(context)->convert();
-                    }, this)) convert();
+                        auto &job = *static_cast<Job *>(context);
+                        job.conversion->convert(job.span);
+                    }, &job)) conversion.convert(span);
 #else
-                    convert();
+                    conversion.convert(span);
 #endif
                     convert_us = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - work).count();
@@ -382,10 +385,12 @@ struct Y2rService : Service {
                 }
 #endif
             }
+            warned_rotation |= conversion.warned_rotation;
             busy = false;
             done->signal();
             ipc.ok();
             break;
+        }
         case 0x0027: ipc.ok(); break;   // StopConversion
         case 0x0028: get(busy); break;  // IsBusyConversion
         case 0x0029: {                  // SetPackageParameter

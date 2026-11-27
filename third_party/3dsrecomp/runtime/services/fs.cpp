@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <filesystem>
 #include <chrono>
 #include <functional>
@@ -39,11 +40,12 @@ void save_dirty();
 struct SaveFile;
 std::shared_ptr<SaveFile> save_file_open(const std::string &path, int fd);
 void save_file_close(SaveFile &f);
+void save_file_close_direct(const std::string &path);
 long save_file_read(SaveFile &f, void *to, u32 len, u64 at);
 long save_file_write(SaveFile &f, const void *from, u32 len, u64 at);
 u64 save_file_size(SaveFile &f);
 void save_file_resize(SaveFile &f, u64 size);
-void save_settle(const std::string &prefix, bool forget);
+bool save_settle(const std::string &prefix, bool forget);
 }
 using wiiu::save_write;
 using wiiu::save_resize;
@@ -60,7 +62,7 @@ struct FsIo {
 #else
 #define FS_NOTE(...)
 #define SAVE_DIRTY()
-#define SAVE_SETTLE(prefix, forget)
+#define SAVE_SETTLE(prefix, forget) true
 struct FsIo {
     explicit FsIo(u32) {}
 };
@@ -107,6 +109,7 @@ static u32 delete_host_file(const std::string &path, std::error_code &ec) {
     return removed && !ec ? 0 : delete_error(ec);
 }
 
+static const u32 ERR_IO = fs_err(1007, 11);  // NoData, Internal: cached changes could not reach storage
 
 }  // namespace kernel
 extern std::string g_save_base;
@@ -516,6 +519,7 @@ struct FileSession : Service {
     std::string path;
 #ifdef __WIIU__
     std::shared_ptr<wiiu::SaveFile> held;  // a save file of the game's, in memory: no storage behind its reads and writes
+    bool direct_save = false;  // this session reserved an uncached save path
 #endif
     FileSession() : Service("fs file") {}
 #ifdef RECOMP_RESUMABLE
@@ -610,6 +614,9 @@ struct FileSession : Service {
             close(fd);
             if (written) SAVE_DIRTY();  // a file's last changes may only go out as it closes
         }
+#ifdef __WIIU__
+        if (direct_save) wiiu::save_file_close_direct(path);
+#endif
     }
     u64 file_size() {
         if (romfs) return size;
@@ -688,10 +695,10 @@ struct FileSession : Service {
             u64 off = (u64)ipc[1] | ((u64)ipc[2] << 32);
             u32 len = ipc[3];
             u32 src = ipc[6];
-            ipc.lk->unlock();  // as for a read
+            s64 n;
+            run_blocked(*ipc.lk, [&] {
             FS_NOTE("save: writing %x bytes to %s", len, path.c_str());
             save_lock();
-            s64 n;
 #ifdef __WIIU__
             if (held) n = wiiu::save_file_write(*held, gptr(src), len, off);
             else
@@ -702,7 +709,7 @@ struct FileSession : Service {
             }
             save_unlock();
             FS_NOTE("save: written, %d", (int)n);
-            ipc.lk->lock();
+            });
             if (n < 0) n = 0;
             if (g_verbose) LOG("[fs] write %s off %llx len %x\n", path.c_str(), (unsigned long long)off, len);
             if (!romfs && n > 0) {
@@ -715,27 +722,34 @@ struct FileSession : Service {
             ipc.set(4, src);
             break;
         }
-        case 0x0804:  // GetSize
+        case 0x0804: {  // GetSize
+            u64 size;
+            run_blocked(*ipc.lk, [&] { size = file_size(); });
             ipc.ok(3);
-            ipc.set64(2, file_size());
+            ipc.set64(2, size);
             break;
-        case 0x0805:  // SetSize
+        }
+        case 0x0805: {  // SetSize
             if (!romfs) {
+                const u64 size = (u64)ipc[1] | ((u64)ipc[2] << 32);
+                run_blocked(*ipc.lk, [&] {
                 save_lock();
 #ifdef __WIIU__
-                if (held) wiiu::save_file_resize(*held, (u64)ipc[1] | ((u64)ipc[2] << 32));
+                if (held) wiiu::save_file_resize(*held, size);
                 else
 #endif
                 {
                     FsIo io(0x0805);
-                    save_resize(fd, (u64)ipc[1] | ((u64)ipc[2] << 32));
+                    save_resize(fd, size);
                 }
                 save_unlock();
+                });
                 written = true;
                 save_changed(path);
             }
             ipc.ok();
             break;
+        }
         case 0x0808:  // Close
         case 0x0809:  // Flush
         case 0x080A:  // SetPriority
@@ -813,11 +827,12 @@ struct DirSession : Service {
 struct FormatInfo {
     u32 bytes = 0x20000, dirs = 0x10, files = 0x10, duplicate = 0;  // what's answered for an archive formatted before this was kept
 };
-static void keep_format_info(const std::string &dir, const FormatInfo &info) {
-    if (FILE *f = fopen((dir + ".format").c_str(), "wb")) {
-        fwrite(&info, sizeof info, 1, f);
-        fclose(f);
-    }
+static bool keep_format_info(const std::string &dir, const FormatInfo &info) {
+    FILE *f = fopen((dir + ".format").c_str(), "wb");
+    if (!f) return false;
+    const bool written = fwrite(&info, sizeof info, 1, f) == 1;
+    const int closed = fclose(f);
+    return written && !closed;
 }
 static FormatInfo format_info(const std::string &dir) {
     FormatInfo info, kept;
@@ -831,14 +846,25 @@ static FormatInfo format_info(const std::string &dir) {
     return info;
 }
 
-static void create_gamecoin(const std::string &dir) {
-    fsys::create_directories(dir);
+static bool create_gamecoin(const std::string &dir) {
+    std::error_code ec;
+    fsys::create_directories(dir, ec);
+    if (ec) return false;
     struct { u32 magic; u16 coins, coins_today; u32 steps, last_steps; u16 year; u8 month, day; } gc{le32(0x4F00), le16(10), 0, 0, 0, le16(2014), 1, 1};
-    if (FILE *f = fopen((dir + "/gamecoin.dat").c_str(), "wb")) {
-        fwrite(&gc, sizeof gc, 1, f);
-        fclose(f);
+    const std::string path = dir + "/gamecoin.dat", fresh = path + ".3diiu-new";
+    if (fsys::exists(path, ec)) return fsys::is_regular_file(path, ec) && !ec;
+    if (ec) return false;
+    FILE *f = fopen(fresh.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(&gc, sizeof gc, 1, f) == 1;
+    if (fflush(f)) ok = false;
+    if (fclose(f)) ok = false;
+    if (ok && !fsys::exists(path, ec) && !ec && !rename(fresh.c_str(), path.c_str())) {
+        LOG("[fs] created shared extdata F000000B with gamecoin.dat (10 Play Coins)\n");
+        return true;
     }
-    LOG("[fs] created shared extdata F000000B with gamecoin.dat (10 Play Coins)\n");
+    fsys::remove(fresh, ec);
+    return fsys::is_regular_file(path, ec) && !ec;
 }
 
 // Mii Maker's database (CFL_DB.dat, in the same extdata), with the console's own Miis put in, once a boot: games list them as Mii Maker's
@@ -847,24 +873,84 @@ static void create_gamecoin(const std::string &dir) {
 // (big-endian), then "CFRA" with its own CRC at 0xE4BE. A Mii already there with the same id and console stays where it is, a new one
 // takes the first free place, and each is written naming the place it lies at (page and slot, in its third byte). A 3DS keeps a Mii at
 // the place it names, and games find it again by that: Super Mario 3D Land shows no face on a save file whose Mii names a place where the
-// database holds another Mii. So a Mii keeps its place from one start to the next, whatever else the console gains or loses. The
-// player's own is placed first and always gets a place: with all hundred taken by others, the last.
+// database holds another Mii. Existing entries stay in their slots. The player's own is imported first when there is room.
 static std::vector<int> mii_places;  // where each of console_miis() lies, or -1: every place was taken
+static bool read_mii_db(FILE *f, std::vector<u8> &db) {
+    const bool ok = fseek(f, 0, SEEK_END) == 0 && ftell(f) == (long)db.size() && fseek(f, 0, SEEK_SET) == 0 &&
+                    fread(db.data(), 1, db.size(), f) == db.size() && !ferror(f);
+    const int closed = fclose(f);
+    return ok && !closed;
+}
+
+static bool write_mii_db(const std::string &path, const std::vector<u8> &db, bool had) {
+    const std::string fresh = path + ".3diiu-new", old = path + ".3diiu-old";
+    std::error_code ec;
+    fsys::remove(fresh, ec);
+    if (ec) return false;
+    FILE *f = fopen(fresh.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(db.data(), 1, db.size(), f) == db.size();
+    if (fflush(f)) ok = false;
+    if (fclose(f)) ok = false;
+    if (ok) {
+        std::vector<u8> check(db.size());
+        f = fopen(fresh.c_str(), "rb");
+        ok = f && read_mii_db(f, check) && check == db;
+    }
+    if (!ok) {
+        fsys::remove(fresh, ec);
+        return false;
+    }
+    if (had) {
+        fsys::remove(old, ec);
+        if (ec || rename(path.c_str(), old.c_str())) {
+            fsys::remove(fresh, ec);
+            return false;
+        }
+    } else if (fsys::exists(path, ec) || ec) {
+        fsys::remove(fresh, ec);
+        return false;  // a database appeared after the missing-file read
+    }
+    if (rename(fresh.c_str(), path.c_str())) {
+        if (!had || !rename(old.c_str(), path.c_str())) fsys::remove(fresh, ec);
+        return false;  // a failed rollback keeps the prior database in .3diiu-old
+    }
+    if (had) fsys::remove(old, ec);
+    return true;
+}
+
 static void sync_mii_db(const std::string &dir) {
     static bool done;
     if (done) return;
-    done = true;
+    static std::chrono::steady_clock::time_point retry_after;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < retry_after) return;
+    struct Cooldown {
+        std::chrono::steady_clock::time_point &after;
+        ~Cooldown() { after = std::chrono::steady_clock::now() + std::chrono::seconds(1); }
+    } cooldown{retry_after};  // include slow failed I/O before the next lookup can retry
+    std::error_code ec;
+    if (!create_gamecoin(dir)) return;
     int mine;
     const auto &miis = console_miis(&mine);
-    mii_places.assign(miis.size(), -1);
-    if (miis.empty()) return;
+    std::vector<int> places(miis.size(), -1);
+    if (miis.empty()) { mii_places.clear(); done = true; return; }
     const size_t players = mine < 0 ? 0 : (size_t)mine;  // as player_mii() has it
     const std::string path = dir + "/CFL_DB.dat";
+    const std::string old = path + ".3diiu-old";
+    const bool had_old = fsys::exists(old, ec);
+    if (ec) return;
+    const bool exists = fsys::exists(path, ec);
+    if (ec) return;
+    if (had_old && !exists && rename(old.c_str(), path.c_str())) return;
     std::vector<u8> db(0x4BD20, 0);
     bool had = false;
     if (FILE *f = fopen(path.c_str(), "rb")) {
-        had = fread(db.data(), 1, db.size(), f) == db.size() && !memcmp(db.data(), "CFOG", 4);
-        fclose(f);
+        had = read_mii_db(f, db) && !memcmp(db.data(), "CFOG", 4);
+        if (!had) { LOG("[fs] Mii Maker's existing database could not be read; kept unchanged\n"); return; }
+    } else if (errno != ENOENT || exists || had_old) {
+        LOG("[fs] Mii Maker's database could not be opened; kept unchanged\n");
+        return;
     }
     auto put_crc = [&](u32 from, u32 at) {
         const u16 c = mii_crc16(&db[from], at - from);
@@ -880,31 +966,42 @@ static void sync_mii_db(const std::string &dir) {
         put_crc(0xC820, 0xE4BE);
     }
     const std::vector<u8> before(db.begin(), db.begin() + 0xC820);
+    constexpr int official_slots = 100;
+    constexpr int reserved_for_game = 10;  // Leave one page for Miis the game creates or copies to Mii Maker.
+    int free_slots = 0;
+    for (int i = 0; i < official_slots; i++) {
+        if (mii_id_empty(&db[8 + i * 0x5C + 0x0C])) free_slots++;
+    }
     u32 placed = 0;
     for (size_t k = 0; k < miis.size(); k++) {
         const size_t n = k == 0 ? players : k <= players ? k - 1 : k;  // the player's, then the rest in their order
         int slot = -1, empty = -1;
-        for (int i = 0; i < 100 && slot < 0; i++) {
+        for (int i = 0; i < official_slots && slot < 0; i++) {
             const u8 *s = &db[8 + i * 0x5C];
             if (!memcmp(s + 0x0C, &miis[n][0x0C], 10)) slot = i;  // the same Mii: its id and the console that made it
-            else if (empty < 0 && !(s[0x0C] | s[0x0D] | s[0x0E] | s[0x0F])) empty = i;
+            else if (empty < 0 && mii_id_empty(s + 0x0C)) empty = i;
         }
-        if (slot < 0) slot = empty;
-        if (slot < 0 && n == players) slot = 99;
-        if (slot < 0) continue;  // all 100 places taken, by other Miis
+        if (slot < 0) {
+            if (empty < 0 || free_slots <= reserved_for_game) continue;
+            slot = empty;
+            free_slots--;
+        }
         u8 *s = &db[8 + slot * 0x5C];
         memcpy(s, miis[n].data(), 0x5C);
         s[0x02] = (u8)(slot / 10 | slot % 10 << 4);
-        mii_places[n] = slot;
+        places[n] = slot;
         placed++;
     }
     put_crc(0, 0xC81E);
-    if (had && std::equal(before.begin(), before.end(), db.begin())) return;
-    fsys::create_directories(dir);
-    if (FILE *f = fopen(path.c_str(), "wb")) {
-        fwrite(db.data(), 1, db.size(), f);
-        fclose(f);
+    if (!(had && std::equal(before.begin(), before.end(), db.begin()))) {
+        fsys::create_directories(dir, ec);
+        if (ec || !write_mii_db(path, db, had)) {
+            LOG("[fs] Mii Maker's database update failed; prior database kept\n");
+            return;
+        }
     }
+    mii_places = std::move(places);
+    done = true;
     LOG("[fs] Mii Maker's database: %u Mii%s from this console\n", placed, placed == 1 ? "" : "s");
 }
 
@@ -912,7 +1009,6 @@ static void sync_mii_db(const std::string &dir) {
 // brought up to date here if the game hasn't opened it yet: in the folder a console has from the start, as open_archive makes it.
 int mii_maker_place(u32 n) {
     const std::string dir = g_save_base + "/shared/extdata/00000000f000000b";
-    if (!fsys::exists(dir)) create_gamecoin(dir);
     sync_mii_db(dir);
     return n < mii_places.size() ? mii_places[n] : -1;
 }
@@ -943,13 +1039,21 @@ struct FsUser : Service {
                 LOG("[fs] OpenArchive: unsupported archive %x path %s\n", id, p.str().c_str());
                 return ERR_NOT_FOUND;
             }
-            if (id == 9 || id == 10) fsys::create_directories(a.host);
-            if (id == 7 && p.word(1) == 0xF000000B && !fsys::exists(a.host)) create_gamecoin(a.host);
-            if (id == 7 && p.word(1) == 0xF000000B) sync_mii_db(a.host);
-            if (!fsys::exists(a.host)) {
+            std::error_code ec;
+            if (id == 9 || id == 10) fsys::create_directories(a.host, ec);
+            if (ec) return ERR_IO;
+            bool exists = fsys::exists(a.host, ec);
+            if (ec) return ERR_IO;
+            if (id == 7 && p.word(1) == 0xF000000B) {
+                if (!create_gamecoin(a.host)) return ERR_IO;
+                exists = true;
+                sync_mii_db(a.host);
+            }
+            if (!exists) {
                 VLOG("[fs] archive %x (%s) not formatted\n", id, a.host.c_str());
                 return id == 4 ? ERR_NOT_FORMATTED : ERR_NOT_FOUND;
             }
+            if (!fsys::is_directory(a.host, ec) || ec) return ERR_IO;
         }
         *out = next_archive++;
         archives[*out] = a;
@@ -1024,9 +1128,13 @@ struct FsUser : Service {
             VLOG("[fs] open %s\n", path.c_str());
 #ifdef __WIIU__
             // the game's own saves are held in memory from here on (save_storage.cpp)
-            if (!path.compare(0, g_save_base.size(), g_save_base) && (fs->held = wiiu::save_file_open(path, fs->fd))) {
-                close(fs->fd);
-                fs->fd = -1;
+            if (!path.compare(0, g_save_base.size(), g_save_base)) {
+                fs->held = wiiu::save_file_open(path, fs->fd);
+                fs->direct_save = !fs->held;
+                if (fs->held) {
+                    close(fs->fd);
+                    fs->fd = -1;
+                }
             }
 #endif
         }
@@ -1037,6 +1145,28 @@ struct FsUser : Service {
     }
 
     void handle(IPC &ipc) override {
+        if (ipc.cmd() == 0x080E) {  // CloseArchive only changes the kernel-owned handle table.
+            archives.erase((u64)ipc[1] | ((u64)ipc[2] << 32));
+            ipc.ok();
+            return;
+        }
+        if (ipc.cmd() == 0x0802) {  // OpenFile: snapshot archive state before storage can block.
+            Archive *a = arch(ipc[2], ipc[3]);
+            if (!a) { ipc.result(ERR_ARCHIVE); return; }
+            Archive archive = *a;
+            const LowPath path = read_path(ipc[4], ipc[5], ipc[9]);
+            const u32 flags = ipc[6];
+            ObjPtr file;
+            u32 result;
+            run_blocked(*ipc.lk, [&] {
+                FsIo io(0x3802);
+                result = open_file(&archive, path, flags, &file);
+                if (result) file.reset();
+            });
+            ipc.result(result, 1, 2);
+            ipc.handles(2, {file}, true);
+            return;
+        }
         FsIo io(0x3000 | ipc.cmd());
         switch (ipc.cmd()) {
         case 0x0801:  // Initialize
@@ -1060,22 +1190,6 @@ struct FsUser : Service {
             if (g_verbose) LOG("[fs] control archive action %u\n", ipc[3]);
             ipc.ok();
             break;
-        case 0x080E:  // CloseArchive
-            archives.erase((u64)ipc[1] | ((u64)ipc[2] << 32));
-            ipc.ok();
-            break;
-        case 0x0802: {  // OpenFile(transaction, archive u64, path type, size, flags, attrs, desc, ptr)
-            Archive *a = arch(ipc[2], ipc[3]);
-            if (!a) { ipc.result(ERR_ARCHIVE); break; }
-            LowPath p = read_path(ipc[4], ipc[5], ipc[9]);
-            ObjPtr f;
-            const bool extdata = a->id == 6 || a->id == 7;
-            u32 r = open_file(a, p, ipc[6], &f);
-            ipc.result(r, 1, 2);
-            ipc.handles(2, {f}, true);
-            if (extdata) sleep_current(3085068, *ipc.lk);
-            break;
-        }
         case 0x0803: {  // OpenFileDirectly
             LowPath ap = read_path(ipc[3], ipc[4], ipc[10]);
             LowPath fp = read_path(ipc[5], ipc[6], ipc[12]);
@@ -1094,14 +1208,17 @@ struct FsUser : Service {
             Archive *a = arch(ipc[2], ipc[3]);
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
-            SAVE_SETTLE(path, false);
+            if (!SAVE_SETTLE(path, false)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             const u32 result = delete_host_file(path, ec);
             if (ec && ec != std::errc::no_such_file_or_directory)
                 LOG("[fs] DeleteFile failed archive=%u path=%s error=%d (%s) result=%08x\n",
                     a->id, path.c_str(), ec.value(), ec.message().c_str(), result);
             ipc.result(result);
-            if (!result) { SAVE_SETTLE(path, true); save_changed(path); }
+            if (!result) {
+                save_changed(path);
+                if (!SAVE_SETTLE(path, true)) ipc.result(ERR_IO);
+            }
             break;
         }
         case 0x0805: {  // RenameFile(transaction, src archive, src type, src size, dst archive, dst type, dst size, ...)
@@ -1110,8 +1227,7 @@ struct FsUser : Service {
             if (!a || !b) { ipc.result(ERR_ARCHIVE); break; }
             std::string s = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[11]).str());
             std::string d = b->host + sanitize(read_path(ipc[8], ipc[9], ipc[13]).str());
-            SAVE_SETTLE(s, true);
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(s, true) || !SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_FILE_NOT_FOUND : 0);
@@ -1123,7 +1239,7 @@ struct FsUser : Service {
             Archive *a = arch(ipc[2], ipc[3]);
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
-            SAVE_SETTLE(path, true);
+            if (!SAVE_SETTLE(path, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             if (ipc.cmd() == 0x0807) fsys::remove_all(path, ec);
             else fsys::remove(path, ec);
@@ -1165,8 +1281,7 @@ struct FsUser : Service {
             if (!a || !b) { ipc.result(ERR_ARCHIVE); break; }
             std::string s = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[11]).str());
             std::string d = b->host + sanitize(read_path(ipc[8], ipc[9], ipc[13]).str());
-            SAVE_SETTLE(s, true);
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(s, true) || !SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_PATH_NOT_FOUND : 0);
@@ -1179,7 +1294,8 @@ struct FsUser : Service {
             if (a->id == 10) { ipc.result(ERR_UNSUPPORTED, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             std::string path = a->host + sanitize(read_path(ipc[3], ipc[4], ipc[6]).str());
             if (!fsys::is_directory(path)) { VLOG("[fs] OpenDirectory %s: not found\n", path.c_str()); ipc.result(ERR_PATH_NOT_FOUND, 1, 2); ipc.handles(2, {nullptr}, true); break; }
-            SAVE_SETTLE(path, false);  // the sizes it lists come from storage
+            // The sizes it lists come from storage, which must contain the cached changes.
+            if (!SAVE_SETTLE(path, false)) { ipc.result(ERR_IO, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             auto ds = std::make_shared<DirSession>();
             for (auto &e : fsys::directory_iterator(path)) ds->entries.push_back(e);
             VLOG("[fs] OpenDirectory %s: %zu entries\n", path.c_str(), ds->entries.size());
@@ -1196,10 +1312,15 @@ struct FsUser : Service {
             // size in 512-byte blocks, directories, files, two bucket counts, duplicate data: after the archive's path in FormatSaveData
             const int at = ipc.cmd() == 0x084C ? 4 : 1;
             FS_NOTE("save: formatting");
-            SAVE_SETTLE(d, true);
+            if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
             fsys::remove_all(d, ec);
-            fsys::create_directories(d);
-            keep_format_info(d, {ipc[at] * 512, ipc[at + 1], ipc[at + 2], ipc[at + 5] & 0xff});
+            if (ec) { ipc.result(ERR_IO); break; }
+            const bool created = fsys::create_directories(d, ec);
+            if (ec || !keep_format_info(d, {ipc[at] * 512, ipc[at + 1], ipc[at + 2], ipc[at + 5] & 0xff})) {
+                if (created) fsys::remove(d, ec);
+                ipc.result(ERR_IO);
+                break;
+            }
             FS_NOTE("save: formatted");
             LOG("[fs] formatted save data at %s\n", d.c_str());
             save_changed(d);
@@ -1220,24 +1341,37 @@ struct FsUser : Service {
             ipc.set(5, info.duplicate);
             break;
         }
+        case 0x0830:    // legacy CreateExtSaveData(media, save id u64, icon size, directories, files, [icon])
+        case 0x0835:    // legacy DeleteExtSaveData(media, save id low)
         case 0x0851:    // CreateExtSaveData(info: media type, save id u64, unknown; directories, files, size limit u64, icon size, [icon])
         case 0x0852: {  // DeleteExtSaveData(info)
+            const bool legacy_create = ipc.cmd() == 0x0830;
+            const bool deleting = ipc.cmd() == 0x0835 || ipc.cmd() == 0x0852;
             char b[64];
-            snprintf(b, sizeof b, "/extdata/%08x%08x", ipc[3], ipc[2]);
+            snprintf(b, sizeof b, "/extdata/%08x%08x", ipc.cmd() == 0x0835 ? 0u : ipc[3], ipc[2]);
             const std::string d = save_root() + b;
-            if (ipc.cmd() == 0x0852) {  // what a game does before it makes its extra data anew ("initialize")
-                std::error_code ec;
-                SAVE_SETTLE(d, true);
+            std::error_code ec;
+            if (deleting) {  // what a game does before it makes its extra data anew ("initialize")
+                if (!SAVE_SETTLE(d, true)) { ipc.result(ERR_IO); break; }
                 fsys::remove_all(d, ec);
-                fsys::remove(d + ".format", ec);
+                if (!ec) fsys::remove(d + ".format", ec);
+                if (ec) { ipc.result(ERR_IO); break; }
             } else {
                 // The counts are asked back (GetFormatInfo), with no size, as for a save: answered with a save's defaults, Pokemon Ultra Sun
                 // called its extra data corrupted at every start after the first (2026-11-13).
-                fsys::create_directories(d);
-                keep_format_info(d, {0, ipc[5], ipc[6], 0});
+                const bool created = fsys::create_directories(d, ec);
+                if (ec || !keep_format_info(d, {legacy_create ? ~0u : 0u, ipc[5], ipc[6], 0})) {
+                    if (created) fsys::remove(d, ec);
+                    ipc.result(ERR_IO);
+                    break;
+                }
             }
             save_changed(d);
-            ipc.ok();
+            ipc.ok(1, legacy_create ? 2 : 0);
+            if (legacy_create) {
+                ipc.set(2, ipc[7]);
+                ipc.set(3, ipc[8]);
+            }
             break;
         }
         case 0x0812:  // GetFreeBytes

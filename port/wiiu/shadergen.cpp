@@ -201,6 +201,34 @@ void gen_lighting(Gen &g, const LightingState &l) {
 }
 }  // namespace
 
+void gen_tev(Gen &g, const DrawState &ds, bool scalar_dot = false) {
+    for (u32 li = 0; li < ds.tev_count; li++) {
+        const u32 si = ds.tev_list[li];
+        const TevStageState &t = ds.tev[si];
+        g.f("    { // stage %u\n      vec4 K = uKonst[%u];\n", si, si);
+        for (int k = 0; k < 3; k++) {
+            g.f("      vec3 cs%d = %s;\n", k, color_mod(t.cmod[k], src_expr(t.csrc[k])).c_str());
+            g.f("      float as%d = %s;\n", k, alpha_mod(t.amod[k], src_expr(t.asrc[k])).c_str());
+        }
+        if (t.cop == 6 || t.cop == 7)
+            g.f("      vec3 r = vec3(clamp(4.0 * %s(cs0 - 0.50196, cs1 - 0.50196), 0.0, 1.0));\n", scalar_dot ? "scalar_dot3" : "dot");
+        else
+            g.f("      vec3 r = %s;\n", combine(t.cop, "cs0", "cs1", "cs2", true).c_str());
+        if (t.cop == 7)
+            g.f("      float a = r.x;\n");
+        else if (t.aop == 6 || t.aop == 7)
+            g.f("      float a = 0.0;\n");
+        else
+            g.f("      float a = %s;\n", combine(t.aop, "as0", "as1", "as2", false).c_str());
+        if (t.cmul != 1) g.f("      r = min(r * %u.0, vec3(1.0));\n", t.cmul);
+        if (t.amul != 1) g.f("      a = min(a * %u.0, 1.0);\n", t.amul);
+        g.f("      outc = vec4(r, a);\n      buf = nxt;\n");
+        if (t.upd_rgb) g.f("      nxt.rgb = outc.rgb;\n");
+        if (t.upd_a) g.f("      nxt.a = outc.a;\n");
+        g.f("    }\n");
+    }
+}
+
 std::string gen_fs_glsl(const DrawState &ds) {
     Gen g;
     g.s = "#version 450\n";
@@ -358,31 +386,7 @@ std::string gen_fs_glsl(const DrawState &ds) {
     if (proctex) g.f("    if (uPt[2].w != 0.0) tx3 = pt_sample(c0 * uPt[2].x + c1 * uPt[2].y + c2 * uPt[2].z);\n");
     if (ds.lighting) gen_lighting(g, ds.light);
     g.f("    vec4 outc = uTevInit[0], buf = uTevInit[1], nxt = uTevInit[2];\n");
-    for (u32 li = 0; li < ds.tev_count; li++) {
-        const u32 si = ds.tev_list[li];
-        const TevStageState &t = ds.tev[si];
-        g.f("    { // stage %u\n      vec4 K = uKonst[%u];\n", si, si);
-        for (int k = 0; k < 3; k++) {
-            g.f("      vec3 cs%d = %s;\n", k, color_mod(t.cmod[k], src_expr(t.csrc[k])).c_str());
-            g.f("      float as%d = %s;\n", k, alpha_mod(t.amod[k], src_expr(t.asrc[k])).c_str());
-        }
-        if (t.cop == 6 || t.cop == 7)
-            g.f("      vec3 r = vec3(clamp(4.0 * dot(cs0 - 0.50196, cs1 - 0.50196), 0.0, 1.0));\n");
-        else
-            g.f("      vec3 r = %s;\n", combine(t.cop, "cs0", "cs1", "cs2", true).c_str());
-        if (t.cop == 7)
-            g.f("      float a = r.x;\n");
-        else if (t.aop == 6 || t.aop == 7)
-            g.f("      float a = 0.0;\n");
-        else
-            g.f("      float a = %s;\n", combine(t.aop, "as0", "as1", "as2", false).c_str());
-        if (t.cmul != 1) g.f("      r = min(r * %u.0, vec3(1.0));\n", t.cmul);
-        if (t.amul != 1) g.f("      a = min(a * %u.0, 1.0);\n", t.amul);
-        g.f("      outc = vec4(r, a);\n      buf = nxt;\n");
-        if (t.upd_rgb) g.f("      nxt.rgb = outc.rgb;\n");
-        if (t.upd_a) g.f("      nxt.a = outc.a;\n");
-        g.f("    }\n");
-    }
+    gen_tev(g, ds);
     if (ds.alpha_test) g.f("    { float A = floor(outc.a * 255.0 + 0.5), B = uDepth.z; if (!(%s)) discard; }\n", cmp_expr(ds.alpha_func));
     if (ds.fog)
         g.f("    { float fi = (%s) * 128.0; float fl = clamp(floor(fi), 0.0, 127.0);\n"
@@ -396,10 +400,12 @@ std::string gen_fs_glsl(const DrawState &ds) {
 // For combiner settings no run has logged: reads them from uniforms and does what gen_fs_glsl() would have compiled in, far more slowly, but with the right colours. A miss draws
 // with this until a build has its own shader. The plain fallbacks have no combiners, lighting or alpha test, so cut-outs draw solid and lit things go black. Supports 2D shadow comparison; leaves out cube maps,
 // cube shadow-map variants and procedural textures. Lit families support up to eight lights; specialized programs remain preferred.
-std::string uber_family_key(bool lit, u32 texture_mask) {
-    return std::string(lit ? "uber lit textures " : "uber textures ") + std::to_string(texture_mask & 7);
+std::string uber_family_key(bool lit, u32 texture_mask, int stages, u32 max_lights) {
+    std::string key = std::string(lit ? "uber lit textures " : "uber textures ") + std::to_string(texture_mask & 7);
+    if (stages >= 0) key += " stages " + std::to_string(stages) + " lights " + std::to_string(lit ? max_lights : 0);
+    return key;
 }
-std::string gen_uber_fs(bool lit, u32 texture_mask) {
+std::string gen_uber_fs(bool lit, u32 texture_mask, int stages, u32 max_lights) {
     std::string s = R"(#version 450
 layout(location = 0) in vec4 vColor;
 layout(location = 1) in vec4 vTc01;
@@ -644,14 +650,10 @@ void lighting() {
     nv = vl > 0.0 ? view * (1.0 / vl) : view;
     dsum = vec4(0.0, 0.0, 0.0, 1.0);
     ssum = vec4(0.0, 0.0, 0.0, 1.0);
-    if (uLit.x > 0) light(0);
-    if (uLit.x > 1) light(1);
-    if (uLit.x > 2) light(2);
-    if (uLit.x > 3) light(3);
-    if (uLit.x > 4) light(4);
-    if (uLit.x > 5) light(5);
-    if (uLit.x > 6) light(6);
-    if (uLit.x > 7) light(7);
+ )";
+    if (lit) for (u32 i = 0; i < std::min<u32>(max_lights, 8); ++i)
+        s += "    if (uLit.x > " + std::to_string(i) + ") light(" + std::to_string(i) + ");\n";
+    if (lit) s += R"(
     if (uLit2.w != 0) {
         if (uLit3.x != 0) dsum.a *= shadow.a;
         if (uLit3.y != 0) ssum.a *= shadow.a;
@@ -665,10 +667,13 @@ void lighting() {
     prim = clamp(vColor, 0.0, 1.0);
     fpc = fsc = vec4(0.0);
     vec2 c0 = vTc01.xy, c1 = vTc01.zw, c2 = vTc2w.xy;
-    vec2 u0 = c0 * uTexCoord[0].x + c1 * uTexCoord[0].y + c2 * uTexCoord[0].z;
+    // The selectors are one-hot. Selecting the coordinate directly avoids
+    // 0 * NaN/Inf from an unrelated varying contaminating a valid UV pair.
+    // uWrap[2].w is reserved for the live comparison; ordinary wrapping uses xy.
+    vec2 u0 = uWrap[2].w != 0 ? (uTexCoord[0].x != 0.0 ? c0 : uTexCoord[0].y != 0.0 ? c1 : c2) : c0 * uTexCoord[0].x + c1 * uTexCoord[0].y + c2 * uTexCoord[0].z;
     if (uUber.w != 0) u0 = u0 * (1.0 / vTc2w.z);
-    vec2 u1 = c0 * uTexCoord[1].x + c1 * uTexCoord[1].y + c2 * uTexCoord[1].z;
-    vec2 u2 = c0 * uTexCoord[2].x + c1 * uTexCoord[2].y + c2 * uTexCoord[2].z;
+    vec2 u1 = uWrap[2].w != 0 ? (uTexCoord[1].x != 0.0 ? c0 : uTexCoord[1].y != 0.0 ? c1 : c2) : c0 * uTexCoord[1].x + c1 * uTexCoord[1].y + c2 * uTexCoord[1].z;
+    vec2 u2 = uWrap[2].w != 0 ? (uTexCoord[2].x != 0.0 ? c0 : uTexCoord[2].y != 0.0 ? c1 : c2) : c0 * uTexCoord[2].x + c1 * uTexCoord[2].y + c2 * uTexCoord[2].z;
  )";
     // Null/unused units need no texture fetch or border test. Lighting retains
     // its own bump/shadow texture path; this mask specializes TEV inputs only.
@@ -691,12 +696,13 @@ void lighting() {
 )";
     if (lit) s += "    lighting();\n";
     s += R"(    outc = uTevInit[0]; buf = uTevInit[1]; nxt = uTevInit[2];
-    if (uUber.x > 0) stage(0);
-    if (uUber.x > 1) stage(1);
-    if (uUber.x > 2) stage(2);
-    if (uUber.x > 3) stage(3);
-    if (uUber.x > 4) stage(4);
-    if (uUber.x > 5) stage(5);
+ )";
+    for (int i = 0; i < (stages < 0 ? 6 : std::min(stages, 6)); ++i) {
+        if (stages < 0) s += "    if (uUber.x > " + std::to_string(i) + ") ";
+        else s += "    ";
+        s += "stage(" + std::to_string(i) + ");\n";
+    }
+    s += R"(
     if (uUber.y >= 0) {
         float A = floor(outc.a * 255.0 + 0.5), B = uDepth.z;
         int f = uUber.y;
@@ -714,6 +720,78 @@ void lighting() {
 }
 )";
     return s;
+}
+
+// Keep lighting, fog, alpha test, wrapping and texture coordinates dynamic,
+// but compile a known material's combiner program once on the PC. Constants,
+// colours and the TEV initial buffers still come from the current draw.
+u64 uber_material_key(const DrawState &ds, u32 max_lights) {
+    u32 ha = 0x4d415431, hb = 0x55c92e3b;  // material namespace, two 32-bit accumulators
+    auto word = [&](u32 v) {
+        ha = (ha ^ v) * 0x85EBCA6Bu;
+        hb = (hb + v) * 0xC2B2AE35u;
+        ha ^= hb >> 15;
+    };
+    u32 mask = 0;
+    for (u32 i = 0; i < 3; ++i) if (ds.need_tex[i] && !ds.tex[i].null_tex) mask |= 1u << i;
+    word(ds.lighting); word(mask); word(ds.lighting ? max_lights : 0); word(ds.tev_count);
+    for (u32 i = 0; i < ds.tev_count && i < 6; ++i) {
+        const u32 stage = ds.tev_list[i];
+        word(stage);
+        const auto &t = ds.tev[stage];
+        auto operands = [](u32 op) { return op == 4 || op == 8 || op == 9 ? 3u : op >= 1 && op <= 7 ? 2u : 1u; };
+        const u32 nc = operands(t.cop), na = t.cop == 7 || t.aop == 6 || t.aop == 7 ? 0 : operands(t.aop);
+        for (u32 k = 0; k < 3; ++k) {
+            word(k < nc ? t.csrc[k] : 0); word(k < na ? t.asrc[k] : 0);
+            word(k < nc ? t.cmod[k] : 0); word(k < na ? t.amod[k] : 0);
+        }
+        word(t.cop); word(t.cop == 7 ? 7 : t.aop == 6 || t.aop == 7 ? 6 : t.aop);
+        word(t.cmul); word(t.amul); word(t.upd_rgb); word(t.upd_a);
+    }
+    return (u64)ha << 32 | hb;
+}
+std::string gen_uber_material_fs(const DrawState &input, u32 max_lights) {
+    const DrawState ds = fs_normal(input);
+    for (u32 i = 0; i < ds.tev_count; ++i) for (u32 k = 0; k < 3; ++k) {
+        const auto &t = ds.tev[ds.tev_list[i]];
+        if (t.csrc[k] == 6 || t.asrc[k] == 6) return {};  // procedural texture needs its own uniform layout
+    }
+    u32 mask = 0;
+    for (u32 i = 0; i < 3; ++i) if (ds.need_tex[i] && !ds.tex[i].null_tex) mask |= 1u << i;
+    std::string source = gen_uber_fs(ds.lighting, mask, 0, max_lights);
+    Gen tev;
+    gen_tev(tev, ds, true);
+    const auto at = source.find("    if (uUber.y >= 0)", source.find("void main()"));
+    source.insert(at, tev.s);
+    return source;
+}
+
+// A second tier fixes structural lighting choices as well as TEV operations.
+// Uniform colours, positions, attenuation values and spotlight enable stay live.
+u64 uber_lighting_material_key(const DrawState &input, u32 max_lights) {
+    const DrawState ds = fs_normal(input);
+    if (!ds.need_shade || !ds.lighting) return 0;
+    u32 words[FS_KEY_WORDS];
+    fs_key_words(ds, words);
+    const u32 start = 5 + ds.tev_count * 5;
+    const u32 count = 9 + std::min<u32>(ds.light.num_lights, 8);
+    return uber_material_key(ds, max_lights) ^ fnv64(words + start, count * sizeof(u32)) ^ 0x6c69742d66616d31ull;
+}
+std::string gen_uber_lighting_material_fs(const DrawState &input, u32 max_lights) {
+    const DrawState ds = fs_normal(input);
+    if (!ds.lighting || (ds.light.shadow_enable && (ds.light.shadow_sel & 3) == 3) ||
+        ((ds.light.bump_mode == 1 || ds.light.bump_mode == 2) && (ds.light.bump_sel & 3) == 3)) return {};
+    std::string source = gen_uber_material_fs(ds, max_lights);
+    if (source.empty()) return {};
+    Gen lighting;
+    gen_lighting(lighting, ds.light);
+    // All dot products in the lighting emitter are vec3; use the same ordered
+    // scalar form as the generic lighting path for the host compiler.
+    for (size_t at = 0; (at = lighting.s.find("dot(", at)) != std::string::npos; at += 12)
+        lighting.s.replace(at, 4, "scalar_dot3(");
+    const auto at = source.find("    lighting();\n", source.find("void main()"));
+    source.replace(at, strlen("    lighting();\n"), lighting.s);
+    return source;
 }
 
 // a vertex shader's outputs to the rasterizer and its uniform block (uInt: loop counts, starts and steps), with more members after uInt

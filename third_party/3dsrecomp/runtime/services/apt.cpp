@@ -1,10 +1,17 @@
 // APT: applet manager. Only the application slot exists; the home menu and the applets are absent (library applets
 // run as HLE, system applets such as the browser close as soon as they start).
+#include <algorithm>
+#include <climits>
 #include <deque>
 
+#include "../mii_select.h"
 #include "../service.h"
 #include "../swkbd.h"
+#include "apt_mii_qr.h"
+#include "apt_wireless_reboot.h"
 #include "services.h"
+
+__attribute__((weak)) bool mii_select_shown() { return false; }
 
 namespace kernel {
 
@@ -64,12 +71,15 @@ static void system_applet_receive(u32 id, u32 signal) {
     send_parameter({id, 0x300, 10, nullptr, {}});  // WakeupByExit: back to the application
 }
 
-// The Mii selector returns the player's Mii (misc.cpp: the console account's, or a stand-in "Mario")
-static std::vector<u8> mii_selector_result() {
+// What the Mii selector returns (MiiSelectorReturn, 0x84 bytes): the Mii picked (misc.cpp), or none when the player cancelled
+static std::vector<u8> mii_selector_result(const std::array<u8, 0x60> *mii) {
     std::vector<u8> r(0x84, 0);
-    r[8] = r[9] = r[10] = r[11] = 0xFF;  // a Mii was selected (0), not a guest (0), guest index -1
-    const auto mii = player_mii();
-    memcpy(&r[0x0C], mii.data(), 0x60);
+    r[8] = r[9] = r[10] = r[11] = 0xFF;  // not a guest (4), guest index -1
+    if (!mii) {
+        r[0] = 1;  // no Mii selected
+        return r;
+    }
+    memcpy(&r[0x0C], mii->data(), 0x60);
     return r;
 }
 
@@ -141,12 +151,12 @@ static void swkbd_result(std::vector<u8> &cfg, ObjPtr mem, std::u16string text, 
     cfg[0x148] = (u8)text.size();
     cfg[0x149] = (u8)(text.size() >> 8);
     wr32(0x14C, 0);  // callback_result: OK
-    LOG("[apt] software keyboard: %s \"%s\"\n", ok ? "typed" : "cancelled", utf8(text).c_str());
+    LOG("[apt] software keyboard: %s (%zu UTF-16 units)\n", ok ? "typed" : "cancelled", text.size());
 }
 
 // true if the applet finished (else it waits for the player: swkbd::finish)
 static bool swkbd_run(u32 id, std::vector<u8> &cfg, ObjPtr mem) {
-    if (cfg.size() < 0x14C) return true;
+    if (cfg.size() < 0x150) return true;
     auto rd32 = [&](size_t o) { u32 v; memcpy(&v, &cfg[o], 4); return le32(v); };
     auto rd16s = [&](size_t o, size_t n) {
         std::u16string s;
@@ -193,11 +203,76 @@ static bool swkbd_run(u32 id, std::vector<u8> &cfg, ObjPtr mem) {
     return false;
 }
 
+// The game's MiiSelectorConf, held until the player picks a console Mii or cancels.
+// The 3DS whitelist addresses 100 database slots. An unrestricted request can also select the Wii U's extra Miis.
+namespace {
+std::mutex mii_m;  // guards the immutable request published to the port
+std::shared_ptr<const mii_select::Request> mii_req;
+std::vector<u32> mii_rows;  // the list's rows: which of console_miis() each is
+u32 mii_wait_id = 0;
+}  // namespace
+
+static void mii_select_run(u32 id, const std::vector<u8> &cfg) {
+    int personal = -1;
+    const auto &miis = console_miis(&personal);
+    const bool show = mii_select_shown();
+    const u8 *allowed = cfg.size() >= 0xFE ? cfg.data() + 0x9A : nullptr;
+    const bool all_allowed = !allowed || std::all_of(allowed, allowed + 100, [](u8 flag) { return flag != 0; });
+    if ((!show && all_allowed) || miis.empty() || cfg.size() < 0x94) {
+        LOG("[apt] Mii selector: returning the player's Mii\n");
+        const auto mii = player_mii();
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(&mii)});
+        return;
+    }
+    mii_select::Request r;
+    std::u16string title;
+    for (size_t o = 0x08; o + 1 < 0x88 && (cfg[o] | cfg[o + 1]); o += 2) title += (char16_t)(cfg[o] | cfg[o + 1] << 8);
+    r.title = utf8(title);
+    std::vector<int> slots(miis.size());
+    std::vector<u32> rows;
+    rows.reserve(miis.size());
+    for (u32 i = 0; i < miis.size(); i++) {
+        const int slot = slots[i] = mii_maker_place(i);
+        if (all_allowed || (slot >= 0 && slot < 100 && allowed[slot])) rows.push_back(i);
+    }
+    if (rows.empty()) {
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(nullptr)});
+        return;
+    }
+    // Bounded guest database order first, followed by overflow in console order.
+    const auto place = [&](u32 i) { return slots[i] < 0 ? INT_MAX : slots[i]; };
+    std::stable_sort(rows.begin(), rows.end(), [&](u32 a, u32 b) { return place(a) < place(b); });
+    const u32 first = cfg[0x90] | cfg[0x91] << 8 | cfg[0x92] << 16 | (u32)cfg[0x93] << 24;
+    std::vector<int> places;
+    places.reserve(rows.size());
+    for (const u32 i : rows) places.push_back(slots[i]);
+    const auto own = std::find(rows.begin(), rows.end(), (u32)personal);
+    r.initial = mii_select::initial_row(places, first, (int)(own - rows.begin()));
+    if (!show) {
+        const auto mii = console_mii(rows[r.initial]);
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(&mii)});
+        return;
+    }
+    r.entries.reserve(rows.size());
+    for (const u32 i : rows) {
+        const auto &m = miis[i];
+        std::u16string name;
+        for (size_t o = 0x1A; o < 0x2E && (m[o] | m[o + 1]); o += 2) name += (char16_t)(m[o] | m[o + 1] << 8);
+        r.entries.push_back({utf8(name), m});
+    }
+    r.can_cancel = cfg[0] != 0;
+    LOG("[apt] Mii selector: waiting for the player (%zu Miis, \"%s\")\n", rows.size(), r.title.c_str());
+    mii_wait_id = id;
+    mii_rows = std::move(rows);
+    auto request = std::make_shared<const mii_select::Request>(std::move(r));
+    std::lock_guard<std::mutex> g(mii_m);
+    mii_req = std::move(request);
+}
+
 static void applet_run(u32 id, std::vector<u8> buf, ObjPtr mem = nullptr) {
     u32 kind = id & 0xFF;
     if (kind == 0x02) {
-        LOG("[apt] Mii selector: returning the standard Mii\n");
-        send_parameter({id, 0x300, 10, nullptr, mii_selector_result()});
+        mii_select_run(id, buf);
         return;
     }
     if (kind == 0x06 && buf.size() >= 8) {
@@ -234,6 +309,36 @@ void swkbd::finish(const std::string &text, bool ok) {
     run_when_quiescent([w, t, ok] {
         swkbd_result(w->cfg, w->mem, t, ok);
         send_parameter({w->id, 0x300, 10, nullptr, std::move(w->cfg)});  // WakeupByExit
+    });
+    schedule_async();
+}
+
+std::shared_ptr<const mii_select::Request> mii_select::pending() {
+    std::lock_guard<std::mutex> g(kernel::mii_m);
+    return kernel::mii_req;
+}
+
+void mii_select::finish(const Request &request, int index) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    std::string name;
+    int mii = -1;  // which of console_miis()
+    {
+        std::lock_guard<std::mutex> g(mii_m);
+        if (mii_req.get() != &request || index < -1 ||
+            (index == -1 && !request.can_cancel) || (index >= 0 && (size_t)index >= mii_rows.size()))
+            return;
+        mii_req.reset();
+        if (index >= 0) {
+            name = request.entries[index].name;
+            mii = (int)mii_rows[index];
+        }
+    }
+    LOG("[apt] Mii selector: %s\n", mii >= 0 ? name.c_str() : "cancelled");
+    const u32 id = mii_wait_id;
+    run_when_quiescent([id, mii] {
+        const auto data = mii >= 0 ? console_mii((u32)mii) : std::array<u8, 0x60>{};
+        send_parameter({id, 0x300, 10, nullptr, mii_selector_result(mii >= 0 ? &data : nullptr)});  // WakeupByExit
     });
     schedule_async();
 }
@@ -366,6 +471,9 @@ struct AptService : Service {
         case 0x0044:  // GetSharedFont
             get_shared_font(ipc);
             break;
+        case 0x0045:  // GetWirelessRebootInfo
+            get_wireless_reboot_info(ipc);
+            break;
         case 0x004B: {  // AppletUtility(cmd, in_size, out_size, in static buffer)
             u32 out_size = ipc[3];
             u32 dst = ipc.static_buffer(0);
@@ -406,11 +514,31 @@ struct AptService : Service {
             unimplemented(ipc);
         }
     }
-    // Wrap seals data with a console key (AES-CCM) for the game to keep, Unwrap opens it again (Mario Kart 7 uses them). It never leaves
-    // this console, so the seal here is the data itself and a 16-byte check: what Wrap made opens, anything else fails as on a 3DS.
-    // Both keep the layouts: Wrap puts the nonce (taken from nonce offset) first and the check last; Unwrap puts the nonce back.
+    // Standard Mii QR data crosses consoles and requires the same authenticated format.
+    // Keep the legacy format for other requests so existing local saves remain readable.
     static void wrap(IPC &ipc, bool seal) {
         const u32 out_size = ipc[1], in_size = ipc[2], nonce_at = ipc[3], nonce_size = std::min<u32>(ipc[4] & ~3u, 12), in = ipc[6], out = ipc[8];
+#ifdef __WIIU__
+        if (nonce_at == apt_mii_qr::nonce_offset && nonce_size == apt_mii_qr::nonce_size &&
+            in_size == (seal ? apt_mii_qr::plain_size : apt_mii_qr::wrapped_size) &&
+            out_size == (seal ? apt_mii_qr::wrapped_size : apt_mii_qr::plain_size)) {
+            const u32 input_type = ipc[5] & 15;
+            if ((input_type != 0xA && input_type != 0xE) || in_size > (ipc[5] >> 4)) {
+                ipc.result(RES_INVALID_COMBINATION);
+                return;
+            }
+            if (!guest_readable_locked(in, in_size)) {
+                ipc.result(RES_INVALID_ADDRESS);
+                return;
+            }
+            if (const u32 error = ipc.mapped_output_error(7, out_size)) {
+                ipc.result(error);
+                return;
+            }
+            wrap_reply(ipc, apt_mii_qr::convert(seal, gptr(in), gptr(out)) ? 0 : 0xC9010401);
+            return;
+        }
+#endif
         auto check = [](const std::vector<u8> &d, u8 *mac) {  // two 64-bit FNV-1a hashes, forwards and backwards
             u64 a = 0xcbf29ce484222325ull, b = 0x84222325cbf29ce4ull;
             for (size_t i = 0; i < d.size(); i++) a = (a ^ d[i]) * 0x100000001b3ull, b = (b ^ d[d.size() - 1 - i]) * 0x100000001b3ull;
@@ -441,11 +569,14 @@ struct AptService : Service {
             res = 0xC9010401;
         }
         for (u32 i = 0; i < out_size && i < body.size(); i++) w8(out + i, body[i]);
+        wrap_reply(ipc, res);
+    }
+    static void wrap_reply(IPC &ipc, u32 res) {
         ipc.result(res, 1, 4);
-        ipc.set(2, (in_size << 4) | 0xA);
-        ipc.set(3, in);
-        ipc.set(4, (out_size << 4) | 0xC);
-        ipc.set(5, out);
+        ipc.set(2, (ipc[2] << 4) | 0xA);
+        ipc.set(3, ipc[6]);
+        ipc.set(4, (ipc[1] << 4) | 0xC);
+        ipc.set(5, ipc[8]);
     }
     void set_handles(IPC &ipc) {
         ipc.set(2, 1 << 26);  // copy 2 handles

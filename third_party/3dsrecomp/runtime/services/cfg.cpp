@@ -1,4 +1,6 @@
 // cfg: system configuration blocks (language, region, user name, ...).
+#include <fstream>
+
 #include "../loader.h"
 #include "../service.h"
 #include "../settings.h"
@@ -11,6 +13,16 @@ int g_system_language = -1;
 
 u32 cfg_languages() { return regions_languages(g_game.regions); }
 
+int cfg_menu_language(int chosen) {
+    static const int built = [] {
+        std::ifstream file(g_game.dir + "/language.txt");
+        int value;
+        char extra;
+        return file >> value && value >= 0 && value < 12 && !(file >> extra) ? value : -1;
+    }();
+    return pick_language(cfg_languages(), chosen, g_system_language, built);
+}
+
 // 0 JPN, 1 USA, 2 EUR, 3 AUS, 4 CHN, 5 KOR, 6 TWN: of the game's own regions (SMDH), one that has its language (languages.h)
 static u32 cfg_region() {
     if (const char *r = getenv("RECOMP_REGION")) return (u32)atoi(r);
@@ -18,20 +30,15 @@ static u32 cfg_region() {
 }
 
 // The game's language, the same all run, as a game may ask more than once (languages.h): the one picked in the options menu
-// (settings.ini), else the console's own
+// (settings.ini), then the build default and the console's own language.
 int cfg_language() {
     static const int language = [] {
-        if (const char *override = getenv("RECOMP_LANGUAGE")) {
+        if (const char *l = getenv("RECOMP_LANGUAGE")) {
             char *end;
-            const long value = strtol(override, &end, 10);
-            if (end != override && !*end && value >= 0 && value <= 11) return (int)value;
+            const long value = strtol(l, &end, 10);
+            if (end != l && !*end && value >= 0 && value < 12) return (int)value;
         }
-        int fallback = g_system_language;
-        std::ifstream file(g_game.dir + "/language.txt");
-        int value;
-        char extra;
-        if (file >> value && value >= 0 && value <= 11 && !(file >> extra)) fallback = value;
-        return pick_language(cfg_languages(), g_settings.language, fallback);
+        return cfg_menu_language(g_settings.language);
     }();
     return language;
 }

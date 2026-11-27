@@ -29,31 +29,59 @@ def romfs_files(path, want):
     """{path: bytes} of the RomFS image files whose name satisfies want(name)."""
     out = {}
     with open(path, 'rb') as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(0)
         hdr = f.read(0x28)
+        if len(hdr) != 0x28:
+            raise ValueError(f'{path}: truncated RomFS header')
         dir_meta_off, dir_meta_size = u32(hdr, 0x0C), u32(hdr, 0x10)
         file_meta_off, file_meta_size = u32(hdr, 0x1C), u32(hdr, 0x20)
         data_off = u32(hdr, 0x24)
+        limit = size if file_meta_size else (size + 15) & ~15  # older empty images can omit the padding
+        if not (u32(hdr, 0) == 0x28 <= dir_meta_off <= dir_meta_off + dir_meta_size
+                <= file_meta_off <= file_meta_off + file_meta_size <= min(size, data_off) and data_off <= limit):
+            raise ValueError(f'{path}: RomFS tables are outside the image')
         f.seek(dir_meta_off)
         dmeta = f.read(dir_meta_size)
         f.seek(file_meta_off)
         fmeta = f.read(file_meta_size)
 
-        def walk(doff, prefix):
+        seen_dirs, seen_files = set(), set()
+
+        def entry_name(table, at, fixed, seen):
+            if at in seen or at % 4 or at + fixed > len(table):
+                raise ValueError(f'{path}: repeated or out-of-bounds RomFS entry')
+            seen.add(at)
+            nlen = u32(table, at + fixed - 4)
+            start = at + fixed
+            if nlen % 2 or start + nlen > len(table):
+                raise ValueError(f'{path}: truncated RomFS entry name')
+            return table[start:start + nlen].decode('utf-16-le')
+
+        entry_name(dmeta, 0, 24, seen_dirs)
+        pending = [(0, '/')]
+        while pending:
+            doff, prefix = pending.pop()
             child, file = u32(dmeta, doff + 8), u32(dmeta, doff + 12)
             while file != 0xFFFFFFFF:
+                name = entry_name(fmeta, file, 32, seen_files)
                 fdata, fsize = struct.unpack_from('<QQ', fmeta, file + 8)
-                nlen = u32(fmeta, file + 28)
-                name = fmeta[file + 32:file + 32 + nlen].decode('utf-16-le')
+                if data_off + fdata + fsize > size:
+                    raise ValueError(f'{path}: RomFS file lies outside the image')
                 if want(name):
                     f.seek(data_off + fdata)
-                    out[prefix + name] = f.read(fsize)
+                    data = f.read(fsize)
+                    if len(data) != fsize:
+                        raise ValueError(f'{path}: truncated RomFS file')
+                    out[prefix + name] = data
                 file = u32(fmeta, file + 4)
+            children = []
             while child != 0xFFFFFFFF:
-                nlen = u32(dmeta, child + 20)
-                name = dmeta[child + 24:child + 24 + nlen].decode('utf-16-le')
-                walk(child, prefix + name + '/')
+                name = entry_name(dmeta, child, 24, seen_dirs)
+                children.append((child, prefix + name + '/'))
                 child = u32(dmeta, child + 4)
-        walk(0, '/')
+            pending.extend(reversed(children))
     return out
 
 

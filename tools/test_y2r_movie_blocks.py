@@ -28,7 +28,7 @@ int main() {
   s.u={0x80000,width*((height+1)/2)/2,width/2,5};
   s.v={0xa0000,width*((height+1)/2)/2,width/2,7};
   s.out={0x100000,width*height*4,unit,unit?1u:0u};
-  s.convert();
+  s.convert(0);
   // Include every output byte, patterned-DMA gaps and the surrounding guards.
   const u32 bytes=((height+7)/8)*width*8*4;
   const u32 span=bytes+(unit?(bytes-1)/unit:0);

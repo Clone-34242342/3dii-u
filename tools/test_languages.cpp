@@ -22,6 +22,9 @@ int main() {
     expect(pick_language(usa, -1, DE) == EN, "an American game on a German Wii U plays in English");
     expect(pick_language(usa, -1, FR) == FR && pick_language(usa, -1, ES) == ES, "an American game takes French and Spanish");
     expect(pick_language(eur, IT, DE) == IT, "the player's choice comes before the console's");
+    expect(pick_language(eur, IT, DE, ES) == IT && pick_language(eur, -1, DE, ES) == ES,
+           "the build chooses the default and a saved setting can override it");
+    expect(pick_language(usa, -1, FR, DE) == FR, "an unsupported build default falls back to the console");
     expect(pick_language(usa, DE, FR) == FR, "a choice the region lacks (a hand-edited settings.ini) is passed over");
     expect(pick_language(eur, 12, -1) == EN && pick_language(eur, -1, 99) == EN, "values out of range are passed over");
     expect(pick_language(region_languages(JPN), -1, EN) == JP, "a Japanese game is told Japanese");
@@ -40,6 +43,9 @@ int main() {
            "region-free games and Australia's are told Europe");
     expect(regions_languages(jue) == (region_languages(JPN) | eur) && regions_languages(0) == eur && regions_languages(1 << USA) == usa,
            "a game offers its regions' languages together");
+    expect(regions_languages(0x80) == eur && pick_region(0x80, EN) == EUR &&
+               regions_languages(0x80 | 1 << USA) == usa && pick_region(0x80 | 1 << USA, EN) == USA,
+           "reserved region bits do not become a region or leave the menu with no choices");
     if (failures) return 1;
     printf("game languages ok\n");
     return 0;
