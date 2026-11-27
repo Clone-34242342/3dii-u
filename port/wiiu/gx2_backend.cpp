@@ -343,10 +343,21 @@ std::atomic<int> viewport_nudge_override{-1};
 GX2PixelShader *uber_for(const DrawState &ds) {
     u32 mask = 0;
     for (u32 i = 0; i < 3; i++) if (ds.need_tex[i] && !ds.tex[i].null_tex) mask |= 1u << i;
-    if (bounded_fallback.load(std::memory_order_relaxed) && ds.tev_count <= 6) {
+    unsigned mode = bounded_fallback.load(std::memory_order_relaxed);
+    if (g_game.program_id == 0x000400000010bf00ULL && !ds.lighting && ds.alpha_test && ds.tev_count == 6) {
+        // Hardware draw trace: this Triple Deluxe UI combiner loses artwork
+        // with full and material fallback, while the bounded shader draws it.
+        u32 words[FS_KEY_WORDS];
+        const u32 count = fs_key_words(ds, words);
+        const u64 key = fnv64(words, count * sizeof(u32));
+        if ((key == 0x598ffe1f5c6d8746ULL || key == 0xd55e3b5a791ff5b0ULL)
+            && bounded_ps_gsh && ps_uber_bounded_index[0][mask][6][0] != MISSED)
+            mode = 1;
+    }
+    if (mode && ds.tev_count <= 6) {
         const u32 bucket = ds.lighting ? uber_light_bucket(std::min<u32>(ds.light.num_lights, 8)) : 0;
-        if (bounded_fallback.load(std::memory_order_relaxed) >= 2) {
-            const bool lighting = bounded_fallback.load(std::memory_order_relaxed) >= 3 && ds.lighting;
+        if (mode >= 2) {
+            const bool lighting = mode >= 3 && ds.lighting;
             const u64 material = uber_material_key(ds, kUberLightCaps[bucket]);
             const u64 keys[] = {lighting ? uber_lighting_material_key(ds, kUberLightCaps[bucket]) : 0,
                                 material_extension.load(std::memory_order_relaxed) ? material ^ kMaterialExtensionTag : 0,
@@ -396,7 +407,7 @@ bool gxt_cpu_tex;                     // a file named "cputex" in the data folde
 // lacked eleven, and the CPU shaded 47,000 vertices a frame, 3.5 fps in Cemu and about 2 on the user's console (2026-11-11).
 static bool glsl_vs = true;
 static bool glsl_force;  // "glslforce": the console's compiler is asked for every pixel shader the shipped set has too, which puts it under a real load in Cemu (it keeps the shipped ones)
-volatile bool uber_all;  // "uberall" (a file in the data folder, or set from the PC): every draw uses the uber shaders, which shows up a mistake in them
+std::atomic<bool> uber_all{false};  // "uberall" (a file in the data folder, or set from the PC): every draw uses the uber shaders, which shows up a mistake in them
 bool uber_fallback;  // a fragment state with no compiled shader draws with them
 bool stale_check;  // a file named "stalecheck": hashes each texture once a flip and logs those whose bytes changed with no notice. The renderer only looks again when told.
 // what the card thread still has to add to shader_misses.bin: this thread must never wait for the card
@@ -704,17 +715,25 @@ void load_shader_tables() {
 const DrawState *ps_last_ds;
 u64 ps_last_version;
 GX2PixelShader *ps_last;
-std::unordered_map<u64, GX2PixelShader *> ps_seen;
+struct SeenPixelShader {
+    GX2PixelShader *shader;
+    u64 fallback_epoch;  // zero for specialized programs, which survive fallback changes
+};
+std::unordered_map<u64, SeenPixelShader> ps_seen;
+u64 ps_fallback_epoch = 1;
+bool ps_last_forced;
 
 GX2PixelShader *find_ps(const DrawState &ds) {
     const DrawState *&last_ds = ps_last_ds;
     u64 &last_version = ps_last_version;
     GX2PixelShader *&last = ps_last;
-    if (&ds == last_ds && g.ds_version == last_version) return last;
+    const bool forced = uber_all.load(std::memory_order_relaxed);
+    if (&ds == last_ds && g.ds_version == last_version && forced == ps_last_forced) return last;
+    ps_last_forced = forced;
     last_ds = &ds;
     last_version = g.ds_version;
-    GX2PixelShader *uber = uber_all ? uber_for(ds) : nullptr;
-    if (uber_all && uber && ds.need_shade) return last = uber;
+    GX2PixelShader *uber = forced && ds.need_shade ? uber_for(ds) : nullptr;
+    if (uber) return last = uber;
     // Nearly every state has been seen before, and a quick hash finds it. The shaders' own keys are hashed a byte at a time, slow on this CPU.
     u32 words[FS_KEY_WORDS];
     const u32 nwords = fs_key_words(ds, words);
@@ -724,9 +743,10 @@ GX2PixelShader *find_ps(const DrawState &ds) {
         hb = (hb + words[i]) * 0xC2B2AE35u;
         ha ^= hb >> 15;
     }
-    std::unordered_map<u64, GX2PixelShader *> &seen = ps_seen;
     const u64 quick = (u64)ha << 32 | hb;
-    if (const auto s = seen.find(quick); s != seen.end()) return last = s->second;
+    if (const auto s = ps_seen.find(quick); s != ps_seen.end()
+        && (!s->second.fallback_epoch || s->second.fallback_epoch == ps_fallback_epoch))
+        return last = s->second.shader;
     const std::string k((const char *)words, nwords * 4);
     const u64 h = fnv64(k.data(), k.size());
     auto it = ps_table.find(h);
@@ -773,7 +793,7 @@ GX2PixelShader *find_ps(const DrawState &ds) {
         miss_put(k.data(), k.size());
         if ((ds.need_shade || ds.wbuffer || ds.scissor_mode == 1) && shader_compile_on()) shader_compile_request(false, compile_key, gen_fs_glsl(normalized), 0);  // gfx_pump installs it under the same canonical key
     }
-    seen[quick] = r;
+    ps_seen[quick] = {r, fallback ? ps_fallback_epoch : 0};
     last = r;
     return r;
 }
@@ -854,7 +874,7 @@ void install_compiled() {
             p.shader = d.ps_shader;
             p.index = COMPILED_HERE;
             GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, p.shader->program, p.shader->size);
-            ps_seen.clear();  // states that found the fallback look again
+            ++ps_fallback_epoch;  // fallback states look again; exact programs stay cached
             ps_last_ds = nullptr;
         }
     }
@@ -3986,9 +4006,11 @@ static void report_frame_pacing(OSTime began) {
     const OSTime now = OSGetSystemTime();
     if (!previous) { previous = start = now; return; }
     const u32 gap = (u32)OSTicksToMicroseconds(now - previous);
-    if (gap > 50000)
+    if (gap > 50000) {
         LOG("[pace-gap] gap %u us; before present %u us; present %u us\n", gap,
             (u32)OSTicksToMicroseconds(began - previous), (u32)OSTicksToMicroseconds(now - began));
+        if (wiiu::av_timing_enabled()) kernel::gsp_report_frame_gap();
+    }
     previous = now;
     longest = std::max(longest, gap);
     const u32 bucket = gap <= 20000 ? 0 : gap <= 35000 ? 1 : gap <= 50000 ? 2 : gap <= 67000 ? 3 : gap <= 100000 ? 4 : 5;
@@ -4038,7 +4060,7 @@ void present() {
     }
     if (forget_ps) {
         forget_ps = false;
-        ps_seen.clear();
+        ++ps_fallback_epoch;
         ps_last_ds = nullptr;
     }
     if (g_settings.show_fps) draw_fps();
@@ -6637,7 +6659,13 @@ void gfx_pump(bool quiet) {
     vblank_pending = false;
     show_lcd_from_memory();
     show_bottom_lcd();
+    const OSTime install_start = wiiu::av_timing_enabled() ? OSGetSystemTime() : 0;
     install_compiled();
+    if (install_start) {
+        const auto elapsed = OSTicksToMicroseconds(OSGetSystemTime() - install_start);
+        if (elapsed >= 5000)
+            LOG("[pace-shader-install] %llu us\n", (unsigned long long)elapsed);
+    }
     if (report_due.exchange(false)) write_report();
     shader_compile_watch();
     u32 mii_layout = 0;
@@ -6741,8 +6769,7 @@ bool gfx_set(const char *name, u32 v) {
         forget_ps = true;
     }
     else if (!strcmp(name, "uberall") && v <= 1) {
-        uber_all = v;
-        forget_ps = true;
+        uber_all.store(v != 0, std::memory_order_relaxed);
     }
     else if (!strcmp(name, "uberfb")) {
         uber_fallback = v;
@@ -6871,7 +6898,7 @@ static void write_report() {
     LOG("[fragment-route] specialized %llu; generic unlit %llu lit %llu; simple %llu; material %llu; lighting %llu; extension %llu; bounded %u; forced %u\n",
         (unsigned long long)st_fragment_specialized, (unsigned long long)st_fragment_fallback[0],
         (unsigned long long)st_fragment_fallback[1], (unsigned long long)st_fragment_simple, (unsigned long long)st_material_draws, (unsigned long long)st_lighting_draws, (unsigned long long)st_extension_draws,
-        (unsigned)bounded_fallback.load(std::memory_order_relaxed), (unsigned)uber_all);
+        (unsigned)bounded_fallback.load(std::memory_order_relaxed), (unsigned)uber_all.load(std::memory_order_relaxed));
     for (u32 lit = 0; lit < 2; ++lit) for (u32 stages = 0; stages <= 6; ++stages) for (u32 bucket = 0; bucket < 5; ++bucket) {
         auto &count = st_fallback_shape[lit][stages][bucket];
         if (count) LOG("[fragment-family] lit %u stages %u light_cap %u draws %llu\n", lit, stages, kUberLightCaps[bucket], (unsigned long long)count);
