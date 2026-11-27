@@ -757,7 +757,7 @@ try:
                 state.setWupUpdateParts(parts)
                 enqueue('Native update')
                 job = state.jobs[0]
-                assert job.output.endswith('Native update_NativeWUP_Update')
+                assert job.output.endswith(os.path.normcase('Native update_NativeWUP_Update'))
                 assert job.argv[job.argv.index('--output-format') + 1] == 'wup-update'
                 assert job.argv[job.argv.index('--wup-update-parts') + 1] == parts
                 assert '--otp' in job.argv and '--homebrew-parts' not in job.argv
