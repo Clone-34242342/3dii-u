@@ -26,6 +26,14 @@ for HTTPS verification. nlohmann/json 3.11.2 (MIT) is vendored in
 HTTP/TLS discovery and authentication; they are not required to enable networking
 when the user leaves wireless Off.
 
+## Open-source country-list replacement
+
+`third_party/system_archives` contains the country-list generator/data from
+[B3n30/citra_system_archives](https://github.com/B3n30/citra_system_archives),
+revision `bbe60b5477fc8d7f317d9a82a9f2e6a789af931c`, copyright 2018 Weiyi Wang,
+GPL-2.0-or-later. Its generated country-list RomFS, source, data and licence are
+bundled with the Builder. A valid user-supplied archive takes precedence.
+
 ## Summary
 
 | Component | Version | Authors | Licence | Copyleft | How it's used |

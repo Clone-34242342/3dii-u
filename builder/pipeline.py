@@ -552,11 +552,17 @@ def build(a):
     for d in plain.values():
         d.f.close()
     shutil.rmtree(tmp, ignore_errors=True)
+    with open(os.path.join(game_dir, 'code.bin'), 'rb') as source:
+        required_archives = dumps.archives_named(source.read())
+    try:
+        supplied = dumps.install_system_fallbacks(archives, required_archives, ROOT)
+        if supplied: print('Bundled open-source system archives: ' + ', '.join(supplied), flush=True)
+    except (OSError, dumps.DumpError) as e:
+        fail(str(e))
     if not partial and not dumps.have_system_archives(archives):  # a Miitopia built without them stopped on the console with FS "not found" (Nov 9)
         fail('The 3DS system files are missing: the Mii data, without which Mii games stop, and the shared font. Give --emulator Azahar\'s '
              'user folder (after its File > Set Up System Files) or the 0004009b folder GodMode9 copies off your 3DS (title, in CTRNAND).')
-    with open(os.path.join(game_dir, 'code.bin'), 'rb') as f:  # and what this game's own code names of them (dumps.archives_named)
-        lacking = [t for t in dumps.archives_named(f.read()) if not dumps.have_system_archives(archives, (t,))]
+    lacking = [t for t in required_archives if not dumps.have_system_archives(archives, (t,))]
     if lacking and not partial:
         t = lacking[0]
         fail(f'This game needs {dumps.ARCHIVE_NAMES.get(t, "a font")} to start. Your 3DS system files are missing a readable copy. '
