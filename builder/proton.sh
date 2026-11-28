@@ -34,4 +34,12 @@ icu="$(dirname -- "$proton")/files/lib/wine/x86_64-windows/icu.dll"
 if [[ ! -e "$system32/icuuc.dll" && -f "$icu" ]]; then
     ln -sfn -- "$icu" "$system32/icuuc.dll"
 fi
+# Proton's default prefix can alias the missing Segoe UI font to Times New
+# Roman. Use its supplied sans-serif replacement in this dedicated prefix.
+if [[ ! -f "$STEAM_COMPAT_DATA_PATH/3dii-fonts-v1" ]]; then
+    for font in 'Segoe UI' 'Segoe UI Semibold'; do
+        "$proton" run reg add 'HKCU\Software\Wine\Fonts\Replacements' /v "$font" /t REG_SZ /d Arial /f
+    done
+    touch "$STEAM_COMPAT_DATA_PATH/3dii-fonts-v1"
+fi
 exec "$proton" run "$exe" "$@"
