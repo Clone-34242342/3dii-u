@@ -240,6 +240,10 @@ def archive_app(name):
 
 
 def main():
+    import PySide6
+    if sys.platform == 'win32' and PySide6.__version__ != '6.11.3':
+        sys.exit('Windows packages require the Proton-tested Qt 6.11.3 runtime. '
+                 'Run: python -m pip install -r builder/requirements-windows.txt')
     import PyInstaller.__main__
     import gui
     release = release_tag(sys.argv, gui.VERSION)
