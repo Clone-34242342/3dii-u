@@ -5,7 +5,13 @@
 #include "azl/dlp_hub.hpp"
 #include "azl/dlp_real_net.hpp"
 
+namespace wiiu::network { struct Config; struct Live; struct ChatLine; bool wireless_enabled(); }
 namespace kernel {
+wiiu::network::Live room_menu_view();
+std::vector<wiiu::network::ChatLine> room_chat_view();
+void room_chat_send(const std::string &);
+std::string configure_room_uds(const wiiu::network::Config &, const std::string &);
+std::string disconnect_room_uds();
 bool register_room_uds();
 void register_room_dlp();
 void start_room_uds();
@@ -17,7 +23,7 @@ struct UdsContext {
     azl::UdsEngine engine{
         &events, {
             [this](azl::WifiPacket &packet) {
-                if (!room.joined()) return;
+                if (!wiiu::network::wireless_enabled() || !room.joined()) return;
                 packet.transmitter_address = room.mac();
                 room.SendWifiPacket(packet);
             },
@@ -29,7 +35,7 @@ struct UdsContext {
     // Destroy the worker before the engine and DLP objects its callbacks use.
     azl::RoomClient room;
     UdsContext() {
-        room.SetWifiCallback([this](const azl::WifiPacket &packet) { engine.OnWifiPacket(packet); });
+        room.SetWifiCallback([this](const azl::WifiPacket &packet) { if(wiiu::network::wireless_enabled())engine.OnWifiPacket(packet); });
     }
 };
 
@@ -43,6 +49,7 @@ public:
     explicit UdsService(std::shared_ptr<UdsContext> ctx)
         : Service("nwm::UDS"), context(std::move(ctx)) {}
     void handle(IPC &ipc) override {
+        if (!wiiu::network::wireless_enabled() && ipc.cmd() != 0x03 && ipc.cmd() != 0x0b) { ipc.result(azl::res::kWirelessOff); return; }
         auto &engine = context->engine;
         auto &events = context->events;
         events.Publish();

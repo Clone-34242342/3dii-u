@@ -522,7 +522,7 @@ void RoomClient::Run(Config config, u32 generation) {
         game_info.queued_ms = platform::NowMs();
         TxQueue::Item join;
         join.bytes = room::EncodeJoinRequest(config.nickname, config.console_id_hash, config.preferred_mac,
-                                             config.password, "");
+                                             config.password, config.authentication_token);
         join.queued_ms = game_info.queued_ms;
         platform::LockGuard lock(mutex_);
         tx_.PushFront(std::move(game_info));

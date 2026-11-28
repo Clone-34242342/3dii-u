@@ -47,6 +47,9 @@
 #include "kernel.h"
 #include "loader.h"
 #include "menu_shortcut.h"
+#include "network_menu.h"
+#include "network_keyboard.h"
+#include "network_settings.h"
 #include "wup_update_guard.h"
 #include "motion_input.h"
 #include "service.h"
@@ -485,9 +488,12 @@ static int hid_thread(int, void *) {
     s16 cx = 0, cy = 0;
     bool touch = false;
     u16 tx = 0, ty = 0;
+    u16 network_px=0,network_py=0;
+    bool network_touch=false;
     for (;;) {
         u32 presses = 0;  // the GamePad's way, from either, for the options menu
         bool toggle_menu = false;
+        float network_ry = pad_ry;
         bool tap = false;  // a touch on the GamePad began, at px, py
         u16 px = 0, py = 0;
         VPADReadError err = VPAD_READ_SUCCESS;
@@ -497,12 +503,15 @@ static int hid_thread(int, void *) {
             pad_held = 0;
             pad_x = pad_y = pad_rx = pad_ry = 0;
             touch = touch_was = false;
+            network_touch=false;
             wiiu::mic_blow(false);
         }
         if (err == VPAD_READ_SUCCESS) {
             pad_held = st.hold;
             pad_rx = st.rightStick.x;
             pad_ry = st.rightStick.y;
+            wiiu::network_keyboard::input(st);
+            network_ry = st.rightStick.y;
             presses |= st.trigger;
             toggle_menu = overlay_pressed(st.trigger, st.hold);
             wiiu::mic_blow(st.hold & VPAD_BUTTON_STICK_R);
@@ -520,6 +529,8 @@ static int hid_thread(int, void *) {
                 down = true;
                 wiiu::touch_to_bottom(px, py, touch, tx, ty);
             }
+            if(down){network_px=px;network_py=py;}
+            network_touch = down;
             tap = down && !touch_was;
             touch_was = down;
         }
@@ -536,6 +547,7 @@ static int hid_thread(int, void *) {
                 pro_y[ch] = ks.pro.leftStick.y;
                 pro_rx[ch] = ks.pro.rightStick.x;
                 pro_ry[ch] = ks.pro.rightStick.y;
+                if(std::abs(pro_ry[ch])>std::abs(network_ry))network_ry=pro_ry[ch];
                 const u32 down = pro_as_gamepad(ks.pro.trigger);
                 presses |= down;
                 toggle_menu |= overlay_pressed(down, pro_as_gamepad(pro_hold[ch]));
@@ -563,9 +575,16 @@ static int hid_thread(int, void *) {
         cx = (s16)(sx * 156.0f);
         cy = (s16)(sy * 156.0f);
         const bool menu_was_open = wiiu::menu_open();
+        if(wiiu::network_menu::active()) {
+            static OSTime last_network_input;
+            const auto now=OSGetSystemTime();
+            float seconds=last_network_input?OSTicksToMicroseconds(now-last_network_input)/1000000.f:0.016f;
+            last_network_input=now;
+            wiiu::network_menu::pointer(network_touch,network_px,network_py,network_ry,seconds);
+        }
         wiiu::menu_input(presses, toggle_menu);
         const bool menu_took_input = menu_was_open || wiiu::menu_open();
-        if (!menu_took_input) {
+        if (!menu_took_input || wiiu::network_keyboard::active()) {
             wiiu::keyboard_input(presses, tap, px, py);
             wiiu::mii_selector_input(presses, tap, px, py);
         }
@@ -1135,7 +1154,7 @@ void frontend_run() {
         GX2WaitForVsync();  // the guest's VBlank is the TV's, so frames line up with its refresh
         kernel::timers_poke();  // a timer whose wake-up went missing, whatever the reason, costs a frame rather than the game: frames carry on even when everything else waits
         // the game waits for VBlank, so it pauses while the menu is open; faster speeds get more VBlanks per TV frame
-        if (!wiiu::menu_open()) {
+        if (!wiiu::menu_open() || wiiu::network_menu::active() || wiiu::network::connected()) {
             const int extra = wiiu::game_speed() / 100 - 1;
             for (int i = 0; i < extra; i++) {
                 kernel::gsp_vblank();

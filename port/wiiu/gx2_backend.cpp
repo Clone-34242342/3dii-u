@@ -33,6 +33,12 @@
 #include <whb/gfx.h>
 
 #include "uber_family.h"
+#include "network_menu.h"
+#include "chat_border.h"
+#include "azl/platform.hpp"
+#include "network_settings.h"
+#include "network_keyboard.h"
+#include "network_menu_model.h"
 
 #include <algorithm>
 #include <array>
@@ -82,6 +88,9 @@ extern "C" void GX2SampleBottomGPUCycle(uint64_t *cycle);
 extern "C" uint64_t GX2GPUTimeToCPUTime(uint64_t time);
 
 namespace wiiu {
+bool keyboard_open();
+bool chat_visible();
+void draw_chat_on(GX2ColorBuffer *);
 #ifdef RECOMP_RESUMABLE
 void draw_state_saving_on(GX2ColorBuffer *cb);
 bool state_loading_visible();
@@ -3937,7 +3946,12 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
     }
     if (to.surface.image) GX2CopySurface(&from->surface, 0, 0, &to.surface, 0, 0);
 #ifdef RECOMP_RESUMABLE
-    const bool overlay = checkpoint::saving_to_disk() || wiiu::state_loading_visible();
+    const bool saving_overlay = checkpoint::saving_to_disk() || wiiu::state_loading_visible();
+#else
+    const bool saving_overlay = false;
+#endif
+    const bool chat_overlay = target == GX2_SCAN_TARGET_DRC && wiiu::chat_visible();
+    const bool overlay = saving_overlay || chat_overlay;
     static bool visible[2];
     const unsigned screen = target == GX2_SCAN_TARGET_DRC;
     if (overlay != visible[screen]) {
@@ -3955,13 +3969,15 @@ void to_screen(GX2ColorBuffer *from, GX2ScanTarget target) {
         // HLE copy does not reproduce this state change.
         restore_context();
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, from->surface.image, from->surface.imageSize);
-        wiiu::draw_state_saving_on(from);
+        if(chat_overlay) wiiu::draw_chat_on(from);
+#ifdef RECOMP_RESUMABLE
+        if(saving_overlay) wiiu::draw_state_saving_on(from);
+#endif
         GX2CopyColorBufferToScanBuffer(from, target);
         GX2CopySurface(&to.surface, 0, 0, &from->surface, 0, 0);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, from->surface.image, from->surface.imageSize);
         return;
     }
-#endif
     GX2CopyColorBufferToScanBuffer(to.surface.image ? &to : from, target);
 }
 
@@ -5521,7 +5537,7 @@ void gfx_vblank() { vblank_pending = true; }
 // A game that's held to a frame rate (cap_game) has a line to let it run free, between the volume and quitting: its cutscenes are timed for
 // that rate, the rest of it may look better without (the user, 2026-11-14)
 static int menu_items() {
-    return (cap_game ? 10 : 9)
+    return (cap_game ? 11 : 10)
 #ifdef RECOMP_RESUMABLE
         + 2
 #endif
@@ -5595,8 +5611,18 @@ void menu_input(u32 pressed, bool toggle) {
         }
         return;
     }
+    if (network_menu::active()) {
+        if(toggle && !network_keyboard::active()) {network_menu::close();return;}
+        network_menu::buttons(pressed);return;
+    }
     if (toggle || (pressed & VPAD_BUTTON_B)) { menu_is_open = false; return; }
     const int count = menu_items();
+#ifdef RECOMP_CLASSIC_MENU
+    const int network_item=count-2;
+#else
+    const int network_item=count-4;
+#endif
+    if(menu_item==network_item && (pressed&VPAD_BUTTON_A)) {network_menu::open();return;}
     if (pressed & VPAD_BUTTON_UP) menu_item = (menu_item + count - 1) % count;
     if (pressed & VPAD_BUTTON_DOWN) menu_item = (menu_item + 1) % count;
     const int dir = (pressed & VPAD_BUTTON_RIGHT) ? 1 : (pressed & VPAD_BUTTON_LEFT) ? -1 : 0;
@@ -5663,7 +5689,7 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     set_blit_colors(0, 0, 0, 0.42f, 0.27f, 0.08f);
     draw_rect(w, h, 127, 60, 727, 104, 0, 0, 1, 1);
     const int count = menu_items();
-    const float rowh = count > 10 ? 27 : count == 10 ? 33 : 36, top = 114;  // a tenth line (the frame limit): closer together, in the same box
+    const float rowh = count > 12 ? 24 : count > 10 ? 27 : count == 10 ? 33 : 36, top = 114;  // a tenth line (the frame limit): closer together, in the same box
     set_blit_colors(0, 0, 0, 1.0f, 0.45f, 0.0f);
     draw_rect(w, h, 145, top + menu_item * rowh - 4, 709, top + menu_item * rowh + (count > 10 ? 27 : count == 10 ? 32 : 38), 0, 0, 1, 1);
     GX2SetPixelTexture(&font_tex, 0);
@@ -5690,13 +5716,14 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
         snprintf(cap, sizeof cap, "MODE: %s", modes[std::clamp(g_settings.wiiu_render_mode, 0, 2)]);
     } else if (cap_fps) snprintf(cap, sizeof cap, "FRAME LIMIT: %u", (unsigned)cap_fps);
     else snprintf(cap, sizeof cap, "FRAME LIMIT: OFF");
-    const char *items[12] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF"};
+    const char *items[16] = {"BACK TO THE GAME", line, vol, lang, tv, pad, res, g_settings.show_fps ? "FPS COUNTER: ON" : "FPS COUNTER: OFF"};
     int item_count = 8;
     if (cap_game) items[item_count++] = cap;
 #ifdef RECOMP_RESUMABLE
     items[item_count++] = "SAVE STATE";
     items[item_count++] = checkpoint::has_state() ? "LOAD STATE" : "LOAD STATE (EMPTY)";
 #endif
+    items[item_count++] = "NETWORK SETTINGS";
     items[item_count++] = "QUIT TO WII U MENU";
     for (int i = 0; i < item_count; i++) {
         draw_text(w, h, items[i], 165, top + i * rowh + 4, count > 10 ? 3 : 4);
@@ -5767,8 +5794,8 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     snprintf(res, sizeof res, "%dp", g_settings.resolution);
     if (cap_fps) snprintf(cap, sizeof cap, "%u fps", (unsigned)cap_fps);
     else snprintf(cap, sizeof cap, "Off");
-    const char *labels[14] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit"};
-    const char *values[14] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
+    const char *labels[16] = {"Back to Game", "Game Speed", "Volume", "Language", "TV Display", "GamePad Display", "Resolution", "FPS Counter", "Frame Limit"};
+    const char *values[16] = {"", speed, vol, k_languages[menu_language()], k_tv_layouts[tv_layout % screens::kTvLayouts],
                               k_pad_layouts[pad_layout % screens::kPadLayouts], res, g_settings.show_fps ? "On" : "Off", cap};
     if (cap_game && has_darkmoon_profile()) {
         const char *modes[] = {"Balanced", "Sharp", "Fast"};
@@ -5780,6 +5807,7 @@ static void draw_menu_on(GX2ColorBuffer *cb) {
     labels[state_item] = "Save State";
     labels[state_item + 1] = checkpoint::has_state() ? "Load State" : "Load State (Empty)";
 #endif
+    labels[count - 4] = "Network settings";
     labels[count - 3] = "Back up Save to SD Card";
     labels[count - 2] = menu_restore_confirm ? "Confirm Restore Next Start (A)" : "Restore Newest Backup Next Start";
     labels[quit] = "Return to Wii U Menu";
@@ -5936,7 +5964,88 @@ void draw_state_saving_on(GX2ColorBuffer *cb) {
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER,cb->surface.image,cb->surface.imageSize);
 }
 #endif
+// Render on the temporary scanout copy, then restore the clean picture. A
+// paused game therefore cannot retain an expired chat card in its borders.
+static std::vector<std::string> border_chat;
+static screens::Rect border_chat_box;
+bool chat_visible() {
+    static u32 last_poll;
+    static int last_layout=-1,last_side;
+    static std::vector<network::ChatLine> lines;
+    if(!network::connected()){last_poll=0;return false;}
+    if(!network::chat_side() || menu_is_open || keyboard_open() || mii_selector_open())return false;
+    if(!network::chat_border(pad_layout,network::chat_side()==1,854,480,border_chat_box))return false;
+    const u32 now=azl::platform::NowMs();
+    const bool poll=!last_poll || now-last_poll>=250;
+    if(poll){lines=network::chat();last_poll=now;}
+    if(!poll && last_layout==pad_layout && last_side==network::chat_side())return !border_chat.empty();
+    last_layout=pad_layout;last_side=network::chat_side();
+    border_chat.clear();
+    const unsigned scale=border_chat_box.w<180?1:2;
+    const unsigned columns=std::max(1u,(border_chat_box.w-12)/(6*scale));
+    const unsigned rows=(border_chat_box.h-12)/(9*scale);
+    for(const auto &line:lines) if(now-line.when<15000) {
+        for(size_t at=0;at<line.text.size();at+=columns)
+            border_chat.push_back(line.text.substr(at,columns));
+    }
+    if(border_chat.size()>rows)border_chat.erase(border_chat.begin(),border_chat.end()-rows);
+    return !border_chat.empty();
+}
+void draw_chat_on(GX2ColorBuffer *cb) {
+    const auto &r=border_chat_box;
+    const unsigned scale=r.w<180?1:2;
+    const u32 height=12+border_chat.size()*9*scale,y=r.y+r.h-height;
+    GX2SetColorBuffer(cb,GX2_RENDER_TARGET_0);cur_color=nullptr;begin_blit();
+    GX2SetViewport(0,0,cb->surface.width,cb->surface.height,0,1);
+    GX2SetScissor(0,0,cb->surface.width,cb->surface.height);
+    GX2SetPixelTexture(&black_tex,0);GX2SetPixelSampler(&blit_sampler,0);
+    set_blit_colors(0,0,0,1,1,1);draw_rect(854,480,r.x,y,r.x+r.w,y+height,0,0,1,1);
+    GX2SetPixelTexture(&font_tex,0);GX2SetPixelSampler(&lut_sampler,0);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY,1,FALSE,TRUE);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0,GX2_BLEND_MODE_SRC_ALPHA,GX2_BLEND_MODE_INV_SRC_ALPHA,GX2_BLEND_COMBINE_MODE_ADD,FALSE,GX2_BLEND_MODE_ONE,GX2_BLEND_MODE_ZERO,GX2_BLEND_COMBINE_MODE_ADD);
+    set_blit_colors(0,0,0,0,0,0);
+    for(size_t i=0;i<border_chat.size();i++)draw_text(854,480,border_chat[i].c_str(),r.x+6,y+6+i*9*scale,scale);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER,cb->surface.image,cb->surface.imageSize);
+}
+static void draw_network_on(GX2ColorBuffer *cb) {
+    const auto view=network_menu::view();
+    const float w=854,h=480;
+    GX2SetColorBuffer(cb,GX2_RENDER_TARGET_0);cur_color=nullptr;begin_blit();
+    GX2SetViewport(0,0,cb->surface.width,cb->surface.height,0,1);
+    GX2SetScissor(0,0,cb->surface.width,cb->surface.height);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY,1,FALSE,TRUE);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0,GX2_BLEND_MODE_SRC_ALPHA,GX2_BLEND_MODE_INV_SRC_ALPHA,GX2_BLEND_COMBINE_MODE_ADD,FALSE,GX2_BLEND_MODE_ONE,GX2_BLEND_MODE_ZERO,GX2_BLEND_COMBINE_MODE_ADD);
+    auto rect=[&](float x,float y,float width,float height,float r,float g,float b){
+        GX2SetPixelTexture(&black_tex,0);GX2SetPixelSampler(&blit_sampler,0);set_blit_colors(0,0,0,r,g,b);draw_rect(w,h,x,y,x+width,y+height,0,0,1,1);
+    };
+    auto text=[&](std::string value,float x,float y,int scale,float r,float g,float b,unsigned max){
+        if(value.size()>max)value=value.substr(0,max-3)+"...";
+        for(char &c:value)if(static_cast<unsigned char>(c)<32)c=' ';
+        GX2SetPixelTexture(&font_tex,0);GX2SetPixelSampler(&lut_sampler,0);set_blit_colors(r,g,b,0,0,0);draw_text(w,h,value.c_str(),x,y,scale);
+    };
+    rect(0,0,w,h,.08f,.13f,.23f);rect(0,0,w,58,.12f,.24f,.41f);
+    text(view.title,24,16,3,1,1,1,43);
+    text(view.status,24,70,2,.68f,.84f,1,65);
+    using G=network::ListGesture;
+    GX2SetScissor(0,unsigned(G::top*cb->surface.height/h),cb->surface.width,unsigned((G::bottom-G::top)*cb->surface.height/h));
+    for(unsigned i=0;i<view.rows.size();i++) {
+        const float y=G::top+i*G::row-view.scroll;if(y+G::row<G::top||y>G::bottom)continue;
+        const auto &row=view.rows[i];bool selected=int(i)==view.selected;
+        rect(24,y,788,45,selected?.14f:.12f,selected?.43f:.20f,selected?.64f:.31f);
+        text(row.label,34,y+5,2,row.enabled?1:.5f,row.enabled?1:.5f,row.enabled?1:.5f,63);
+        text(row.value,34,y+25,2,.64f,.82f,.98f,63);
+    }
+    GX2SetScissor(0,0,cb->surface.width,cb->surface.height);
+    const float area=G::bottom-G::top,total=std::max(area,view.rows.size()*G::row);
+    const float thumb=std::clamp(area*area/total,24.f,area);
+    const float y=G::top+(area-thumb)*(view.scroll/std::max(1.f,total-area));
+    rect(818,G::top,30,area,.16f,.23f,.34f);rect(820,y,26,thumb,.35f,.77f,1.f);
+    text(view.hint,24,432,2,.8f,.88f,1,65);
+    text("B: BACK     A: CHOOSE     RIGHT STICK / TOUCH: SCROLL",24,460,2,.65f,.75f,.9f,65);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER,cb->surface.image,cb->surface.imageSize);
+}
 static void draw_menu() {
+    if(network_menu::active()) {draw_network_on(drc_cb);draw_network_on(tv_cb);tv_layout_shown=-1;state_lost=true;return;}
     draw_menu_on(drc_cb);
     draw_menu_on(tv_cb);
     tv_layout_shown = -1;  // once it closes, the TV is cleared before the game's next picture: the panel stood over the gaps between screens
@@ -5953,6 +6062,7 @@ static constexpr float KB_X = 107, KB_Y = 150, KB_W = 64, KB_H = 62;
 static constexpr float KB_NUMPAD_OFFSET = 90;
 static std::mutex kb_m;
 static std::atomic<bool> kb_active;
+static bool kb_network;
 static int kb_row = 1, kb_col = 0;
 static bool kb_shift;
 static std::string kb_text;
@@ -5981,7 +6091,7 @@ static bool kb_confirmable(const swkbd::Request &request, const std::string &tex
 }
 
 static bool kb_accepts(const swkbd::Request &request, const std::string &text, char c) {
-    if (text.size() >= 63 || (request.max_len > 0 && kb_units(text) >= request.max_len)) return false;
+    if (text.size() >= (kb_network ? network_keyboard::limit() : 63) || (request.max_len > 0 && kb_units(text) >= request.max_len)) return false;
     if (c >= '0' && c <= '9') {
         const auto digits = std::count_if(text.begin(), text.end(), [](char d) { return d >= '0' && d <= '9'; });
         return !request.digits_limited || digits < request.max_digits;
@@ -6022,7 +6132,12 @@ void keyboard_input(u32 pressed, bool touch_began, u16 x, u16 y) {
     {
         std::lock_guard<std::mutex> lock(kb_m);
         if (!kb_active) {
-            if (swkbd::pending(&kb_req)) {
+            if (network_keyboard::fallback_pending()) {
+                kb_req={};kb_req.hint=network_keyboard::label();kb_req.initial=network_keyboard::initial();
+                kb_req.max_len=network_keyboard::limit();kb_req.password=network_keyboard::secret();kb_req.numpad=network_keyboard::numeric();kb_req.can_cancel=true;
+                kb_text=kb_req.initial;kb_network=true;kb_active=true;kb_row=kb_req.numpad?0:1;kb_col=0;kb_shift=false;
+            } else if (swkbd::pending(&kb_req)) {
+                kb_network=false;
                 size_t n = std::min<size_t>(kb_req.initial.size(), 63);
                 while (n && ((unsigned char)kb_req.initial[n] & 0xc0) == 0x80) --n;
                 kb_text.assign(kb_req.initial, 0, n);
@@ -6060,7 +6175,7 @@ void keyboard_input(u32 pressed, bool touch_began, u16 x, u16 y) {
                 else kb_col = kb_columns[(kb_special(kb_col) + 5 + dx) % 5];
             }
             if (pressed & VPAD_BUTTON_A) choice = kb_press(kb_row, kb_col);
-            else if (pressed & VPAD_BUTTON_B) choice = kb_press(4, 6);    // delete
+            else if (pressed & VPAD_BUTTON_B) choice = kb_network ? -1 : kb_press(4, 6);    // delete
             else if (pressed & VPAD_BUTTON_Y) choice = kb_press(4, 0);    // shift
             else if (pressed & VPAD_BUTTON_X) choice = kb_press(4, 2);    // space
             else if (pressed & VPAD_BUTTON_PLUS) choice = kb_press(4, 8); // OK
@@ -6071,7 +6186,7 @@ void keyboard_input(u32 pressed, bool touch_began, u16 x, u16 y) {
             kb_active = false;
         }
     }
-    if (choice) swkbd::finish(result, choice > 0);
+    if (choice) {if(kb_network){kb_network=false;network_keyboard::fallback_finish(result,choice>0);}else swkbd::finish(result,choice>0);}
 }
 
 static bool draw_keyboard() {
@@ -6668,9 +6783,17 @@ void gfx_pump(bool quiet) {
     }
     if (report_due.exchange(false)) write_report();
     shader_compile_watch();
+    static bool chat_was_visible;
+    const bool chat_now=chat_visible();
+    if(chat_now || chat_was_visible)screen_fresh=true;
+    chat_was_visible=chat_now;
     u32 mii_layout = 0;
     if (menu_is_open) {
         draw_menu();
+        if(network_menu::active() && network_keyboard::active()) {
+            if(!network_keyboard::draw()) draw_keyboard();
+            GX2SetContextState(ctx);cur_color=nullptr;
+        }
         screen_fresh = true;
     } else if (draw_keyboard() || draw_mii_selector(mii_layout)) {
         screen_fresh = true;

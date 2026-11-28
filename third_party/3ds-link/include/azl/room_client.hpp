@@ -47,6 +47,7 @@ public:
         std::string password;
         std::string console_id_hash;
         std::string game_name;
+        std::string authentication_token; // Optional room-scoped JWT; never logged or persisted.
         u64 game_id = 0;
         Mac preferred_mac = kNoPreferredMac;
     };

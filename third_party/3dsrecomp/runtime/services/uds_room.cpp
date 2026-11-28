@@ -9,6 +9,8 @@
 #include <coreinit/time.h>
 #include "azl/log.hpp"
 #include "azl/stats.hpp"
+#include "../../../../port/wiiu/network_settings.h"
+#include "azl/chat_core.hpp"
 
 extern "C" void enet_wiiu_trace(int kind, int result, int error, u32 host, u32 port, u32 word) {
     static u32 samples[2][2]{};
@@ -24,22 +26,26 @@ namespace kernel {
 namespace {
 std::shared_ptr<UdsContext> live_room;
 std::atomic<bool> room_shutting_down{false};
+bool events_timer_pending;
+std::mutex room_config_mutex;
+std::atomic<azl::ChatSink *> room_chat{nullptr};
 
 // Kernel timer callbacks run with kmutex held. Networking only touches the
 // engine and the bridge's own mutex, so kernel callbacks never wait on sockets.
 void publish_room_events() {
+    events_timer_pending = false;
     if (!live_room || room_shutting_down.load(std::memory_order_acquire)) return;
-    live_room->events.Publish();
-    // The radio switch and the room transport are separate states. Games such
-    // as Tri Force Heroes read this byte directly, without asking AC at all.
-    // A configured radio stays enabled while the room is connecting or offline.
-    w8(mem::SHARED_PAGE + 0x67, 1);  // WifiState::Enabled, not Internet
-    const bool joined = live_room->room.joined();
+    const bool enabled = wiiu::network::wireless_enabled();
+    w8(mem::SHARED_PAGE + 0x67, enabled ? 1 : 0);
+    const bool joined = enabled && live_room->room.joined();
     w8(mem::SHARED_PAGE + 0x66, joined ? 3 : 0);
+    if (!enabled) return; // Off has no recurring timer or networking worker.
+    live_room->events.Publish();
     if (joined) {
         const auto mac = live_room->room.mac();
         std::copy(mac.begin(), mac.end(), gptr(mem::SHARED_PAGE + 0x60));
     }
+    events_timer_pending = true;
     add_timeout(now_ns() + 10000000, publish_room_events);
 }
 }
@@ -113,12 +119,17 @@ void register_room_dlp() {
 
 void start_room_uds() {
     // Install optional adapters before the worker can observe their pointers.
-    if (live_room && !live_room->room.Start(live_room->configuration))
+    if (!wiiu::network::wireless_enabled()) return;
+    if(!wiiu::network::initialize_sockets()){wiiu::network::report("Could not initialize Wii U networking.");return;}
+    wiiu::network::start();
+    if(!live_room)return;
+    if(!room_chat){room_chat=new azl::ChatSink;live_room->room.SetChatSink(room_chat.load());}
+    if (live_room && !live_room->configuration.host.empty() && !live_room->room.Start(live_room->configuration))
         LOG("[uds-room] worker failed to start\n");
 }
 
 bool room_wireless_available() {
-    return live_room && live_room->room.joined();
+    return wiiu::network::wireless_enabled() && live_room && live_room->room.joined();
 }
 
 static std::string persistent_room_identity() {
@@ -155,43 +166,17 @@ static std::string mii_room_nickname() {
 }
 
 bool register_room_uds() {
-    // One SD-card configuration is shared by Homebrew and installed titles.
-    // Deliberately do not fall back to stale per-title endpoints.
-    std::ifstream input("fs:/vol/external01/3dii-u/multiplayer-room.txt");
-    if (!input) {
-        OSReport("[uds-room] shared SD configuration missing; room networking disabled\n");
-        return false;
-    }
+    wiiu::network::initialize();
+    const auto settings = wiiu::network::view().config;
     azl::RoomClient::Config config;
-    std::string line;
-    while (std::getline(input, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        const auto split = line.find('=');
-        if (split == std::string::npos || line.empty() || line[0] == '#') continue;
-        const auto key = line.substr(0, split), value = line.substr(split + 1);
-        if (key == "host") config.host = value;
-        else if (key == "nickname") config.nickname = value;
-        else if (key == "password") config.password = value;
-        else if (key == "console_id") config.console_id_hash = value;
-        else if (key == "port") {
-            unsigned port = 0;
-            std::istringstream number(value);
-            if (!(number >> port) || port == 0 || port > 65535) return false;
-            config.port = port;
-        }
-    }
-    if (config.host.empty()) {
-        OSReport("[uds-room] shared SD host is blank; room networking disabled\n");
-        return false;
-    }
+    config.host = settings.host; config.port = settings.port; config.password = settings.password;
+    config.nickname = settings.nickname;
+    config.console_id_hash = settings.console_id;
     if (config.nickname.empty() || config.nickname == "auto" || config.nickname == "mii")
         config.nickname = mii_room_nickname();
-    if (config.console_id_hash.empty() || config.console_id_hash == "auto")
+    // The persistent identity is needed only when wireless is enabled.
+    if (wiiu::network::wireless_enabled() && (config.console_id_hash.empty() || config.console_id_hash == "auto"))
         config.console_id_hash = persistent_room_identity();
-    if (config.host.empty() || config.console_id_hash.empty()) {
-        LOG("[uds-room] configuration needs host, nickname, and unique console_id\n");
-        return false;
-    }
     config.game_id = g_game.program_id;
     // load_game has already read the original SMDH title for both packaging formats.
     config.game_name = g_game.name.empty() ? g_game.title : g_game.name;
@@ -202,8 +187,9 @@ bool register_room_uds() {
     azl::SetLogSink([](const char *line) { OSReport("[uds-link] %s\n", line); });
     live_room = std::make_shared<UdsContext>();
     live_room->configuration = config;
+    live_room->room.SetChatSink(room_chat.load());
     live_room->room.SetTickCallback([](u64 now) {
-        if (room_shutting_down.load(std::memory_order_acquire)) return;
+        if (room_shutting_down.load(std::memory_order_acquire) || !wiiu::network::wireless_enabled()) return;
         live_room->engine.Tick(now);
         // Resumable guest timeouts run on the sole dispatcher. A service
         // waiting for DLP cannot also pump that queue: use the room worker.
@@ -216,6 +202,8 @@ bool register_room_uds() {
     });
     live_room->room.SetStateCallback([](azl::RoomClient::State state, azl::RoomClient::Error error) {
         OSReport("[uds-room] %s: %s\n", azl::RoomClient::StateName(state), azl::RoomClient::ErrorName(error));
+        wiiu::network::connection_changed(state==azl::RoomClient::State::Joined);
+        wiiu::network::report(std::string(azl::RoomClient::StateName(state)) + (error == azl::RoomClient::Error::None ? "" : std::string(": ") + azl::RoomClient::ErrorName(error)));
         if (state == azl::RoomClient::State::Idle && !room_shutting_down.load(std::memory_order_acquire))
             live_room->engine.OnTransportDown(azl::NetworkStatusChangeReason::ConnectionLost);
     });
@@ -224,10 +212,71 @@ bool register_room_uds() {
     publish_room_events();
     return true;
 }
+wiiu::network::Live room_menu_view() {
+    wiiu::network::Live result;
+    if (!live_room) {result.status="Room service is not initialized.";return result;}
+    result.joined=live_room->room.joined();
+    const auto info=live_room->room.room_info();result.name=info.name;
+    {std::lock_guard lock(room_config_mutex);result.nickname=live_room->configuration.nickname;}
+    result.status=azl::RoomClient::StateName(live_room->room.state());
+    if(auto error=live_room->room.error();error!=azl::RoomClient::Error::None)
+        result.status=azl::RoomClient::ErrorName(error);
+    for(const auto &member:info.members)
+        result.members.push_back(member.nickname+"  -  "+(member.game_name.empty()?"Not running a game":member.game_name));
+    azl::chat::View chat{};
+    if(room_chat && room_chat.load()->ring.ReadInto(&chat)) for(unsigned i=0;i<chat.count;i++) {
+        const auto &line=chat.lines[i];
+        result.chat.push_back((line.nick_len?std::string(line.nick)+": ":"")+line.text);
+    }
+    return result;
+}
+std::vector<wiiu::network::ChatLine> room_chat_view() {
+    std::vector<wiiu::network::ChatLine> result;
+    auto *sink=room_chat.load();azl::chat::View view{};
+    if(sink && sink->ring.ReadInto(&view)) for(unsigned i=0;i<view.count;i++) {
+        const auto &line=view.lines[i];
+        result.push_back({line.t_ms,(line.nick_len?std::string(line.nick)+": ":"")+line.text});
+    }
+    return result;
+}
+void room_chat_send(const std::string &text) {
+    if(!live_room || !live_room->room.joined()) {wiiu::network::report("Join a room before sending chat.");return;}
+    if(!room_chat || !room_chat.load()->Post(text.c_str(),text.size())) wiiu::network::report("Chat message is empty or another message is still sending.");
+}
+std::string disconnect_room_uds() {
+    if (!live_room) return "Room service is unavailable.";
+    if (!live_room->room.Stop()) return "Room worker did not stop; restart the game before reconnecting.";
+    live_room->engine.OnTransportDown(azl::NetworkStatusChangeReason::ConnectionLost);
+    return "Disconnected from the room.";
+}
+std::string configure_room_uds(const wiiu::network::Config &settings, const std::string &authentication) {
+    if (!live_room || room_shutting_down.load()) return "Room service is shutting down.";
+    if (!live_room->room.Stop()) return "Room worker did not stop; restart the game before reconnecting.";
+    live_room->engine.OnTransportDown(azl::NetworkStatusChangeReason::ConnectionLost);
+    azl::RoomClient::Config config;{std::lock_guard lock(room_config_mutex);config=live_room->configuration;}
+    config.host=settings.host;config.port=settings.port;config.password=settings.password;
+    config.nickname=settings.nickname.empty()||settings.nickname=="auto"||settings.nickname=="mii" ? mii_room_nickname() : settings.nickname;
+    config.console_id_hash=settings.console_id.empty()||settings.console_id=="auto" ? persistent_room_identity() : settings.console_id;
+    config.authentication_token=authentication;
+    {std::lock_guard lock(room_config_mutex);live_room->configuration=config;}
+    {
+        Lock lock(kmutex);
+        w8(mem::SHARED_PAGE+0x67, settings.enabled ? 1 : 0);
+        w8(mem::SHARED_PAGE+0x66,0);
+        if(settings.enabled && !events_timer_pending) publish_room_events();
+    }
+    if(!settings.enabled) return "Wireless communication is off.";
+    if(config.host.empty()) return "Wireless is on. Enter a server or browse public rooms.";
+    if(config.console_id_hash.empty()) return "Could not create the room identity in save storage.";
+    if(!room_chat){room_chat=new azl::ChatSink;live_room->room.SetChatSink(room_chat.load());}
+    if(!live_room->room.Start(config)) return "Could not start the room connection.";
+    return "Connecting to the room...";
+}
 // Stop while the application's socket services and callbacks still exist.
 // Never hold kmutex here: the worker can be completing a DLP tick with it.
 void shutdown_room_uds() {
     if (!live_room || room_shutting_down.exchange(true, std::memory_order_acq_rel)) return;
+    if(!wiiu::network::shutdown()) {live_room->room.RequestStop(true);return;}
     OSReport("[uds-room] shutdown: stopping room worker before process cleanup\n");
     const bool stopped = live_room->room.StopWithin(1000);
     OSReport("[uds-room] shutdown: worker %s\n", stopped ? "stopped" : "exceeded 1000 ms; process teardown will reclaim it");

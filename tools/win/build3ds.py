@@ -450,7 +450,7 @@ def link_setup():
 def runtime_flags(extra):
     return ['-std=c++20', '-O2', '-g0', '-w', '-mcpu=750', '-meabi', '-mhard-float', '-ffunction-sections', '-fno-strict-aliasing', '-fno-exceptions', '-fno-if-conversion',
             '-fno-if-conversion2', '-D__WIIU__', '-D__WUT__', '-DESPRESSO', f'-I{ROOT}/third_party/3ds-link/include', f'-I{PORT}/wiiu', f'-I{PORT}', f'-I{RT}', f'-I{RT}/audio', f'-I{RT}/gpu', f'-I{RT}/services',
-            f'-I{CAFEGLSL_PPC}/include',
+            f'-I{CAFEGLSL_PPC}/include', f'-I{ROOT}/toolchain/network_ppc/include', '-DCURL_STATICLIB',
             '-isystem', f'{WUT}/include', '-include', f'{PORT}/wiiu/shim.h'] + (['-DRECOMP_MEASURE'] if MEASURE else []) + extra
 
 
@@ -674,7 +674,7 @@ def link_game(g, rt, code, link_flags=None):
     argv += ['-Wl,--start-group']
     if FFL_TRIAL:
         argv += [rel(f'{FFL_TRIAL}/lib3dii_ffl_narrow.a'), rel(f'{DKP}/portlibs/ppc/lib/libz.a')]
-    argv += [f'-L{WUT}/lib', f'-L{CAFEGLSL_PPC}/lib', '-lcafeglsl', '-lwut', '-lstdc++', '-lm', '-lc', '-lsysbase', '-lgcc', '-Wl,--end-group', f'@link/{g.name}_code.rsp', '-o', elf]
+    argv += [f'-L{WUT}/lib', f'-L{CAFEGLSL_PPC}/lib', f'-L{ROOT}/toolchain/network_ppc/lib', '-lcurl', '-lmbedtls', '-lmbedx509', '-lmbedcrypto', '-lbrotlidec', '-lbrotlicommon', '-lz', '-lcafeglsl', '-lwut', '-lstdc++', '-lm', '-lc', '-lsysbase', '-lgcc', '-Wl,--end-group', f'@link/{g.name}_code.rsp', '-o', elf]
     r = run(argv, cwd=WORK, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
     errors = sorted({re.sub(r'^.*ld(\.exe)?: ', '', x) for x in r.stdout.splitlines() if re.search(r'undefined reference|error|multiple definition|truncated', x)})
     for e in errors[:30]:

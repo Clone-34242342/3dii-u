@@ -14,6 +14,18 @@ How each part reaches you decides what its licence asks of whoever distributes i
   distributes games; you build them from your own dumps for your own console.
 - **Build tool**: a program the build runs; nothing of it ends up in a game except where noted.
 
+## Public-room browser dependencies
+
+The Wii U room browser links libcurl 8.7.1 (curl licence), Mbed TLS 2.28.8
+(Apache-2.0), zlib (zlib licence), and Brotli's decoder/common libraries (MIT),
+from devkitPro portlibs. The Windows engine includes their PowerPC static libraries
+and headers in `toolchain/network_ppc`, with licence texts alongside them.
+The Mozilla CA certificate bundle distributed by curl is MPL-2.0 and is embedded
+for HTTPS verification. nlohmann/json 3.11.2 (MIT) is vendored in
+`third_party/nlohmann` with its licence. These dependencies are used by public-room
+HTTP/TLS discovery and authentication; they are not required to enable networking
+when the user leaves wireless Off.
+
 ## Summary
 
 | Component | Version | Authors | Licence | Copyleft | How it's used |
