@@ -24,4 +24,14 @@ export STEAM_COMPAT_CLIENT_INSTALL_PATH="$steam"
 export STEAM_COMPAT_DATA_PATH=${THREEDII_PROTON_DATA:-"${XDG_DATA_HOME:-$HOME/.local/share}/3dii-u-builder/proton"}
 export SteamAppId=0 SteamGameId=0
 mkdir -p -- "$STEAM_COMPAT_DATA_PATH"
+# Qt imports Windows' icuuc.dll name; Proton supplies the same exports in
+# icu.dll. Keep this alias in the Builder's own prefix, never in the package.
+if [[ ! -f "$STEAM_COMPAT_DATA_PATH/pfx/system.reg" ]]; then
+    "$proton" run cmd /c exit 0
+fi
+system32="$STEAM_COMPAT_DATA_PATH/pfx/drive_c/windows/system32"
+icu="$(dirname -- "$proton")/files/lib/wine/x86_64-windows/icu.dll"
+if [[ ! -e "$system32/icuuc.dll" && -f "$icu" ]]; then
+    ln -sfn -- "$icu" "$system32/icuuc.dll"
+fi
 exec "$proton" run "$exe" "$@"
