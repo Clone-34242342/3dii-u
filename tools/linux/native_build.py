@@ -40,6 +40,28 @@ def load_builder(work, compiler=None):
     return build3ds
 
 
+def prepare_entries(game_dir, cro_base):
+    """Discover entries in the same address space the Wii U recompiler uses."""
+    game_dir = Path(game_dir)
+    path = game_dir / 'functions.txt'
+    before = path.read_bytes() if path.exists() else None
+    times = path.stat() if path.exists() else None
+    if before:
+        for line in before.decode().splitlines():
+            if line.strip() and int(line, 16) >= 0x20000000:
+                raise ValueError('functions.txt contains entries outside Wii U guest memory. '
+                                 'Regenerate its CRO entries with RECOMP_CRO_BASE=' + str(cro_base) +
+                                 ' before compiling; desktop CRO slots cannot be reused.')
+    env = dict(os.environ, RECOMP_CRO_BASE=str(cro_base))
+    for script in ('find_entries.py', 'cro_entries.py'):
+        result = subprocess.run([sys.executable, str(ROOT / 'tools' / script), str(game_dir), '--write'],
+                                env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(result.stdout.strip()[-500:], flush=True)
+    # Discovery is idempotent: an unchanged list must not invalidate the code cache.
+    if before is not None and path.read_bytes() == before:
+        os.utime(path, ns=(times.st_atime_ns, times.st_mtime_ns))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("command", choices=["code", "shaders", "selftest"])
@@ -94,6 +116,13 @@ def main():
         b.DKP = str(alias); b.WUT = str(alias / "wut"); b.BIN = str(tools.resolve() / "powerpc-eabi-")
         if a.cafeglsl_ppc: b.CAFEGLSL_PPC = str(a.cafeglsl_ppc.resolve())
         os.environ.update(DEVKITPRO=str(alias), DEVKITPPC=str(alias / "devkitPPC"), PATH=str(tools.resolve()) + os.pathsep + str(alias / "devkitPPC/bin") + os.pathsep + str(alias / "tools/bin") + os.pathsep + os.environ["PATH"])
+    if a.command == 'code':
+        try:
+            prepare_entries(a.game_dir.resolve(), b.CRO_BASE)
+        except subprocess.CalledProcessError as error:
+            ap.error((error.stdout or '').strip() or str(error))
+        except ValueError as error:
+            ap.error(str(error))
     previous = os.environ.get("THREEDII_SESSION_STATES")
     if a.execution_mode != "auto":
         os.environ["THREEDII_SESSION_STATES"] = "0" if a.execution_mode == "classic" else "1"
