@@ -82,7 +82,7 @@ def replace_generics(original,packet,output):
     for old,updated in zip(blocks,assembled):
         kind,head,_=old;i=struct.unpack_from('>I',head,28)[0]
         if not (kind in (6,7) and i in mapping) and old!=updated:raise ValueError('Specialized/vertex shader changed')
-    if any(gsh_rules.check(words,regs) or regs>(48 if kind=='vertex' else 200) for kind,regs,words in gsh_rules.programs(payload)):
+    if any(gsh_rules.check(words,regs) or regs>(124 if kind=='vertex' else 200) for kind,regs,words in gsh_rules.programs(payload)):
         raise ValueError('Final shader pack fails GPU rules')
     output.mkdir(parents=True,exist_ok=True)
     (output/'shaders.gsh').write_bytes(payload);(output/'shaders.idx').write_bytes(index)

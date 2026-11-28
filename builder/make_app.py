@@ -27,7 +27,7 @@ ROOT = os.path.dirname(HERE)
 OUT = os.path.join(HERE, 'dist')
 DEVKITPRO = 'C:/devkitPro/opt/devkitpro'
 ENGINE_DIRS = ('third_party/3ds-link', 'tools', 'phase0/tools', 'phase0/title_code', 'port','third_party/3dsrecomp/runtime', 'third_party/3dsrecomp/tools', 'third_party/3dsrecomp/games',
-               'third_party/nlohmann', 'third_party/system_archives', 'toolchain/network_ppc', 'third_party/stb', 'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
+               'third_party/cafeglsl_fallback/windows-x86_64', 'third_party/nlohmann', 'third_party/system_archives', 'toolchain/network_ppc', 'third_party/stb', 'third_party/cafeglsl_ppc/cafeglsl-1.0.0-rc1-wiiu-ppc', 'toolchain/aac_ppc')
 ENGINE_FILES = ('builder/multiplayer-defaults.json', 'third_party/cafeglsl/glslcompiler.exe', 'third_party/cafeglsl/libwinpthread-1.dll', 'third_party/cafeglsl/zlib1.dll',
                 'third_party/3dsrecomp/LICENSE')
 WORK = os.path.join(HERE, 'build_app')  # PyInstaller's own work folder, gone afterwards
@@ -139,6 +139,8 @@ def bundle_engine(engine):
     """the build engine, in the repository's layout, so the app builds wherever it is"""
     sys.path.insert(0, os.path.join(ROOT, 'tools'))
     import observation_catalog
+    import setup_fallback_compiler
+    setup_fallback_compiler.ensure('windows-x86_64')
     observation_catalog.validate(ROOT)
     def skip(folder, names):  # caches, links WSL left that Windows can't open (third_party/3dsrecomp/games/*/profile.txt), and the tools
         # for testing on this PC's own console (its address, this PC's paths), which no build runs

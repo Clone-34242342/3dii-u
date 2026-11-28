@@ -305,6 +305,8 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
     collisions = reserved.intersection(os.listdir(archives))
     if collisions:
         raise ValueError('system archives folder contains game content: ' + ', '.join(sorted(collisions)))
+    if include_shaders and not os.path.isfile(os.path.join(shaders, 'fallback-shaders.bin')):
+        raise ValueError('Optimized fallback shader pack is missing; rebuild shaders with the current Builder')
     rpx_name = os.path.basename(rpx)
     shutil.rmtree(os.path.join(title, 'content'), ignore_errors=True)
     for d in ('code', 'content', 'meta'):
@@ -391,6 +393,9 @@ def make_title(title, game, rpx, shaders, title_id, name, product, archives=ARCH
             f.write(font)
     for f in (('shaders.gsh', 'shaders.idx') if include_shaders else ()):
         shutil.copyfile(os.path.join(shaders, f), os.path.join(content, f))
+    if include_shaders:
+        optimized = os.path.join(shaders, 'fallback-shaders.bin')
+        shutil.copyfile(optimized, os.path.join(content, 'fallback-shaders.bin'))
     bezel = bezel_pixels(pad_bezel) if pad_bezel else None
     if bezel:  # the GamePad's picture where no screen is: the console reads its bytes as they are
         with open(os.path.join(content, 'pad_bezel.rgba'), 'wb') as f:

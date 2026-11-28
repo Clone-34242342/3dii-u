@@ -24,11 +24,14 @@ def builder_module():
         os.environ['PATH'] = previous
 
 
-def build(generator, compiler, output, jobs=4, materials=None, full=False, lighting=False, exclude_pack=None, material_extension=False):
+def build(generator, compiler, output, jobs=4, materials=None, full=False, lighting=False, exclude_pack=None, material_extension=False, generator_args=(), max_families=None):
     output.mkdir(parents=True, exist_ok=True)
     glsl = output / 'glsl'
-    subprocess.run([str(generator)] + (['--full', str(glsl)] if full else ['--lighting', str(glsl), str(materials)] if lighting else [str(glsl)] + ([str(materials)] if materials else [])), check=True)
+    subprocess.run([str(generator), *generator_args] + (['--full', str(glsl)] if full else ['--lighting', str(glsl), str(materials)] if lighting else [str(glsl)] + ([str(materials)] if materials else [])), check=True)
     entries = [line.split('\t') for line in (glsl / 'families.tsv').read_text().splitlines()]
+    candidates = len(entries)
+    if not entries: raise ValueError('No fallback families generated')
+    if max_families is not None: entries = entries[:max_families]
     if not entries or len(entries) > 2048 or (not materials and len(entries) != (16 if full else 336)) or len({key for key, _ in entries}) != len(entries):
         raise ValueError('Incomplete or oversized fallback family manifest')
     for key, name in entries:
@@ -81,7 +84,7 @@ def build(generator, compiler, output, jobs=4, materials=None, full=False, light
     counts = builder.merge_gfd([str(dest) for _, dest in batches], str(raw))
     if counts != {3: 0, 6: len(entries)}:
         raise ValueError('Fallback compiler changed family count/order')
-    subprocess.run([str(generator), '--fit', str(raw), str(fixed)], check=True)
+    subprocess.run([str(generator), *generator_args, '--fit', str(raw), str(fixed)], check=True)
     spec = importlib.util.spec_from_file_location('fallback_gsh_rules', ROOT / 'tools/gsh_rules.py')
     rules = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(rules)
@@ -101,7 +104,7 @@ def build(generator, compiler, output, jobs=4, materials=None, full=False, light
     temporary.write_bytes(payload)
     temporary.replace(destination)
     report = dict(families=len(entries), bytes=len(payload), max_registers=max(p[1] for p in programs),
-                  hardware_status='not tested', preserves_material_features=True, excluded_existing=excluded, material_extension=material_extension)
+                  uncompiled_families=candidates-len(entries), hardware_status='not tested', preserves_material_features=True, excluded_existing=excluded, material_extension=material_extension)
     (output / 'fallback-build-report.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps(report), flush=True)
     return destination

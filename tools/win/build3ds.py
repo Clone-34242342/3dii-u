@@ -708,8 +708,8 @@ def build_shadergen(args):
         return os.environ['THREEDII_SHADERGEN']
     d = WORK + '/shadergen'
     os.makedirs(d, exist_ok=True)
-    flags = HOST_CXX + ['-std=c++20', '-O1', '-w', f'-I{PORT}/wiiu', f'-I{PORT}/pc/win', f'-I{PORT}/pc', f'-I{RT}', f'-I{RT}/gpu', '-include', f'{PORT}/pc/shim.h']
-    sources = [ROOT + '/tools/shadergen_main.cpp', ROOT + '/tools/shadergen_lists.cpp', PORT + '/wiiu/shadergen.cpp', PORT + '/wiiu/shaderkeys.cpp', RT + '/gpu/shader.cpp', ROOT + '/tools/win/shadergen_stubs.cpp']
+    flags = HOST_CXX + ['-std=c++20', '-O1', '-w', '-DTHREEDII_COMBINED_SHADERGEN', f'-I{PORT}/wiiu', f'-I{PORT}/pc/win', f'-I{PORT}/pc', f'-I{RT}', f'-I{RT}/gpu', '-include', f'{PORT}/pc/shim.h']
+    sources = [ROOT + '/tools/fallbackgen.cpp', ROOT + '/tools/shadergen_main.cpp', ROOT + '/tools/shadergen_lists.cpp', PORT + '/wiiu/shadergen.cpp', PORT + '/wiiu/shaderkeys.cpp', RT + '/gpu/shader.cpp', ROOT + '/tools/win/shadergen_stubs.cpp']
     items = [(os.path.basename(s), s, f'{d}/{os.path.basename(s)}.o', flags) for s in sources]
     compile_all(items, args.jobs, 'shader generator')
     exe = d + '/shadergen.exe'
@@ -956,6 +956,9 @@ def build_shaders(g, args):
     import shader_coverage
     shader_coverage.check(g.dir + '/shader_logs', g.shaders, g.pipelines)
     compile_shaders(g.shaders, args.jobs)
+    from pathlib import Path
+    import production_fallbacks
+    production_fallbacks.integrate(Path(g.shaders), Path(exe), Path(WORK), args.jobs)
     shutil.rmtree(g.shaders + '/glsl', ignore_errors=True)  # compiled into shaders.gsh; nothing reads the GLSL after
 
 

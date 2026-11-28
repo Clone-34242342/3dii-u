@@ -59,7 +59,7 @@ static int fit(const char *input, const char *output) {
     std::cout << "Fitted " << count << " pixel programs with the runtime's GPU corrections\n";
     return 0;
 }
-int main(int argc, char **argv) {
+int fallbackgen_main(int argc, char **argv) {
     if (argc == 4 && std::string(argv[1]) == "--fit") return fit(argv[2], argv[3]);
     const bool lighting = argc == 4 && std::string(argv[1]) == "--lighting";
     if (argc != 2 && argc != 3 && !lighting) { std::cerr << "fallbackgen <output-directory> | --fit <input.gsh> <output.gsh>\n"; return 1; }
@@ -113,3 +113,7 @@ int main(int argc, char **argv) {
         }
     return manifest ? 0 : 13;
 }
+
+#ifndef THREEDII_COMBINED_SHADERGEN
+int main(int argc, char **argv) { return fallbackgen_main(argc, argv); }
+#endif

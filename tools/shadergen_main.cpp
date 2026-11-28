@@ -150,7 +150,10 @@ std::string hex64(u64 v) {
 
 int lists_main(int argc, char **argv);  // shadergen_lists.cpp
 
+int fallbackgen_main(int argc, char **argv);
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && !strcmp(argv[1], "--fallback")) return fallbackgen_main(argc - 1, argv + 1);
     if (argc >= 2 && !strcmp(argv[1], "--lists")) return lists_main(argc, argv);
     if (argc < 5) {
         fprintf(stderr, "usage: shadergen <pipelines.bin> <log dir> <output dir> <compiler>\n       shadergen --lists <out.bin> <romfs.bin>...\n");
@@ -168,6 +171,15 @@ int main(int argc, char **argv) {
     for (const auto &e : fsys::directory_iterator(logs))
         if (e.path().extension() == ".bin" && e.path().filename() != "confirmed.bin") read_log(e.path().string());
     printf("%zu fragment keys (%zu shipped), %zu vertex records\n", fs_keys.size(), shipped, vs_records.size());
+
+    // Preserve the exact discovered inputs for material/lighting family generation.
+    std::string fragment_inputs;
+    for (const auto &key : fs_keys) {
+        const u32 n = (u32)key.size();
+        for (unsigned i = 0; i < 4; ++i) fragment_inputs += char(n >> (8 * i));
+        fragment_inputs += key;
+    }
+    write_file(out + "/fragment-states.bin", fragment_inputs);
 
     // fragment shaders: many states differ only in what the source doesn't depend on (blending, say)
     std::map<std::string, u32> ps_sources;
