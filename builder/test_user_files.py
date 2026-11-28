@@ -65,4 +65,15 @@ with tempfile.TemporaryDirectory() as tmp:
     os.makedirs(card)
     pipeline.check_card(card)
     assert os.listdir(os.path.join(card, 'install')) == [], 'the check left its file on the card'
+with tempfile.TemporaryDirectory() as tmp:
+    from pathlib import Path
+    public = Path(__file__).resolve().parents[1]/'third_party/system_archives/0004009b00010402.romfs'
+    relative = next(iter(uf.PUBLIC_ARCHIVES))
+    exact = put(tmp, relative, public.read_bytes())
+    assert uf.bundled(tmp) == []
+    put(tmp,relative,b'other archive with the approved filename')
+    assert uf.bundled(tmp) == [exact]
+    os.remove(exact)
+    elsewhere = put(tmp,'engine/private/0004009b00010402.romfs',public.read_bytes())
+    assert uf.bundled(tmp) == [elsewhere]
 print('user files: ok')
