@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -38,6 +39,14 @@ def load_builder(work, compiler=None):
     build3ds.run = native_run
     if compiler: build3ds.GLSLC = str(Path(compiler).resolve())
     return build3ds
+
+
+def observation_slug(game_dir, name):
+    """Versioned output names must still stage the game's canonical catalog."""
+    info = json.loads((Path(game_dir) / 'info.json').read_text())
+    program = f"{int(info['program_id'], 16):016X}"
+    profiles = json.loads((ROOT / 'builder/compat.json').read_text())
+    return profiles.get(program, {}).get('slug') or re.sub(r'_v[0-9]+$', '', name)
 
 
 def prepare_entries(game_dir, cro_base):
@@ -128,6 +137,7 @@ def main():
         os.environ["THREEDII_SESSION_STATES"] = "0" if a.execution_mode == "classic" else "1"
     try:
         game = b.Game(a.name or a.game_dir.name, str(a.game_dir.resolve()))
+        game.observation_slug = observation_slug(a.game_dir, game.name)
     finally:
         if previous is None: os.environ.pop("THREEDII_SESSION_STATES", None)
         else: os.environ["THREEDII_SESSION_STATES"] = previous

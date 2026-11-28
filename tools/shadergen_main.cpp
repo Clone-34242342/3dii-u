@@ -166,20 +166,36 @@ int main(int argc, char **argv) {
     const std::vector<u8> pl = read_file(pipelines);
     for (size_t p = 8; p < pl.size() && read_fs_key(pl, p);) {}
     const size_t shipped = fs_keys.size();
+    std::vector<std::string> preferred_fs_keys = fs_keys;
     // a finished game's list first (builder/shaderlogs.py, confirm): its shaders keep their numbers, and what the logs add since comes after
-    if (fsys::exists(fsys::path(logs) / "confirmed.bin")) read_log((fsys::path(logs) / "confirmed.bin").string());
-    for (const auto &e : fsys::directory_iterator(logs))
-        if (e.path().extension() == ".bin" && e.path().filename() != "confirmed.bin") read_log(e.path().string());
+    if (fsys::exists(fsys::path(logs) / "confirmed.bin")) {
+        read_log((fsys::path(logs) / "confirmed.bin").string());
+        preferred_fs_keys = fs_keys;
+    }
+    for (const auto &e : fsys::directory_iterator(logs)) {
+        if (e.path().extension() != ".bin" || e.path().filename() == "confirmed.bin") continue;
+        const auto begin = fs_keys.size();
+        read_log(e.path().string());
+        if (!e.path().filename().string().starts_with("other_"))
+            preferred_fs_keys.insert(preferred_fs_keys.end(), fs_keys.begin() + begin, fs_keys.end());
+    }
     printf("%zu fragment keys (%zu shipped), %zu vertex records\n", fs_keys.size(), shipped, vs_records.size());
 
     // Preserve the exact discovered inputs for material/lighting family generation.
     std::string fragment_inputs;
-    for (const auto &key : fs_keys) {
+    const std::set<std::string> own_states(preferred_fs_keys.begin(), preferred_fs_keys.end());
+    preferred_fs_keys.insert(preferred_fs_keys.end(), fs_keys.begin(), fs_keys.end());
+    std::set<std::string> written;
+    for (const auto &key : preferred_fs_keys) {
+        if (!written.insert(key).second) continue;
         const u32 n = (u32)key.size();
         for (unsigned i = 0; i < 4; ++i) fragment_inputs += char(n >> (8 * i));
         fragment_inputs += key;
     }
     write_file(out + "/fragment-states.bin", fragment_inputs);
+    write_file(out + "/fallback-input-report.json", "{\"preferred_game_states\":" +
+        std::to_string(own_states.size()) + ",\"total_unique_states\":" + std::to_string(written.size()) + "}\n");
+    printf("Fallback discovery inputs: %zu preferred game states, %zu total unique states\n", own_states.size(), written.size());
 
     // fragment shaders: many states differ only in what the source doesn't depend on (blending, say)
     std::map<std::string, u32> ps_sources;

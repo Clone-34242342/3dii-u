@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,6 +9,16 @@ from tools.linux import native_build
 
 
 class EntryAddressTests(unittest.TestCase):
+    def test_versioned_build_uses_program_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root/'builder').mkdir()
+            (root/'info.json').write_text(json.dumps({'program_id':'0004000000030800'}))
+            (root/'builder/compat.json').write_text(json.dumps({'0004000000030800':{'slug':'g_amke'}}))
+            with patch.object(native_build, 'ROOT', root):
+                self.assertEqual(native_build.observation_slug(root,'arbitrary_v3152'),'g_amke')
+                (root/'builder/compat.json').write_text('{}')
+                self.assertEqual(native_build.observation_slug(root,'g_amke_v3152'),'g_amke')
+
     def test_rejects_desktop_module_addresses_before_building(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'functions.txt'

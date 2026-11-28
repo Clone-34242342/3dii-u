@@ -18,7 +18,8 @@ logs, screenshots, game data and console keys in the local build directory.
   Shader-bearing native updates must include it too.
 - [x] Verify this integrated path in the packaged Windows executable, rather
   than assuming a successful manual build verifies the GUI distribution.
-- [ ] Refresh the friend ZIP and upload link after these checks pass.
+- [x] Refresh the friend ZIP and upload link after these checks pass.
+  Source `0a30736`; new link: https://buzzheavier.com/mkhbs0jow1j4.
 
 The packaged Windows executable passed a real compiler smoke test under Steam
 Proton: 16 general + 336 bounded + two material + one lighting family, unchanged
@@ -77,3 +78,34 @@ coverage and the index are preserved.
 
 Local build evidence: `3Dii-U-build-work/pokemon-fallback-20261128/` contains the
 compiler logs, input states, program validation reports and delivery results.
+
+## Current delivery queue
+
+- [x] Pokémon X complete native update uploaded to the SD install folder.
+- [ ] Pokémon real-hardware forced/normal visual comparison after installation.
+- [ ] Mario Kart 7 native update: executable + complete new shaders, upload by FTP.
+- [ ] Monster Hunter 4 Ultimate: rebuild the full WUP including optimized shaders;
+  retain on the PC, do not upload to the Wii U.
+- [x] Keep bulk discovery, shared catalog staging, variant generation and coverage
+  checking in the standard shader build and PR.
+- [ ] Investigate Pokémon-specific asset material discovery: the earlier scan
+  produced no own `models_fs.bin` states. Shared catalog coverage and optimized
+  generic families are not proof its runtime materials were all discovered.
+
+The new native network keyboard/chat overlay still needs its previously planned
+hardware validation; Cemu menu tests alone are not sufficient. Keep that testing
+separate from the shader build correction.
+
+### Catalog identity and optimization priority
+
+Native builds now resolve the canonical observation catalog through `program_id`
+in `info.json` and compatibility profiles. A version suffix in an output folder
+must not suppress the game's own records. Unknown profiles may fall back to the
+unversioned build name. The GUI already assigns the canonical observation slug.
+The real generator regression test deliberately creates borrowed inputs first
+and verifies that optimization inputs still put own-game states first, retaining
+both. Specialized shader generation retains its complete input set.
+
+Mario Kart's corrected scan restored seven portable vertex records and produced
+972 new model/template states using 102 logged configurations. These figures
+are evidence of a working bulk pass, not exhaustive gameplay coverage.
