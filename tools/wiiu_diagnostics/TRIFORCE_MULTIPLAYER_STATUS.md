@@ -27,6 +27,13 @@ account's Mii name, adjusted to the room's ASCII and minimum-length rules.
 save storage. It does not publish OTP or SEEPROM data. Each client needs a unique
 nickname and identity; do not copy one client's generated identity to another.
 
+Rebuilt titles advertise their original 3DS SMDH display name in the room's
+member list (for example, `MARIO KART 7`), alongside the selected nickname.
+If the display name is unavailable, the runtime uses the executable's short
+title, then `3Dii U` if both are missing. The game ID is unchanged. The startup
+log records the advertised name and ID as `[uds-room] playing ...`.
+Existing executables need rebuilding to receive this display-only correction.
+
 All Builder output modes generate this blank template under `3dii-u/` alongside
 the output, or at the SD root when copying directly to a card. Existing settings
 are preserved. No personal or public server address is shipped in the defaults.

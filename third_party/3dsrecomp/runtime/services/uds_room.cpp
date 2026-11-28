@@ -193,9 +193,12 @@ bool register_room_uds() {
         return false;
     }
     config.game_id = g_game.program_id;
-    config.game_name = "3Dii U";
+    // load_game has already read the original SMDH title for both packaging formats.
+    config.game_name = g_game.name.empty() ? g_game.title : g_game.name;
+    if (config.game_name.empty()) config.game_name = "3Dii U";
     azl::g_debug_level = 1;
     OSReport("[uds-room] target %s:%u as %s\n", config.host.c_str(), unsigned(config.port), config.nickname.c_str());
+    OSReport("[uds-room] playing %s (%016llx)\n", config.game_name.c_str(), (unsigned long long)config.game_id);
     azl::SetLogSink([](const char *line) { OSReport("[uds-link] %s\n", line); });
     live_room = std::make_shared<UdsContext>();
     live_room->configuration = config;
